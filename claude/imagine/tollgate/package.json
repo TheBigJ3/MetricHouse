@@ -1,0 +1,10 @@
+{
+  "name": "tollgate",
+  "private": true,
+  "type": "module",
+  "description": "Hypothetical LLM gateway built against the unimplemented MetricHouse spec, to find its flaws.",
+  "dependencies": {
+    "metrichouse": "workspace:*",
+    "redis": "^4.7.0"
+  }
+}
