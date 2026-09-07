@@ -1,0 +1,21 @@
+packages:
+  - 'packages/*'
+  # examples/, runtime-tests/ and benchmarks/ are planned but hold no package
+  # yet — their globs matched nothing, and the vitest equivalent matched a
+  # README and broke `pnpm test`. Each gets its entry back when it has a
+  # package.json.
+
+# claude/imagine/* is deliberately excluded. Those projects are written against
+# an unimplemented API to find its flaws — they must never resolve or build.
+
+# Shared versions, referenced as "catalog:" in each package.
+catalog:
+  typescript: ^7.0.2
+  tsdown: ^0.23.0
+  vitest: ^5.0.0
+  '@types/node': ^26.4.1
+  publint: ^0.3.24
+  '@arethetypeswrong/cli': ^0.18.5
+
+onlyBuiltDependencies:
+  - '@biomejs/biome'

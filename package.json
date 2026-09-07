@@ -1,0 +1,31 @@
+{
+  "name": "@metrichouse/repo",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@12.3.4",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm -r --parallel dev",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "format": "biome format --write .",
+    "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm lint:publish",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "pnpm build && changeset publish",
+    "lint:publish": "pnpm -r lint:publish"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.12",
+    "@changesets/cli": "^3.0.2",
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  }
+}

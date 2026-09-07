@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# node
+node_modules/
+.pnpm-debug.log*
+dist/
+*.tsbuildinfo
+.npm
+.pnpm-store/
+
+# env
+.env
+.env.*
+!.env.example
+
+# editors
+.vscode/
+.idea/
+
+# build
+*.tsbuildinfo
+coverage/
+.vitest/
+
+# local scratch scripts
+packages/*/test.ts
