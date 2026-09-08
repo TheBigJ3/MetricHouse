@@ -11,7 +11,13 @@
 import type { Claim, Driver } from '../drivers/types.js'
 import type { InferShape, Shape, TypeKind } from '../schema/types.js'
 
-export type MetricKind = 'counter' | 'gauge' | 'event'
+/**
+ * Every primitive, in declaration order. A single list rather than a bare
+ * union so {@link isMetric} cannot drift out of sync with the type.
+ */
+export const METRIC_KINDS = ['counter', 'gauge', 'event', 'log'] as const
+
+export type MetricKind = (typeof METRIC_KINDS)[number]
 
 /**
  * The dims argument, required only when the metric declares any.
@@ -182,7 +188,7 @@ export function isMetric(value: unknown): value is AnyMetric {
   const candidate = value as Partial<AnyMetric>
   return (
     typeof candidate.name === 'string' &&
-    (candidate.kind === 'counter' || candidate.kind === 'gauge' || candidate.kind === 'event') &&
+    (METRIC_KINDS as readonly string[]).includes(candidate.kind as string) &&
     typeof candidate.bind === 'function' &&
     typeof candidate.claimBatch === 'function' &&
     typeof candidate.resolutionMs === 'number'

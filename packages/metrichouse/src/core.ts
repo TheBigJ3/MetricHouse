@@ -4,8 +4,8 @@
  * Everything an application calls at runtime. No SQL, no filesystem, no build
  * tooling: this entry point must stay small enough to ship to an edge bundle.
  *
- * Spec: initialPlan/01-schema.md, 03-counter.md, 05-events.md, 08-house.md,
- *       14-identity.md, 15-live-read.md, 25-packaging.md
+ * Spec: initialPlan/01-schema.md, 03-counter.md, 05-events.md, 06-logs.md,
+ *       08-house.md, 14-identity.md, 15-live-read.md, 25-packaging.md
  */
 
 export type {
@@ -37,7 +37,8 @@ export type { Hasher } from './identity.js'
 // can be installed before anything writes
 export { getHasher, hash, naturalKey, rowId, setHasher, uuidv7 } from './identity.js'
 export type { BatchLifecycle, BucketedOptions } from './metrics/bucketed.js'
-// the shared aggregate lifecycle, for anyone adding a primitive
+// the shared aggregate lifecycle, for anyone adding a primitive — its staged
+// counterpart is `stagedMetric`, below
 export { bucketedLifecycle } from './metrics/bucketed.js'
 export type { Counter, CounterConfig, CounterRow } from './metrics/counter.js'
 // primitives
@@ -51,9 +52,18 @@ export type {
   EventRow,
   EventStage,
 } from './metrics/event.js'
-export { event, RESERVED_EVENT_COLUMNS } from './metrics/event.js'
+export { event, RESERVED_EVENT_COLUMNS, stagedMetric } from './metrics/event.js'
 export type { Gauge, GaugeAggregate, GaugeConfig, GaugeRow, GaugeTotals } from './metrics/gauge.js'
 export { GAUGE_AGGREGATES, gauge } from './metrics/gauge.js'
+export type {
+  ChildLog,
+  DefaultLogLevels,
+  Log,
+  LogConfig,
+  LogFieldsArgs,
+  LogWriters,
+} from './metrics/log.js'
+export { DEFAULT_LOG_LEVELS, log, RESERVED_LOG_COLUMNS } from './metrics/log.js'
 export type {
   AnyMetric,
   DimsArgs,

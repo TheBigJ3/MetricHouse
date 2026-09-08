@@ -4,12 +4,15 @@ A metric collection layer for TypeScript that owns the parts of metrics a query
 can never reconstruct — bucket boundaries, atomic aggregation, durable staging,
 flush — and refuses to own anything else.
 
-> **Status: three primitives run.** `counter`, `gauge` and `event` all write
-> through the memory driver, live-read, and flush to your `write()` with stable
-> row ids — the snippet below is a working program, not a sketch. `event`
-> brings the second storage model with it: records are staged and shipped
-> whole, never folded, so the driver contract now covers both aggregation and
-> durable staging. Still missing: the Redis driver, `level`/`log`/`distinct`,
+> **Status: four primitives run.** `counter`, `gauge`, `event` and `log` all
+> write through the memory driver, live-read, and flush to your `write()` with
+> stable row ids — the snippet below is a working program, not a sketch.
+> `event` brought the second storage model with it: records are staged and
+> shipped whole, never folded, so the driver contract covers both aggregation
+> and durable staging. `log` is the first thing built *on* that model rather
+> than beside it — a log is an event with a level, a `minLevel` filter and a
+> bound `child()` logger, sharing every staging guarantee instead of growing a
+> second pipeline. Still missing: the Redis driver, `level`/`distinct`,
 > `ingest`/`backfill`, and the CLI. The specification in
 > [`claude/initialPlan/`](claude/initialPlan/) describes the whole design;
 > [`claude/imagine/`](claude/imagine/) holds three hypothetical projects

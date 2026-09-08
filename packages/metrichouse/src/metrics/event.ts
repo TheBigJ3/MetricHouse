@@ -25,6 +25,7 @@ import type {
   AnyMetric,
   MaterializedBatch,
   MetricBinding,
+  MetricKind,
   Row,
   RowColumn,
   RowShape,
@@ -128,9 +129,15 @@ export interface EventConfig<F extends Shape> {
   readonly write?: WriteFn
 }
 
-export interface Event<F extends Shape> extends AnyMetric {
+/**
+ * `K` is the kind this metric reports to a sink. It is a parameter, not the
+ * constant `'event'`, because {@link stagedMetric} is also what backs `log()`
+ * — a log is stored as an event and must still say `'log'` in a
+ * {@link WriteContext}.
+ */
+export interface Event<F extends Shape, K extends MetricKind = 'event'> extends AnyMetric {
   readonly name: string
-  readonly kind: 'event'
+  readonly kind: K
   readonly fields: F
   readonly stage: EventStage
   readonly flushMs: number
@@ -165,6 +172,30 @@ const DEFAULT_MAX_SIZE = 500
  * outside `[0, 1]`, or an empty name.
  */
 export function event<F extends Shape>(name: string, config: EventConfig<F>): Event<F> {
+  return stagedMetric(name, config, 'event')
+}
+
+/**
+ * The staged lifecycle, for a primitive that appends records rather than
+ * folding them into buckets.
+ *
+ * The counterpart to `bucketedLifecycle` on the aggregate side, and factored
+ * out for the same reason: `log()` is an event with three reserved fields and
+ * a level filter in front of `record()`, and reimplementing staging, batching,
+ * claiming and sampling to get that would have been four hundred lines of
+ * duplicate to keep in step forever.
+ *
+ * `kind` is the only thing a caller varies. Everything else about a log — the
+ * composed field shape, the level methods, `child()` — is built on top of the
+ * event this returns, not inside it.
+ *
+ * @throws see {@link event}.
+ */
+export function stagedMetric<F extends Shape, K extends MetricKind>(
+  name: string,
+  config: EventConfig<F>,
+  kind: K,
+): Event<F, K> {
   if (typeof name !== 'string' || name.trim() === '') {
     throw new Error('event: name must be a non-empty string')
   }
@@ -479,9 +510,9 @@ export function event<F extends Shape>(name: string, config: EventConfig<F>): Ev
     return row
   }
 
-  const self: Event<F> = {
+  const self: Event<F, K> = {
     name,
-    kind: 'event',
+    kind,
     fields,
     stage,
     // an event has fields, not dims: they are unkeyed, `json()` is legal among
