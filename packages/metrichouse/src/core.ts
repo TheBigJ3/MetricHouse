@@ -91,7 +91,10 @@ export type {
   FieldType,
   InferShape,
   InferValue,
+  MarkOptional,
+  RequiredKeys,
   Shape,
+  ShapeArgs,
   Simplify,
   TypeKind,
 } from './schema/types.js'

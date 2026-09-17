@@ -19,7 +19,7 @@
  */
 
 import type { Claim } from '../drivers/types.js'
-import type { FieldType, InferShape, InferValue, Shape } from '../schema/types.js'
+import type { InferShape, MarkOptional, Shape, ShapeArgs } from '../schema/types.js'
 import { oneOf, str } from '../schema/types.js'
 import type { DurationInput } from '../time/duration.js'
 import { type Event, type EventBatchConfig, type EventStage, stagedMetric } from './event.js'
@@ -102,34 +102,12 @@ function shadows(level: string): boolean {
   return RESERVED_LEVEL_NAMES.includes(level) || level in {}
 }
 
-/** The keys a call site must supply, if any. */
-type RequiredKeys<S extends Shape> = {
-  [K in keyof S]: S[K]['isOptional'] extends true ? never : K
-}[keyof S]
-
 /**
- * The fields argument — omittable only when nothing in the shape is required.
- *
- * The sibling of `DimsArgs`, and split out for the same reason: a log with no
- * declared fields, or one whose fields are all optional, should read
- * `log.info('started')` rather than `log.info('started', {})`.
+ * The fields argument — omittable only when nothing in the shape is required,
+ * so a log with no declared fields reads `log.info('started')` rather than
+ * `log.info('started', {})`.
  */
-export type LogFieldsArgs<F extends Shape> = [RequiredKeys<F>] extends [never]
-  ? [fields?: InferShape<F>]
-  : [fields: InferShape<F>]
-
-/**
- * The shape a child logger still accepts: every field the parent declared,
- * with the bound ones now omittable.
- *
- * Omittable rather than *removed*. Removing them would satisfy the required
- * fields, which is the point of `child()` — but it would also make overriding
- * one at a single call site a type error, and a bound field is a default, not
- * a lock.
- */
-type WithBound<F extends Shape, K extends PropertyKey> = {
-  [P in keyof F]: P extends K ? FieldType<InferValue<F[P]>, true> : F[P]
-}
+export type LogFieldsArgs<F extends Shape> = ShapeArgs<F>
 
 /**
  * One method per declared level.
@@ -148,8 +126,8 @@ export type LogWriters<F extends Shape, L extends readonly string[]> = {
  *
  * Not a metric: it stages into the log that made it, shares its batch, and is
  * the reason `requestId` does not have to be threaded through every call in a
- * request. Its remaining fields are the parent's minus the bound ones, so a
- * required field satisfied by `child()` stops being required at the call site.
+ * request. A required field satisfied by `child()` stops being required at the
+ * call site, and may still be overridden there — see `MarkOptional`.
  */
 export type ChildLog<F extends Shape, L extends readonly string[]> = LogWriters<F, L> & {
   readonly name: string
@@ -158,7 +136,7 @@ export type ChildLog<F extends Shape, L extends readonly string[]> = LogWriters<
 
   at(level: L[number], message: string | Error, ...fields: LogFieldsArgs<F>): void
 
-  child<const B extends Partial<InferShape<F>>>(fields: B): ChildLog<WithBound<F, keyof B>, L>
+  child<const B extends Partial<InferShape<F>>>(fields: B): ChildLog<MarkOptional<F, keyof B>, L>
 }
 
 export interface LogConfig<F extends Shape, L extends readonly string[]> {
@@ -218,7 +196,7 @@ export type Log<F extends Shape, L extends readonly string[]> = AnyMetric &
     at(level: L[number], message: string | Error, ...fields: LogFieldsArgs<F>): void
 
     /** A logger that merges `fields` into every call. */
-    child<const B extends Partial<InferShape<F>>>(fields: B): ChildLog<WithBound<F, keyof B>, L>
+    child<const B extends Partial<InferShape<F>>>(fields: B): ChildLog<MarkOptional<F, keyof B>, L>
 
     /** How many records are staged and not yet shipped. */
     pending(): Promise<number>

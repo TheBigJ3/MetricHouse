@@ -61,6 +61,32 @@ export type InferShape<S extends Shape> = Simplify<
   }
 >
 
+/** The keys a call site must supply — neither `.optional()` nor `.default()`. */
+export type RequiredKeys<S extends Shape> = Exclude<keyof S, OptionalKeys<S>>
+
+/**
+ * A values argument, omittable only when nothing in the shape is required.
+ *
+ * Stricter than `DimsArgs`, which demands the argument whenever any dim is
+ * declared: this one lets `log.info('started')` and `span.end()` stand alone
+ * once every remaining key is optional.
+ */
+export type ShapeArgs<S extends Shape> = [RequiredKeys<S>] extends [never]
+  ? [values?: InferShape<S>]
+  : [values: InferShape<S>]
+
+/**
+ * The same shape with `K` made omittable — what is left to supply once some
+ * values have been bound in advance.
+ *
+ * Omittable rather than *removed*: removing a bound key satisfies it, which is
+ * the point of binding, but would also make overriding it at one call site a
+ * type error. A bound value is a default, not a lock.
+ */
+export type MarkOptional<S extends Shape, K extends PropertyKey> = {
+  [P in keyof S]: P extends K ? FieldType<InferValue<S[P]>, true> : S[P]
+}
+
 /** Everything a constructor can vary. Carried through modifiers unchanged. */
 interface TypeOpts<TValue> {
   hasDefault?: boolean
