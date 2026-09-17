@@ -1,7 +1,7 @@
 {
   "name": "metrichouse",
   "version": "0.0.0",
-  "description": "Metric collection that owns bucketing, aggregation and flush — and nothing a query can reconstruct.",
+  "description": "Metric collection that owns bucketing, aggregation and flush \u2014 and nothing a query can reconstruct.",
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
@@ -42,6 +42,16 @@
         "default": "./dist/memory.cjs"
       }
     },
+    "./ioredis": {
+      "import": {
+        "types": "./dist/ioredis.d.mts",
+        "default": "./dist/ioredis.mjs"
+      },
+      "require": {
+        "types": "./dist/ioredis.d.cts",
+        "default": "./dist/ioredis.cjs"
+      }
+    },
     "./package.json": "./package.json"
   },
   "scripts": {
@@ -53,6 +63,7 @@
   "devDependencies": {
     "@arethetypeswrong/cli": "catalog:",
     "@types/node": "catalog:",
+    "ioredis": "catalog:",
     "publint": "catalog:",
     "tsdown": "catalog:",
     "typescript": "catalog:",
@@ -68,5 +79,13 @@
     "redis",
     "analytics",
     "telemetry"
-  ]
+  ],
+  "peerDependencies": {
+    "ioredis": ">=5"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    }
+  }
 }

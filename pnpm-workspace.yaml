@@ -16,6 +16,7 @@ catalog:
   '@types/node': ^26.4.1
   publint: ^0.3.24
   '@arethetypeswrong/cli': ^0.18.5
+  ioredis: ^6.0.0
 
 onlyBuiltDependencies:
   - '@biomejs/biome'

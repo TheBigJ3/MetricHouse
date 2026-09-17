@@ -2,6 +2,14 @@
 
 A driver is the storage contract for open buckets and staged events — increment, observe, append, read, claim, ack. Everything above it is driver-agnostic (schema, bucketing, row shaping, identity), so adding a backend is one interface, not a fork.
 
+**The memory driver is the specification.** Not by convention — mechanically.
+Everything a driver must do lives in
+[`contract.ts`](../../packages/metrichouse/src/drivers/contract.ts) as an
+executable suite, written against the memory driver because that is the one
+implementation small enough to read in a sitting. A new backend is not "a
+driver" because it satisfies the TypeScript interface; a stub of twelve
+`async () => {}` methods does that. It is a driver when it passes that file.
+
 ## Main functions
 
 **Write path** — all batched, one round trip per call
@@ -31,13 +39,38 @@ A driver is the storage contract for open buckets and staged events — incremen
 **Capabilities**
 - `capabilities: { durable: boolean; shared: boolean; atomicMerge: boolean; sketches: boolean; retention: boolean }` — the house reads this to decide whether at-least-once is honestly available, and which primitives this driver can host
 
+## Adding a backend
+
+Start here, before writing a line of the driver itself:
+
+```ts
+// drivers/yours.test.ts
+describeDriverContract('yours', {
+  make: () => yours(conn),
+  cleanup: (driver) => wipe(driver),
+  capabilities: { durable: true, shared: true, atomicMerge: true },
+})
+```
+
+Call it, watch it fail, make it pass. Then add what your backend is *allowed*
+to differ on — a series cap, a key layout, a claim that survives a restart — in
+your own file, never in the shared one. That split is the whole discipline:
+anything in `contract.ts` is a promise every driver makes, so a test that only
+one backend could pass does not belong there.
+
 ## What is implemented
 
-Ten of the methods above exist today, in `packages/metrichouse/src/drivers/`.
+Twelve methods exist today, in `packages/metrichouse/src/drivers/`, across two
+drivers — [`memory`](11-driver-memory.md) and [`ioredis`](10-driver-redis.md).
 The rest wait on the primitives that need them: `adjust`/`readTotals`/
 `dumpTotals`/`restoreTotals` on [`level`](20-level.md), `addDistinct` on
-[`distinct`](21-distinct.md), `recoverStale` on a driver where a claim can
-outlive the process that took it.
+[`distinct`](21-distinct.md).
+
+`recoverStale` is now the one method with a driver that could use it — a Redis
+claim genuinely can outlive the process that took it, and `{ns}:claims:{metric}`
+scores every claim by `claimedAt` for exactly that purpose. It stays unbuilt
+because adding it means changing the interface and the memory driver too, and
+the first job was parity.
 
 ```
 increment  observe  append          write path
@@ -45,7 +78,7 @@ readBuckets  readPending  countPending    read path
 claim  claimRecords  ack  release      flush path
 ```
 
-Three differences from the sketch above, all found by building it:
+Four differences from the sketch above, all found by building it:
 
 - **`claim` takes a watermark; `claimRecords` takes a limit.** They are separate
   methods because the storage models are separate. Whether a *bucket* may ship
@@ -60,6 +93,11 @@ Three differences from the sketch above, all found by building it:
   positional arguments — and `countPending` is split out of it, because `XLEN`
   and `XRANGE` are different calls and counting a million staged rows by
   dragging them over the wire should not be the easy path.
+- **The driver is never told which kind it serves.** `readBuckets` takes a
+  metric name, so a counter and a gauge share one storage shape and the *value*
+  says which it is. Redis wanted separate `c:` and `g:` key prefixes for
+  readability; the contract would not have it, and the reasoning is in
+  [10-driver-redis.md](10-driver-redis.md).
 
 `capabilities` is three flags, not five: `sketches` and `retention` describe
 features no primitive has asked for yet.

@@ -12,8 +12,10 @@ flush — and refuses to own anything else.
 > aggregation and durable staging. The two newest add no storage of their own:
 > `log` is an event with a level, a `minLevel` filter and a bound `child()`
 > logger, and `timer` is a gauge of durations with a `start()` handle, a scoped
-> `time()`, and an optional event for percentiles. Still missing: the Redis
-> driver, `level`/`distinct`, `ingest`/`backfill`, and the CLI. The specification in
+> `time()`, and an optional event for percentiles. Storage is now two drivers,
+> not one: `ioredis` joined `memory`, both measured against the same executable
+> driver contract, so at-least-once is real rather than best-effort. Still
+> missing: `level`/`distinct`, `ingest`/`backfill`, and the CLI. The specification in
 > [`claude/initialPlan/`](claude/initialPlan/) describes the whole design;
 > [`claude/imagine/`](claude/imagine/) holds three hypothetical projects
 > written to break it.

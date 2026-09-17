@@ -2,6 +2,13 @@
 
 The memory driver implements the full driver contract with plain `Map`s, so single-process apps, CLIs, cron jobs, and tests get identical behavior with no Redis. It is legitimate for production on one process and gives up exactly two things: sharing across instances, and surviving a crash.
 
+It is also the **scaffold every other driver is built on**. The behaviour that
+made it here first got lifted into
+[`contract.ts`](../../packages/metrichouse/src/drivers/contract.ts), an
+executable suite both drivers run — so "identical behavior with no Redis" is a
+thing CI checks rather than a thing this page claims. See
+[09-drivers.md](09-drivers.md).
+
 ## Main functions
 
 **Construction**
@@ -42,8 +49,10 @@ has none of that: an unbounded dim is a silent heap climb inside the process
 serving requests, and the first symptom is an OOM kill.
 
 So the memory driver caps and warns; Redis stays open and is analysed
-statically by `metrichouse check` instead. Moving from `memory()` to `redis()`
-**removes** a guard you may have been relying on.
+statically by `metrichouse check` instead. Moving from `memory()` to
+`ioredis()` **removes** a guard you may have been relying on, at the same
+moment it **adds** durability — which is why `maxSeries` and `maxStaged` live
+in `memory.test.ts` and not in the shared contract.
 
 ## What the house does differently here
 
@@ -80,5 +89,5 @@ Swapping to shared, durable storage later:
 
 ```diff
 - driver: memory({ maxSeries: 50_000 }),
-+ driver: redis(client),
++ driver: ioredis(client),
 ```
