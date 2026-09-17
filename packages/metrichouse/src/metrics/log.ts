@@ -19,10 +19,17 @@
  */
 
 import type { Claim } from '../drivers/types.js'
-import type { InferShape, MarkOptional, Shape, ShapeArgs } from '../schema/types.js'
+import type { LiveFields, SnapshotOptions } from '../runtime/live.js'
+import type { InferShape, MarkOptional, Shape, ShapeArgs, Simplify } from '../schema/types.js'
 import { oneOf, str } from '../schema/types.js'
 import type { DurationInput } from '../time/duration.js'
-import { type Event, type EventBatchConfig, type EventStage, stagedMetric } from './event.js'
+import {
+  type Event,
+  type EventBatchConfig,
+  type EventLiveRow,
+  type EventStage,
+  stagedMetric,
+} from './event.js'
 import type {
   AnyMetric,
   MaterializedBatch,
@@ -170,7 +177,32 @@ export interface LogConfig<F extends Shape, L extends readonly string[]> {
   readonly write?: WriteFn
 }
 
-export type Log<F extends Shape, L extends readonly string[]> = AnyMetric &
+/**
+ * One live row from a log: the reserved three, your declared fields, and the
+ * liveness fields.
+ *
+ * `level` is typed to the levels this log declares, so a snapshot narrows the
+ * same way a call site does.
+ */
+export type LogLiveRow<F extends Shape, L extends readonly string[]> = Simplify<
+  {
+    id: string
+    ts: Date
+    level: L[number]
+    message: string
+    error_stack?: string
+  } & InferShape<F> & { _ingested_at: Date } & LiveFields
+>
+
+/**
+ * `snapshot` is omitted from {@link AnyMetric} and redeclared below rather than
+ * simply added. A `Log` is an intersection, not an interface, so two signatures
+ * for one name merge into an **overload set** instead of the more specific one
+ * overriding the broader — and the erased `LiveRow[]` would win by being first,
+ * which is how the typed row silently became `unknown` per key once. The other
+ * four kinds use `interface … extends AnyMetric` and narrow it normally.
+ */
+export type Log<F extends Shape, L extends readonly string[]> = Omit<AnyMetric, 'snapshot'> &
   LogWriters<F, L> & {
     readonly name: string
     readonly kind: 'log'
@@ -203,6 +235,9 @@ export type Log<F extends Shape, L extends readonly string[]> = AnyMetric &
 
     /** The first `n` staged records as rows, without consuming them. */
     peek(n?: number): Promise<Row[]>
+
+    /** Unshipped log lines as typed rows. Never partial — see the event. */
+    snapshot(options?: SnapshotOptions): Promise<LogLiveRow<F, L>[]>
 
     drain(): Promise<void>
 
@@ -368,6 +403,7 @@ export function log<
 
     name,
     kind: 'log' as const,
+    storage: 'staged' as const,
     fields,
     levels,
     minLevel,
@@ -407,6 +443,10 @@ export function log<
 
     peek(n?: number): Promise<Row[]> {
       return inner.peek(n)
+    },
+
+    snapshot(options?: SnapshotOptions): Promise<EventLiveRow<Shape>[]> {
+      return inner.snapshot(options)
     },
 
     drain(): Promise<void> {

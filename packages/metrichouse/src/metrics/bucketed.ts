@@ -11,6 +11,15 @@
  */
 
 import { type Cell, type Claim, type Driver, isBucketClaim } from '../drivers/types.js'
+import {
+  applySnapshot,
+  type LiveRow,
+  type MergeValues,
+  type SnapshotOptions,
+  snapshotRange,
+  type TypedSnapshot,
+} from '../runtime/live.js'
+import type { Shape } from '../schema/types.js'
 import { closedUpTo } from '../time/buckets.js'
 import type { AnyMetric, MaterializedBatch, Row } from './types.js'
 
@@ -23,6 +32,71 @@ import type { AnyMetric, MaterializedBatch, Row } from './types.js'
  * buckets.
  */
 export const DEFAULT_GRACE_MS = 2_000
+
+/**
+ * The read half, for a kind whose live data is buckets.
+ *
+ * Generic in the dims and in the value columns the kind adds, so a counter's
+ * snapshot returns rows with `park: string` and `value: number` rather than
+ * `unknown` per key. The erased {@link AnyMetric.snapshot} stays as it is —
+ * this narrows it, which is legal precisely because a typed row is still a
+ * {@link LiveRow}.
+ */
+export type BucketedReader<D extends Shape, V> = TypedSnapshot<D, V>
+
+export interface BucketedReaderOptions {
+  readonly name: string
+  readonly resolutionMs: number
+  /** Declared dims, for validating a `dims` filter and a `groupBy`. */
+  readonly dims: Shape
+  /** Read late, not captured: a metric is declared before it is bound. */
+  readonly driver: () => Driver
+  readonly now: () => number
+  readonly materialize: (bucketTs: number, dimKey: string, cell: Cell) => Row
+  readonly mergeValues: MergeValues
+}
+
+/**
+ * Live read for a bucketed kind.
+ *
+ * The sibling of {@link bucketedLifecycle}: that one is the write path's shared
+ * half, this one is the read path's. Both exist so a third aggregate kind
+ * supplies what is actually different about it — how a cell becomes a row, and
+ * how two of them merge — and inherits everything else.
+ *
+ * The clock is read once per call and passed down, so every row in one snapshot
+ * agrees about which bucket is open. Reading it per row would let a snapshot
+ * that straddles a boundary report two different answers about the same window.
+ */
+export function bucketedReader<D extends Shape, V>(
+  options: BucketedReaderOptions,
+): BucketedReader<D, V> {
+  const { name, resolutionMs, dims, driver, now, materialize, mergeValues } = options
+
+  // the one cast: `applySnapshot` works in erased rows because filtering and
+  // merging are the same work whatever the columns are called, and the kind
+  // supplies the type that says what they are. Casting here rather than at each
+  // of the three call sites keeps it to one place that can be checked.
+  const reader = {
+    async snapshot(snapshotOptions: SnapshotOptions = {}): Promise<LiveRow[]> {
+      const nowMs = now()
+      const range = snapshotRange(snapshotOptions, resolutionMs, nowMs)
+
+      const live = await driver().readBuckets({ metric: name, ...range })
+
+      return applySnapshot(
+        live.map((row) => ({
+          bucketTs: row.bucketTs,
+          row: materialize(row.bucketTs, row.dimKey, row.value),
+        })),
+        snapshotOptions,
+        { metric: name, dims, resolutionMs, nowMs, mergeValues },
+      )
+    },
+  }
+
+  return reader as unknown as BucketedReader<D, V>
+}
 
 /** The four {@link AnyMetric} methods that move a batch. */
 export type BatchLifecycle = Pick<

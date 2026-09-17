@@ -17,6 +17,7 @@
 import type { AppendOp, Claim, Driver, RecordClaim, StagedRecord } from '../drivers/types.js'
 import { isRecordClaim } from '../drivers/types.js'
 import { uuidv7 } from '../identity.js'
+import type { LiveFields, SnapshotOptions } from '../runtime/live.js'
 import { shipClaim } from '../runtime/ship.js'
 import { applyDimDefaults, validateDims } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
@@ -89,6 +90,15 @@ export type EventRow<F extends Shape> = Simplify<
   { id: string; ts: Date } & InferShape<F> & { _ingested_at: Date; _sample_rate?: number }
 >
 
+/**
+ * One live row from an event: the row a sink would receive, plus the liveness
+ * fields.
+ *
+ * No conditional on the options, unlike an aggregate kind: `rollup` and
+ * `groupBy` have nothing to collapse here, so the shape never varies.
+ */
+export type EventLiveRow<F extends Shape> = Simplify<EventRow<F> & LiveFields>
+
 export interface EventConfig<F extends Shape> {
   /** The payload schema. Unlike dims, `json()` is legal here. */
   readonly fields: F
@@ -160,6 +170,17 @@ export interface Event<F extends Shape, K extends MetricKind = 'event'> extends 
 
   /** The first `n` staged records as rows, without consuming them. */
   peek(n?: number): Promise<Row[]>
+
+  /**
+   * Unshipped records as live rows.
+   *
+   * `peek()` with the rest of the snapshot vocabulary, and the staged answer to
+   * a question the aggregate kinds answer with buckets. Every row reads
+   * `bucket_open: false`: a record is complete the instant it is appended, so
+   * there is no partial window for `complete` to exclude and no elapsed
+   * fraction to report.
+   */
+  snapshot(options?: SnapshotOptions): Promise<EventLiveRow<F>[]>
 
   drain(): Promise<void>
   rowShape(): RowShape
@@ -546,6 +567,28 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     }
   }
 
+  function toMs(at: number | Date): number {
+    return at instanceof Date ? at.getTime() : at
+  }
+
+  /**
+   * The local-buffer answer to `readPending`'s query.
+   *
+   * Half-open `[from, to)`, matching the driver, so a staged snapshot reads the
+   * same whichever side of `stage` it lands on.
+   */
+  function bounded(
+    records: readonly StagedRecord[],
+    from: number | undefined,
+    to: number | undefined,
+    limit: number | undefined,
+  ): StagedRecord[] {
+    const within = records.filter(
+      (record) => (from === undefined || record.ts >= from) && (to === undefined || record.ts < to),
+    )
+    return limit === undefined ? within : within.slice(0, limit)
+  }
+
   /** Turn one staged record into the row a sink receives. */
   function materialize(record: StagedRecord): Row {
     const row: Row = { id: record.id, ts: new Date(record.ts) }
@@ -567,6 +610,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   const self: Event<F, K> = {
     name,
     kind,
+    storage: 'staged',
     fields,
     stage,
     // an event has fields, not dims: they are unkeyed, `json()` is legal among
@@ -613,6 +657,31 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     async pending(): Promise<number> {
       if (stage === 'local') return buffer.length
       return activeDriver().countPending(name)
+    },
+
+    async snapshot(options: SnapshotOptions = {}): Promise<EventLiveRow<F>[]> {
+      const from = options.from === undefined ? undefined : toMs(options.from)
+      const to = options.to === undefined ? undefined : toMs(options.to)
+
+      const records =
+        stage === 'local'
+          ? bounded(buffer, from, to, options.limit)
+          : await activeDriver().readPending({
+              metric: name,
+              ...(from !== undefined && { from }),
+              ...(to !== undefined && { to }),
+              ...(options.limit !== undefined && { limit: options.limit }),
+            })
+
+      return records.map(
+        (record) =>
+          ({
+            ...materialize(record),
+            // complete on arrival, and with no window to be a fraction of
+            bucket_open: false,
+            bucket_elapsed_ms: 0,
+          }) as unknown as EventLiveRow<F>,
+      )
     },
 
     async peek(n?: number): Promise<Row[]> {

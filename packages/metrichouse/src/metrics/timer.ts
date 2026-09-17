@@ -27,6 +27,7 @@
  */
 
 import type { Claim, GaugeCell } from '../drivers/types.js'
+import type { SnapshotOptions } from '../runtime/live.js'
 import { encodeDimKey } from '../schema/dims.js'
 import {
   assertValue,
@@ -37,7 +38,13 @@ import {
   type ShapeArgs,
 } from '../schema/types.js'
 import type { DurationInput } from '../time/duration.js'
-import { type Gauge, type GaugeAggregate, type GaugeTotals, gauge } from './gauge.js'
+import {
+  type Gauge,
+  type GaugeAggregate,
+  type GaugeLiveRow,
+  type GaugeTotals,
+  gauge,
+} from './gauge.js'
 import type {
   AnyMetric,
   DimsArgs,
@@ -173,6 +180,11 @@ export interface Timer<D extends Shape> extends AnyMetric {
   totals(): Promise<GaugeTotals | undefined>
 
   drain(): Promise<void>
+  /** Every unflushed bucket of durations. See `snapshot` on a gauge. */
+  snapshot<const O extends SnapshotOptions = Record<never, never>>(
+    options?: O,
+  ): Promise<GaugeLiveRow<D, O>[]>
+
   rowShape(): RowShape
 }
 
@@ -389,6 +401,7 @@ export function timer<D extends Shape = Record<never, never>>(
   const self = {
     name,
     kind: 'timer' as const,
+    storage: 'bucketed' as const,
     dims,
     resolutionMs: inner.resolutionMs,
 
@@ -471,6 +484,12 @@ export function timer<D extends Shape = Record<never, never>>(
 
     drain(): Promise<void> {
       return inner.drain()
+    },
+
+    snapshot<const O extends SnapshotOptions = Record<never, never>>(
+      options?: O,
+    ): Promise<GaugeLiveRow<D, O>[]> {
+      return inner.snapshot(options)
     },
 
     rowShape(): RowShape {

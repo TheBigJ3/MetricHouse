@@ -37,11 +37,21 @@ export type { Hasher } from './identity.js'
 // identity — public so a sink can reproduce a row id, and so a custom hasher
 // can be installed before anything writes
 export { getHasher, hash, naturalKey, rowId, setHasher, uuidv7 } from './identity.js'
-export type { BatchLifecycle, BucketedOptions } from './metrics/bucketed.js'
-// the shared aggregate lifecycle, for anyone adding a primitive — its staged
-// counterpart is `stagedMetric`, below
-export { bucketedLifecycle, DEFAULT_GRACE_MS } from './metrics/bucketed.js'
-export type { Counter, CounterConfig, CounterRow } from './metrics/counter.js'
+export type {
+  BatchLifecycle,
+  BucketedOptions,
+  BucketedReader,
+  BucketedReaderOptions,
+} from './metrics/bucketed.js'
+// the shared aggregate lifecycle and its read half, for anyone adding a
+// primitive — the staged counterpart is `stagedMetric`, below
+export { bucketedLifecycle, bucketedReader, DEFAULT_GRACE_MS } from './metrics/bucketed.js'
+export type {
+  Counter,
+  CounterConfig,
+  CounterLiveRow,
+  CounterRow,
+} from './metrics/counter.js'
 // primitives
 export { counter } from './metrics/counter.js'
 export type {
@@ -50,11 +60,19 @@ export type {
   Event,
   EventBatchConfig,
   EventConfig,
+  EventLiveRow,
   EventRow,
   EventStage,
 } from './metrics/event.js'
 export { event, RESERVED_EVENT_COLUMNS, stagedMetric } from './metrics/event.js'
-export type { Gauge, GaugeAggregate, GaugeConfig, GaugeRow, GaugeTotals } from './metrics/gauge.js'
+export type {
+  Gauge,
+  GaugeAggregate,
+  GaugeConfig,
+  GaugeLiveRow,
+  GaugeRow,
+  GaugeTotals,
+} from './metrics/gauge.js'
 export { GAUGE_AGGREGATES, gauge } from './metrics/gauge.js'
 export type {
   ChildLog,
@@ -62,6 +80,7 @@ export type {
   Log,
   LogConfig,
   LogFieldsArgs,
+  LogLiveRow,
   LogWriters,
 } from './metrics/log.js'
 export { DEFAULT_LOG_LEVELS, log, RESERVED_LOG_COLUMNS } from './metrics/log.js'
@@ -76,6 +95,7 @@ export type {
   Row,
   RowColumn,
   RowShape,
+  StorageModel,
   WriteContext,
   WriteFn,
 } from './metrics/types.js'
@@ -92,10 +112,28 @@ export type {
   House,
   HouseConfig,
   HouseDefaultsConfig,
+  HouseSnapshot,
+  HouseSnapshotOptions,
   SchemaInput,
 } from './runtime/house.js'
 // runtime
 export { createHouse } from './runtime/house.js'
+// live read — the snapshot engine is pure, and exported so a custom primitive
+// can reuse it rather than reimplement rollup and top-K
+export type {
+  BucketedRow,
+  Direction,
+  LiveDims,
+  LiveFields,
+  LiveIdentity,
+  LiveRow,
+  LiveRowOf,
+  MergeValues,
+  RollupMode,
+  SnapshotOptions,
+  TypedSnapshot,
+} from './runtime/live.js'
+export { applySnapshot, liveness, snapshotRange } from './runtime/live.js'
 export type { OpenSeriesShip, ShipOutcome } from './runtime/ship.js'
 export { shipClaim, shipOpenSeries } from './runtime/ship.js'
 export type {

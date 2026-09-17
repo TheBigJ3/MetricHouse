@@ -13,12 +13,13 @@
 
 import { type Cell, type Driver, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
+import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
 import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
 import { assertResolution, bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
-import { bucketedLifecycle, DEFAULT_GRACE_MS } from './bucketed.js'
+import { bucketedLifecycle, bucketedReader, DEFAULT_GRACE_MS } from './bucketed.js'
 import type { AnyMetric, DimsArgs, MetricBinding, Row, RowShape, WriteFn } from './types.js'
 
 export type { DimsArgs, RowColumn, RowShape } from './types.js'
@@ -27,6 +28,17 @@ export type { DimsArgs, RowColumn, RowShape } from './types.js'
 export type CounterRow<D extends Shape> = Simplify<
   { id: string; bucket_ts: Date } & InferShape<D> & { value: number }
 >
+
+/**
+ * One live row from a counter, typed to its dims and to the options asked for.
+ *
+ * The same columns as {@link CounterRow}, plus `bucket_open` and
+ * `bucket_elapsed_ms` — minus whatever a `rollup` or a `groupBy` merged away.
+ */
+export type CounterLiveRow<
+  D extends Shape,
+  O extends SnapshotOptions = Record<never, never>,
+> = LiveRowOf<D, { value: number }, O>
 
 export interface CounterConfig<D extends Shape> {
   /** Omit entirely for a counter with no dimensions. */
@@ -91,6 +103,17 @@ export interface Counter<D extends Shape> extends AnyMetric {
    * `0` when nothing has been recorded.
    */
   current(dims?: InferShape<D>): Promise<number>
+
+  /**
+   * Every unflushed bucket, as typed rows.
+   *
+   * Narrows {@link AnyMetric.snapshot} to this counter's dims: `park` comes
+   * back a `string` rather than an `unknown`, and a `rollup` or `groupBy`
+   * changes the row type to match what it actually merged away.
+   */
+  snapshot<const O extends SnapshotOptions = Record<never, never>>(
+    options?: O,
+  ): Promise<CounterLiveRow<D, O>[]>
 
   /**
    * Resolve when every write issued so far has reached the driver.
@@ -216,6 +239,10 @@ export function counter<D extends Shape = Record<never, never>>(
     return activeBinding().driver
   }
 
+  function nowMs(): number {
+    return (activeBinding().now ?? Date.now)()
+  }
+
   /**
    * Under `delivery: 'immediate'`, follow the write with a send of the whole
    * open bucket for this series.
@@ -265,6 +292,11 @@ export function counter<D extends Shape = Record<never, never>>(
     return rows.reduce((sum, row) => sum + (row.value as number), 0)
   }
 
+  /** Counters merge by adding, across buckets and across series alike. */
+  function mergeValues(rows: readonly Row[]): Record<string, unknown> {
+    return { value: totalOf(rows) }
+  }
+
   return {
     ...bucketedLifecycle({
       name,
@@ -275,8 +307,19 @@ export function counter<D extends Shape = Record<never, never>>(
       totalOf,
     }),
 
+    ...bucketedReader<D, { value: number }>({
+      name,
+      resolutionMs,
+      dims,
+      driver: activeDriver,
+      now: nowMs,
+      materialize,
+      mergeValues,
+    }),
+
     name,
     kind: 'counter',
+    storage: 'bucketed',
     dims,
     resolutionMs,
 

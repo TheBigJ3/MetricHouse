@@ -10,6 +10,7 @@
 
 import type { Claim, Driver } from '../drivers/types.js'
 import type { DeliveryMode, HouseDefaults } from '../runtime/delivery.js'
+import type { LiveRow, SnapshotOptions } from '../runtime/live.js'
 import type { InferShape, Shape, TypeKind } from '../schema/types.js'
 
 /**
@@ -19,6 +20,17 @@ import type { InferShape, Shape, TypeKind } from '../schema/types.js'
 export const METRIC_KINDS = ['counter', 'gauge', 'event', 'log', 'timer'] as const
 
 export type MetricKind = (typeof METRIC_KINDS)[number]
+
+/**
+ * Which of the two storage models a metric's live data sits in.
+ *
+ * The distinction the whole library is built around, finally said out loud
+ * rather than inferred. `'bucketed'` folds writes into a window — counter,
+ * gauge, timer; `'staged'` appends them to a run — event, log. Everything that
+ * has to branch on it was otherwise branching on `kind` against a hardcoded
+ * list, which is the drift {@link METRIC_KINDS} exists to prevent.
+ */
+export type StorageModel = 'bucketed' | 'staged'
 
 /**
  * The dims argument, required only when the metric declares any.
@@ -171,6 +183,8 @@ export interface MaterializedBatch {
 export interface AnyMetric {
   readonly name: string
   readonly kind: MetricKind
+  /** Which storage model holds this metric's live data. */
+  readonly storage: StorageModel
   readonly dims: Shape
   readonly resolutionMs: number
   readonly flushMs: number
@@ -180,6 +194,27 @@ export interface AnyMetric {
   readonly write: WriteFn | undefined
   bind(binding: MetricBinding): void
   drain(): Promise<void>
+
+  /** The runtime column list a sink will receive, in order. */
+  rowShape(): RowShape
+
+  /**
+   * Everything still in the driver for this metric — the open bucket, plus any
+   * closed bucket not yet flushed and acked.
+   *
+   * On {@link AnyMetric} rather than on each kind because every reader of it —
+   * `house.snapshot()`, a dashboard, the cost projection, the test helpers —
+   * wants live rows without first learning what kind it is holding. The write
+   * path got that abstraction on day one, in the four batch methods below; this
+   * is the same idea for the read path.
+   *
+   * A staged kind answers with its unshipped records rather than with nothing:
+   * a record is complete the instant it is appended, so it is never partial and
+   * `complete: true` cannot exclude it. The options that only mean something to
+   * an aggregate — `rollup`, `groupBy`, `orderBy` — are ignored there, so that
+   * `house.snapshot(options)` stays callable across a mixed schema.
+   */
+  snapshot(options?: SnapshotOptions): Promise<LiveRow[]>
 
   /**
    * Move everything shippable out of the live set and hold it pending a write.

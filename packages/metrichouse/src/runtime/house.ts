@@ -14,6 +14,7 @@
 
 import type { Driver } from '../drivers/types.js'
 import { type AnyMetric, isMetric, type WriteFn } from '../metrics/types.js'
+import { bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
 import {
   type DeliveryConfig,
@@ -23,6 +24,7 @@ import {
 } from './delivery.js'
 import type { MetricFlushState } from './flush.js'
 import { type FlushContext, type FlushOptions, type FlushReport, runFlush } from './flush.js'
+import type { LiveRow, SnapshotOptions } from './live.js'
 
 /** An array of metrics, or an imported schema module. */
 export type SchemaInput = readonly AnyMetric[] | Record<string, unknown>
@@ -37,6 +39,14 @@ export interface HouseDefaultsConfig {
   readonly flush?: DurationInput
   readonly grace?: DurationInput
 }
+
+export interface HouseSnapshotOptions extends SnapshotOptions {
+  /** Restrict the snapshot to these metric names. */
+  readonly only?: readonly string[]
+}
+
+/** Live rows per metric, keyed by name — the same shape a flush report uses. */
+export type HouseSnapshot = Record<string, LiveRow[]>
 
 export interface HouseConfig {
   readonly driver: Driver
@@ -69,6 +79,27 @@ export interface House {
   metrics(): AnyMetric[]
   get(name: string): AnyMetric | undefined
   flush(options?: FlushOptions): Promise<FlushReport>
+
+  /**
+   * Every registered metric's unflushed data, in one call.
+   *
+   * Options that only mean something to an aggregate are ignored by a staged
+   * kind rather than rejected, so one set of them can be handed to a mixed
+   * schema. Metrics are read in parallel: these are independent reads and a
+   * dashboard is waiting on all of them.
+   */
+  snapshot(options?: HouseSnapshotOptions): Promise<HouseSnapshot>
+
+  /**
+   * Every metric's open bucket — the cheap dashboard call.
+   *
+   * Bucketed kinds only. A staged metric has no open bucket to report, so it is
+   * absent from the result rather than present and empty, which would read as
+   * "nothing happening" instead of "wrong question" — `pending()` is what
+   * counts an unshipped backlog.
+   */
+  current(): Promise<HouseSnapshot>
+
   /**
    * Resolve when every queued write has reached the driver.
    *
@@ -170,6 +201,39 @@ export function createHouse(config: HouseConfig): House {
 
     flush(options?: FlushOptions): Promise<FlushReport> {
       return runFlush(flushContext, options)
+    },
+
+    async snapshot(options: HouseSnapshotOptions = {}): Promise<HouseSnapshot> {
+      const { only, ...perMetric } = options
+      const wanted = [...registry.values()].filter(
+        (metric) => only === undefined || only.includes(metric.name),
+      )
+
+      const snapshot: HouseSnapshot = {}
+      await Promise.all(
+        wanted.map(async (metric) => {
+          snapshot[metric.name] = await metric.snapshot(perMetric)
+        }),
+      )
+      return snapshot
+    },
+
+    async current(): Promise<HouseSnapshot> {
+      const nowMs = now()
+      const bucketed = [...registry.values()].filter((metric) => metric.storage === 'bucketed')
+
+      const snapshot: HouseSnapshot = {}
+      await Promise.all(
+        bucketed.map(async (metric) => {
+          // each metric's own resolution decides which bucket is open, so the
+          // lower bound is per metric rather than one shared timestamp
+          snapshot[metric.name] = await metric.snapshot({
+            complete: false,
+            from: bucketStart(nowMs, metric.resolutionMs),
+          })
+        }),
+      )
+      return snapshot
     },
 
     async drain(): Promise<void> {

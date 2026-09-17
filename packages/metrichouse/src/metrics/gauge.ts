@@ -16,12 +16,13 @@
 
 import { type Cell, type Driver, type GaugeCell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
+import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
 import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
 import type { InferShape, Shape, Simplify } from '../schema/types.js'
 import { assertResolution, bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
-import { bucketedLifecycle, DEFAULT_GRACE_MS } from './bucketed.js'
+import { bucketedLifecycle, bucketedReader, DEFAULT_GRACE_MS } from './bucketed.js'
 import type {
   AnyMetric,
   DimsArgs,
@@ -50,6 +51,18 @@ export type GaugeTotals = Omit<GaugeCell, 'last'>
 export type GaugeRow<D extends Shape> = Simplify<
   { id: string; bucket_ts: Date } & InferShape<D> & Partial<Record<GaugeAggregate, number>>
 >
+
+/**
+ * One live row from a gauge.
+ *
+ * The aggregate columns are `Partial` for the same reason {@link GaugeRow} is:
+ * which of the five reach a row is a runtime `aggregate` setting, and a gauge
+ * is not generic in it.
+ */
+export type GaugeLiveRow<
+  D extends Shape,
+  O extends SnapshotOptions = Record<never, never>,
+> = LiveRowOf<D, Partial<Record<GaugeAggregate, number>>, O>
 
 export interface GaugeConfig<D extends Shape> {
   /** Omit entirely for a gauge with no dimensions. */
@@ -108,6 +121,17 @@ export interface Gauge<D extends Shape, K extends MetricKind = 'gauge'> extends 
    * written to is a lie, and a chart should show a gap.
    */
   current(...dims: DimsArgs<D>): Promise<GaugeCell | undefined>
+
+  /**
+   * Every unflushed bucket of folds, as typed rows.
+   *
+   * A `rollup` merges the folds the way the five aggregates merge: `sum` and
+   * `count` add, `min` and `max` take the extreme, `last` is the latest in
+   * bucket order.
+   */
+  snapshot<const O extends SnapshotOptions = Record<never, never>>(
+    options?: O,
+  ): Promise<GaugeLiveRow<D, O>[]>
 
   /**
    * Every series in the open bucket, merged — the gauge equivalent of a
@@ -248,6 +272,10 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     return activeBinding().driver
   }
 
+  function nowMs(): number {
+    return (activeBinding().now ?? Date.now)()
+  }
+
   function materialize(bucketTs: number, dimKey: string, cell: Cell): Row {
     const fold = asFold(cell)
     const row: Row = {
@@ -265,6 +293,45 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     return rows.reduce((total, row) => total + (typeof row.sum === 'number' ? row.sum : 0), 0)
   }
 
+  /**
+   * Merge folds the way the five aggregates merge, which is the reason those
+   * five and not `avg`: `sum` and `count` add, `min` and `max` take the
+   * extreme, and `last` is the latest — answerable only because rows arrive in
+   * ascending bucket order.
+   *
+   * Merging across *series* takes the same path, and `last` is the one column
+   * it cannot answer honestly: with several series there is no single latest
+   * observation. It reports the last one in bucket order rather than inventing
+   * a rule, which is why `totals()` drops `last` and a `groupBy` that keeps
+   * every dim does not.
+   */
+  function mergeValues(rows: readonly Row[]): Record<string, unknown> {
+    const merged: Record<string, unknown> = {}
+    const numbers = (column: GaugeAggregate): number[] =>
+      rows.map((row) => row[column]).filter((value): value is number => typeof value === 'number')
+
+    for (const column of aggregate) {
+      switch (column) {
+        case 'last':
+          merged.last = rows.at(-1)?.last
+          break
+        case 'min':
+          merged.min = Math.min(...numbers('min'))
+          break
+        case 'max':
+          merged.max = Math.max(...numbers('max'))
+          break
+        case 'sum':
+          merged.sum = totalOf(rows)
+          break
+        case 'count':
+          merged.count = numbers('count').reduce((total, value) => total + value, 0)
+          break
+      }
+    }
+    return merged
+  }
+
   return {
     ...bucketedLifecycle({
       name,
@@ -275,8 +342,19 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       totalOf,
     }),
 
+    ...bucketedReader<D, Partial<Record<GaugeAggregate, number>>>({
+      name,
+      resolutionMs,
+      dims,
+      driver: activeDriver,
+      now: nowMs,
+      materialize,
+      mergeValues,
+    }),
+
     name,
     kind,
+    storage: 'bucketed',
     dims,
     resolutionMs,
 
