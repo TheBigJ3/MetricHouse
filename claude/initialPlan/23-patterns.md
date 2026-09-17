@@ -93,6 +93,10 @@ A completed duration is one observation: put it on a [gauge](04-gauge.md) for
 min/max/mean, and on an [event](05-events.md) if you want percentiles. Do not
 reach for time-in-state; there is no state to be in.
 
+[`timer()`](26-timer.md) is this pattern packaged: a gauge preset with a
+`start()` handle and a scoped `time()`, and a `record` event for the
+percentiles.
+
 ## What not to build on MetricHouse
 
 - **Rate limits and quotas.** Needs a sliding window MetricHouse deliberately

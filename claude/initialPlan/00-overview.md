@@ -21,7 +21,7 @@ MetricHouse owns anything that is **lost forever if not captured at write time**
 | Backdating | `add(n, dims, { at })` accepted within `grace`, warned past it |
 | Historical data | `house.backfill()` / `house.ingest()` — bypasses buckets entirely |
 | Federation | One house's `write()` is another's `ingest()`; ids carry idempotency across hops |
-| Primitives | counter, gauge, **level**, event, log, **distinct** — no histogram (derive it in SQL) |
+| Primitives | counter, gauge, **level**, event, log, **distinct**, timer — no histogram (derive it in SQL) |
 | Metadata | Counter/gauge → declared bucketing dims. Event/log → free payload |
 | Dim keying | Cross-product — one series per unique combination |
 | Cardinality | Open values, no runtime guard — `metrichouse check` projects the cost statically |
@@ -79,6 +79,7 @@ MetricHouse owns anything that is **lost forever if not captured at write time**
 - [21-distinct.md](21-distinct.md) — distinct (unique counts)
 - [05-events.md](05-events.md) — events
 - [06-logs.md](06-logs.md) — logs
+- [26-timer.md](26-timer.md) — timer (durations, as a gauge preset)
 
 **Time**
 - [07-buckets.md](07-buckets.md) — resolution, boundaries, open vs closed
