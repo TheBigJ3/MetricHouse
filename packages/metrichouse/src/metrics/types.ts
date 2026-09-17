@@ -15,7 +15,7 @@ import type { InferShape, Shape, TypeKind } from '../schema/types.js'
  * Every primitive, in declaration order. A single list rather than a bare
  * union so {@link isMetric} cannot drift out of sync with the type.
  */
-export const METRIC_KINDS = ['counter', 'gauge', 'event', 'log'] as const
+export const METRIC_KINDS = ['counter', 'gauge', 'event', 'log', 'timer'] as const
 
 export type MetricKind = (typeof METRIC_KINDS)[number]
 
@@ -66,7 +66,8 @@ export interface WriteContext {
   readonly bucketTo: number
   /**
    * This batch's headline number, defined per kind: every increment for a
-   * counter, every observed value for a gauge, every row for an event.
+   * counter, every observed value for a gauge or a timer, every row for an
+   * event or a log.
    *
    * A metric tracks one thing, and its dims are extra information collected
    * alongside. A sink that only wants the headline can write this and ignore

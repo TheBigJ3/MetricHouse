@@ -5,7 +5,8 @@
  * tooling: this entry point must stay small enough to ship to an edge bundle.
  *
  * Spec: initialPlan/01-schema.md, 03-counter.md, 05-events.md, 06-logs.md,
- *       08-house.md, 14-identity.md, 15-live-read.md, 25-packaging.md
+ *       08-house.md, 14-identity.md, 15-live-read.md, 25-packaging.md,
+ *       26-timer.md
  */
 
 export type {
@@ -64,6 +65,8 @@ export type {
   LogWriters,
 } from './metrics/log.js'
 export { DEFAULT_LOG_LEVELS, log, RESERVED_LOG_COLUMNS } from './metrics/log.js'
+export type { TimeArgs, Timer, TimerConfig, TimerHandle } from './metrics/timer.js'
+export { DURATION_FIELD, TIMER_AGGREGATES, timer } from './metrics/timer.js'
 export type {
   AnyMetric,
   DimsArgs,

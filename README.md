@@ -4,16 +4,16 @@ A metric collection layer for TypeScript that owns the parts of metrics a query
 can never reconstruct — bucket boundaries, atomic aggregation, durable staging,
 flush — and refuses to own anything else.
 
-> **Status: four primitives run.** `counter`, `gauge`, `event` and `log` all
-> write through the memory driver, live-read, and flush to your `write()` with
-> stable row ids — the snippet below is a working program, not a sketch.
-> `event` brought the second storage model with it: records are staged and
-> shipped whole, never folded, so the driver contract covers both aggregation
-> and durable staging. `log` is the first thing built *on* that model rather
-> than beside it — a log is an event with a level, a `minLevel` filter and a
-> bound `child()` logger, sharing every staging guarantee instead of growing a
-> second pipeline. Still missing: the Redis driver, `level`/`distinct`,
-> `ingest`/`backfill`, and the CLI. The specification in
+> **Status: five primitives run.** `counter`, `gauge`, `event`, `log` and
+> `timer` all write through the memory driver, live-read, and flush to your
+> `write()` with stable row ids — the snippet below is a working program, not a
+> sketch. `event` brought the second storage model with it: records are staged
+> and shipped whole, never folded, so the driver contract covers both
+> aggregation and durable staging. The two newest add no storage of their own:
+> `log` is an event with a level, a `minLevel` filter and a bound `child()`
+> logger, and `timer` is a gauge of durations with a `start()` handle, a scoped
+> `time()`, and an optional event for percentiles. Still missing: the Redis
+> driver, `level`/`distinct`, `ingest`/`backfill`, and the CLI. The specification in
 > [`claude/initialPlan/`](claude/initialPlan/) describes the whole design;
 > [`claude/imagine/`](claude/imagine/) holds three hypothetical projects
 > written to break it.
@@ -66,7 +66,7 @@ runtime-tests/        the same suite against Node, Bun, Deno, Workers, Edge, Lam
 benchmarks/           write-path overhead, Lua contention, flush throughput
 examples/             small runnable apps, all in CI
 docs/                 the documentation site
-claude/initialPlan/   the specification — 25 files, one per system
+claude/initialPlan/   the specification — 26 files, one per system
 claude/imagine/       hypothetical projects written to break the specification
 ```
 
@@ -82,7 +82,7 @@ and a matrix, not with prose.
 
 ### `initialPlan/` — the specification
 
-25 files. Each covers one system: a two-sentence summary, its main functions,
+26 files. Each covers one system: a two-sentence summary, its main functions,
 and a usage snippet. Start with
 [`00-overview.md`](claude/initialPlan/00-overview.md), which carries the locked
 decisions, the data flow, and an index.
