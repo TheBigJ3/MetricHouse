@@ -14,17 +14,47 @@
 
 import type { Driver } from '../drivers/types.js'
 import { type AnyMetric, isMetric, type WriteFn } from '../metrics/types.js'
+import { type DurationInput, parseDuration } from '../time/duration.js'
+import {
+  type DeliveryConfig,
+  type DeliveryMode,
+  type HouseDefaults,
+  resolveDelivery,
+} from './delivery.js'
 import type { MetricFlushState } from './flush.js'
 import { type FlushContext, type FlushOptions, type FlushReport, runFlush } from './flush.js'
 
 /** An array of metrics, or an imported schema module. */
 export type SchemaInput = readonly AnyMetric[] | Record<string, unknown>
 
+/**
+ * Delivery settings this house supplies where a metric declares none.
+ *
+ * Durations, not milliseconds: this is the configuration surface, and it is
+ * parsed once at `createHouse` so the write path never sees a string.
+ */
+export interface HouseDefaultsConfig {
+  readonly flush?: DurationInput
+  readonly grace?: DurationInput
+}
+
 export interface HouseConfig {
   readonly driver: Driver
   readonly schema?: SchemaInput
   /** Fallback sink for metrics that do not declare their own. */
   readonly write?: WriteFn
+  /**
+   * How this house gets rows out — `'staged'` (the default) waits for
+   * `flush()`, `'immediate'` ships as data arrives, `'auto'` asks the driver.
+   *
+   * A deployment setting, not a schema one: the same metrics run on a dev
+   * branch against `memory()` and in production against Redis, and only one of
+   * those has a reason to hold data back. See
+   * [delivery.ts](./delivery.ts) for what each mode does to each storage model.
+   */
+  readonly delivery?: DeliveryConfig
+  /** Cadence and grace for metrics that declare neither. */
+  readonly defaults?: HouseDefaultsConfig
   /** Clock, injectable for tests. Defaults to `Date.now`. */
   readonly now?: () => number
   readonly onError?: (error: unknown, context: { metric: string }) => void
@@ -32,6 +62,8 @@ export interface HouseConfig {
 }
 
 export interface House {
+  /** How this house delivers, with `'auto'` already resolved. */
+  readonly delivery: DeliveryMode
   /** Bind metrics declared after boot. */
   register(...metrics: AnyMetric[]): void
   metrics(): AnyMetric[]
@@ -57,6 +89,15 @@ export function createHouse(config: HouseConfig): House {
   const registry = new Map<string, AnyMetric>()
   const flushState = new Map<string, MetricFlushState>()
 
+  // resolved once, at boot: `'auto'` is a question about the driver, and the
+  // driver cannot change under a house
+  const delivery: DeliveryMode = resolveDelivery(config.delivery, config.driver.capabilities)
+
+  const defaults: HouseDefaults = {
+    ...(config.defaults?.flush !== undefined && { flushMs: parseDuration(config.defaults.flush) }),
+    ...(config.defaults?.grace !== undefined && { graceMs: parseDuration(config.defaults.grace) }),
+  }
+
   // said once, at boot: a driver that cannot survive a restart cannot honour
   // at-least-once, and the difference should not be discovered during an
   // incident
@@ -64,6 +105,18 @@ export function createHouse(config: HouseConfig): House {
     config.onWarn?.(
       'driver is not durable — at-least-once degrades to best-effort, and a crash ' +
         'between claim and ack loses that window',
+      {},
+    )
+  }
+
+  // also said once: immediate delivery changes what a sink must do about
+  // duplicate ids, and finding that out from a wrong dashboard is worse than
+  // hearing it at boot
+  if (delivery === 'immediate') {
+    config.onWarn?.(
+      "delivery is 'immediate' — bucketed rows are resent as their bucket fills, so the sink " +
+        'must keep the newest row per id rather than fold duplicates together. Staged kinds ' +
+        'ship without flush(); bucketed kinds still need it to retire closed buckets',
       {},
     )
   }
@@ -79,6 +132,8 @@ export function createHouse(config: HouseConfig): House {
       metric.bind({
         driver: config.driver,
         now,
+        delivery,
+        defaults,
         // named, not captured: `register` can add a derive target after the
         // event that names it, and a lazy lookup is what makes that legal
         resolve: (target) => registry.get(target),
@@ -101,6 +156,8 @@ export function createHouse(config: HouseConfig): House {
   }
 
   return {
+    delivery,
+
     register,
 
     metrics(): AnyMetric[] {

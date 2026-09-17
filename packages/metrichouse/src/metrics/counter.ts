@@ -13,11 +13,12 @@
 
 import { type Cell, type Driver, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
+import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
 import { assertResolution, bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
-import { bucketedLifecycle } from './bucketed.js'
+import { bucketedLifecycle, DEFAULT_GRACE_MS } from './bucketed.js'
 import type { AnyMetric, DimsArgs, MetricBinding, Row, RowShape, WriteFn } from './types.js'
 
 export type { DimsArgs, RowColumn, RowShape } from './types.js'
@@ -32,8 +33,15 @@ export interface CounterConfig<D extends Shape> {
   readonly dims?: D
   /** Bucket width, e.g. `'1s'`. Parsed once, here, never on the write path. */
   readonly resolution: DurationInput
-  /** Minimum shipping cadence, e.g. `'5m'`. Must be a whole multiple of `resolution`. */
-  readonly flush: DurationInput
+  /**
+   * Minimum shipping cadence, e.g. `'5m'`. Must be a whole multiple of
+   * `resolution`.
+   *
+   * Omit it to take `defaults.flush` from the house — cadence is a delivery
+   * setting, and a schema shared by a dev branch and a production fleet may
+   * have no opinion worth forcing on both.
+   */
+  readonly flush?: DurationInput
   /** How long past a boundary a late write still lands in the closed bucket. Default `'2s'`. */
   readonly grace?: DurationInput
   /** `int()` (default) or `float()`. Decides whether `.add()` accepts fractions. */
@@ -128,9 +136,12 @@ export function counter<D extends Shape = Record<never, never>>(
   // parsed once, here — the write path does integer math and never sees a
   // duration string
   const resolutionMs = parseDuration(config.resolution)
-  const flushMs = parseDuration(config.flush)
-  const graceMs = parseDuration(config.grace ?? '2s')
-  assertResolution(resolutionMs, flushMs)
+  const ownFlushMs = config.flush === undefined ? undefined : parseDuration(config.flush)
+  const ownGraceMs = config.grace === undefined ? undefined : parseDuration(config.grace)
+  // still eager when the metric declares its own cadence, which is the case
+  // that used to be the only one: a bad pair is a programming error and should
+  // surface when the schema file is read, not at the first flush
+  if (ownFlushMs !== undefined) assertResolution(resolutionMs, ownFlushMs)
 
   const isFloat = config.value?.kind === 'float'
 
@@ -151,6 +162,24 @@ export function counter<D extends Shape = Record<never, never>>(
       throw new Error(`${name}: expected a counter cell but the driver returned a gauge fold`)
     }
     return cell
+  }
+
+  /**
+   * The metric's own cadence, or the house's. Resolved on every read rather
+   * than at bind, so nothing has to care which came first.
+   */
+  function effectiveFlushMs(): number {
+    const ms = ownFlushMs ?? binding?.defaults?.flushMs
+    if (ms === undefined) {
+      throw new Error(
+        `${name}: no flush cadence — declare flush on the counter, or defaults.flush on the house`,
+      )
+    }
+    return ms
+  }
+
+  function effectiveGraceMs(): number {
+    return ownGraceMs ?? binding?.defaults?.graceMs ?? DEFAULT_GRACE_MS
   }
 
   function activeBinding(): MetricBinding {
@@ -187,6 +216,42 @@ export function counter<D extends Shape = Record<never, never>>(
     return activeBinding().driver
   }
 
+  /**
+   * Under `delivery: 'immediate'`, follow the write with a send of the whole
+   * open bucket for this series.
+   *
+   * Chained onto the driver write rather than racing it: the fold has to
+   * include the increment that triggered the send, or the sink is told a total
+   * that is already stale by one.
+   */
+  function deliver(write: Promise<void>, bucketTs: number, dimKey: string): Promise<void> {
+    if (binding?.delivery !== 'immediate') return write
+    return write.then(() => shipOpen(bucketTs, dimKey))
+  }
+
+  async function shipOpen(bucketTs: number, dimKey: string): Promise<void> {
+    const active = activeBinding()
+    const sink = config.write ?? active.write
+    if (!sink) {
+      throw new Error(
+        `${name}: delivery is 'immediate', so this counter ships without waiting for flush() — ` +
+          'it needs a write() declared on the metric or on createHouse',
+      )
+    }
+
+    await shipOpenSeries({
+      metric: name,
+      kind: 'counter',
+      resolutionMs,
+      driver: active.driver,
+      bucketTs,
+      dimKey,
+      materialize,
+      totalOf,
+      sink,
+    })
+  }
+
   function materialize(bucketTs: number, dimKey: string, cell: Cell): Row {
     return {
       id: rowId(name, bucketTs, dimKey),
@@ -204,7 +269,7 @@ export function counter<D extends Shape = Record<never, never>>(
     ...bucketedLifecycle({
       name,
       resolutionMs,
-      graceMs,
+      graceMs: effectiveGraceMs,
       driver: activeDriver,
       materialize,
       totalOf,
@@ -214,8 +279,17 @@ export function counter<D extends Shape = Record<never, never>>(
     kind: 'counter',
     dims,
     resolutionMs,
-    flushMs,
-    graceMs,
+
+    // getters, because either may come from the house and a metric is declared
+    // before it is bound
+    get flushMs(): number {
+      return effectiveFlushMs()
+    },
+
+    get graceMs(): number {
+      return effectiveGraceMs()
+    },
+
     isFloat,
     write: config.write,
 
@@ -228,6 +302,10 @@ export function counter<D extends Shape = Record<never, never>>(
         throw new Error(`${name}: already bound to a house — a metric belongs to exactly one`)
       }
       binding = next
+      // the half of validation that could not run at declare time: a cadence
+      // taken from the house is only knowable now, and createHouse is still
+      // early enough to be a boot failure rather than a flush-time surprise
+      if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs())
     },
 
     add(first?: number | InferShape<D>, second?: InferShape<D>): void {
@@ -253,7 +331,8 @@ export function counter<D extends Shape = Record<never, never>>(
       const dimKey = keyFor(values)
       const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
 
-      track(active.driver.increment([{ metric: name, bucketTs, dimKey, delta }]), active.onError)
+      const write = active.driver.increment([{ metric: name, bucketTs, dimKey, delta }])
+      track(deliver(write, bucketTs, dimKey), active.onError)
     },
 
     async current(values?: InferShape<D>): Promise<number> {

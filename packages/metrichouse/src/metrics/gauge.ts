@@ -16,15 +16,17 @@
 
 import { type Cell, type Driver, type GaugeCell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
+import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
 import type { InferShape, Shape, Simplify } from '../schema/types.js'
 import { assertResolution, bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
-import { bucketedLifecycle } from './bucketed.js'
+import { bucketedLifecycle, DEFAULT_GRACE_MS } from './bucketed.js'
 import type {
   AnyMetric,
   DimsArgs,
   MetricBinding,
+  MetricKind,
   Row,
   RowColumn,
   RowShape,
@@ -53,7 +55,8 @@ export interface GaugeConfig<D extends Shape> {
   /** Omit entirely for a gauge with no dimensions. */
   readonly dims?: D
   readonly resolution: DurationInput
-  readonly flush: DurationInput
+  /** Minimum shipping cadence. Omit it to take `defaults.flush` from the house. */
+  readonly flush?: DurationInput
   /** How long past a boundary a late write still lands in the closed bucket. Default `'2s'`. */
   readonly grace?: DurationInput
   /**
@@ -68,11 +71,22 @@ export interface GaugeConfig<D extends Shape> {
   readonly write?: WriteFn
 }
 
-export interface Gauge<D extends Shape> extends AnyMetric {
+/**
+ * `K` is the kind this metric reports to a sink. It is a parameter, not the
+ * constant `'gauge'`, for the same reason {@link stagedMetric} takes one: a
+ * `timer` is a gauge of durations and must still say `'timer'` in a
+ * {@link WriteContext}.
+ *
+ * The claim path reads `kind` off whatever object the flush engine was handed,
+ * so a wrapper's own `kind` is enough there. Immediate delivery has no such
+ * indirection — the gauge ships itself, from inside — so the kind has to be
+ * something it knows.
+ */
+export interface Gauge<D extends Shape, K extends MetricKind = 'gauge'> extends AnyMetric {
   /** @internal — shared read path behind `current` and `totals`. */
   openFolds(dims?: InferShape<D>): Promise<GaugeCell[]>
   readonly name: string
-  readonly kind: 'gauge'
+  readonly kind: K
   readonly dims: D
   readonly resolutionMs: number
   readonly flushMs: number
@@ -120,10 +134,11 @@ export interface Gauge<D extends Shape> extends AnyMetric {
  * @throws if the configuration is invalid — see `counter()` for the same
  * declare-time checks on name, dims and resolution.
  */
-export function gauge<D extends Shape = Record<never, never>>(
+export function gauge<D extends Shape = Record<never, never>, K extends MetricKind = 'gauge'>(
   name: string,
   config: GaugeConfig<D>,
-): Gauge<D> {
+  kind: K = 'gauge' as K,
+): Gauge<D, K> {
   if (typeof name !== 'string' || name.trim() === '') {
     throw new Error('gauge: name must be a non-empty string')
   }
@@ -132,9 +147,9 @@ export function gauge<D extends Shape = Record<never, never>>(
   assertDimsLegal(dims, name)
 
   const resolutionMs = parseDuration(config.resolution)
-  const flushMs = parseDuration(config.flush)
-  const graceMs = parseDuration(config.grace ?? '2s')
-  assertResolution(resolutionMs, flushMs)
+  const ownFlushMs = config.flush === undefined ? undefined : parseDuration(config.flush)
+  const ownGraceMs = config.grace === undefined ? undefined : parseDuration(config.grace)
+  if (ownFlushMs !== undefined) assertResolution(resolutionMs, ownFlushMs)
 
   const aggregate = config.aggregate ?? GAUGE_AGGREGATES
   if (aggregate.length === 0) {
@@ -156,6 +171,21 @@ export function gauge<D extends Shape = Record<never, never>>(
     return cell
   }
 
+  /** The metric's own cadence, or the house's. See the counter for the rule. */
+  function effectiveFlushMs(): number {
+    const ms = ownFlushMs ?? binding?.defaults?.flushMs
+    if (ms === undefined) {
+      throw new Error(
+        `${name}: no flush cadence — declare flush on the gauge, or defaults.flush on the house`,
+      )
+    }
+    return ms
+  }
+
+  function effectiveGraceMs(): number {
+    return ownGraceMs ?? binding?.defaults?.graceMs ?? DEFAULT_GRACE_MS
+  }
+
   function activeBinding(): MetricBinding {
     if (!binding) {
       throw new Error(
@@ -167,6 +197,39 @@ export function gauge<D extends Shape = Record<never, never>>(
 
   function keyFor(values: InferShape<D> | undefined): string {
     return encodeDimKey(dims, (values ?? {}) as Record<string, unknown>)
+  }
+
+  /**
+   * Under `delivery: 'immediate'`, follow the observation with a send of the
+   * whole open fold for this series — `min` and `max` are only right once the
+   * driver has merged the value that triggered the send.
+   */
+  function deliver(write: Promise<void>, bucketTs: number, dimKey: string): Promise<void> {
+    if (binding?.delivery !== 'immediate') return write
+    return write.then(() => shipOpen(bucketTs, dimKey))
+  }
+
+  async function shipOpen(bucketTs: number, dimKey: string): Promise<void> {
+    const active = activeBinding()
+    const sink = config.write ?? active.write
+    if (!sink) {
+      throw new Error(
+        `${name}: delivery is 'immediate', so this gauge ships without waiting for flush() — ` +
+          'it needs a write() declared on the metric or on createHouse',
+      )
+    }
+
+    await shipOpenSeries({
+      metric: name,
+      kind,
+      resolutionMs,
+      driver: active.driver,
+      bucketTs,
+      dimKey,
+      materialize,
+      totalOf,
+      sink,
+    })
   }
 
   function track(write: Promise<void>, onError: MetricBinding['onError']): void {
@@ -206,18 +269,25 @@ export function gauge<D extends Shape = Record<never, never>>(
     ...bucketedLifecycle({
       name,
       resolutionMs,
-      graceMs,
+      graceMs: effectiveGraceMs,
       driver: activeDriver,
       materialize,
       totalOf,
     }),
 
     name,
-    kind: 'gauge',
+    kind,
     dims,
     resolutionMs,
-    flushMs,
-    graceMs,
+
+    get flushMs(): number {
+      return effectiveFlushMs()
+    },
+
+    get graceMs(): number {
+      return effectiveGraceMs()
+    },
+
     aggregate,
     write: config.write,
 
@@ -230,6 +300,7 @@ export function gauge<D extends Shape = Record<never, never>>(
         throw new Error(`${name}: already bound to a house — a metric belongs to exactly one`)
       }
       binding = next
+      if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs())
     },
 
     set(value: number, ...args: DimsArgs<D>): void {
@@ -242,7 +313,8 @@ export function gauge<D extends Shape = Record<never, never>>(
       const dimKey = keyFor(args[0])
       const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
 
-      track(active.driver.observe([{ metric: name, bucketTs, dimKey, value }]), active.onError)
+      const write = active.driver.observe([{ metric: name, bucketTs, dimKey, value }])
+      track(deliver(write, bucketTs, dimKey), active.onError)
     },
 
     async openFolds(values?: InferShape<D>): Promise<GaugeCell[]> {

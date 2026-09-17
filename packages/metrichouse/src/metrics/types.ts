@@ -9,6 +9,7 @@
  */
 
 import type { Claim, Driver } from '../drivers/types.js'
+import type { DeliveryMode, HouseDefaults } from '../runtime/delivery.js'
 import type { InferShape, Shape, TypeKind } from '../schema/types.js'
 
 /**
@@ -81,8 +82,15 @@ export interface WriteContext {
    * What caused this call. `'flush'` is `house.flush()`; `'batch'` is a
    * locally staged event shipping itself on `batch.maxSize` or `maxAge`,
    * which happens without anyone calling flush.
+   *
+   * `'immediate'` is `delivery: 'immediate'`, and it is the one source whose
+   * rows a sink must treat as **last-write-wins on `id`**. The other two send
+   * a row once and resend it only as a byte-identical retry, so deduplicating
+   * them either way is correct. An immediate bucketed row is a running total
+   * that a later send supersedes — folding those together, rather than keeping
+   * the newest, double-counts.
    */
-  readonly source: 'flush' | 'batch'
+  readonly source: 'flush' | 'batch' | 'immediate'
 }
 
 /**
@@ -120,6 +128,15 @@ export interface MetricBinding {
    * registration order does not matter.
    */
   readonly resolve?: (name: string) => AnyMetric | undefined
+  /**
+   * How this house delivers, already resolved — a metric never sees `'auto'`.
+   *
+   * Absent means `'staged'`, so a metric bound by something that predates
+   * delivery behaves exactly as it always did.
+   */
+  readonly delivery?: DeliveryMode
+  /** Cadence and grace for a metric that declares neither. */
+  readonly defaults?: HouseDefaults
 }
 
 /**

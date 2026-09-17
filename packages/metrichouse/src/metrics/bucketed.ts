@@ -14,6 +14,16 @@ import { type Cell, type Claim, type Driver, isBucketClaim } from '../drivers/ty
 import { closedUpTo } from '../time/buckets.js'
 import type { AnyMetric, MaterializedBatch, Row } from './types.js'
 
+/**
+ * How long past a boundary a late write still lands in the closed bucket, when
+ * neither the metric nor the house says otherwise.
+ *
+ * Shared by every bucketed kind so the number is written once: a counter and a
+ * gauge disagreeing about it would put the same late write in two different
+ * buckets.
+ */
+export const DEFAULT_GRACE_MS = 2_000
+
 /** The four {@link AnyMetric} methods that move a batch. */
 export type BatchLifecycle = Pick<
   AnyMetric,
@@ -23,7 +33,11 @@ export type BatchLifecycle = Pick<
 export interface BucketedOptions {
   readonly name: string
   readonly resolutionMs: number
-  readonly graceMs: number
+  /**
+   * Read late, not captured: grace may come from the house, and a metric is
+   * declared before it is bound.
+   */
+  readonly graceMs: () => number
   /** Read late, not captured: a metric is declared before it is bound. */
   readonly driver: () => Driver
   readonly materialize: (bucketTs: number, dimKey: string, cell: Cell) => Row
@@ -47,7 +61,7 @@ export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
   return {
     async claimBatch(nowMs: number): Promise<Claim> {
       // everything strictly below this has ended and outlived grace
-      return driver().claim(name, closedUpTo(resolutionMs, nowMs, graceMs))
+      return driver().claim(name, closedUpTo(resolutionMs, nowMs, graceMs()))
     },
 
     materializeClaim(claim: Claim): MaterializedBatch {

@@ -376,7 +376,12 @@ export function log<
     // is not and has none
     dims: {},
     resolutionMs: inner.resolutionMs,
-    flushMs: inner.flushMs,
+
+    // read through: the event resolves its cadence against its binding
+    get flushMs(): number {
+      return inner.flushMs
+    },
+
     graceMs: inner.graceMs,
     write: inner.write,
 

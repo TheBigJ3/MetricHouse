@@ -67,7 +67,8 @@ export interface TimerConfig<D extends Shape> {
   /** Omit entirely for a timer with no dimensions. */
   readonly dims?: D
   readonly resolution: DurationInput
-  readonly flush: DurationInput
+  /** Minimum shipping cadence. Omit it to take `defaults.flush` from the house. */
+  readonly flush?: DurationInput
   /** How long past a boundary a late timing still lands in the closed bucket. Default `'2s'`. */
   readonly grace?: DurationInput
   /** Which aggregates reach your sink. Default {@link TIMER_AGGREGATES}. */
@@ -233,14 +234,20 @@ export function timer<D extends Shape = Record<never, never>>(
     }
   }
 
-  const inner: Gauge<D> = gauge(name, {
-    dims,
-    resolution: config.resolution,
-    flush: config.flush,
-    aggregate: config.aggregate ?? TIMER_AGGREGATES,
-    ...(config.grace !== undefined && { grace: config.grace }),
-    ...(config.write !== undefined && { write: config.write }),
-  })
+  // the gauge is told it is a timer: it ships itself under `delivery:
+  // 'immediate'`, and a sink should not be told a timing came from a gauge
+  const inner: Gauge<D, 'timer'> = gauge(
+    name,
+    {
+      dims,
+      resolution: config.resolution,
+      aggregate: config.aggregate ?? TIMER_AGGREGATES,
+      ...(config.flush !== undefined && { flush: config.flush }),
+      ...(config.grace !== undefined && { grace: config.grace }),
+      ...(config.write !== undefined && { write: config.write }),
+    },
+    'timer',
+  )
 
   let binding: MetricBinding | undefined
   let recordTarget: RecordTarget | undefined
@@ -384,8 +391,18 @@ export function timer<D extends Shape = Record<never, never>>(
     kind: 'timer' as const,
     dims,
     resolutionMs: inner.resolutionMs,
-    flushMs: inner.flushMs,
-    graceMs: inner.graceMs,
+
+    // read through, not copied: the gauge resolves these against its binding,
+    // and a timer declared before its house would otherwise freeze the wrong
+    // answer at construction
+    get flushMs(): number {
+      return inner.flushMs
+    },
+
+    get graceMs(): number {
+      return inner.graceMs
+    },
+
     aggregate: inner.aggregate,
     record: config.record,
     write: config.write,

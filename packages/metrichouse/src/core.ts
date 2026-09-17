@@ -40,7 +40,7 @@ export { getHasher, hash, naturalKey, rowId, setHasher, uuidv7 } from './identit
 export type { BatchLifecycle, BucketedOptions } from './metrics/bucketed.js'
 // the shared aggregate lifecycle, for anyone adding a primitive — its staged
 // counterpart is `stagedMetric`, below
-export { bucketedLifecycle } from './metrics/bucketed.js'
+export { bucketedLifecycle, DEFAULT_GRACE_MS } from './metrics/bucketed.js'
 export type { Counter, CounterConfig, CounterRow } from './metrics/counter.js'
 // primitives
 export { counter } from './metrics/counter.js'
@@ -79,17 +79,25 @@ export type {
   WriteContext,
   WriteFn,
 } from './metrics/types.js'
+// delivery — how a house gets rows out, as opposed to what a metric measures
+export type { DeliveryConfig, DeliveryMode, HouseDefaults } from './runtime/delivery.js'
+export { resolveDelivery } from './runtime/delivery.js'
 export type {
   FlushOptions,
   FlushReport,
   FlushSkipReason,
   MetricFlushReport,
 } from './runtime/flush.js'
-export type { House, HouseConfig, SchemaInput } from './runtime/house.js'
+export type {
+  House,
+  HouseConfig,
+  HouseDefaultsConfig,
+  SchemaInput,
+} from './runtime/house.js'
 // runtime
 export { createHouse } from './runtime/house.js'
-export type { ShipOutcome } from './runtime/ship.js'
-export { shipClaim } from './runtime/ship.js'
+export type { OpenSeriesShip, ShipOutcome } from './runtime/ship.js'
+export { shipClaim, shipOpenSeries } from './runtime/ship.js'
 export type {
   FieldType,
   InferShape,

@@ -96,7 +96,10 @@ export interface EventConfig<F extends Shape> {
   readonly stage?: EventStage
   /** Local staging only — ignored when `stage: 'driver'`. */
   readonly batch?: EventBatchConfig
-  /** Minimum shipping cadence for `flush()`. Default `'30s'`. */
+  /**
+   * Minimum shipping cadence for `flush()`. Takes `defaults.flush` from the
+   * house when omitted, and `'30s'` when neither says.
+   */
   readonly flush?: DurationInput
   /**
    * Where a record's `ts` comes from: `'auto'` (default) stamps it at
@@ -163,6 +166,7 @@ export interface Event<F extends Shape, K extends MetricKind = 'event'> extends 
 }
 
 const DEFAULT_MAX_SIZE = 500
+const DEFAULT_FLUSH_MS = 30_000
 
 /**
  * Declare an event.
@@ -212,7 +216,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   }
 
   const stage: EventStage = config.stage ?? 'driver'
-  const flushMs = parseDuration(config.flush ?? '30s')
+  const ownFlushMs = config.flush === undefined ? undefined : parseDuration(config.flush)
   const maxSize = config.batch?.maxSize ?? DEFAULT_MAX_SIZE
   const maxAgeMs = parseDuration(config.batch?.maxAge ?? '10s')
 
@@ -259,6 +263,21 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   const localInFlight = new Map<string, RecordClaim>()
   let localSeq = 0
   let batchTimer: ReturnType<typeof setTimeout> | undefined
+
+  /**
+   * The event's own cadence, the house's, or the fallback.
+   *
+   * Unlike a bucketed kind this cannot fail: there is no resolution for a
+   * cadence to divide, so a default is always safe.
+   */
+  function effectiveFlushMs(): number {
+    return ownFlushMs ?? binding?.defaults?.flushMs ?? DEFAULT_FLUSH_MS
+  }
+
+  /** Does this house ship without waiting for anyone to call `flush()`? */
+  function isImmediate(): boolean {
+    return binding?.delivery === 'immediate'
+  }
 
   function activeBinding(): MetricBinding {
     if (!binding) {
@@ -418,6 +437,13 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       const wasEmpty = buffer.length === 0
       buffer.push(...records)
 
+      // immediate delivery is `maxSize: 1` without saying so — the batch
+      // settings still describe the shape of a send, they just stop being what
+      // decides when one happens
+      if (isImmediate()) {
+        shipLocal('immediate')
+        return
+      }
       if (buffer.length >= maxSize) {
         shipLocal('batch')
         return
@@ -435,7 +461,35 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     }
 
     const ops: AppendOp[] = records.map((record) => ({ metric: name, ...record }))
-    track(activeDriver().append(ops))
+    const append = activeDriver().append(ops)
+
+    // `stage` says *where* a record waits; delivery says *when* it leaves. A
+    // driver-staged event under immediate delivery still round-trips through
+    // the driver — it just does not wait for a flush to claim it back.
+    track(isImmediate() ? append.then(shipStaged) : append)
+  }
+
+  /**
+   * Claim and ship whatever is staged, right now.
+   *
+   * Exactly what `house.flush()` does for this metric, minus the cadence
+   * check — a staged record is complete the instant it is appended, so unlike
+   * a bucketed kind there is no partial state to protect and the ordinary
+   * claim/ack path is correct. Immediate delivery therefore *replaces* flush
+   * here rather than running alongside it.
+   */
+  async function shipStaged(): Promise<void> {
+    const sink = config.write ?? binding?.write
+    if (!sink) {
+      throw new Error(
+        `${name}: delivery is 'immediate', so this event ships without waiting for flush() — ` +
+          'it needs a write() declared on the metric or on createHouse',
+      )
+    }
+
+    const claim = await activeDriver().claimRecords(name, config.claimLimit)
+    const outcome = await shipClaim(self, claim, sink, { attempt: 1, source: 'immediate' })
+    if (outcome.error !== undefined) throw outcome.error
   }
 
   /** Take the local buffer and push it at the sink, off the caller's stack. */
@@ -521,7 +575,11 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     // nor does it bucket — a record is its own instant, and 1ms is the finest
     // grain the rest of the system can express
     resolutionMs: 1,
-    flushMs,
+
+    get flushMs(): number {
+      return effectiveFlushMs()
+    },
+
     graceMs: 0,
     write: config.write,
 
