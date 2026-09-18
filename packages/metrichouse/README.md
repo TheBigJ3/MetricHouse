@@ -127,10 +127,9 @@ Node 20 or newer.
 
 ## Documentation
 
-The full design specification — 26 files, one per system — lives in
-[`claude/initialPlan/`](https://github.com/TheBigJ3/MetricHouse/tree/main/claude/initialPlan),
-starting with
-[`00-overview.md`](https://github.com/TheBigJ3/MetricHouse/blob/main/claude/initialPlan/00-overview.md).
+Getting started, one page per primitive, deployment guides, worked examples and
+an API reference live in
+[`docs/`](https://github.com/TheBigJ3/MetricHouse/tree/main/docs).
 
 ## License
 

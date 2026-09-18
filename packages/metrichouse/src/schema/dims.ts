@@ -5,8 +5,6 @@
  * "Willow at riverside" answerable later, and what makes cardinality
  * multiply. Values are open and unguarded by design; the projection in
  * `metrichouse cost` is the answer, not a runtime cap.
- *
- * Spec: initialPlan/02-dims.md
  */
 
 import { assertValue, type FieldType, type Shape } from './types.js'

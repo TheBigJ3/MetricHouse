@@ -7,8 +7,6 @@
  *
  * MetricHouse guarantees the *same id*; whether your store collapses the two
  * rows is your `write()` and your table.
- *
- * Spec: initialPlan/14-identity.md
  */
 
 import { dimOrder } from './schema/dims.js'

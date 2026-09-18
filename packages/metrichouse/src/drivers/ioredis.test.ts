@@ -10,8 +10,6 @@
  * Needs a server. `REDIS_URL`, or localhost:6379. Without one the whole file
  * reports as skipped rather than failing, because a contributor with no Redis
  * should still be able to run `pnpm test` and trust the result.
- *
- * Spec: initialPlan/10-driver-redis.md
  */
 
 import { randomUUID } from 'node:crypto'

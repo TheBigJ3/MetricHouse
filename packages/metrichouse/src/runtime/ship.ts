@@ -16,8 +16,6 @@
  * Nothing here knows what a bucket is. The metric claimed the data and the
  * metric turns it into rows; this is only the part that must not get the order
  * wrong.
- *
- * Spec: initialPlan/12-flush.md
  */
 
 import { type Cell, type Claim, type Driver, isEmptyClaim } from '../drivers/types.js'

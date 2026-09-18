@@ -4,8 +4,6 @@
  * Every time-shaped config field in MetricHouse — `resolution`, `flush`,
  * `grace`, `retention`, `totalTtl` — is a duration. This is the bottom of the
  * dependency graph: nothing here imports anything.
- *
- * Spec: initialPlan/07-buckets.md
  */
 
 /** Units accepted by {@link parseDuration}. Lowercase only. */

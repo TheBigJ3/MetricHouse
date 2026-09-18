@@ -33,8 +33,6 @@
  * claim and delete its closed buckets, or they accumulate in the driver
  * forever. The final flush row carries the same id and the complete fold, so it
  * supersedes every partial send — the two paths converge rather than fight.
- *
- * Spec: initialPlan/08-house.md, 12-flush.md, 14-identity.md
  */
 
 import type { DriverCapabilities } from '../drivers/types.js'

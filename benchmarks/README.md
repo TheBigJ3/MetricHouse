@@ -9,10 +9,6 @@ driver with no local buffer. That is a deliberate trade for exact live reads,
 and it is only defensible if the overhead is measured and published rather than
 asserted.
 
-[Breadcrumb flaw B09](../claude/imagine/breadcrumb/FINDINGS.md) is what happens when it
-is not: ~230 ms added to a 300 ms request budget, discovered by reasoning about
-it rather than by a number in CI.
-
 ## What to measure
 
 **Write path** — the number that goes in the README

@@ -19,8 +19,6 @@
  * is safe to call at module scope. On those runtimes the pump is a cron
  * calling `house.flush()`, or a handler calling `metric.flush()`, and this
  * file is not involved.
- *
- * Spec: initialPlan/08-house.md, 12-flush.md
  */
 
 import type { AnyMetric } from '../metrics/types.js'

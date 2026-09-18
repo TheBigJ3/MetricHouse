@@ -22,8 +22,6 @@
  * the bucket where it completed. On Cloudflare Workers `performance.now()`
  * only advances across I/O, so a timer there measures I/O-bound work and
  * reads pure CPU work as zero.
- *
- * Spec: initialPlan/26-timer.md
  */
 
 import type { Claim, GaugeCell } from '../drivers/types.js'

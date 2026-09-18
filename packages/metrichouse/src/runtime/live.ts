@@ -20,8 +20,6 @@
  * and excludes the open bucket outright, and any row that *is* partial carries
  * `bucket_open` and `bucket_elapsed_ms` so extrapolating is a decision made
  * with the numbers rather than an accident.
- *
- * Spec: initialPlan/15-live-read.md
  */
 
 import type { Row } from '../metrics/types.js'

@@ -7,8 +7,6 @@
  *
  * It is the only driver that caps series, because nothing else is watching it.
  * A shared driver defers to the static projection in `metrichouse cost`.
- *
- * Spec: initialPlan/11-driver-memory.md, 09-drivers.md
  */
 
 import {

@@ -21,8 +21,6 @@
  *
  * Not a test file itself: `vitest.config.ts` collects `src/**\/*.test.ts`, and
  * this exports a function instead of running one.
- *
- * Spec: initialPlan/09-drivers.md, 11-driver-memory.md
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'

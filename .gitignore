@@ -22,7 +22,6 @@ dist/
 *.tgz
 
 # build
-*.tsbuildinfo
 coverage/
 .vitest/
 

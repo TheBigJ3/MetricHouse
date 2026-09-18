@@ -179,7 +179,7 @@ describe('record', () => {
   })
 
   it('stamps _ingested_at from the clock even when ts is backdated', async () => {
-    // C02: an untrusted or backdated timestamp must stay distinguishable from
+    // An untrusted or backdated timestamp must stay distinguishable from
     // when MetricHouse actually saw the record
     const walks = bound()
     walks.record(WALK, { at: new Date(clock - 6 * 24 * 3600_000) })

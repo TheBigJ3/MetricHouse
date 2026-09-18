@@ -5,8 +5,6 @@
  * every other backend — see that file for why. What stays here is the part
  * memory is *allowed* to differ on: it is the only driver that caps series and
  * staged records, because it is the only one with no server to watch it.
- *
- * Spec: initialPlan/11-driver-memory.md
  */
 
 import { describe, expect, it } from 'vitest'

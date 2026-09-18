@@ -25,20 +25,11 @@ importing it gets nothing and no error. The same rule governs
 
 `dependencies` must stay near zero.
 
-## Why `metrichouse-kit` is gone
+## The CLI
 
-The second package existed for [Breadcrumb flaw
-B05](../claude/imagine/breadcrumb/FINDINGS.md): one entry point put a SQL
-generator inside edge middleware. MetricHouse now emits no SQL at all, so the
-generator, the schema differ, and the migration commands are deleted rather
-than relocated — and the split's stated reason went with them.
-
-What remained of the kit — `init`, `cost`, `inspect`, `flush`, `collect` — is
-worth building, and [17-cli.md](../claude/initialPlan/17-cli.md) keeps the
-design. None of it is buildable before the runtime exists, and `cost` has no
-schema to project from until there is one. The package comes back after slice 1
-lands, and its justification will be "a CLI needs `node:fs` and must never be a
-runtime dependency" — a real reason, but a different one.
+A CLI — `init`, `cost`, `inspect`, `flush`, `collect` — is planned as a
+separate package, because it needs `node:fs` and must never be a runtime
+dependency. It is not built yet.
 
 ## The boundary
 
@@ -46,4 +37,4 @@ MetricHouse sits between the data and the datastore. It owns bucketing,
 aggregation, staging, identity and flush; it hands your `write()` typed rows
 and stops. It emits no SQL, diffs no schema, and opens no connection. What
 those rows land in — the table, its types, whether it collapses duplicate
-`id`s — is yours. See [13-sink.md](../claude/initialPlan/13-sink.md).
+`id`s — is yours. See [Writing a sink](../docs/guide/writing-a-sink.md).

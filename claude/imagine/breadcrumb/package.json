@@ -1,8 +1,0 @@
-{
-  "name": "breadcrumb",
-  "private": true,
-  "type": "module",
-  "description": "Hypothetical serverless product analytics, built against the twice-revised MetricHouse spec to attack its process-model assumptions.",
-  "dependencies": { "metrichouse": "workspace:*", "next": "^15.0.0" },
-  "devDependencies": { "vitest": "^2.0.0" }
-}

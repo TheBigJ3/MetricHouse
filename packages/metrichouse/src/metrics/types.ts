@@ -4,8 +4,6 @@
  * `Counter<D>` is generic in its dims, so a house cannot hold a heterogeneous
  * list of them. {@link AnyMetric} is what the house and the flush engine
  * actually need — no `add`, no dim generics, nothing that varies by kind.
- *
- * Spec: initialPlan/08-house.md, 13-sink.md
  */
 
 import type { Claim, Driver } from '../drivers/types.js'

@@ -14,8 +14,6 @@
  * flush cadence and its own crash semantics — and logs are the one signal that
  * matters most in the minute a process is dying. Sharing `stagedMetric` means
  * a log inherits the staging guarantees rather than reimplementing them badly.
- *
- * Spec: initialPlan/06-logs.md
  */
 
 import type { Claim } from '../drivers/types.js'

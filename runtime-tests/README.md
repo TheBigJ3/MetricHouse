@@ -8,9 +8,9 @@ nothing about whether a write survives an isolate freeze.
 
 ## Why this is level 1
 
-[Breadcrumb](../claude/imagine/breadcrumb/) found that the write path behaves
-differently on every serverless platform, and that the failure mode is silent:
-`.add()` never throws, so a lost write looks identical to a successful one.
+The write path behaves differently on every serverless platform, and the
+failure mode is silent: `.add()` never throws, so a lost write looks identical
+to a successful one.
 Nothing but running on the real thing catches it.
 
 ## Matrix

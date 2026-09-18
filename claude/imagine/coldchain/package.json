@@ -1,7 +1,0 @@
-{
-  "name": "coldchain",
-  "private": true,
-  "type": "module",
-  "description": "Hypothetical reefer-monitoring platform, built against the revised MetricHouse spec to attack the Tollgate fixes.",
-  "dependencies": { "metrichouse": "workspace:*", "redis": "^4.7.0" }
-}

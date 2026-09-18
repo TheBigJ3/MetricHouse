@@ -8,8 +8,6 @@
  * This is the subtlest arithmetic in the project. Getting {@link closedUpTo}
  * wrong either ships a bucket twice or loses one, and neither surfaces until
  * there is a real driver underneath.
- *
- * Spec: initialPlan/07-buckets.md
  */
 
 import { formatDuration } from './duration.js'

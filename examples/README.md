@@ -3,10 +3,6 @@
 Small, complete, runnable applications. Each one boots, emits real metrics,
 flushes to a real database, and can be read start to finish in a few minutes.
 
-Not to be confused with [`imagine/`](../claude/imagine/), which contains *hypothetical*
-projects written to break the spec. Those do not run and never will. These do,
-and CI runs them.
-
 ## Planned
 
 | Example | Shows |

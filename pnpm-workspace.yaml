@@ -6,9 +6,6 @@ packages:
   # README and broke `pnpm test`. Each gets its entry back when it has a
   # package.json.
 
-# claude/imagine/* is deliberately excluded. Those projects are written against
-# an unimplemented API to find its flaws — they must never resolve or build.
-
 # Shared versions, referenced as "catalog:" in each package.
 catalog:
   typescript: ^7.0.2

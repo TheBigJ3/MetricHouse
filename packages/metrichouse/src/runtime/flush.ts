@@ -17,8 +17,6 @@
  * whatever claim its own storage model needs — a watermark over closed buckets
  * for a counter, the staged backlog for an event — so a new primitive is the
  * four {@link AnyMetric} batch methods plus this mixin, and no edit here.
- *
- * Spec: initialPlan/12-flush.md
  */
 
 import type { AnyMetric, WriteFn } from '../metrics/types.js'

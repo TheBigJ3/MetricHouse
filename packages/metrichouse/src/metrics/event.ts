@@ -10,8 +10,6 @@
  * rather than another `bucketedLifecycle` caller, and it is why the driver
  * grew `append`, `readPending`, `countPending` and `claimRecords` — a bucket's
  * worth of methods could not express "keep all of it, in order, exactly once".
- *
- * Spec: initialPlan/05-events.md
  */
 
 import type { AppendOp, Claim, Driver, RecordClaim, StagedRecord } from '../drivers/types.js'

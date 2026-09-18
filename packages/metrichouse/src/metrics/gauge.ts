@@ -10,8 +10,6 @@
  * A bucket with no observations is *absent*, which on a chart is a hole rather
  * than a held value. For a quantity that persists between observations — queue
  * depth, in-flight requests — use `level()`.
- *
- * Spec: initialPlan/04-gauge.md
  */
 
 import { type Cell, type Driver, type GaugeCell, isGaugeCell } from '../drivers/types.js'

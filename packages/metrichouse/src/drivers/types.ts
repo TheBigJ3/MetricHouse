@@ -24,8 +24,6 @@
  * and claims everything strictly below it; deciding what "closed" means belongs
  * to `time/buckets.ts`, which is the only place that knows a metric's
  * resolution and grace.
- *
- * Spec: initialPlan/09-drivers.md
  */
 
 /** One counter increment, already bucketed and keyed. */

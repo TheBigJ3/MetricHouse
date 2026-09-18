@@ -3,10 +3,6 @@
  *
  * Everything an application calls at runtime. No SQL, no filesystem, no build
  * tooling: this entry point must stay small enough to ship to an edge bundle.
- *
- * Spec: initialPlan/01-schema.md, 03-counter.md, 05-events.md, 06-logs.md,
- *       08-house.md, 14-identity.md, 15-live-read.md, 25-packaging.md,
- *       26-timer.md
  */
 
 export type {

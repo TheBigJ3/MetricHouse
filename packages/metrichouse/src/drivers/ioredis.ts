@@ -22,8 +22,6 @@
  * one of them. The name leaves `nodeRedis()` free for whoever wants it, and
  * the {@link describeDriverContract} suite is what will tell them they got it
  * right.
- *
- * Spec: initialPlan/10-driver-redis.md, 09-drivers.md
  */
 
 import {

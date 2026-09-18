@@ -7,8 +7,6 @@
  * A declaration is **inert**. `counter()` opens nothing and touches no driver;
  * calling `.add()` before a house has bound it throws rather than silently
  * dropping the write.
- *
- * Spec: initialPlan/03-counter.md, 01-schema.md, 07-buckets.md
  */
 
 import { type Cell, type Driver, isGaugeCell } from '../drivers/types.js'

@@ -4,8 +4,6 @@
  * A declaration is inert data: `str()` returns a descriptor, not a validator
  * bound to anything. The house reads these later; the type system reads them
  * immediately, which is what makes `.add()` narrow without codegen.
- *
- * Spec: initialPlan/01-schema.md, 02-dims.md
  */
 
 /** Every type a dim or field can declare. */

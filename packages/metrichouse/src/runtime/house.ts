@@ -14,8 +14,6 @@
  * the driver you hand it — so it is safe to call at module scope, which is the
  * only thing that works on a runtime that re-runs module scope on every cold
  * start.
- *
- * Spec: initialPlan/08-house.md
  */
 
 import type { Driver } from '../drivers/types.js'

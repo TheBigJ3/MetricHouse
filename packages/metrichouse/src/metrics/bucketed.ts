@@ -6,8 +6,6 @@
  * hand the driver's claim/ack/release back untouched. That common part lives
  * here so a third aggregate kind — `level()` is the one coming — implements
  * `materialize` and `totalOf` and inherits the rest.
- *
- * Spec: initialPlan/12-flush.md, 07-buckets.md
  */
 
 import { type Cell, type Claim, type Driver, isBucketClaim } from '../drivers/types.js'

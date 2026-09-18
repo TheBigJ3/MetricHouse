@@ -18,10 +18,7 @@ flush — and refuses to own anything else.
 > just a failed call. It does not yet hold across a failed *process*: in-flight
 > claims are tracked but never swept, so a crash mid-flush strands that window.
 > Still missing: `level`/`distinct`, `ingest`/`backfill`, the claim sweeper,
-> and the CLI. The specification in
-> [`claude/initialPlan/`](claude/initialPlan/) describes the whole design;
-> [`claude/imagine/`](claude/imagine/) holds three hypothetical projects
-> written to break it.
+> and the CLI.
 
 ## The rule
 
@@ -109,8 +106,39 @@ A metric is a complete unit — what it measures, how often it ships, and where
 it ships to — so flushing one needs no house at all:
 
 ```ts
-setInterval(() => house.flush(), 10_000)
+await dogPoops.flush()
+// -> { rows: 12, buckets: 300, skipped: false }
 ```
+
+Nothing ticks on its own. On a **long-lived process**, `house.start()` gives
+each metric its own interval at its own cadence, and nothing else has to pump:
+
+```ts
+house.start()                     // dog_poops ships every 5m, on its own timer
+process.on('SIGTERM', async () => {
+  await house.stop()              // clear timers, drain, force a final flush
+})
+```
+
+On **edge and serverless**, where the isolate is frozen between requests and a
+timer never fires, you pump it yourself. `house.flush()` is a fan-out over
+`metric.flush()`, and each metric still honours its own cadence — so a cron
+every ten seconds still ships `dog_poops` only every five minutes:
+
+```ts
+setInterval(() => house.flush(), 10_000)   // or a cron, or a request handler
+```
+
+Three separate knobs, and it is worth keeping them apart:
+
+| | what it is | who owns it |
+|---|---|---|
+| `resolution: '1s'` | bucket width — the fidelity of the stored series | the metric |
+| `flush: '5m'` | a **minimum** on how often this metric ships | the metric |
+| `start()` / `flush()` | what actually asks it to | you |
+
+Under-pumping costs freshness, never fidelity: a claim takes *every* closed
+bucket, so five minutes of one-second buckets arrive as 300 rows at once.
 
 ## Repository layout
 
@@ -120,8 +148,6 @@ runtime-tests/        the same suite against Node, Bun, Deno, Workers, Edge, Lam
 benchmarks/           write-path overhead, Lua contention, flush throughput
 examples/             small runnable apps, all in CI
 docs/                 the documentation site
-claude/initialPlan/   the specification — 26 files, one per system
-claude/imagine/       hypothetical projects written to break the specification
 ```
 
 One package: `metrichouse`, the runtime, small enough to ship to an edge
@@ -134,33 +160,10 @@ they cover — a network call on the hot path, and a write path that can be
 silently discarded by a serverless isolate — are only defensible with numbers
 and a matrix, not with prose.
 
-### `initialPlan/` — the specification
-
-26 files. Each covers one system: a two-sentence summary, its main functions,
-and a usage snippet. Start with
-[`00-overview.md`](claude/initialPlan/00-overview.md), which carries the locked
-decisions, the data flow, and an index.
-
-### `imagine/` — hypothetical projects that break the spec
-
-Three projects written against MetricHouse *before it exists*, each chosen to
-attack a different assumption. Each carries a `FINDINGS.md`. See
-[`imagine/README.md`](claude/imagine/README.md) for the method.
-
-| Project | Workload | Found |
-| --- | --- | --- |
-| [`tollgate`](claude/imagine/tollgate/) | LLM API gateway | 14 flaws, 9 configs, 4 stat types |
-| [`coldchain`](claude/imagine/coldchain/) | 100k IoT devices, 6-day offline gaps | 9 flaws, 4 configs, 0 stat types |
-| [`breadcrumb`](claude/imagine/breadcrumb/) | serverless product analytics | 9 flaws, 5 configs, 0 stat types |
-
-Three rounds in, the pattern is clear: **the data model has held under every
-workload, and the runtime contract has broken under each new one.**
-
 ## Where it stands
 
-Settled and stress-tested across three workloads: the chef rule, resolution
-independent of flush, deterministic row ids, explicit `flush()`, per-metric
-write functions, pre-declared dimensions.
+Settled: the chef rule, resolution independent of flush, deterministic row ids,
+explicit `flush()`, per-metric write functions, pre-declared dimensions.
 
 Open, and worth arguing about:
 
