@@ -30,6 +30,7 @@ import type {
   Row,
   RowColumn,
   RowShape,
+  WriteContext,
   WriteFn,
 } from './types.js'
 
@@ -79,8 +80,13 @@ export interface GaugeConfig<D extends Shape> {
    * migration of what is already in flight.
    */
   readonly aggregate?: readonly GaugeAggregate[]
-  /** Where this gauge's rows go. Required — see the counter for why. */
-  readonly write: WriteFn
+  /**
+   * Where this gauge's rows go. Required — see the counter for why.
+   *
+   * Receives {@link GaugeRow}: dims typed, aggregates `Partial` for the same
+   * reason the row type gives.
+   */
+  readonly write: WriteFn<GaugeRow<D>>
 }
 
 /**
@@ -104,7 +110,8 @@ export interface Gauge<D extends Shape, K extends MetricKind = 'gauge'> extends 
   readonly flushMs: number
   readonly graceMs: number
   readonly aggregate: readonly GaugeAggregate[]
-  readonly write: WriteFn
+  /** The sink this gauge was declared with. A method, as on the counter. */
+  write(rows: GaugeRow<D>[], context: WriteContext): Promise<void> | void
   readonly isBound: boolean
 
   bind(binding: MetricBinding): void
@@ -184,6 +191,9 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     }
   }
 
+  // erased for the engine, which carries rows of every kind. See the counter
+  const sink = config.write as WriteFn
+
   let binding: MetricBinding | undefined
   const pending = new Set<Promise<void>>()
 
@@ -244,7 +254,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       dimKey,
       materialize,
       totalOf,
-      sink: config.write,
+      sink,
     })
   }
 
@@ -348,7 +358,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     ...metricFlush({
       name,
       flushMs: effectiveFlushMs,
-      sink: () => config.write,
+      sink: () => sink,
       now: nowMs,
       self: () => self,
     }),

@@ -19,7 +19,15 @@ import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
 import { assertResolution, bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
 import { bucketedLifecycle, bucketedReader, DEFAULT_GRACE_MS } from './bucketed.js'
-import type { AnyMetric, DimsArgs, MetricBinding, Row, RowShape, WriteFn } from './types.js'
+import type {
+  AnyMetric,
+  DimsArgs,
+  MetricBinding,
+  Row,
+  RowShape,
+  WriteContext,
+  WriteFn,
+} from './types.js'
 
 export type { DimsArgs, RowColumn, RowShape } from './types.js'
 
@@ -61,8 +69,11 @@ export interface CounterConfig<D extends Shape> {
    * Where this counter's rows go. Required: a counter that measures something
    * and ships it nowhere is a misconfiguration, and the only moment it can be
    * caught for free is here.
+   *
+   * Receives {@link CounterRow}, so each dim in `rows` has the type it was
+   * declared with.
    */
-  readonly write: WriteFn
+  readonly write: WriteFn<CounterRow<D>>
 }
 
 // extends AnyMetric so the compiler, not a test, guarantees a counter is
@@ -77,7 +88,16 @@ export interface Counter<D extends Shape> extends AnyMetric {
   readonly flushMs: number
   readonly graceMs: number
   readonly isFloat: boolean
-  readonly write: WriteFn
+
+  /**
+   * The sink this counter was declared with, receiving typed rows.
+   *
+   * A method for the reason {@link AnyMetric.write} gives, and for one more:
+   * `add` and `current` are methods too, so a `Counter<D>` stays assignable to
+   * a counter declared with wider dims. The config is where your function is
+   * checked strictly.
+   */
+  write(rows: CounterRow<D>[], context: WriteContext): Promise<void> | void
 
   readonly isBound: boolean
 
@@ -170,6 +190,11 @@ export function counter<D extends Shape = Record<never, never>>(
   if (ownFlushMs !== undefined) assertResolution(resolutionMs, ownFlushMs)
 
   const isFloat = config.value?.kind === 'float'
+
+  // the flush engine and the open series path carry rows of every kind, so
+  // they take the sink erased. `materialize` builds each row from the declared
+  // dims, and that is what makes the narrower type in the config true
+  const sink = config.write as WriteFn
 
   let binding: MetricBinding | undefined
 
@@ -271,7 +296,7 @@ export function counter<D extends Shape = Record<never, never>>(
       dimKey,
       materialize,
       totalOf,
-      sink: config.write,
+      sink,
     })
   }
 
@@ -318,7 +343,7 @@ export function counter<D extends Shape = Record<never, never>>(
     ...metricFlush({
       name,
       flushMs: effectiveFlushMs,
-      sink: () => config.write,
+      sink: () => sink,
       now: nowMs,
       self: () => self,
     }),

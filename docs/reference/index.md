@@ -95,7 +95,7 @@ Every metric type has these members, whatever it measures.
 | `metric.flushMs` | `number` | The shortest gap allowed between two shipments, in milliseconds |
 | `metric.graceMs` | `number` | How long a late write may still land in a closed window, in milliseconds |
 | `metric.isBound` | `boolean` | Whether a house has registered it yet |
-| `metric.write` | `WriteFn` | The write function it was declared with |
+| `metric.write` | `WriteFn` | The write function it was declared with. Each type narrows its rows, as it narrows `snapshot()` |
 | `metric.flush(options?)` | `Promise<MetricFlushReport>` | Ships everything finished to its write function, if its cadence allows. Needs no house |
 | `metric.drain()` | `Promise<void>` | Resolves once this metric's queued writes have reached the driver |
 | `metric.snapshot(options?)` | `Promise<LiveRow[]>` | Everything unshipped, as rows |
@@ -234,7 +234,7 @@ All of these are exported as types from `metrichouse/core`.
 `Gauge`, `GaugeConfig`, `GaugeRow`, `GaugeLiveRow`, `GaugeAggregate`, `GaugeTotals`,
 `Event`, `EventConfig`, `EventRow`, `EventLiveRow`, `EventStage`, `EventBatchConfig`,
 `DeriveFn`, `DeriveTarget`,
-`Log`, `LogConfig`, `LogLiveRow`, `LogWriters`, `ChildLog`, `LogFieldsArgs`, `DefaultLogLevels`,
+`Log`, `LogConfig`, `LogRow`, `LogLiveRow`, `LogWriters`, `ChildLog`, `LogFieldsArgs`, `DefaultLogLevels`,
 `Timer`, `TimerConfig`, `TimerHandle`, `TimeArgs`
 
 **Shared**

@@ -41,6 +41,7 @@ import {
   type Gauge,
   type GaugeAggregate,
   type GaugeLiveRow,
+  type GaugeRow,
   type GaugeTotals,
   gauge,
 } from './gauge.js'
@@ -50,6 +51,7 @@ import type {
   MaterializedBatch,
   MetricBinding,
   RowShape,
+  WriteContext,
   WriteFn,
 } from './types.js'
 
@@ -92,8 +94,12 @@ export interface TimerConfig<D extends Shape> {
    * timing, so the two may be declared in either order.
    */
   readonly record?: string
-  /** Where this timer's rows go. Required — see the counter for why. */
-  readonly write: WriteFn
+  /**
+   * Where this timer's rows go. Required — see the counter for why.
+   *
+   * A timer is a gauge of durations, so it receives {@link GaugeRow}.
+   */
+  readonly write: WriteFn<GaugeRow<D>>
 }
 
 /** One timing in progress. */
@@ -135,7 +141,8 @@ export interface Timer<D extends Shape> extends AnyMetric {
   readonly aggregate: readonly GaugeAggregate[]
   /** The event timings are also recorded to, if any. */
   readonly record: string | undefined
-  readonly write: WriteFn
+  /** The sink this timer was declared with. A method, as on the counter. */
+  write(rows: GaugeRow<D>[], context: WriteContext): Promise<void> | void
   readonly isBound: boolean
 
   bind(binding: MetricBinding): void

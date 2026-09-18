@@ -5,8 +5,12 @@ between MetricHouse and your storage, and it is the only part of the pipeline yo
 have to write yourself.
 
 ```ts
-type WriteFn = (rows: Row[], context: WriteContext) => Promise<void> | void
+type WriteFn<R extends Row = Row> = (rows: R[], context: WriteContext) => Promise<void> | void
 ```
+
+`R` is the type of one row. You never write it yourself: TypeScript works it out
+from the dimensions or fields declared next to `write`, so each metric's rows
+arrive already typed.
 
 Return normally and the data is deleted. Throw and it comes back on the next
 attempt.
@@ -108,6 +112,84 @@ httpRequests.rowShape()
 
 This is the honest column list, in order, and it is the right way to generate a
 table definition or check that your schema still matches.
+
+### Rows are typed
+
+`rows` has the type of the metric it belongs to. Every dimension or field comes
+back as the type you declared it with, and a column the metric never produces is
+a type error.
+
+```ts
+const httpRequests = counter('http_requests', {
+  dims: { route: str(), status: oneOf(['2xx', '4xx', '5xx']) },
+  resolution: '10s',
+  flush: '1m',
+  write: async (rows) => {
+    rows[0].route      // string
+    rows[0].status     // '2xx' | '4xx' | '5xx'
+    rows[0].value      // number
+    rows[0].bucket_ts  // Date
+    rows[0].method
+    //      ^^^^^^ Type error: this counter has no method dimension
+  },
+})
+```
+
+These are the same types [`snapshot()`](./reading-live-data.md#types-follow-the-options)
+returns, without the two liveness columns, `bucket_open` and
+`bucket_elapsed_ms`, which only a live read adds. Each type is exported from
+`metrichouse/core` for when you want to name it.
+
+| Kind | Each row is a | Typed from |
+| --- | --- | --- |
+| `counter` | `CounterRow<D>` | `D`, the declared dimensions |
+| `gauge`, `timer` | `GaugeRow<D>` | `D`, the declared dimensions |
+| `event` | `EventRow<F>` | `F`, the declared fields |
+| `log` | `LogRow<F, L>` | `F`, the declared fields, and `L`, the declared levels |
+
+Two columns are typed more loosely than they arrive:
+
+- **A gauge's or a timer's aggregates** are typed `number | undefined`. Which of
+  them reach a row is decided by the `aggregate` setting when the program runs,
+  and the type does not follow that setting.
+- **A `json()` field** is typed as the value you recorded, but it arrives as a
+  string. TypeScript cannot tell a `json()` field apart from any other field once
+  its type has been worked out, so only these docs can tell you.
+
+In production, name the columns you insert instead of passing each row through.
+Then a schema change breaks the build at the sink, before it can reach the
+table.
+
+```ts
+const httpRequests = counter('http_requests', {
+  dims: { route: str(), status: oneOf(['2xx', '4xx', '5xx']) },
+  resolution: '10s',
+  flush: '1m',
+  write: async (rows) => {
+    await db
+      .insertInto('http_requests')
+      .values(
+        rows.map((row) => ({
+          id: row.id,
+          bucket_ts: row.bucket_ts,
+          // Renaming the route dimension in the schema stops this line
+          // compiling. Passing the whole row through would only find out
+          // when the insert runs.
+          route: row.route,
+          status: row.status,
+          // The table calls it requests. The rename is typed too.
+          requests: row.value,
+        })),
+      )
+      // A retry resends the same id, and this turns the second insert
+      // into an update.
+      .onConflict((oc) =>
+        oc.column('id').doUpdateSet((eb) => ({ requests: eb.ref('excluded.requests') })),
+      )
+      .execute()
+  },
+})
+```
 
 ## The context
 
@@ -260,6 +342,9 @@ rethrow.
 ## Sending several metrics to one place
 
 Each metric declares its own `write`, so a shared helper is the normal pattern.
+A helper typed with `Row[]` fits every metric, because every row is a `Row`.
+Inside the helper the columns read as `unknown`, which is fine for code that
+hands rows straight to a database client.
 
 ```ts
 // metrics/sinks.ts
@@ -318,7 +403,8 @@ export const appLog = log('app_log', {
 
 `bucket_ts`, `ts` and `_ingested_at` arrive as JavaScript `Date` objects, and any
 `ts()` field you declared does too. Most database clients accept a `Date`
-directly. If yours wants something else, convert in the sink:
+directly. If yours wants something else, convert in the sink. The row is typed,
+so `bucket_ts` is already known to be a `Date`:
 
 ```ts
 write: async (rows) => {
@@ -326,7 +412,7 @@ write: async (rows) => {
     table: 'http_requests',
     values: rows.map((row) => ({
       ...row,
-      bucket_ts: (row.bucket_ts as Date).toISOString(),
+      bucket_ts: row.bucket_ts.toISOString(),
     })),
     format: 'JSONEachRow',
   })
@@ -335,7 +421,9 @@ write: async (rows) => {
 
 Fields declared with `json()` arrive already turned into a string, so the column
 they want is text. That is deliberate: a payload column is nearly always stored
-as text or as the database's own JSON type, and both accept a string.
+as text or as the database's own JSON type, and both accept a string. The row
+type still shows the value you recorded, as [Rows are typed](#rows-are-typed)
+explains.
 
 ## In production
 

@@ -202,6 +202,9 @@ A snapshot row's `level` is typed to the levels you declared.
 Column order is `id, ts, level, message, error_stack`, then your fields, then
 `_ingested_at`.
 
+Inside `write`, each row is a `LogRow`, and its `level` is typed to the levels you
+declared, the same as a snapshot row. See [Rows are typed](../guide/writing-a-sink.md#rows-are-typed).
+
 ::: code-group
 
 ```sql [ClickHouse]

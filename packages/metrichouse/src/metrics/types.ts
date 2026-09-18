@@ -108,8 +108,17 @@ export interface WriteContext {
 /**
  * The one function you write. Throw to signal failure: the claim is released
  * and the same rows come back next flush with `attempt` incremented.
+ *
+ * `R` is the row the metric hands over. Each kind's config narrows it to its
+ * own, so a counter's sink receives `CounterRow<D>` with every dim typed, the
+ * same columns `snapshot()` returns without the liveness fields. `Row` is the
+ * erased default, and a sink typed with it is accepted by every metric, which
+ * is what keeps one shared helper usable across a schema.
  */
-export type WriteFn = (rows: Row[], context: WriteContext) => Promise<void> | void
+export type WriteFn<R extends Row = Row> = (
+  rows: R[],
+  context: WriteContext,
+) => Promise<void> | void
 
 /** What a house supplies when it registers a metric. */
 export interface MetricBinding {
@@ -192,8 +201,14 @@ export interface AnyMetric {
    * is only somewhere to keep a set of them. A schema whose counters go to
    * ClickHouse and whose logs go to S3 needs no special case, because there
    * was never one sink to special-case.
+   *
+   * Declared with method syntax so each kind can narrow it to its own row, as
+   * `snapshot` is narrowed. TypeScript checks the parameters of a function
+   * typed property strictly, and a counter's sink accepts only counter rows, so
+   * as a property it could never stand in for this one, which accepts any row.
+   * A method is checked in both directions, and that is enough.
    */
-  readonly write: WriteFn
+  write(rows: Row[], context: WriteContext): Promise<void> | void
   bind(binding: MetricBinding): void
   drain(): Promise<void>
 

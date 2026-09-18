@@ -35,6 +35,7 @@ import type {
   MetricBinding,
   Row,
   RowShape,
+  WriteContext,
   WriteFn,
 } from './types.js'
 
@@ -173,36 +174,50 @@ export interface LogConfig<F extends Shape, L extends readonly string[]> {
   readonly flush?: DurationInput
   /** Records one flush may carry. Unlimited by default. */
   readonly claimLimit?: number
-  /** Where this log's rows go. Required — see the counter for why. */
-  readonly write: WriteFn
+  /**
+   * Where this log's rows go. Required — see the counter for why.
+   *
+   * Receives {@link LogRow}, so `level` is one of the declared levels.
+   */
+  readonly write: WriteFn<LogRow<F, L>>
 }
 
 /**
- * One live row from a log: the reserved three, your declared fields, and the
- * liveness fields.
+ * The row shape a log's `write()` receives: the reserved three, your declared
+ * fields, and when the line was recorded.
  *
- * `level` is typed to the levels this log declares, so a snapshot narrows the
- * same way a call site does.
+ * `level` is typed to the levels this log declares, so a sink narrows the same
+ * way a call site does. `error_stack` is present only on a line written with an
+ * `Error`. A log never samples, so there is no `_sample_rate`.
  */
-export type LogLiveRow<F extends Shape, L extends readonly string[]> = Simplify<
+export type LogRow<F extends Shape, L extends readonly string[]> = Simplify<
   {
     id: string
     ts: Date
     level: L[number]
     message: string
     error_stack?: string
-  } & InferShape<F> & { _ingested_at: Date } & LiveFields
+  } & InferShape<F> & { _ingested_at: Date }
+>
+
+/** One live row from a log: the row a sink would receive, plus the liveness fields. */
+export type LogLiveRow<F extends Shape, L extends readonly string[]> = Simplify<
+  LogRow<F, L> & LiveFields
 >
 
 /**
- * `snapshot` is omitted from {@link AnyMetric} and redeclared below rather than
- * simply added. A `Log` is an intersection, not an interface, so two signatures
- * for one name merge into an **overload set** instead of the more specific one
- * overriding the broader — and the erased `LiveRow[]` would win by being first,
- * which is how the typed row silently became `unknown` per key once. The other
- * four kinds use `interface … extends AnyMetric` and narrow it normally.
+ * `snapshot` and `write` are omitted from {@link AnyMetric} and redeclared
+ * below rather than simply added. A `Log` is an intersection, not an interface,
+ * so two signatures for one name merge into an **overload set** instead of the
+ * more specific one overriding the broader. The erased one would then win by
+ * being first, which is how the typed row silently became `unknown` per key
+ * once. The other four kinds use `interface … extends AnyMetric` and narrow it
+ * normally.
  */
-export type Log<F extends Shape, L extends readonly string[]> = Omit<AnyMetric, 'snapshot'> &
+export type Log<F extends Shape, L extends readonly string[]> = Omit<
+  AnyMetric,
+  'snapshot' | 'write'
+> &
   LogWriters<F, L> & {
     readonly name: string
     readonly kind: 'log'
@@ -212,7 +227,8 @@ export type Log<F extends Shape, L extends readonly string[]> = Omit<AnyMetric, 
     readonly minLevel: L[number]
     readonly stage: EventStage
     readonly flushMs: number
-    readonly write: WriteFn
+    /** The sink this log was declared with. A method, as on the counter. */
+    write(rows: LogRow<F, L>[], context: WriteContext): Promise<void> | void
     readonly isBound: boolean
 
     bind(binding: MetricBinding): void
@@ -340,7 +356,9 @@ export function log<
       ...(config.batch !== undefined && { batch: config.batch }),
       ...(config.flush !== undefined && { flush: config.flush }),
       ...(config.claimLimit !== undefined && { claimLimit: config.claimLimit }),
-      write: config.write,
+      // the event underneath is declared over the composed shape, so it cannot
+      // name the log's own row. The rows it builds are exactly that row
+      write: config.write as WriteFn,
     },
     'log',
   )

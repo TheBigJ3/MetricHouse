@@ -79,6 +79,7 @@ export type {
   LogConfig,
   LogFieldsArgs,
   LogLiveRow,
+  LogRow,
   LogWriters,
 } from './metrics/log.js'
 export { DEFAULT_LOG_LEVELS, log, RESERVED_LOG_COLUMNS } from './metrics/log.js'

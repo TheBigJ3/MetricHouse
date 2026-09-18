@@ -145,6 +145,9 @@ these two settings deliberately, see
 }
 ```
 
+Inside `write`, each row is a `CounterRow`. `route` is a `string`, `status` is
+one of the four values you listed, and `value` is a `number`. See [Rows are typed](../guide/writing-a-sink.md#rows-are-typed).
+
 ```ts
 httpRequests.rowShape().columns.map((c) => c.name)
 // ['id', 'bucket_ts', 'route', 'status', 'value']

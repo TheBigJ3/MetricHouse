@@ -275,6 +275,10 @@ The id is a UUID version 7, so it sorts by time. It is minted when you call
 `record()` rather than at flush time, which is what makes a retried batch resend
 the same rows instead of new ones.
 
+Inside `write`, each row is an `EventRow`, with every field typed as you declared
+it. `processor` is the one to watch: its type is the object you recorded, and it
+arrives as a string. See [Rows are typed](../guide/writing-a-sink.md#rows-are-typed).
+
 ::: code-group
 
 ```sql [ClickHouse]

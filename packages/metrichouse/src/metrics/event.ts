@@ -144,8 +144,12 @@ export interface EventConfig<F extends Shape> {
    * Set it when the backlog can outgrow what the sink will accept at once.
    */
   readonly claimLimit?: number
-  /** Where this event's rows go. Required — see the counter for why. */
-  readonly write: WriteFn
+  /**
+   * Where this event's rows go. Required — see the counter for why.
+   *
+   * Receives {@link EventRow}, with every declared field typed.
+   */
+  readonly write: WriteFn<EventRow<F>>
 }
 
 /**
@@ -160,7 +164,8 @@ export interface Event<F extends Shape, K extends MetricKind = 'event'> extends 
   readonly fields: F
   readonly stage: EventStage
   readonly flushMs: number
-  readonly write: WriteFn
+  /** The sink this event was declared with. A method, as on the counter. */
+  write(rows: EventRow<F>[], context: WriteContext): Promise<void> | void
   readonly isBound: boolean
 
   bind(binding: MetricBinding): void
@@ -281,6 +286,9 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
 
   const derive = config.derive ?? {}
   const samples = config.sample !== undefined
+
+  // erased for the engine, which carries rows of every kind. See the counter
+  const sink = config.write as WriteFn
 
   let binding: MetricBinding | undefined
   const pendingWrites = new Set<Promise<void>>()
@@ -507,7 +515,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
    */
   async function shipStaged(): Promise<void> {
     const claim = await activeDriver().claimRecords(name, config.claimLimit)
-    const outcome = await shipClaim(self, claim, config.write, {
+    const outcome = await shipClaim(self, claim, sink, {
       attempt: 1,
       source: 'immediate',
     })
@@ -526,7 +534,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
 
     track(
       (async (): Promise<void> => {
-        const outcome = await shipClaim(self, claim, config.write, { attempt: 1, source })
+        const outcome = await shipClaim(self, claim, sink, { attempt: 1, source })
         // a failed sink already released the records back into the buffer;
         // rethrow so the failure reaches onError rather than vanishing
         if (outcome.error !== undefined) throw outcome.error
@@ -601,7 +609,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     ...metricFlush({
       name,
       flushMs: effectiveFlushMs,
-      sink: () => config.write,
+      sink: () => sink,
       now: () => (activeBinding().now ?? Date.now)(),
       self: () => self,
     }),

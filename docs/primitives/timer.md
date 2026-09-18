@@ -132,6 +132,10 @@ WHERE bucket_ts >= now() - INTERVAL 1 HOUR
 GROUP BY route;
 ```
 
+Inside `write`, each row is a `GaugeRow`, because a timer is a gauge of
+durations. Your dimensions have the types you declared, and each aggregate is
+typed `number | undefined`. See [Rows are typed](../guide/writing-a-sink.md#rows-are-typed).
+
 ### Try the fold
 
 These are durations in one bucket. Drag them and watch the four stored numbers

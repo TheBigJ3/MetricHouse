@@ -140,6 +140,10 @@ A rollup merges folds the way the five aggregates merge: `sum` and `count` add,
 }
 ```
 
+Inside `write`, each row is a `GaugeRow`. `region` is one of the three values you
+listed. Each aggregate is typed `number | undefined`, because which of them you
+keep is set by `aggregate` when the program runs. See [Rows are typed](../guide/writing-a-sink.md#rows-are-typed).
+
 ::: code-group
 
 ```sql [ClickHouse]
