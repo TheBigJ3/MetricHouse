@@ -104,7 +104,7 @@ function llms(site: string): string {
 > connection and ships no dashboard: you supply one function that receives an
 > array of plain objects, and everything after that is yours.
 
-Package: \`metrichouse\` on npm. MIT licensed. Node 20 or newer. Version 0.1.0.
+Package: \`metrichouse\` on npm. MIT licensed. Node 20 or newer. Version 0.2.0.
 Source: https://github.com/TheBigJ3/MetricHouse
 
 ## The problem it solves

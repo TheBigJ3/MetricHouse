@@ -1,5 +1,88 @@
 # metrichouse
 
+## 0.2.0
+
+### Minor Changes
+
+- 830e657: The metric owns its flush.
+  
+  A metric is now a complete unit — what it measures, how often it ships, and
+  where it ships to — so `metric.flush()` works with no house involved. `flush`
+  and retry state moved out of the house's bookkeeping and onto the metric
+  itself.
+  
+  - **`metric.flush(options?)`** ships that metric to its own sink and returns
+    its `MetricFlushReport`. Honours the metric's cadence; `{ force: true }`
+    ignores it.
+  - **`house.start()` / `house.stop()`** — an opt-in scheduler that gives each
+    metric its own interval at its own cadence, so `flush: '5m'` becomes an
+    actual cadence rather than only a floor. For long-lived processes; edge and
+    serverless keep pumping `house.flush()` from a cron, because a timer in a
+    frozen isolate never fires. `stop()` clears the timers, drains, and forces a
+    final flush.
+  - **`house.flush()`** is now a fan-out over `metric.flush()`. Same signature,
+    same `FlushReport`, `only` and `force` unchanged.
+  
+  **Breaking:** `write` is required on every metric, and `createHouse({ write })`
+  is gone. A house is somewhere to keep a set of metrics, not the thing that
+  ships them, so there is no longer a fallback sink to fall back to — which also
+  retires the "no write()" runtime errors, now a compile error instead.
+  
+  ```diff
+  -const hits = counter('hits', { resolution: '1s', flush: '5m' })
+  -const house = createHouse({ driver, schema, write: send })
+  +const hits = counter('hits', { resolution: '1s', flush: '5m', write: send })
+  +const house = createHouse({ driver, schema })
+  ```
+- 4ef51c2: Claims stranded by a crashed flush are now recovered.
+  
+  A claim moves data out of the live set, which is what stops two flushers
+  shipping one window. It is also why a process that died holding one left data
+  nothing could reach again: `claim` reads the live set, and the abandoned batch
+  was no longer in it. On `ioredis` that batch survived the crash in Redis and
+  then sat there for ever. At-least-once held across a failed *write*; it did not
+  hold across a failed *process*. Now it does.
+  
+  - **`driver.recover(metric)`** is new. The flush calls it after the cadence
+    check and before it claims, so whatever it puts back ships in that same
+    flush. There is nothing to turn on.
+  - **`ioredis(client, { recoverAfter })`**, five minutes by default, is how long
+    a claim may be held before a flush treats it as abandoned. Keep it above your
+    sink's timeout. Nothing can ask a claim whether its owner is still writing,
+    and taking one back from an owner that is merely slow ships those rows twice
+    and then fails that owner's `ack`. Waiting is much the cheaper mistake, which
+    is why the default is generous.
+  - **`MetricFlushReport.recovered`** carries a `RecoveryReport` when a pass found
+    something and is absent otherwise, so its presence is the news: something
+    crashed between claiming a batch and settling it. A pass that throws is
+    reported as `recoveryError` and does not stop the flush, so one stuck claim
+    never becomes a metric that stops delivering.
+  
+  A recovered window is merged back into the live set, never shipped from
+  `recover`. An aggregate row is identified by its metric, its window and its
+  dims, so the abandoned half and anything written since carry the same row id —
+  sending them as two batches would let a sink upserting on that id keep one and
+  discard the other, and the total would be wrong.
+  
+  `memory()` recovers nothing and always will: its claims live in the process
+  that took them, so a crash leaves nothing behind to find. That is what
+  `durable: false` costs, and it is unchanged.
+  
+  **Breaking for custom drivers:** `Driver` is thirteen methods now, and
+  `recover` is required. A driver whose claims cannot outlive the process returns
+  the exported `NOTHING_RECOVERED`.
+  
+  ```diff
+   async release(claim) { /* ... */ },
+  +async recover(metric) { return NOTHING_RECOVERED },
+  ```
+
+### Patch Changes
+
+- cccecf4: The package README and description now explain why MetricHouse exists: it
+  fits into the stack you already have, lets your own code read the numbers
+  live, and hands you finished rows to store however your storage needs.
+
 ## 0.1.0
 
 ### Minor Changes
