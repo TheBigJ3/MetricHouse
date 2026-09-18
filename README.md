@@ -48,17 +48,20 @@ you import `metrichouse/ioredis`.
 
 ## Documentation
 
-The user-facing docs are a VitePress site in [`docs/`](docs/): getting started,
-one page per primitive, deployment guides, worked examples, and an API
-reference. Every snippet in it is checked against the built package.
+**[www.metrichouse.dev](https://www.metrichouse.dev/guide/getting-started)** —
+getting started, one page per primitive, deployment guides, worked examples, and
+an API reference. Every snippet in it is checked against the built package.
+
+The site is a VitePress project in [`docs/`](docs/), so it runs locally too:
 
 ```bash
 pnpm --filter @metrichouse/docs dev      # http://localhost:5173
 ```
 
 It is deployed on Vercel, which builds it from `docs/` on every push to `main`.
-[`docs/vercel.json`](docs/vercel.json) holds the build command and the output
-directory, and [`docs/README.md`](docs/README.md) explains the rest.
+[`docs/vercel.json`](docs/vercel.json) holds the build command, the output
+directory and clean URLs, and [`docs/README.md`](docs/README.md) explains the
+rest.
 
 ## What it looks like
 

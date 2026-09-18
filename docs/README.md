@@ -162,6 +162,13 @@ Vercel reads `docs/vercel.json` and that file holds both settings it needs.
 | Root directory | `docs` | the Vercel project settings |
 | Build command | `pnpm run build` | `vercel.json` |
 | Output directory | `.vitepress/dist` | `vercel.json`, relative to the root directory |
+| Clean URLs | on | `vercel.json` |
+
+`cleanUrls` is there because the site sets `cleanUrls: true` in
+`config.mts`, which makes every internal link extensionless. Vercel serves
+`.html` files at their `.html` path unless it is told otherwise, so without the
+setting each of those links lands on a 404. With it, `/guide/getting-started`
+serves `guide/getting-started.html` and the `.html` form redirects to it.
 
 Two things are worth knowing about that layout. `pnpm install` runs against the
 workspace lockfile one level up and installs the site's own dependencies, which

@@ -8,6 +8,8 @@ flush — and refuses to own anything else.
 npm install metrichouse
 ```
 
+Full documentation: **[www.metrichouse.dev](https://www.metrichouse.dev/guide/getting-started)**.
+
 ## The rule
 
 > The chef cooks the food. Someone else plates it.
@@ -128,9 +130,9 @@ Node 20 or newer.
 
 ## Documentation
 
-Getting started, one page per primitive, deployment guides, worked examples and
-an API reference live in
-[`docs/`](https://github.com/TheBigJ3/MetricHouse/tree/main/docs).
+**[www.metrichouse.dev](https://www.metrichouse.dev/guide/getting-started)** —
+getting started, one page per primitive, deployment guides, worked examples and
+an API reference.
 
 ## License
 

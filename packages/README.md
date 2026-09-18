@@ -37,4 +37,4 @@ MetricHouse sits between the data and the datastore. It owns bucketing,
 aggregation, staging, identity and flush; it hands your `write()` typed rows
 and stops. It emits no SQL, diffs no schema, and opens no connection. What
 those rows land in — the table, its types, whether it collapses duplicate
-`id`s — is yours. See [Writing a sink](../docs/guide/writing-a-sink.md).
+`id`s — is yours. See [Writing a sink](https://www.metrichouse.dev/guide/writing-a-sink).
