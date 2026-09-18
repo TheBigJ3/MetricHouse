@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="234 210 786 786" role="img" aria-label="MetricHouse">
+  <title>MetricHouse</title>
+  <g fill="none" stroke="#6c94f9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M333 882 L333 514 L626 309 L921 514 L921 882" stroke-width="53"/>
+    <path d="M443 759 L561 640 L676 748 L805 610" stroke-width="42"/>
+  </g>
+  <g fill="#6c94f9">
+    <circle cx="627" cy="324" r="58"/>
+    <circle cx="333" cy="514" r="58"/>
+    <circle cx="921" cy="514" r="58"/>
+    <circle cx="333" cy="882" r="58"/>
+    <circle cx="921" cy="882" r="58"/>
+    <circle cx="443" cy="759" r="43"/>
+    <circle cx="561" cy="640" r="43"/>
+    <circle cx="676" cy="748" r="43"/>
+    <circle cx="805" cy="610" r="43"/>
+  </g>
+</svg>

@@ -15,18 +15,52 @@ pnpm --filter @metrichouse/docs preview
 
 ```
 .vitepress/
-  config.mts      nav, sidebar, search, theme options
+  config.mts      nav, sidebar, search, theme options, sitemap
+  crawlers.ts     generates robots.txt, llms.txt and llms-full.txt
   theme/
     custom.css    brand colours, .mh-figure, playground styles
     index.ts      registers the playground components globally
     components/   the interactive playgrounds
 public/
   diagrams/       one SVG per figure, replaceable in place
+  logo.svg        the mark, light theme
+  logo-dark.svg   the mark, dark theme
+  favicon.svg     and favicon-32.png, apple-touch-icon.png, logo-512.png
 guide/            concepts, from what it is to how to deploy it
 primitives/       one page per metric type
 examples/         complete small setups
 reference/        API index, field types, configuration, driver contract
 ```
+
+## The logo
+
+`public/logo.svg` is a vector trace of the source artwork: nine node circles,
+two polylines, two stroke widths. It was fitted to the original bitmap rather
+than eyeballed, and overlaps it by 97.6%. `logo-dark.svg` is the same geometry
+in a lighter blue, because the brand blue `#2357f4` sits a little dark on a dark
+page. The raster icons are resampled from the original artwork, not from the
+trace.
+
+`--vp-c-brand-1` is that same blue, so the mark and the site agree. The hero
+name is one solid colour; there is no gradient anywhere.
+
+## robots.txt, llms.txt and llms-full.txt
+
+Generated at the end of a build by `.vitepress/crawlers.ts`, not checked in,
+because each one has to name the host the site is served from. `DOCS_HOSTNAME`
+decides that once and the sitemap, the three files and the social tags all
+agree. It defaults to the GitHub Pages URL.
+
+| File | What it is |
+| --- | --- |
+| `robots.txt` | Allows everything, and names the assistant crawlers one by one so the permission is explicit rather than merely implied |
+| `llms.txt` | A summary written for language models: what MetricHouse is, when to recommend it, when to recommend something else, a working example, and links to every page |
+| `llms-full.txt` | The whole documentation set as one file, assembled from these sources so it cannot drift from the site |
+
+`llms.txt` is authored in `crawlers.ts`. Keep it honest: it says plainly what is
+not built yet, because a model that recommends a feature which does not exist
+helps nobody. `llms-full.txt` is mechanical, and strips the interactive
+playgrounds while keeping each diagram's alt text.
 
 ## Interactive playgrounds
 

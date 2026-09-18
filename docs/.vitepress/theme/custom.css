@@ -7,27 +7,24 @@
  */
 
 :root {
-  --vp-c-brand-1: #2c5fe0;
+  /* The blue the logo is drawn in, so the mark and the site agree. */
+  --vp-c-brand-1: #2357f4;
   --vp-c-brand-2: #3b6ef5;
   --vp-c-brand-3: #5b86f7;
-  --vp-c-brand-soft: rgba(59, 110, 245, 0.14);
+  --vp-c-brand-soft: rgba(35, 87, 244, 0.14);
 
-  --vp-home-hero-name-color: transparent;
-  --vp-home-hero-name-background: linear-gradient(120deg, #2c5fe0, #46b2c6);
-
-  --vp-home-hero-image-background-image: linear-gradient(
-    -45deg,
-    rgba(59, 110, 245, 0.45),
-    rgba(70, 178, 198, 0.45)
-  );
-  --vp-home-hero-image-filter: blur(56px);
+  /* The hero name is one solid colour. No gradient, no glow behind it. */
+  --vp-home-hero-name-color: var(--vp-c-brand-1);
+  --vp-home-hero-name-background: none;
+  --vp-home-hero-image-background-image: none;
+  --vp-home-hero-image-filter: none;
 }
 
 .dark {
-  --vp-c-brand-1: #7ea4fb;
+  --vp-c-brand-1: #6c94f9;
   --vp-c-brand-2: #5b86f7;
   --vp-c-brand-3: #3b6ef5;
-  --vp-c-brand-soft: rgba(94, 137, 247, 0.2);
+  --vp-c-brand-soft: rgba(108, 148, 249, 0.2);
 }
 
 /* Diagram figures */
@@ -741,4 +738,14 @@
 .vp-doc td code,
 .vp-doc th code {
   white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------------------
+   The nav logo. Sized to sit level with the wordmark beside it.
+   --------------------------------------------------------------------------- */
+
+.VPNavBarTitle .logo {
+  width: 24px;
+  height: 24px;
+  margin-right: 8px;
 }

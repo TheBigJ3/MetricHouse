@@ -36,10 +36,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Build the site
-        # GitHub Pages serves this repository from /MetricHouse/, so asset paths
-        # need that prefix. Other hosts serve from the root and leave it unset.
         env:
+          # GitHub Pages serves this repository from /MetricHouse/, so asset
+          # paths need that prefix. DOCS_HOSTNAME is what robots.txt, llms.txt
+          # and the sitemap put in their own URLs. A fork changes both.
           DOCS_BASE: /MetricHouse/
+          DOCS_HOSTNAME: https://thebigj3.github.io
         run: pnpm --filter @metrichouse/docs build
 
       - uses: actions/configure-pages@v5

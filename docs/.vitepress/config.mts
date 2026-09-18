@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitepress'
+import { writeCrawlerFiles } from './crawlers.js'
 
 /**
  * Set DOCS_BASE when the site is served from a sub path.
@@ -6,6 +7,12 @@ import { defineConfig } from 'vitepress'
  * Netlify, Vercel and Cloudflare Pages serve from the root, so leave it unset.
  */
 const base = process.env.DOCS_BASE ?? '/'
+
+/**
+ * Where the site is served from, without a trailing slash. Used by the sitemap,
+ * by robots.txt and by llms.txt, so all three agree about their own URLs.
+ */
+const SITE = (process.env.DOCS_HOSTNAME ?? 'https://thebigj3.github.io').replace(/\/$/, '')
 
 export default defineConfig({
   base,
@@ -17,8 +24,14 @@ export default defineConfig({
   lastUpdated: true,
   srcExclude: ['**/DIAGRAMS.md', '**/README.md'],
 
+  sitemap: { hostname: `${SITE}${base}` },
+
   head: [
-    ['meta', { name: 'theme-color', content: '#3b6ef5' }],
+    ['link', { rel: 'icon', type: 'image/svg+xml', href: `${base}favicon.svg` }],
+    ['link', { rel: 'icon', type: 'image/png', sizes: '32x32', href: `${base}favicon-32.png` }],
+    ['link', { rel: 'apple-touch-icon', href: `${base}apple-touch-icon.png` }],
+    ['meta', { name: 'theme-color', content: '#2357f4' }],
+    ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:title', content: 'MetricHouse' }],
     [
       'meta',
@@ -28,9 +41,13 @@ export default defineConfig({
           'A metrics library for TypeScript that captures data now and lets you store it anywhere.',
       },
     ],
+    ['meta', { property: 'og:image', content: `${SITE}${base}logo-512.png` }],
+    ['meta', { name: 'twitter:card', content: 'summary' }],
   ],
 
   themeConfig: {
+    logo: { light: '/logo.svg', dark: '/logo-dark.svg', alt: 'MetricHouse' },
+
     outline: { level: [2, 3], label: 'On this page' },
 
     search: { provider: 'local' },
@@ -131,5 +148,14 @@ export default defineConfig({
       message: 'Released under the MIT License.',
       copyright: 'Copyright © 2026 MetricHouse contributors',
     },
+  },
+
+  /**
+   * robots.txt, llms.txt and llms-full.txt are generated rather than checked in,
+   * because every one of them has to name the host the site is actually served
+   * from. One `DOCS_HOSTNAME` decides it for all three and for the sitemap.
+   */
+  buildEnd(config) {
+    return writeCrawlerFiles(config.srcDir, config.outDir, `${SITE}${base}`)
   },
 })
