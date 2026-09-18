@@ -81,16 +81,15 @@ same rows rather than creating new ones.
 
 ## What is not protected
 
-### A process that dies mid flush
+### A process that dies mid flush, on `memory()`
 
 Between claiming a window and acknowledging it, the data sits in a holding area.
+With `memory()` that holding area is a map inside your process, so a crash takes
+it too. There is nothing left behind to find.
 
-- With **`ioredis()`**, that holding area is a real Redis key, so the data is
-  still there after the crash. It is not yet swept back into the live set
-  automatically, which means that window stays staged and undelivered until you
-  intervene. This is a known gap and is tracked in the repository.
-- With **`memory()`**, the holding area is a map inside your process, so the
-  window is gone.
+With `ioredis()` the holding area is a real Redis key, which outlives the process
+that wrote it, and a later flush puts it back. See
+[Recovering a crashed flush](#recovering-a-crashed-flush).
 
 ### Data still on its way to the driver
 
@@ -119,6 +118,107 @@ Grace holds a just finished window open a little longer. A write arriving after
 grace has passed lands in a window that has already shipped. That window ships
 again, with the same id and a larger value, so a table that keeps the newest row
 per id ends up correct and one that adds duplicates does not.
+
+## Recovering a crashed flush
+
+A claim moves data out of the live set. That is what stops two instances shipping
+the same window, and it is also why a process that dies holding one leaves data
+that no later flush can see: a flush claims from the live set, and the claimed
+window is no longer in it.
+
+With `ioredis()` that window is still in Redis under a key of its own. Every
+flush that is going to claim first looks for claims that have been held too long,
+merges them back into the live set, and then claims as usual, so the same flush
+ships what it just repaired.
+
+You do not turn this on. It is what `ioredis()` does.
+
+```ts
+const report = await house.flush()
+
+// absent on an ordinary flush, so its presence is the news
+if (report.metrics.http_requests?.recovered) {
+  logger.warn('a flusher died holding a batch, and it has been put back')
+}
+```
+
+```ts
+interface RecoveryReport {
+  claims: number             // abandoned claims put back
+  buckets: number            // windows put back, across those claims
+  records: number            // records put back, across those claims
+  oldestClaimedAt?: number   // when the longest stranded one was taken
+}
+```
+
+Something crashing between a claim and its acknowledgement is worth knowing
+about, so report it rather than letting it heal quietly:
+
+```ts
+setInterval(async () => {
+  const report = await house.flush()
+
+  for (const [metric, result] of Object.entries(report.metrics)) {
+    if (result.recovered) {
+      const { claims, buckets, records, oldestClaimedAt } = result.recovered
+      logger.warn(
+        { metric, claims, buckets, records, strandedForMs: Date.now() - oldestClaimedAt! },
+        'recovered a batch a dead flusher was holding',
+      )
+    }
+
+    // the sweep failed. The flush below it still ran, so rows still shipped.
+    if (result.recoveryError) {
+      logger.error({ err: result.recoveryError, metric }, 'recovery pass failed')
+    }
+  }
+}, 10_000)
+```
+
+### How long it waits
+
+A claim held by a flusher that is still writing looks exactly like a claim held
+by one that has died. The only thing separating them is how long it has been
+held, so that is what the driver goes on.
+
+```ts
+ioredis(client, { recoverAfter: '5m' })    // the default
+```
+
+Set this above your sink's timeout. Set it lower and a slow write can have its
+window taken back and shipped by another instance, which sends those rows twice
+and then fails the original flush's acknowledgement. Neither of those loses
+data, because both sends carry the same row ids, but it is noise you do not
+need. Set it higher and a genuinely crashed window waits longer to ship.
+
+Waiting is much the cheaper mistake, which is why the default is generous.
+
+### Why it merges rather than shipping
+
+A recovered window goes back into the live set. It is never sent straight to your
+database, and that is the part worth understanding.
+
+An aggregate row is identified by its metric, its window and its dimension
+values, so the abandoned half and anything written since it was stranded carry
+the same `id`. Sending them as two batches means your table keeps one and
+discards the other, and the total is then wrong. Merging them back into one live
+window is what makes the next flush send a single complete row.
+
+Records are different, since each one has an id of its own, but they are still
+put back at the head of the queue so they ship in the order they arrived.
+
+### What it does not cover
+
+- **`memory()` has nothing to recover.** Its claims live in the process that took
+  them, so a crash leaves nothing behind. `recover()` on it always reports zero,
+  and that is honest rather than unimplemented.
+- **A metric removed from your schema stops being swept**, because nothing
+  flushes it any more. Flush it once more before you delete it.
+- **A locally staged event or log**, `stage: 'local'`, waits in your process
+  rather than in the driver, so the same limit applies as for `memory()`.
+- **A recovery that fails** is reported as `recoveryError` and does not stop the
+  flush. The live data still ships, so one stuck claim never becomes a metric
+  that stops delivering.
 
 ## Where errors go
 
@@ -255,5 +355,5 @@ write: async (rows, context) => {
 - [ ] `house.drain()` runs before a serverless response returns.
 - [ ] Your dimensions have a small, known set of values.
 - [ ] Something alerts on repeated flush failures.
-- [ ] Your sink has a timeout.
+- [ ] Your sink has a timeout, and `recoverAfter` is longer than it.
 - [ ] Your sink chunks very large batches.

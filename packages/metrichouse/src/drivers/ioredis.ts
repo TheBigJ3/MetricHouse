@@ -12,6 +12,7 @@
  *              memory                        ioredis
  * claim        read-and-hold in a Map        RENAME-equivalent into a key
  * crash        the window is gone            the window is still there
+ * recover      nothing to find               puts the window back, on a cutoff
  * capabilities durable:false shared:false    durable:true shared:true
  * ```
  *
@@ -24,6 +25,7 @@
  * right.
  */
 
+import { type DurationInput, parseDuration } from '../time/duration.js'
 import {
   type AppendOp,
   type BucketClaim,
@@ -36,8 +38,10 @@ import {
   type GaugeOp,
   type IncrOp,
   isRecordClaim,
+  NOTHING_RECOVERED,
   type PendingQuery,
   type RecordClaim,
+  type RecoveryReport,
   type StagedRecord,
 } from './types.js'
 
@@ -94,6 +98,23 @@ export interface IoredisDriverOptions {
    * write, and nothing reads between the halves.
    */
   readonly maxPipelineSize?: number
+
+  /**
+   * How long a claim may be in flight before {@link Driver.recover} treats it
+   * as abandoned by a dead flusher. Defaults to `'5m'`.
+   *
+   * **Set this above your sink's timeout.** It is the one number that decides
+   * whether a claim belongs to a corpse or to a process that is simply taking
+   * its time, and there is no way to tell those apart from here. Too low and a
+   * slow write has its rows taken back and shipped by someone else — a
+   * duplicate, which the row ids survive, plus a failed `ack` on the original
+   * flush, which is only noise. Too high and a genuinely crashed window waits
+   * longer to ship. The default is generous for that reason.
+   *
+   * `0` recovers every claim on sight, including ones taken a moment ago,
+   * which is useful in a test and nowhere else.
+   */
+  readonly recoverAfter?: DurationInput
 }
 
 /** Introspection this driver offers beyond the {@link Driver} contract. */
@@ -106,6 +127,8 @@ export interface IoredisDriver extends Driver {
 
 const DEFAULT_NAMESPACE = 'mh'
 const DEFAULT_MAX_PIPELINE = 1000
+/** Five minutes. Far longer than any sane sink, which is the point. */
+const DEFAULT_RECOVER_AFTER = 300_000
 
 /**
  * A gauge fold, packed into one hash field as `last|min|max|sum|count`.
@@ -213,52 +236,107 @@ return 1
 `
 
 /**
- * Settle a claim by putting the data back.
+ * Put one in-flight bucket hash back into the live set.
  *
  * Merge, never overwrite: a write can land in a bucket while it is claimed —
  * backdated, or a straggler from another instance — and overwriting would drop
  * it silently. A counter merges by addition, a gauge by folding the two halves
  * with the *newer* one keeping `last`.
  *
+ * A function rather than two copies, because {@link RELEASE_BUCKETS} and
+ * {@link RECOVER_CLAIMS} both put a claim back and a merge rule written twice
+ * is a merge rule that eventually disagrees with itself.
+ *
+ * Returns how many distinct buckets it restored.
+ */
+const LUA_RESTORE_BUCKETS = `${LUA_HELPERS}
+local function mh_restore_buckets(inflight, prefix, idx)
+  local data = redis.call('HGETALL', inflight)
+  local seen = {}
+  local buckets = 0
+
+  for i = 1, #data, 2 do
+    local composite = data[i]
+    local held = data[i + 1]
+    -- bucketTs is digits, so the first colon is always the real boundary,
+    -- whatever the dim key happens to contain
+    local sep = string.find(composite, ':', 1, true)
+    local bucketTs = string.sub(composite, 1, sep - 1)
+    local field = string.sub(composite, sep + 1)
+    local key = prefix .. bucketTs
+
+    if seen[bucketTs] == nil then
+      seen[bucketTs] = true
+      buckets = buckets + 1
+    end
+
+    local cur = redis.call('HGET', key, field)
+    if cur == false then
+      redis.call('HSET', key, field, held)
+    else
+      local h = mh_parse(held)
+      local c = mh_parse(cur)
+      if h == false and c == false then
+        redis.call('HINCRBYFLOAT', key, field, held)
+      elseif type(h) == 'table' and type(c) == 'table' then
+        redis.call('HSET', key, field, mh_pack(
+          c[1],
+          math.min(h[2], c[2]),
+          math.max(h[3], c[3]),
+          h[4] + c[4],
+          h[5] + c[5]
+        ))
+      else
+        error(redis.error_reply('MHKIND cannot merge a counter cell with a gauge cell'))
+      end
+    end
+
+    -- dropped from the claim as it lands. The kind clash above aborts the
+    -- script, and Redis does not roll a script back, so a re-run has to finish
+    -- the job rather than add the cells it already restored a second time.
+    redis.call('HDEL', inflight, composite)
+    redis.call('ZADD', idx, bucketTs, bucketTs)
+  end
+
+  return buckets
+end
+`
+
+/**
+ * Put one in-flight record list back at the **front** of the queue.
+ *
+ * They are older than anything appended while they were in flight, and a claim
+ * ships oldest first, so returning them to the back would ship out of order.
+ *
+ * `LPUSH a b c` leaves `c b a`, so each chunk goes in reversed, and the chunks
+ * themselves run back to front — which is what lands the whole run in its
+ * original order.
+ *
+ * Returns how many records it restored.
+ */
+const LUA_RESTORE_RECORDS = `
+local function mh_restore_records(inflight, records)
+  local held = redis.call('LRANGE', inflight, 0, -1)
+  local i = #held
+  while i >= 1 do
+    local chunk = {}
+    local stop = math.max(1, i - 999)
+    for j = i, stop, -1 do chunk[#chunk + 1] = held[j] end
+    redis.call('LPUSH', records, unpack(chunk))
+    i = stop - 1
+  end
+  return #held
+end
+`
+
+/**
+ * Settle a claim by putting the data back.
+ *
  * KEYS: claims, in-flight hash, index. ARGV: claimId, bucket key prefix.
  */
-const RELEASE_BUCKETS = `${LUA_HELPERS}
+const RELEASE_BUCKETS = `${LUA_RESTORE_BUCKETS}
 if redis.call('ZREM', KEYS[1], ARGV[1]) == 0 then return 0 end
-
-local data = redis.call('HGETALL', KEYS[2])
-for i = 1, #data, 2 do
-  local composite = data[i]
-  local held = data[i + 1]
-  -- bucketTs is digits, so the first colon is always the real boundary,
-  -- whatever the dim key happens to contain
-  local sep = string.find(composite, ':', 1, true)
-  local bucketTs = string.sub(composite, 1, sep - 1)
-  local field = string.sub(composite, sep + 1)
-  local key = ARGV[2] .. bucketTs
-
-  local cur = redis.call('HGET', key, field)
-  if cur == false then
-    redis.call('HSET', key, field, held)
-  else
-    local h = mh_parse(held)
-    local c = mh_parse(cur)
-    if h == false and c == false then
-      redis.call('HINCRBYFLOAT', key, field, held)
-    elseif type(h) == 'table' and type(c) == 'table' then
-      redis.call('HSET', key, field, mh_pack(
-        c[1],
-        math.min(h[2], c[2]),
-        math.max(h[3], c[3]),
-        h[4] + c[4],
-        h[5] + c[5]
-      ))
-    else
-      return redis.error_reply('MHKIND cannot merge a counter cell with a gauge cell')
-    end
-  end
-  redis.call('ZADD', KEYS[3], bucketTs, bucketTs)
-end
-
+mh_restore_buckets(KEYS[2], ARGV[2], KEYS[3])
 redis.call('DEL', KEYS[2])
 return 1
 `
@@ -293,32 +371,68 @@ return taken
 `
 
 /**
- * Put claimed records back at the **front** of the queue.
- *
- * They are older than anything appended while they were in flight, and a claim
- * ships oldest first, so returning them to the back would ship out of order.
- *
- * `LPUSH a b c` leaves `c b a`, so each chunk goes in reversed, and the chunks
- * themselves run back to front — which is what lands the whole run in its
- * original order.
+ * Settle a record claim by putting the records back.
  *
  * KEYS: records, in-flight list, claims. ARGV: claimId.
  */
-const RELEASE_RECORDS = `
+const RELEASE_RECORDS = `${LUA_RESTORE_RECORDS}
 if redis.call('ZREM', KEYS[3], ARGV[1]) == 0 then return 0 end
-
-local held = redis.call('LRANGE', KEYS[2], 0, -1)
-local i = #held
-while i >= 1 do
-  local chunk = {}
-  local stop = math.max(1, i - 999)
-  for j = i, stop, -1 do chunk[#chunk + 1] = held[j] end
-  redis.call('LPUSH', KEYS[1], unpack(chunk))
-  i = stop - 1
-end
-
+mh_restore_records(KEYS[2], KEYS[1])
 redis.call('DEL', KEYS[2])
 return 1
+`
+
+/**
+ * Put every claim older than a cutoff back into the live set.
+ *
+ * The other half of the at-least-once guarantee, and the half `claim` cannot
+ * provide. A claim moves data out of the live set; a flusher that dies before
+ * settling one leaves a batch that no later `claim` can reach, because `claim`
+ * reads the index and the abandoned buckets were taken out of it. This walks
+ * the claims registry instead, which is the only place that still names them.
+ *
+ * **The cutoff is a guess about a dead process, so it errs long.** There is no
+ * way to ask a claim whether its owner is still writing, and taking one back
+ * from an owner that is merely slow ships those rows twice and fails that
+ * owner's `ack`. Waiting longer costs a later delivery, which is the cheaper
+ * mistake by a wide margin.
+ *
+ * KEYS: claims, index, records. ARGV: cutoff, in-flight prefix, bucket prefix.
+ */
+const RECOVER_CLAIMS = `${LUA_RESTORE_BUCKETS}${LUA_RESTORE_RECORDS}
+local abandoned = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'WITHSCORES')
+local claims = 0
+local buckets = 0
+local records = 0
+local oldest = 0
+
+for i = 1, #abandoned, 2 do
+  local id = abandoned[i]
+  local inflight = ARGV[2] .. id
+
+  -- a claim id says nothing about which storage model it holds, and it does
+  -- not have to: a bucket claim is a hash and a record claim is a list. 'none'
+  -- is an empty claim, which moved nothing and only has a registration to drop
+  local kind = redis.call('TYPE', inflight)['ok']
+  if kind == 'hash' then
+    buckets = buckets + mh_restore_buckets(inflight, ARGV[3], KEYS[2])
+  elseif kind == 'list' then
+    records = records + mh_restore_records(inflight, KEYS[3])
+  end
+
+  -- restored first, deregistered second, and that order is safe only because
+  -- a script is one atomic step: no client can see a claim that is both back
+  -- in the live set and still registered. A script that aborts partway leaves
+  -- a claim the next pass finishes, rather than one nobody is named on.
+  redis.call('DEL', inflight)
+  redis.call('ZREM', KEYS[1], id)
+
+  -- ascending by score, so the first one through is the longest stranded
+  if claims == 0 then oldest = tonumber(abandoned[i + 1]) end
+  claims = claims + 1
+end
+
+return { claims, buckets, records, oldest }
 `
 
 /**
@@ -391,6 +505,7 @@ function typedError(error: unknown, metric: string): Error {
 export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {}): IoredisDriver {
   const ns = options.namespace ?? DEFAULT_NAMESPACE
   const maxPipeline = Math.max(1, options.maxPipelineSize ?? DEFAULT_MAX_PIPELINE)
+  const recoverAfterMs = parseDuration(options.recoverAfter ?? DEFAULT_RECOVER_AFTER)
 
   const key = {
     bucket: (metric: string, bucketTs: number | string) => `${ns}:b:${metric}:${bucketTs}`,
@@ -807,6 +922,37 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       if (settled === 0) {
         throw new Error(`ioredis driver: claim ${claim.id} is not in flight — already settled?`)
       }
+    },
+
+    async recover(metric: string): Promise<RecoveryReport> {
+      // one instant for the whole pass, and the same clock `claim` stamped the
+      // registry with, so "older than the cutoff" is a comparison between two
+      // readings of one clock rather than between two machines' ideas of now
+      const cutoff = Date.now() - recoverAfterMs
+
+      let raw: unknown
+      try {
+        const results = await runScripts(
+          [
+            {
+              script: RECOVER_CLAIMS,
+              keys: [key.claims(metric), key.idx(metric), key.records(metric)],
+              // `inflight('')` rather than a literal, so the prefix cannot
+              // drift from the key the claim was actually written to
+              args: [cutoff, key.inflight(''), key.bucketPrefix(metric)],
+            },
+          ],
+          'recover',
+        )
+        raw = results[0]
+      } catch (error) {
+        throw typedError(error, metric)
+      }
+
+      const [claims = 0, buckets = 0, records = 0, oldest = 0] = (raw ?? []) as number[]
+      if (claims === 0) return NOTHING_RECOVERED
+
+      return { claims, buckets, records, ...(oldest > 0 && { oldestClaimedAt: oldest }) }
     },
   }
 }

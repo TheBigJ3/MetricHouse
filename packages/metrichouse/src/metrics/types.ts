@@ -6,7 +6,7 @@
  * actually need — no `add`, no dim generics, nothing that varies by kind.
  */
 
-import type { Claim, Driver } from '../drivers/types.js'
+import type { Claim, Driver, RecoveryReport } from '../drivers/types.js'
 import type { DeliveryMode, HouseDefaults } from '../runtime/delivery.js'
 import type { FlushOptions, MetricFlushReport } from '../runtime/flush.js'
 import type { LiveRow, SnapshotOptions } from '../runtime/live.js'
@@ -168,11 +168,11 @@ export interface MaterializedBatch {
 /**
  * Everything the house and the flush engine need, with dim types erased.
  *
- * The four batch methods are what keep the flush engine kind-agnostic. It runs
- * `claimBatch -> materializeClaim -> write -> ackBatch | releaseBatch` and
- * never learns whether the data underneath was a bucket of folded cells or a
- * run of staged records. Adding a primitive means implementing these four, not
- * editing the lifecycle.
+ * The five batch methods are what keep the flush engine kind-agnostic. It runs
+ * `recoverBatch -> claimBatch -> materializeClaim -> write -> ackBatch |
+ * releaseBatch` and never learns whether the data underneath was a bucket of
+ * folded cells or a run of staged records. Adding a primitive means
+ * implementing these five, not editing the lifecycle.
  */
 export interface AnyMetric {
   readonly name: string
@@ -230,6 +230,20 @@ export interface AnyMetric {
    * `house.snapshot(options)` stays callable across a mixed schema.
    */
   snapshot(options?: SnapshotOptions): Promise<LiveRow[]>
+
+  /**
+   * Put back anything a previous flusher claimed and then died holding.
+   *
+   * Runs before {@link AnyMetric.claimBatch}, because an abandoned claim is
+   * data that has already left the live set: nothing downstream of the claim
+   * can see it, so the repair has to happen upstream of one. What it puts back
+   * is claimed and shipped by the very same flush.
+   *
+   * Nothing is shipped from here, only merged back. The reasoning, and the
+   * question of when a claim counts as abandoned, belong to the driver —
+   * {@link Driver.recover} is where both are written down.
+   */
+  recoverBatch(): Promise<RecoveryReport>
 
   /**
    * Move everything shippable out of the live set and hold it pending a write.

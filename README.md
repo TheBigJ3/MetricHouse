@@ -15,10 +15,10 @@ flush — and refuses to own anything else.
 > `time()`, and an optional event for percentiles. Storage is now two drivers,
 > not one: `ioredis` joined `memory`, both measured against the same executable
 > driver contract, so at-least-once holds across a failed write rather than
-> just a failed call. It does not yet hold across a failed *process*: in-flight
-> claims are tracked but never swept, so a crash mid-flush strands that window.
-> Still missing: `level`/`distinct`, `ingest`/`backfill`, the claim sweeper,
-> and the CLI.
+> just a failed call. On `ioredis` it now holds across a failed *process* too:
+> a flush puts back any claim held longer than `recoverAfter` before it claims,
+> so a crash mid-flush delays that window rather than stranding it. Still
+> missing: `level`/`distinct`, `ingest`/`backfill`, and the CLI.
 
 ## The rule
 

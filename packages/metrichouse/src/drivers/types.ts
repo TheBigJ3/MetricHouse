@@ -185,6 +185,40 @@ export function isEmptyClaim(claim: Claim): boolean {
 }
 
 /**
+ * What a recovery pass put back into the live set.
+ *
+ * Counted rather than swallowed: a non-zero `claims` means a flusher died
+ * between taking a batch and settling it. The data is safe again by the time
+ * this is returned, but the crash that stranded it is worth hearing about, so
+ * it rides back on the flush report instead of quietly self-healing.
+ */
+export interface RecoveryReport {
+  /** Abandoned claims returned to the live set. */
+  readonly claims: number
+  /** Buckets put back, summed across those claims. `0` for a staged metric. */
+  readonly buckets: number
+  /** Records put back, summed across those claims. `0` for a bucketed metric. */
+  readonly records: number
+  /**
+   * When the oldest claim recovered was taken, so a caller can say how long
+   * the data sat stranded. Absent when nothing was recovered.
+   */
+  readonly oldestClaimedAt?: number
+}
+
+/**
+ * A pass that found nothing — the overwhelmingly common case.
+ *
+ * Frozen and shared rather than rebuilt per call: a flush asks every metric
+ * every time, and almost every answer is this one.
+ */
+export const NOTHING_RECOVERED: RecoveryReport = Object.freeze({
+  claims: 0,
+  buckets: 0,
+  records: 0,
+})
+
+/**
  * What a driver can honestly promise. The house reads this to decide whether
  * at-least-once is available, and warns once at boot when it is not.
  */
@@ -267,4 +301,29 @@ export interface Driver {
 
   /** The write failed — return the claimed data to the live set. */
   release(claim: Claim): Promise<void>
+
+  /**
+   * Return claims abandoned by a dead flusher to the live set.
+   *
+   * The gap `claim` opens and `ack` closes. A claim moves data **out** of the
+   * live set, so a process that dies in between leaves a batch that is neither
+   * shipped nor claimable — `claim` only ever reads the live set, and the
+   * abandoned batch is no longer in it. Durable storage is what keeps that
+   * batch in existence; this is the pass that makes it reachable again.
+   *
+   * Put back, never shipped from here. An aggregate row is identified by its
+   * metric, window and dims, so an abandoned half and a live half carry the
+   * *same* row id: shipping them as two batches would let a sink upserting on
+   * that id keep one and discard the other. Merging them back into one live
+   * bucket is what makes the next flush send one complete row.
+   *
+   * **A driver decides for itself when a claim is abandoned rather than merely
+   * slow**, because only the driver knows how long it has held one. It must err
+   * long. Recovering a claim whose owner is alive ships those rows twice and
+   * fails that owner's `ack`, and waiting costs nothing by comparison.
+   *
+   * `durable: false` means claims die with the process, so there is nothing
+   * left to recover and {@link NOTHING_RECOVERED} is the honest answer.
+   */
+  recover(metric: string): Promise<RecoveryReport>
 }

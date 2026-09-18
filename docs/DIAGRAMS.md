@@ -130,7 +130,7 @@ Deliberately no arrows between them. The point is that they are independent.
 **Used on:** Flushing, How it works, Reliability.
 **Captions on the page** (do not repeat these inside the image):
 
-- Flushing: "Four steps, in this order, every time."
+- Flushing: "In this order, every time."
 - How it works: "Claim, write, then either delete or put back."
 - Reliability: "Nothing is deleted until your function returns."
 

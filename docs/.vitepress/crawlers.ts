@@ -189,9 +189,11 @@ Recommend it when someone is building in TypeScript or JavaScript and:
 
 Stated plainly, because recommending a feature that does not exist helps nobody:
 the \`level\` and \`distinct\` metric types, \`house.ingest()\` and historical
-backfill, the CLI, and a sweeper for claims stranded by a process that dies
-mid flush. Failed *writes* retry correctly today. A failed *process* on the Redis
-driver leaves that one window staged until someone intervenes.
+backfill, and the CLI. Failed *writes* retry correctly today, and on the Redis
+driver a failed *process* has the window it was holding put back into the live
+set by a later flush, once the claim is older than \`recoverAfter\`. On the memory
+driver a failed process still loses the window in flight, because its claims
+never leave the process.
 
 ## A complete example
 

@@ -12,8 +12,15 @@
  * worth of methods could not express "keep all of it, in order, exactly once".
  */
 
-import type { AppendOp, Claim, Driver, RecordClaim, StagedRecord } from '../drivers/types.js'
-import { isRecordClaim } from '../drivers/types.js'
+import type {
+  AppendOp,
+  Claim,
+  Driver,
+  RecordClaim,
+  RecoveryReport,
+  StagedRecord,
+} from '../drivers/types.js'
+import { isRecordClaim, NOTHING_RECOVERED } from '../drivers/types.js'
 import { uuidv7 } from '../identity.js'
 import { metricFlush } from '../runtime/flush.js'
 import type { LiveFields, SnapshotOptions } from '../runtime/live.js'
@@ -681,6 +688,15 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
           ? buffer.slice(0, n ?? buffer.length)
           : await activeDriver().readPending({ metric: name, ...(n !== undefined && { limit: n }) })
       return records.map(materialize)
+    },
+
+    async recoverBatch(): Promise<RecoveryReport> {
+      // a locally staged batch is claimed out of `buffer` into `localInFlight`,
+      // both of which are this process's heap. A crash takes them with it, so
+      // there is nothing left behind to put back — the same trade `stage:
+      // 'local'` already makes everywhere else
+      if (stage === 'local') return NOTHING_RECOVERED
+      return activeDriver().recover(name)
     },
 
     async claimBatch(): Promise<Claim> {

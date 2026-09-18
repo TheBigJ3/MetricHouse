@@ -8,7 +8,13 @@
  * `materialize` and `totalOf` and inherits the rest.
  */
 
-import { type Cell, type Claim, type Driver, isBucketClaim } from '../drivers/types.js'
+import {
+  type Cell,
+  type Claim,
+  type Driver,
+  isBucketClaim,
+  type RecoveryReport,
+} from '../drivers/types.js'
 import {
   applySnapshot,
   type LiveRow,
@@ -99,7 +105,7 @@ export function bucketedReader<D extends Shape, V>(
 /** The four {@link AnyMetric} methods that move a batch. */
 export type BatchLifecycle = Pick<
   AnyMetric,
-  'claimBatch' | 'materializeClaim' | 'ackBatch' | 'releaseBatch'
+  'recoverBatch' | 'claimBatch' | 'materializeClaim' | 'ackBatch' | 'releaseBatch'
 >
 
 export interface BucketedOptions {
@@ -131,6 +137,10 @@ export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
   }
 
   return {
+    async recoverBatch(): Promise<RecoveryReport> {
+      return driver().recover(name)
+    },
+
     async claimBatch(nowMs: number): Promise<Claim> {
       // everything strictly below this has ended and outlived grace
       return driver().claim(name, closedUpTo(resolutionMs, nowMs, graceMs()))

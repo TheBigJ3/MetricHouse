@@ -75,7 +75,9 @@ contributes to the same window, so a live read is exact across your whole fleet
 rather than per process.
 
 A claim is a real move into a key of its own, so it outlives the process that
-took it.
+took it. If a flusher dies holding one, a later flush finds it and merges it back
+into the live set before claiming, so those rows ship rather than sitting in
+Redis for ever. See [Recovering a crashed flush](/guide/reliability#recovering-a-crashed-flush).
 
 ### Passing a client lazily
 
@@ -93,11 +95,20 @@ const driver = ioredis(() => new Redis(process.env.REDIS_URL!))
 ioredis(client, {
   namespace: 'mh',         // key prefix
   maxPipelineSize: 1000,   // commands per round trip
+  recoverAfter: '5m',      // how long a claim may be held before it counts as abandoned
 })
 ```
 
 Give two houses that share one Redis different namespaces. Every key this driver
 creates starts with that prefix.
+
+`recoverAfter` is the one number behind crash recovery. A claim held by a flusher
+that is still writing looks exactly like a claim held by one that has died, and
+how long it has been held is all there is to tell them apart. Keep it above your
+sink's timeout. Lower and a slow write can have its window taken back and shipped
+by another instance, which duplicates those rows and fails the original
+acknowledgement. Higher and a crashed window waits longer to ship. Nothing is
+lost either way.
 
 ### Looking at a running system
 
@@ -173,7 +184,7 @@ export const house = createHouse({ driver, schema })
 
 ## Writing your own
 
-The `Driver` interface is twelve methods. It is exported, so a driver for
+The `Driver` interface is thirteen methods. It is exported, so a driver for
 DynamoDB, Cloudflare Durable Objects, Postgres or anything else is an ordinary
 object.
 
@@ -196,6 +207,7 @@ export function myDriver(): Driver {
     async claimRecords(metric, limit) { /* ... */ },
     async ack(claim) { /* ... */ },
     async release(claim) { /* ... */ },
+    async recover(metric) { /* ... */ },
   }
 }
 ```
@@ -233,6 +245,9 @@ function connect(): Redis {
 export const driver = ioredis(connect, {
   namespace: process.env.METRICS_NAMESPACE ?? 'mh',
   maxPipelineSize: 1000,
+  // comfortably longer than the sink timeout, so a slow write is never
+  // mistaken for a dead process
+  recoverAfter: '5m',
 })
 
 export async function seriesReport(metrics: string[]) {

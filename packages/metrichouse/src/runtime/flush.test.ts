@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { memory } from '../drivers/memory.js'
-import type { Driver } from '../drivers/types.js'
+import { type Driver, NOTHING_RECOVERED, type RecoveryReport } from '../drivers/types.js'
 import type { Counter } from '../metrics/counter.js'
 import { counter } from '../metrics/counter.js'
 import { event } from '../metrics/event.js'
@@ -343,6 +343,95 @@ describe('failure and retry', () => {
 
     expect((await house.flush()).ok).toBe(false)
     expect(await driver.readBuckets({ metric: 'm' })).toHaveLength(1)
+  })
+})
+
+describe('recovery', () => {
+  let metric: ReturnType<typeof make>
+  let write: ReturnType<typeof vi.fn>
+
+  /** What a driver reports after putting a dead flusher's batch back. */
+  const found: RecoveryReport = {
+    claims: 1,
+    buckets: 2,
+    records: 0,
+    oldestClaimedAt: 1_788_616_900_000,
+  }
+
+  /** A metric with data closed and waiting. */
+  const ready = async (override: Partial<Driver>): Promise<House> => {
+    const house = createHouse({ driver: { ...driver, ...override }, schema: [metric], now })
+    metric.add(A)
+    await house.drain()
+    settle()
+    return house
+  }
+
+  beforeEach(() => {
+    write = vi.fn()
+    metric = make('m', { write })
+  })
+
+  it('says nothing about recovery on an ordinary flush', async () => {
+    // absent rather than zero, so its presence is the news: a report carrying
+    // `recovered` means something crashed holding a batch
+    const report = await (await ready({})).flush()
+    expect(report.metrics.m?.recovered).toBeUndefined()
+    expect(report.metrics.m?.recoveryError).toBeUndefined()
+  })
+
+  it('reports what a recovery put back', async () => {
+    const house = await ready({ recover: async () => found })
+    expect((await house.flush()).metrics.m?.recovered).toEqual(found)
+  })
+
+  it('recovers before it claims, so a restored batch ships in the same flush', async () => {
+    const order: string[] = []
+    const house = await ready({
+      recover: async () => {
+        order.push('recover')
+        return found
+      },
+      claim: async (name, upTo) => {
+        order.push('claim')
+        return driver.claim(name, upTo)
+      },
+    })
+
+    await house.flush()
+    expect(order).toEqual(['recover', 'claim'])
+  })
+
+  it('does not sweep on a flush the cadence skips', async () => {
+    // nothing recovered can leave on a flush that is not going to claim, so
+    // the repair belongs after the cadence check rather than before it
+    const recover = vi.fn(async () => NOTHING_RECOVERED)
+    const house = await ready({ recover })
+
+    await house.flush()
+    expect(recover).toHaveBeenCalledTimes(1)
+
+    await house.flush()
+    expect(recover).toHaveBeenCalledTimes(1)
+  })
+
+  it('ships anyway when the recovery itself fails', async () => {
+    // the repair is not a precondition. A sweep that keeps failing must not
+    // turn into a metric that never ships again.
+    const boom = new Error('redis said no')
+    const house = await ready({
+      recover: async () => {
+        throw boom
+      },
+    })
+
+    const report = await house.flush()
+    expect(report.metrics.m?.recoveryError).toBe(boom)
+    expect(report.metrics.m?.rows).toBe(1)
+    // `error` is the sink failing, and the sink did not fail
+    expect(report.metrics.m?.error).toBeUndefined()
+    expect(report.ok).toBe(true)
+    expect(write).toHaveBeenCalledTimes(1)
   })
 })
 

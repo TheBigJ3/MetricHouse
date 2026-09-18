@@ -22,8 +22,10 @@ import {
   type IncrOp,
   isGaugeCell,
   isRecordClaim,
+  NOTHING_RECOVERED,
   type PendingQuery,
   type RecordClaim,
+  type RecoveryReport,
   type StagedRecord,
 } from './types.js'
 
@@ -414,6 +416,16 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           existing.set(dimKey, mergeCells(value, current))
         }
       }
+    },
+
+    async recover(): Promise<RecoveryReport> {
+      // Nothing to find, and not because the sweep is unimplemented: this
+      // driver's claims live in `inFlight`, a Map in the process that took
+      // them. A process that dies takes the Map with it, so there is never an
+      // abandoned claim left behind to return — the window is simply gone.
+      // That is the whole of what `durable: false` costs, said once more here
+      // so it cannot be mistaken for an oversight.
+      return NOTHING_RECOVERED
     },
   }
 }

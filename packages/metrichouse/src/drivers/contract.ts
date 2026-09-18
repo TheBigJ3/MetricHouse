@@ -5,7 +5,7 @@
  * driver *is* the specification: it is the one implementation small enough to
  * read in a sitting, and its behaviour is what the rest of the library was
  * written against. A new backend is not "a driver" because it satisfies the
- * TypeScript interface — a stub of twelve `async () => {}` methods does that.
+ * TypeScript interface — a stub of thirteen `async () => {}` methods does that.
  * It is a driver when it passes this file.
  *
  * ```
@@ -16,8 +16,8 @@
  * So the rule for adding a backend is mechanical: call this, watch it fail,
  * make it pass. Nothing here may reference a concrete driver, and anything a
  * driver is *allowed* to differ on — a series cap, a key layout, whether a
- * claim survives a restart — belongs in that driver's own test file rather
- * than here.
+ * claim survives a restart, how long one has to be held before it counts as
+ * abandoned — belongs in that driver's own test file rather than here.
  *
  * Not a test file itself: `vitest.config.ts` collects `src/**\/*.test.ts`, and
  * this exports a function instead of running one.
@@ -478,6 +478,48 @@ export function describeDriverContract(name: string, options: DriverContractOpti
 
         await driver.ack(retry)
         expect(await driver.readBuckets({ metric: M })).toEqual([])
+      })
+    })
+
+    describe('recover', () => {
+      it('reports nothing when no claim has been abandoned', async () => {
+        await incr(1000, WILLOW)
+        expect(await driver.recover(M)).toEqual({ claims: 0, buckets: 0, records: 0 })
+      })
+
+      it('reports nothing for a metric that has never been written', async () => {
+        expect(await driver.recover('unseen')).toEqual({ claims: 0, buckets: 0, records: 0 })
+      })
+
+      it('leaves the live set untouched', async () => {
+        await incr(1000, WILLOW, 3)
+        await driver.recover(M)
+        expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: 1000, dimKey: WILLOW, value: 3 },
+        ])
+      })
+
+      it('does not take back a claim that was only just made', async () => {
+        // the safety property every driver shares, whatever each one decides
+        // "abandoned" means. A flush that is still writing owns its batch, and
+        // taking it back underneath one ships those rows twice and then fails
+        // that flush's ack. Erring long is the whole of the rule.
+        await incr(1000, WILLOW, 5)
+        const claim = await driver.claim(M, 2000)
+
+        expect((await driver.recover(M)).claims).toBe(0)
+        expect(await driver.readBuckets({ metric: M })).toEqual([])
+        // still in flight, and still its owner's to settle
+        await expect(driver.ack(claim)).resolves.toBeUndefined()
+      })
+
+      it('does not take back a record claim that was only just made', async () => {
+        await driver.append([rec('a', 1000)])
+        const claim = await driver.claimRecords(M)
+
+        expect((await driver.recover(M)).claims).toBe(0)
+        expect(await driver.readPending({ metric: M })).toEqual([])
+        await expect(driver.ack(claim)).resolves.toBeUndefined()
       })
     })
 

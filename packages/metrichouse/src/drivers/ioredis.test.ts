@@ -215,6 +215,200 @@ if (!client) {
     })
   })
 
+  describe('ioredis · recover', () => {
+    /**
+     * A driver that treats every claim as abandoned.
+     *
+     * `recoverAfter: 0` is the whole of what a test needs from the clock: the
+     * cutoff is the only thing separating a dead flusher from a slow one, and
+     * setting it to zero makes a claim taken a moment ago stand in for one
+     * taken by a process that never came back.
+     */
+    const sweeper = (ns: string) => ioredis(live, { namespace: ns, recoverAfter: 0 })
+
+    it('puts back a window the flusher died holding, and the next claim gets it', async () => {
+      const ns = fresh()
+      const crashed = ioredis(live, { namespace: ns })
+      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 4 }])
+      await crashed.claim(M, 2000)
+      // the crash: nothing acks, nothing releases, the process is gone
+
+      // a claim alone can never find it again, because claim reads the index
+      // and the claim took that bucket out of it
+      const restarted = sweeper(ns)
+      const probe = await restarted.claim(M, 2000)
+      expect(probe.buckets).toEqual([])
+      // settled, so the probe is not itself an abandoned claim for the sweep
+      // below to find
+      await restarted.ack(probe)
+
+      expect(await restarted.recover(M)).toEqual({
+        claims: 1,
+        buckets: 1,
+        records: 0,
+        oldestClaimedAt: expect.any(Number),
+      })
+
+      const retry = await restarted.claim(M, 2000)
+      expect([...(retry.buckets[0]?.values ?? [])]).toEqual([[WILLOW, 4]])
+
+      await wipe(ns)
+    })
+
+    it('merges the stranded window with writes that landed while it was gone', async () => {
+      // the reason recovery puts data back rather than shipping it: both
+      // halves carry the same row id, so a sink upserting on that id would
+      // keep one and discard the other
+      const ns = fresh()
+      const crashed = ioredis(live, { namespace: ns })
+      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 5 }])
+      await crashed.claim(M, 2000)
+
+      const survivor = sweeper(ns)
+      await survivor.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 2 }])
+      await survivor.recover(M)
+
+      expect(await survivor.readBuckets({ metric: M })).toEqual([
+        { bucketTs: 1000, dimKey: WILLOW, value: 7 },
+      ])
+
+      await wipe(ns)
+    })
+
+    it('folds a stranded gauge back together without inventing observations', async () => {
+      const ns = fresh()
+      const crashed = ioredis(live, { namespace: ns })
+      await crashed.observe([
+        { metric: G, bucketTs: 1000, dimKey: WILLOW, value: 5 },
+        { metric: G, bucketTs: 1000, dimKey: WILLOW, value: 2 },
+      ])
+      await crashed.claim(G, 2000)
+
+      const survivor = sweeper(ns)
+      await survivor.observe([{ metric: G, bucketTs: 1000, dimKey: WILLOW, value: 9 }])
+      await survivor.recover(G)
+
+      const row = (await survivor.readBuckets({ metric: G }))[0]
+      expect(row?.value).toEqual({ last: 9, min: 2, max: 9, sum: 16, count: 3 })
+
+      await wipe(ns)
+    })
+
+    it('puts stranded records back at the front, in their original order', async () => {
+      const ns = fresh()
+      const crashed = ioredis(live, { namespace: ns })
+      await crashed.append([
+        { metric: M, id: 'r0', ts: 1000, fields: {} },
+        { metric: M, id: 'r1', ts: 1001, fields: {} },
+      ])
+      await crashed.claimRecords(M)
+
+      const survivor = sweeper(ns)
+      await survivor.append([{ metric: M, id: 'later', ts: 9000, fields: {} }])
+
+      expect(await survivor.recover(M)).toMatchObject({ claims: 1, buckets: 0, records: 2 })
+      expect((await survivor.readPending({ metric: M })).map((r) => r.id)).toEqual([
+        'r0',
+        'r1',
+        'later',
+      ])
+
+      await wipe(ns)
+    })
+
+    it('settles an empty claim rather than leaving it registered for ever', async () => {
+      // an empty claim moves nothing, so there is no in-flight key at all —
+      // only a registration, which still has to be cleared or it is swept on
+      // every flush from now on
+      const ns = fresh()
+      const crashed = ioredis(live, { namespace: ns })
+      await crashed.claim(M, 2000)
+
+      const survivor = sweeper(ns)
+      expect(await survivor.recover(M)).toMatchObject({ claims: 1, buckets: 0, records: 0 })
+      expect((await survivor.recover(M)).claims).toBe(0)
+
+      await wipe(ns)
+    })
+
+    it('leaves a claim younger than recoverAfter alone', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns, recoverAfter: '5m' })
+      await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      const claim = await driver.claim(M, 2000)
+
+      expect((await driver.recover(M)).claims).toBe(0)
+      // untouched, so the flush still writing it can settle it normally
+      await expect(driver.ack(claim)).resolves.toBeUndefined()
+
+      await wipe(ns)
+    })
+
+    it('reports when the oldest recovered claim was taken', async () => {
+      const ns = fresh()
+      const crashed = ioredis(live, { namespace: ns })
+      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      const before = Date.now()
+      const first = await crashed.claim(M, 2000)
+      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await crashed.claim(M, 2000)
+
+      const report = await sweeper(ns).recover(M)
+      expect(report.claims).toBe(2)
+      expect(report.oldestClaimedAt).toBe(first.claimedAt)
+      expect(report.oldestClaimedAt).toBeGreaterThanOrEqual(before)
+
+      await wipe(ns)
+    })
+
+    it('refuses the original owner an ack once the claim has been recovered', async () => {
+      // the interlock, from the other side: if the dead process turns out to
+      // be alive after all, it is told rather than allowed to delete a window
+      // that is now back in the live set
+      const ns = fresh()
+      const crashed = ioredis(live, { namespace: ns })
+      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      const claim = await crashed.claim(M, 2000)
+
+      await sweeper(ns).recover(M)
+      await expect(crashed.ack(claim)).rejects.toThrow(/not in flight/)
+
+      await wipe(ns)
+    })
+
+    it('lets only one of two racing sweepers take a claim', async () => {
+      const ns = fresh()
+      const crashed = ioredis(live, { namespace: ns })
+      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 6 }])
+      await crashed.claim(M, 2000)
+
+      const [a, b] = await Promise.all([sweeper(ns).recover(M), sweeper(ns).recover(M)])
+      expect(a.claims + b.claims).toBe(1)
+      // restored once, not twice: two sweepers must not double the count
+      expect(await crashed.readBuckets({ metric: M })).toEqual([
+        { bucketTs: 1000, dimKey: WILLOW, value: 6 },
+      ])
+
+      await wipe(ns)
+    })
+
+    it('leaves nothing behind once the recovered window has been acked', async () => {
+      const ns = fresh()
+      const crashed = ioredis(live, { namespace: ns })
+      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await crashed.claim(M, 2000)
+
+      const survivor = sweeper(ns)
+      await survivor.recover(M)
+      await survivor.ack(await survivor.claim(M, 2000))
+
+      const left = (await live.keys(`${ns}:*`)).filter((k) => k !== `${ns}:seq`)
+      expect(left).toEqual([])
+
+      await wipe(ns)
+    })
+  })
+
   describe('ioredis · shared', () => {
     it('folds three instances into one bucket', async () => {
       // the reason this driver exists: no coordination, one series

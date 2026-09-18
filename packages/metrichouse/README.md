@@ -115,11 +115,12 @@ minor versions may break.
 Not yet built: the `level` and `distinct` primitives, `house.ingest()` and
 backfill, the collector, and the CLI.
 
-One known gap worth stating plainly: the `ioredis` driver tracks in-flight
-claims but never sweeps them, so a process that dies between claiming a window
-and acknowledging it leaves that window's data staged and undelivered. Failed
-*writes* retry correctly and lose nothing; a failed *process* currently does
-not. See [issue tracker](https://github.com/TheBigJ3/MetricHouse/issues).
+At-least-once holds across a failed *process* as well as a failed write, on
+`ioredis`: a claim is a durable move, and a flush merges back any claim held
+longer than `recoverAfter` (five minutes by default) before it claims, so a
+crash mid-flush ships that window late rather than never. On `memory` a failed
+process still loses the window in flight, because its claims never leave the
+process and there is nothing left behind to recover.
 
 ## Requirements
 

@@ -19,6 +19,7 @@
  * four {@link AnyMetric} batch methods plus this mixin, and no edit here.
  */
 
+import type { RecoveryReport } from '../drivers/types.js'
 import type { AnyMetric, WriteFn } from '../metrics/types.js'
 import { shipClaim } from './ship.js'
 
@@ -44,6 +45,21 @@ export interface MetricFlushReport {
   /** How long until the cadence lets this metric ship again. */
   readonly nextEligibleInMs?: number
   readonly error?: unknown
+  /**
+   * Set when this flush found a claim a dead flusher had left behind and put
+   * it back before claiming.
+   *
+   * Absent on the ordinary flush, so its presence is the signal: something
+   * crashed between claiming a batch and settling it. The rows are in this
+   * flush, or in the next one, either way — but the crash is worth logging.
+   */
+  readonly recovered?: RecoveryReport
+  /**
+   * Set when the recovery pass itself failed. Separate from `error`, which
+   * means the *sink* failed: the flush below it still ran, and `rows` says
+   * what it shipped.
+   */
+  readonly recoveryError?: unknown
 }
 
 export interface FlushReport {
@@ -125,11 +141,34 @@ export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush
         }
       }
 
-      // 2. claim — atomically invisible to live reads and to a second flusher.
+      // 2. recover — a batch claimed by a flusher that then died is already
+      //    out of the live set, so `claimBatch` cannot reach it however long
+      //    it waits. Putting it back first is what lets this flush ship it.
+      //
+      //    After the cadence check, because recovered data can only leave on a
+      //    flush that is actually going to claim, and wrapped because this is
+      //    a repair rather than a precondition: a recovery that keeps failing
+      //    must not turn into a metric that never ships again.
+      let recovered: RecoveryReport | undefined
+      let recoveryError: unknown
+      try {
+        const pass = await metric.recoverBatch()
+        // absent unless it found something, so a caller can treat the field's
+        // presence as the news rather than reading a zero on every flush
+        if (pass.claims > 0) recovered = pass
+      } catch (error) {
+        recoveryError = error
+      }
+      const repair = {
+        ...(recovered !== undefined && { recovered }),
+        ...(recoveryError !== undefined && { recoveryError }),
+      }
+
+      // 3. claim — atomically invisible to live reads and to a second flusher.
       //    What is claimable is the metric's judgement, not this file's.
       const claim = await metric.claimBatch(now)
 
-      // 3. ship — materialize, write, then ack or release
+      // 4. ship — materialize, write, then ack or release
       const outcome = await shipClaim(metric, claim, options.sink(), {
         attempt: state.attempt,
         source: 'flush',
@@ -142,6 +181,7 @@ export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush
           rows: outcome.rows,
           skipped: false,
           error: outcome.error,
+          ...repair,
         }
       }
 
@@ -152,13 +192,13 @@ export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush
         // later would then wait a full interval — the coarser the resolution,
         // the worse it gets, because early flushes always find the only bucket
         // still open.
-        return { buckets: 0, rows: 0, skipped: false }
+        return { buckets: 0, rows: 0, skipped: false, ...repair }
       }
 
       state.lastFlushMs = now
       state.attempt = 1
 
-      return { buckets: outcome.buckets, rows: outcome.rows, skipped: false }
+      return { buckets: outcome.buckets, rows: outcome.rows, skipped: false, ...repair }
     },
   }
 }

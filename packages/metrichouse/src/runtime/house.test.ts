@@ -65,6 +65,7 @@ describe('createHouse', () => {
       claimRecords: vi.fn(),
       ack: vi.fn(),
       release: vi.fn(),
+      recover: vi.fn(),
     }
     createHouse({ driver: spy, schema: [makeCounter()] })
     for (const method of [
@@ -78,6 +79,7 @@ describe('createHouse', () => {
       spy.claimRecords,
       spy.ack,
       spy.release,
+      spy.recover,
     ]) {
       expect(method).not.toHaveBeenCalled()
     }

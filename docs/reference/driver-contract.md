@@ -1,8 +1,8 @@
 # Driver contract
 
 A driver is where running totals and staged records live between a write and a
-flush. The interface is twelve methods. Implementing it is how you put MetricHouse
-on storage it does not ship with.
+flush. The interface is thirteen methods. Implementing it is how you put
+MetricHouse on storage it does not ship with.
 
 ```ts
 import type { Driver } from 'metrichouse/core'
@@ -30,6 +30,7 @@ export function myDriver(): Driver {
     async claimRecords(metric, limit) { /* RecordClaim */ },
     async ack(claim) {},
     async release(claim) {},
+    async recover(metric) { /* RecoveryReport */ },
   }
 }
 ```
@@ -258,6 +259,62 @@ A claim can be settled exactly once. Acking a released claim, or releasing an
 acked one, has to throw. Silently accepting it means a bug in the layer above
 turns into missing data.
 
+## Recovering
+
+### recover
+
+```ts
+recover(metric: string): Promise<RecoveryReport>
+```
+
+Return claims abandoned by a flusher that died to the live set.
+
+```ts
+interface RecoveryReport {
+  claims: number             // abandoned claims put back
+  buckets: number            // windows put back, across those claims
+  records: number            // records put back, across those claims
+  oldestClaimedAt?: number   // when the longest stranded one was taken
+}
+```
+
+This is the hole that claiming opens. A claim moves data **out** of the live set,
+so a process that dies between `claim` and `ack` leaves a batch no later `claim`
+can reach, because `claim` only ever reads the live set. Storage that outlives
+the process is what keeps that batch in existence. This is what makes it
+reachable again.
+
+The flush calls it before it claims, so whatever is put back ships in that same
+flush.
+
+Four rules:
+
+- **Put back, never shipped.** An aggregate row is identified by its metric,
+  window and dimension values, so an abandoned half and a live half carry the
+  same `id`. Sending them as two batches means a table upserting on that id keeps
+  one and discards the other. Merge them into one live window instead.
+- **Merge the same way `release` does.** It is the same operation on the same
+  data, and a merge rule written twice eventually disagrees with itself.
+- **Decide for yourself when a claim is abandoned, and err long.** Only the
+  driver knows how long it has held one. Taking a claim back from an owner that
+  is merely slow ships those rows twice and then fails that owner's `ack`, and
+  waiting costs nothing by comparison. The Redis driver waits five minutes by
+  default and exposes `recoverAfter`.
+- **Settle exactly once.** Two instances sweeping at the same moment must put the
+  data back once, not twice. Whatever makes `ack` and `release` single shot is
+  what makes this single shot.
+
+A driver whose `capabilities.durable` is `false` has nothing to recover, because
+its claims die with the process. Reporting zero is the honest answer:
+
+```ts
+import { NOTHING_RECOVERED } from 'metrichouse/core'
+
+async recover() {
+  return NOTHING_RECOVERED
+}
+```
+
 ## The rules in full
 
 A driver has to satisfy all of these.
@@ -300,6 +357,17 @@ A driver has to satisfy all of these.
 - Settling the same claim twice throws.
 - Nothing is lost when a write fails and the flush retries.
 
+**Recovering**
+
+- A metric with no abandoned claim recovers nothing.
+- A claim that was only just taken is left alone, so a flush still writing keeps
+  what it is holding.
+- Recovery never touches the live set beyond merging into it.
+- A recovered window merges with anything written while it was stranded.
+- Recovered records return ahead of anything appended since.
+- An empty claim is settled rather than left registered for ever.
+- Two sweeps running at once put the data back once.
+
 ## Testing your driver
 
 The repository holds an executable version of the list above as a shared test
@@ -331,7 +399,7 @@ Folded storage only, enough to see the shape.
 
 ```ts
 import type { BucketClaim, Cell, Claim, Driver } from 'metrichouse/core'
-import { isBucketClaim } from 'metrichouse/core'
+import { isBucketClaim, NOTHING_RECOVERED } from 'metrichouse/core'
 
 export function tinyDriver(): Driver {
   // metric -> bucketTs -> dimKey -> cell
@@ -428,8 +496,12 @@ export function tinyDriver(): Driver {
       }
     },
 
+    // Nothing to recover: this driver's claims live in `inFlight`, which dies
+    // with the process. A durable driver sweeps its claim registry here.
+    async recover() { return NOTHING_RECOVERED },
+
     // The staged half is left out for brevity. A real driver implements all
-    // twelve methods.
+    // thirteen methods.
     async observe() { throw new Error('not implemented') },
     async append() { throw new Error('not implemented') },
     async readPending() { return [] },

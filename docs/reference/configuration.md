@@ -137,15 +137,21 @@ runaway dimension into a loud error instead of a crash with no warning.
 ## ioredis
 
 ```ts
-ioredis(clientOrFactory, { namespace, maxPipelineSize })
+ioredis(clientOrFactory, { namespace, maxPipelineSize, recoverAfter })
 ```
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `namespace` | string | `'mh'` | Key prefix |
 | `maxPipelineSize` | number | `1000` | Commands per round trip |
+| `recoverAfter` | duration | `'5m'` | How long a claim may be held before a flush treats it as abandoned |
 
 Pass a function rather than a client to delay connecting until the first write.
+
+Keep `recoverAfter` above your sink's timeout. It is what separates a flusher
+that crashed from one that is merely slow, and taking a claim back from a slow
+one ships those rows twice. See
+[Recovering a crashed flush](/guide/reliability#recovering-a-crashed-flush).
 
 ## Durations
 

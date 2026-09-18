@@ -7,16 +7,23 @@ Nothing flushes on its own. Something has to ask.
 
 <figure class="mh-figure">
   <img src="/diagrams/claim-ack-release.svg" alt="Data is claimed, handed to your write function, then either acknowledged and deleted or released back." />
-  <figcaption>Four steps, in this order, every time.</figcaption>
+  <figcaption>In this order, every time.</figcaption>
 </figure>
 
 1. **Check the cadence.** If this metric shipped recently, stop and report that
    it was skipped.
-2. **Claim.** Move everything eligible out of the live set. It is now invisible
+2. **Recover.** Put back anything a previous flusher claimed and then died
+   holding, so this flush can ship it. Almost always there is nothing to do, and
+   on `memory()` there is never anything to do.
+3. **Claim.** Move everything eligible out of the live set. It is now invisible
    to live reads and to any other flush.
-3. **Write.** Turn the claim into rows and call your function.
-4. **Settle.** If your function returned, delete the claimed data. If it threw,
+4. **Write.** Turn the claim into rows and call your function.
+5. **Settle.** If your function returned, delete the claimed data. If it threw,
    put it back unchanged.
+
+Recovery comes before the claim on purpose. A claim that was abandoned is already
+out of the live set, so claiming can never find it however long you wait. See
+[Recovering a crashed flush](/guide/reliability#recovering-a-crashed-flush).
 
 ## Three ways to ask
 
@@ -61,6 +68,8 @@ interface MetricFlushReport {
   reason?: 'cadence' | 'not-selected'
   nextEligibleInMs?: number   // when the cadence will allow the next attempt
   error?: unknown             // set if your write function threw
+  recovered?: RecoveryReport  // set if a dead flusher's batch was put back
+  recoveryError?: unknown     // set if that repair failed. The flush still ran
 }
 ```
 
@@ -76,6 +85,12 @@ interface FlushReport {
 A failure is reported rather than thrown because by the time your function has
 thrown, the claim has already been released. The data is safe. You are being
 told, not rescued.
+
+`recovered` and `recoveryError` are about a different thing, and neither changes
+`ok`. `error` means your sink failed and this batch is going to be retried.
+`recovered` means an *earlier* flush died holding a batch and this one put it
+back. `recoveryError` means that repair failed, which delays the stranded batch
+and nothing else, so the flush underneath it still claims and still ships.
 
 ```ts
 const report = await house.flush()

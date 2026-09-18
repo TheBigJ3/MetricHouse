@@ -20,6 +20,7 @@ export type {
   IncrOp,
   PendingQuery,
   RecordClaim,
+  RecoveryReport,
   StagedRecord,
 } from './drivers/types.js'
 // the driver contract, for anyone implementing a backend
@@ -28,6 +29,7 @@ export {
   isEmptyClaim,
   isGaugeCell,
   isRecordClaim,
+  NOTHING_RECOVERED,
 } from './drivers/types.js'
 export type { Hasher } from './identity.js'
 // identity — public so a sink can reproduce a row id, and so a custom hasher
