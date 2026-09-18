@@ -49,6 +49,20 @@ npm install metrichouse
 Node 20 or newer. `ioredis` is an optional peer dependency, required only if
 you import `metrichouse/ioredis`.
 
+## Documentation
+
+The user-facing docs are a VitePress site in [`docs/`](docs/): getting started,
+one page per primitive, deployment guides, worked examples, and an API
+reference. Every snippet in it is checked against the built package.
+
+```bash
+pnpm --filter @metrichouse/docs dev      # http://localhost:5173
+```
+
+It deploys to GitHub Pages from
+[`.github/workflows/docs.yml`](.github/workflows/docs.yml) on every push to
+`main` that touches `docs/`.
+
 ## What it looks like
 
 Declare a metric:

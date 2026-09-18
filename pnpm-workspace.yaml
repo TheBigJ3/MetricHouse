@@ -1,5 +1,6 @@
 packages:
   - 'packages/*'
+  - 'docs'
   # examples/, runtime-tests/ and benchmarks/ are planned but hold no package
   # yet — their globs matched nothing, and the vitest equivalent matched a
   # README and broke `pnpm test`. Each gets its entry back when it has a
@@ -17,6 +18,11 @@ catalog:
   publint: ^0.3.24
   '@arethetypeswrong/cli': ^0.18.5
   ioredis: ^6.0.0
+  vitepress: ^1.6.4
 
 onlyBuiltDependencies:
   - '@biomejs/biome'
+
+# pnpm 12's key for the same thing. esbuild is vitepress's bundler.
+allowBuilds:
+  esbuild: true

@@ -28,3 +28,8 @@ coverage/
 
 # local scratch scripts
 packages/*/test.ts
+
+# vitepress
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+docs/.vitepress/.temp/
