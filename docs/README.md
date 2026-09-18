@@ -18,9 +18,10 @@ pnpm --filter @metrichouse/docs preview
   config.mts      nav, sidebar, search, theme options, sitemap
   crawlers.ts     generates robots.txt, llms.txt and llms-full.txt
   theme/
-    custom.css    brand colours, .mh-figure, playground styles
-    index.ts      registers the playground components globally
-    components/   the interactive playgrounds
+    custom.css    brand colours, .mh-figure, the lockup, playground styles
+    index.ts      registers the layout and the playground components
+    Layout.vue    the default layout, with the home page lockup slotted in
+    components/   MhLockup.vue and the interactive playgrounds
 public/
   diagrams/       one SVG per figure, replaceable in place
   logo.svg        the mark, light theme
@@ -41,8 +42,21 @@ in a lighter blue, because the brand blue `#2357f4` sits a little dark on a dark
 page. The raster icons are resampled from the original artwork, not from the
 trace.
 
-`--vp-c-brand-1` is that same blue, so the mark and the site agree. The hero
-name is one solid colour; there is no gradient anywhere.
+`--vp-c-brand-1` is that same blue, so the mark and the site agree. There is no
+gradient anywhere on the site.
+
+## Showing the name
+
+The home page does not set `hero.name`. The default theme renders that field as
+a word the size of the headline, which left two large lines competing and made
+the name look like decoration.
+
+Instead `Layout.vue` fills the `home-hero-info-before` slot with
+`components/MhLockup.vue`: the mark at 38px beside `MetricHouse` at 26px, so the
+name is shown the way a logo is and the large type belongs to the sentence that
+says what the library does. The mark is inline SVG coloured by
+`--vp-c-brand-1`, so it needs no separate dark copy, and `.mh-lockup` in
+`custom.css` holds the sizes.
 
 ## robots.txt, llms.txt and llms-full.txt
 

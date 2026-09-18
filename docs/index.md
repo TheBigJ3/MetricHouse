@@ -2,7 +2,6 @@
 layout: home
 
 hero:
-  name: MetricHouse
   text: Metrics you capture now, stored wherever you want
   tagline: A small TypeScript library that counts things, records events and times operations. It hands you finished rows and lets you decide where they go.
   actions:
