@@ -89,9 +89,10 @@ await dogPoops.current({ dogName: 'Willow', park: 'riverside', kind: 'solid' })
 // -> 7        live, from the unflushed bucket, before anything hits the database
 ```
 
-Nothing flushes on its own. `house.flush()` is called by you — from a cron, a
-worker, or a timer — and a metric's `flush` setting is a **minimum cadence**,
-not a schedule, so this still ships `dog_poops` only every 5 minutes:
+### Getting it out
+
+A metric is a complete unit — what it measures, how often it ships, and where
+it ships to — so flushing one needs no house at all:
 
 ```ts
 setInterval(() => house.flush(), 10_000)

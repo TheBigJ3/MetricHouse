@@ -106,8 +106,13 @@ export type {
   FlushOptions,
   FlushReport,
   FlushSkipReason,
+  HouseFlushOptions,
+  MetricFlushOptions,
   MetricFlushReport,
 } from './runtime/flush.js'
+// the flush half of a metric, for anyone adding a primitive — the storage
+// halves are `bucketedLifecycle` and `stagedMetric`
+export { metricFlush } from './runtime/flush.js'
 export type {
   House,
   HouseConfig,
@@ -134,6 +139,8 @@ export type {
   TypedSnapshot,
 } from './runtime/live.js'
 export { applySnapshot, liveness, snapshotRange } from './runtime/live.js'
+export type { Scheduler, SchedulerOptions } from './runtime/scheduler.js'
+export { createScheduler } from './runtime/scheduler.js'
 export type { OpenSeriesShip, ShipOutcome } from './runtime/ship.js'
 export { shipClaim, shipOpenSeries } from './runtime/ship.js'
 export type {

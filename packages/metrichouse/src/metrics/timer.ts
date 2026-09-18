@@ -27,6 +27,7 @@
  */
 
 import type { Claim, GaugeCell } from '../drivers/types.js'
+import type { FlushOptions, MetricFlushReport } from '../runtime/flush.js'
 import type { SnapshotOptions } from '../runtime/live.js'
 import { encodeDimKey } from '../schema/dims.js'
 import {
@@ -93,8 +94,8 @@ export interface TimerConfig<D extends Shape> {
    * timing, so the two may be declared in either order.
    */
   readonly record?: string
-  /** This timer's sink. Falls back to the house's `write` when omitted. */
-  readonly write?: WriteFn
+  /** Where this timer's rows go. Required — see the counter for why. */
+  readonly write: WriteFn
 }
 
 /** One timing in progress. */
@@ -136,7 +137,7 @@ export interface Timer<D extends Shape> extends AnyMetric {
   readonly aggregate: readonly GaugeAggregate[]
   /** The event timings are also recorded to, if any. */
   readonly record: string | undefined
-  readonly write: WriteFn | undefined
+  readonly write: WriteFn
   readonly isBound: boolean
 
   bind(binding: MetricBinding): void
@@ -256,7 +257,7 @@ export function timer<D extends Shape = Record<never, never>>(
       aggregate: config.aggregate ?? TIMER_AGGREGATES,
       ...(config.flush !== undefined && { flush: config.flush }),
       ...(config.grace !== undefined && { grace: config.grace }),
-      ...(config.write !== undefined && { write: config.write }),
+      write: config.write,
     },
     'timer',
   )
@@ -498,6 +499,15 @@ export function timer<D extends Shape = Record<never, never>>(
 
     // the bucketed lifecycle, untouched — the flush engine talks to the gauge
     // underneath and only learns from `kind` that a timer was involved
+    /**
+     * Delegated, not reimplemented: the cadence and retry state belong to the
+     * one thing that actually holds the buckets. A timer that counted its own
+     * attempts would disagree with the gauge underneath it.
+     */
+    flush(options?: FlushOptions): Promise<MetricFlushReport> {
+      return inner.flush(options)
+    },
+
     claimBatch(nowMs: number): Promise<Claim> {
       return inner.claimBatch(nowMs)
     },

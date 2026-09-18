@@ -13,6 +13,7 @@
 
 import { type Cell, type Driver, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
+import { metricFlush } from '../runtime/flush.js'
 import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
 import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
@@ -58,8 +59,12 @@ export interface CounterConfig<D extends Shape> {
   readonly grace?: DurationInput
   /** `int()` (default) or `float()`. Decides whether `.add()` accepts fractions. */
   readonly value?: FieldType<number, false>
-  /** This metric's sink. Falls back to the house's `write` when omitted. */
-  readonly write?: WriteFn
+  /**
+   * Where this counter's rows go. Required: a counter that measures something
+   * and ships it nowhere is a misconfiguration, and the only moment it can be
+   * caught for free is here.
+   */
+  readonly write: WriteFn
 }
 
 // extends AnyMetric so the compiler, not a test, guarantees a counter is
@@ -74,7 +79,7 @@ export interface Counter<D extends Shape> extends AnyMetric {
   readonly flushMs: number
   readonly graceMs: number
   readonly isFloat: boolean
-  readonly write: WriteFn | undefined
+  readonly write: WriteFn
 
   readonly isBound: boolean
 
@@ -258,13 +263,6 @@ export function counter<D extends Shape = Record<never, never>>(
 
   async function shipOpen(bucketTs: number, dimKey: string): Promise<void> {
     const active = activeBinding()
-    const sink = config.write ?? active.write
-    if (!sink) {
-      throw new Error(
-        `${name}: delivery is 'immediate', so this counter ships without waiting for flush() — ` +
-          'it needs a write() declared on the metric or on createHouse',
-      )
-    }
 
     await shipOpenSeries({
       metric: name,
@@ -275,7 +273,7 @@ export function counter<D extends Shape = Record<never, never>>(
       dimKey,
       materialize,
       totalOf,
-      sink,
+      sink: config.write,
     })
   }
 
@@ -297,7 +295,9 @@ export function counter<D extends Shape = Record<never, never>>(
     return { value: totalOf(rows) }
   }
 
-  return {
+  // named, so the flush mixin can reach the finished metric — it is spread
+  // into this object while the object is still being built
+  const self: Counter<D> = {
     ...bucketedLifecycle({
       name,
       resolutionMs,
@@ -315,6 +315,14 @@ export function counter<D extends Shape = Record<never, never>>(
       now: nowMs,
       materialize,
       mergeValues,
+    }),
+
+    ...metricFlush({
+      name,
+      flushMs: effectiveFlushMs,
+      sink: () => config.write,
+      now: nowMs,
+      self: () => self,
     }),
 
     name,
@@ -419,4 +427,6 @@ export function counter<D extends Shape = Record<never, never>>(
       }
     },
   }
+
+  return self
 }

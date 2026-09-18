@@ -1,19 +1,25 @@
 /**
  * The house — the runtime instance.
  *
- * Binds a driver to your schema, holds the global fallback sink, and exposes
- * flush and drain. Metrics are inert declarations until a house registers
- * them.
+ * Binds a driver to your schema and exposes flush, snapshot and drain across
+ * all of it. Metrics are inert declarations until a house registers them.
  *
- * `createHouse` opens no connections of its own — it uses the driver you hand
- * it — so it is safe to call at module scope, which is the only thing that
- * works on a runtime that re-runs module scope on every cold start.
+ * A house is **somewhere to keep a set of metrics**, not the thing that ships
+ * them. Each metric owns its cadence, its sink and its retry state, so
+ * `metric.flush()` works alone; `house.flush()` is the loop over that for a
+ * caller holding a whole schema, and `house.start()` is the optional timer
+ * that pumps it for you on a long-lived process.
+ *
+ * `createHouse` opens no connections and starts no timers of its own — it uses
+ * the driver you hand it — so it is safe to call at module scope, which is the
+ * only thing that works on a runtime that re-runs module scope on every cold
+ * start.
  *
  * Spec: initialPlan/08-house.md
  */
 
 import type { Driver } from '../drivers/types.js'
-import { type AnyMetric, isMetric, type WriteFn } from '../metrics/types.js'
+import { type AnyMetric, isMetric } from '../metrics/types.js'
 import { bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
 import {
@@ -22,9 +28,9 @@ import {
   type HouseDefaults,
   resolveDelivery,
 } from './delivery.js'
-import type { MetricFlushState } from './flush.js'
-import { type FlushContext, type FlushOptions, type FlushReport, runFlush } from './flush.js'
+import { type FlushContext, type FlushReport, type HouseFlushOptions, runFlush } from './flush.js'
 import type { LiveRow, SnapshotOptions } from './live.js'
+import { createScheduler, type Scheduler } from './scheduler.js'
 
 /** An array of metrics, or an imported schema module. */
 export type SchemaInput = readonly AnyMetric[] | Record<string, unknown>
@@ -51,8 +57,6 @@ export type HouseSnapshot = Record<string, LiveRow[]>
 export interface HouseConfig {
   readonly driver: Driver
   readonly schema?: SchemaInput
-  /** Fallback sink for metrics that do not declare their own. */
-  readonly write?: WriteFn
   /**
    * How this house gets rows out — `'staged'` (the default) waits for
    * `flush()`, `'immediate'` ships as data arrives, `'auto'` asks the driver.
@@ -78,7 +82,42 @@ export interface House {
   register(...metrics: AnyMetric[]): void
   metrics(): AnyMetric[]
   get(name: string): AnyMetric | undefined
-  flush(options?: FlushOptions): Promise<FlushReport>
+  /**
+   * Flush every registered metric to its own sink, in registration order.
+   *
+   * A fan-out over `metric.flush()` and nothing more — each metric still
+   * honours its own cadence, so calling this every ten seconds ships a
+   * five-minute metric every five minutes. The convenience is that a cron
+   * handler holding a whole schema does not have to loop.
+   */
+  flush(options?: HouseFlushOptions): Promise<FlushReport>
+
+  /** Is the scheduler ticking? */
+  readonly running: boolean
+
+  /**
+   * Start flushing each metric on its own cadence.
+   *
+   * Turns `flush: '5m'` from a floor into a schedule: one interval per metric,
+   * at that metric's `flushMs`, so nothing else has to pump. Idempotent, and
+   * a metric registered afterwards is scheduled as it arrives.
+   *
+   * **For a long-lived process only.** On Workers, Vercel edge and Lambda the
+   * isolate is frozen between requests and the interval never fires — there,
+   * keep calling `flush()` from a cron. Nothing starts on its own precisely so
+   * that `createHouse` stays safe at module scope on those runtimes.
+   */
+  start(): void
+
+  /**
+   * Stop the scheduler and get everything out.
+   *
+   * Clears the intervals, drains the writes still on their way to the driver,
+   * then forces a final flush past every cadence. What it cannot ship is the
+   * open bucket: it has not closed, and shipping a partial fold under the same
+   * row id is the corruption `delivery: 'immediate'` exists to handle.
+   */
+  stop(): Promise<FlushReport>
 
   /**
    * Every registered metric's unflushed data, in one call.
@@ -118,7 +157,11 @@ function collect(schema: SchemaInput | undefined): AnyMetric[] {
 export function createHouse(config: HouseConfig): House {
   const now = config.now ?? Date.now
   const registry = new Map<string, AnyMetric>()
-  const flushState = new Map<string, MetricFlushState>()
+
+  const scheduler: Scheduler = createScheduler({
+    metrics: () => [...registry.values()],
+    ...(config.onError && { onError: config.onError }),
+  })
 
   // resolved once, at boot: `'auto'` is a question about the driver, and the
   // driver cannot change under a house
@@ -169,9 +212,11 @@ export function createHouse(config: HouseConfig): House {
         // event that names it, and a lazy lookup is what makes that legal
         resolve: (target) => registry.get(target),
         ...(config.onError && { onError: config.onError }),
-        ...(config.write && { write: config.write }),
       })
       registry.set(metric.name, metric)
+      // a metric added while the scheduler is running gets its interval now,
+      // rather than at the next start() that may never come
+      scheduler.add(metric)
     }
   }
 
@@ -182,8 +227,6 @@ export function createHouse(config: HouseConfig): House {
     get metrics(): AnyMetric[] {
       return [...registry.values()]
     },
-    sinkFor: (metric) => metric.write ?? config.write,
-    state: flushState,
   }
 
   return {
@@ -199,8 +242,25 @@ export function createHouse(config: HouseConfig): House {
       return registry.get(name)
     },
 
-    flush(options?: FlushOptions): Promise<FlushReport> {
+    flush(options?: HouseFlushOptions): Promise<FlushReport> {
       return runFlush(flushContext, options)
+    },
+
+    get running(): boolean {
+      return scheduler.running
+    },
+
+    start(): void {
+      scheduler.start()
+    },
+
+    async stop(): Promise<FlushReport> {
+      scheduler.stop()
+      // drain first: a write still in flight to the driver is not yet
+      // claimable, and flushing before it lands would leave it behind in a
+      // process that is about to exit
+      await Promise.all([...registry.values()].map((metric) => metric.drain()))
+      return runFlush(flushContext, { force: true })
     },
 
     async snapshot(options: HouseSnapshotOptions = {}): Promise<HouseSnapshot> {

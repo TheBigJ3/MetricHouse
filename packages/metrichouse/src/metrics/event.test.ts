@@ -7,6 +7,9 @@ import { counter } from './counter.js'
 import { type Event, event } from './event.js'
 import type { Row, WriteContext, WriteFn } from './types.js'
 
+/** A sink that keeps nothing — for declaration tests that never ship. */
+const discard: WriteFn = () => {}
+
 function expectRejected(fn: () => unknown): Error {
   let caught: unknown
   try {
@@ -34,7 +37,11 @@ let driver: Driver
 const now = () => clock
 
 function make(overrides: Partial<Parameters<typeof event<Fields>>[1]> = {}): Event<Fields> {
-  return event('walk_started', { fields: makeFields(), ...overrides })
+  return event('walk_started', {
+    fields: makeFields(),
+    ...overrides,
+    write: overrides.write ?? discard,
+  })
 }
 
 function bound(overrides: Partial<Parameters<typeof event<Fields>>[1]> = {}): Event<Fields> {
@@ -50,47 +57,52 @@ beforeEach(() => {
 
 describe('declaration', () => {
   it('is inert — a declaration is not bound to anything', () => {
-    const walks = event('walk_started', { fields: makeFields() })
+    const walks = event('walk_started', { write: discard, fields: makeFields() })
     expect(walks.isBound).toBe(false)
     // and writing before a house has bound it is loud, not silent
     expect(expectRejected(() => walks.record(WALK)).message).toMatch(/not bound to a house/)
   })
 
   it('refuses an empty name', () => {
-    expect(expectRejected(() => event('  ', { fields: {} })).message).toMatch(/non-empty/)
+    expect(expectRejected(() => event('  ', { write: discard, fields: {} })).message).toMatch(
+      /non-empty/,
+    )
   })
 
   it('accepts json(), which a dim may not', () => {
     // the whole reason events exist: a payload cannot be a series key, but it
     // is exactly what an event is for
-    expect(() => event('e', { fields: { payload: json() } })).not.toThrow()
+    expect(() => event('e', { write: discard, fields: { payload: json() } })).not.toThrow()
   })
 
   it.each(['id', 'ts', '_ingested_at', '_sample_rate'])(
     'refuses a field named %s — MetricHouse owns that column',
     (reserved) => {
-      expect(expectRejected(() => event('e', { fields: { [reserved]: str() } })).message).toMatch(
-        /reserved column/,
-      )
+      expect(
+        expectRejected(() => event('e', { write: discard, fields: { [reserved]: str() } })).message,
+      ).toMatch(/reserved column/)
     },
   )
 
   it('refuses a timestamp field that is not declared', () => {
     expect(
-      expectRejected(() => event('e', { fields: { a: str() }, timestamp: 'nope' as 'a' })).message,
+      expectRejected(() =>
+        event('e', { write: discard, fields: { a: str() }, timestamp: 'nope' as 'a' }),
+      ).message,
     ).toMatch(/not a declared field/)
   })
 
   it('refuses a timestamp field that is not ts()', () => {
     expect(
-      expectRejected(() => event('e', { fields: { a: str() }, timestamp: 'a' })).message,
+      expectRejected(() => event('e', { write: discard, fields: { a: str() }, timestamp: 'a' }))
+        .message,
     ).toMatch(/declares str\(\).*must be ts\(\)/)
   })
 
   it('refuses a sample rate outside [0, 1]', () => {
-    expect(expectRejected(() => event('e', { fields: {}, sample: 1.5 })).message).toMatch(
-      /between 0 and 1/,
-    )
+    expect(
+      expectRejected(() => event('e', { write: discard, fields: {}, sample: 1.5 })).message,
+    ).toMatch(/between 0 and 1/)
   })
 
   it('defaults to driver staging', () => {
@@ -149,6 +161,7 @@ describe('record', () => {
   it('takes ts from a declared field when asked', async () => {
     const occurred = new Date(clock - 60_000)
     const walks = event('walk_started', {
+      write: discard,
       fields: { dogName: str(), occurredAt: ts() },
       timestamp: 'occurredAt',
     })
@@ -267,7 +280,7 @@ describe('materialized rows', () => {
 describe('sampling', () => {
   it('keeps everything at a rate of 1 and drops everything at 0', async () => {
     const kept = bound({ sample: 1 })
-    const dropped = event('dropped', { fields: makeFields(), sample: 0 })
+    const dropped = event('dropped', { write: discard, fields: makeFields(), sample: 0 })
     dropped.bind({ driver, now })
 
     kept.recordMany([WALK, WALK, WALK])
@@ -287,6 +300,7 @@ describe('sampling', () => {
 
   it('evaluates a per-event rate, so errors can be kept and successes sampled', async () => {
     const walks = event('walk_started', {
+      write: discard,
       fields: { dogName: str(), status: str() },
       sample: (fields) => (fields.status === 'ok' ? 0 : 1),
     })
@@ -303,7 +317,7 @@ describe('sampling', () => {
   })
 
   it('refuses a rate a sample function returns outside [0, 1]', () => {
-    const walks = event('e', { fields: { a: str() }, sample: () => 7 })
+    const walks = event('e', { write: discard, fields: { a: str() }, sample: () => 7 })
     walks.bind({ driver, now })
     expect(expectRejected(() => walks.record({ a: 'x' })).message).toMatch(/not a rate in \[0, 1\]/)
   })
@@ -678,22 +692,9 @@ describe('local staging', () => {
     expect(await walks.pending()).toBe(2)
   })
 
-  it('reports a missing sink rather than losing the batch', async () => {
-    const onError = vi.fn()
-    const walks = make({ stage: 'local', batch: { maxSize: 1 } })
-    createHouse({ driver, schema: [walks], now, onError })
-
-    walks.record(WALK)
-
-    expect(onError.mock.calls[0]?.[0]).toMatchObject({
-      message: expect.stringMatching(/no write\(\)/),
-    })
-    expect(await walks.pending()).toBe(1)
-  })
-
-  it('falls back to the house sink', async () => {
-    const walks = make({ stage: 'local', batch: { maxSize: 1 } })
-    createHouse({ driver, schema: [walks], now, write })
+  it('ships a local batch to the sink the metric declared', async () => {
+    const walks = make({ stage: 'local', batch: { maxSize: 1 }, write })
+    createHouse({ driver, schema: [walks], now })
 
     walks.record(WALK)
     await walks.drain()

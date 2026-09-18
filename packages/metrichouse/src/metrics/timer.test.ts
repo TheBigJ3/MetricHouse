@@ -6,7 +6,10 @@ import { float, int, oneOf, str } from '../schema/types.js'
 import { counter } from './counter.js'
 import { event } from './event.js'
 import { timer } from './timer.js'
-import type { Row, WriteContext } from './types.js'
+import type { Row, WriteContext, WriteFn } from './types.js'
+
+/** A sink that keeps nothing — for declaration tests that never ship. */
+const discard: WriteFn = () => {}
 
 function expectRejected(fn: () => unknown): Error {
   let caught: unknown
@@ -35,6 +38,7 @@ function bound(overrides: Partial<Parameters<typeof timer<Dims>>[1]> = {}) {
     resolution: '10s',
     flush: '1m',
     ...overrides,
+    write: overrides.write ?? discard,
   })
   metric.bind({ driver, now })
   return metric
@@ -53,15 +57,20 @@ afterEach(() => {
 
 describe('declaration', () => {
   it('is inert — starting before a house has bound it is loud', () => {
-    const latency = timer('latency', { dims: makeDims(), resolution: '10s', flush: '1m' })
+    const latency = timer('latency', {
+      write: discard,
+      dims: makeDims(),
+      resolution: '10s',
+      flush: '1m',
+    })
     expect(latency.isBound).toBe(false)
     expect(expectRejected(() => latency.start()).message).toMatch(/not bound to a house/)
   })
 
   it('refuses an empty name', () => {
-    expect(expectRejected(() => timer(' ', { resolution: '1s', flush: '1s' })).message).toMatch(
-      /non-empty/,
-    )
+    expect(
+      expectRejected(() => timer(' ', { write: discard, resolution: '1s', flush: '1s' })).message,
+    ).toMatch(/non-empty/)
   })
 
   it('reports itself as a timer, not as the gauge it is built on', () => {
@@ -71,17 +80,21 @@ describe('declaration', () => {
   it('refuses a dim named duration_ms, even with no record event', () => {
     expect(
       expectRejected(() =>
-        timer('t', { dims: { duration_ms: str() }, resolution: '1s', flush: '1s' }),
+        timer('t', { write: discard, dims: { duration_ms: str() }, resolution: '1s', flush: '1s' }),
       ).message,
     ).toMatch(/reserved/)
   })
 
   it('refuses a record that names nothing, or the timer itself', () => {
     expect(
-      expectRejected(() => timer('t', { resolution: '1s', flush: '1s', record: '' })).message,
+      expectRejected(() =>
+        timer('t', { write: discard, resolution: '1s', flush: '1s', record: '' }),
+      ).message,
     ).toMatch(/must name an event/)
     expect(
-      expectRejected(() => timer('t', { resolution: '1s', flush: '1s', record: 't' })).message,
+      expectRejected(() =>
+        timer('t', { write: discard, resolution: '1s', flush: '1s', record: 't' }),
+      ).message,
     ).toMatch(/names the timer itself/)
   })
 
@@ -94,7 +107,9 @@ describe('declaration', () => {
   })
 
   it('keeps every check the gauge makes', () => {
-    expect(() => timer('t', { resolution: '10s', flush: '15s' })).toThrow(/divide flush/)
+    expect(() => timer('t', { write: discard, resolution: '10s', flush: '15s' })).toThrow(
+      /divide flush/,
+    )
   })
 })
 
@@ -297,14 +312,14 @@ describe('time', () => {
   })
 
   it('refuses to run the work when unbound', () => {
-    const latency = timer('t', { resolution: '1s', flush: '1s' })
+    const latency = timer('t', { write: discard, resolution: '1s', flush: '1s' })
     const work = vi.fn(() => 1)
     expect(expectRejected(() => latency.time(work)).message).toMatch(/not bound/)
     expect(work).not.toHaveBeenCalled()
   })
 
   it('refuses a non-function', () => {
-    const latency = timer('t', { resolution: '1s', flush: '1s' })
+    const latency = timer('t', { write: discard, resolution: '1s', flush: '1s' })
     latency.bind({ driver, now })
     expect(expectRejected(() => (latency.time as (x: unknown) => unknown)('nope')).message).toMatch(
       /needs a function/,
@@ -312,7 +327,7 @@ describe('time', () => {
   })
 
   it('needs no dims on a dimensionless timer', async () => {
-    const job = timer('job', { resolution: '1s', flush: '1s' })
+    const job = timer('job', { write: discard, resolution: '1s', flush: '1s' })
     job.bind({ driver, now })
     job.time(() => {
       mono += 2
@@ -349,6 +364,7 @@ describe('record', () => {
   function house(extra: Parameters<typeof createHouse>[0]['schema'] & object) {
     const errors: unknown[] = []
     const latency = timer('latency', {
+      write: discard,
       dims: makeDims(),
       resolution: '10s',
       flush: '1m',
@@ -364,9 +380,7 @@ describe('record', () => {
   }
 
   const matchingEvent = () =>
-    event('latency_events', {
-      fields: { ...makeDims(), duration_ms: float() },
-    })
+    event('latency_events', { write: discard, fields: { ...makeDims(), duration_ms: float() } })
 
   it('records every timing to the event, with its dims and duration', async () => {
     const events = matchingEvent()
@@ -400,6 +414,7 @@ describe('record', () => {
   it('keeps the gauge exact when the event samples', async () => {
     // the same split derive makes: exact aggregate, sampled detail
     const events = event('latency_events', {
+      write: discard,
       fields: { ...makeDims(), duration_ms: float() },
       sample: 0,
     })
@@ -415,6 +430,7 @@ describe('record', () => {
   it('does not care which was registered first', async () => {
     const events = matchingEvent()
     const latency = timer('latency', {
+      write: discard,
       dims: makeDims(),
       resolution: '10s',
       flush: '1m',
@@ -444,28 +460,38 @@ describe('record', () => {
 
     it('when the target is not an event', async () => {
       await expectReported(
-        [counter('latency_events', { resolution: '1s', flush: '1s' })],
+        [counter('latency_events', { write: discard, resolution: '1s', flush: '1s' })],
         /is a counter/,
       )
     })
 
     it('when duration_ms is missing', async () => {
       await expectReported(
-        [event('latency_events', { fields: makeDims() })],
+        [event('latency_events', { write: discard, fields: makeDims() })],
         /must declare duration_ms: float\(\)/,
       )
     })
 
     it('when duration_ms is an int, which would reject a fractional duration', async () => {
       await expectReported(
-        [event('latency_events', { fields: { ...makeDims(), duration_ms: int() } })],
+        [
+          event('latency_events', {
+            write: discard,
+            fields: { ...makeDims(), duration_ms: int() },
+          }),
+        ],
         /must declare duration_ms: float\(\)/,
       )
     })
 
     it("when the event lacks one of the timer's dims", async () => {
       await expectReported(
-        [event('latency_events', { fields: { route: str(), duration_ms: float() } })],
+        [
+          event('latency_events', {
+            write: discard,
+            fields: { route: str(), duration_ms: float() },
+          }),
+        ],
         /does not declare \[status\]/,
       )
     })
@@ -474,6 +500,7 @@ describe('record', () => {
       await expectReported(
         [
           event('latency_events', {
+            write: discard,
             fields: { ...makeDims(), duration_ms: float(), userId: str() },
           }),
         ],

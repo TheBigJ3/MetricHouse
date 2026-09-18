@@ -10,6 +10,7 @@
 
 import type { Claim, Driver } from '../drivers/types.js'
 import type { DeliveryMode, HouseDefaults } from '../runtime/delivery.js'
+import type { FlushOptions, MetricFlushReport } from '../runtime/flush.js'
 import type { LiveRow, SnapshotOptions } from '../runtime/live.js'
 import type { InferShape, Shape, TypeKind } from '../schema/types.js'
 
@@ -91,7 +92,8 @@ export interface WriteContext {
   /** `1` on the first try, higher after a previous release. */
   readonly attempt: number
   /**
-   * What caused this call. `'flush'` is `house.flush()`; `'batch'` is a
+   * What caused this call. `'flush'` is `metric.flush()` — whether a cron, a
+   * scheduler tick or `house.flush()` asked for it; `'batch'` is a
    * locally staged event shipping itself on `batch.maxSize` or `maxAge`,
    * which happens without anyone calling flush.
    *
@@ -124,12 +126,6 @@ export interface MetricBinding {
    * thrown from `.add()`, which has already returned — so it lands here.
    */
   readonly onError?: (error: unknown, context: { metric: string }) => void
-  /**
-   * The house's fallback sink, for a metric that ships without waiting for
-   * `flush()` — a locally staged event reaching `batch.maxSize` is the only
-   * one so far.
-   */
-  readonly write?: WriteFn
   /**
    * Look up a sibling metric by name.
    *
@@ -190,10 +186,31 @@ export interface AnyMetric {
   readonly flushMs: number
   readonly graceMs: number
   readonly isBound: boolean
-  /** This metric's own sink, if it declared one. Falls back to the house's. */
-  readonly write: WriteFn | undefined
+  /**
+   * Where this metric's rows go.
+   *
+   * Declared on the metric, not on the house: a metric is a complete unit —
+   * what it measures, how often it ships, and where it ships to — and a house
+   * is only somewhere to keep a set of them. A schema whose counters go to
+   * ClickHouse and whose logs go to S3 needs no special case, because there
+   * was never one sink to special-case.
+   */
+  readonly write: WriteFn
   bind(binding: MetricBinding): void
   drain(): Promise<void>
+
+  /**
+   * Ship everything closed to this metric's own sink, and settle the claim.
+   *
+   * The whole delivery unit, and callable with no house in sight. Honours the
+   * metric's cadence — an early call reports `skipped` with `reason:
+   * 'cadence'` rather than shipping — unless `force` says otherwise.
+   *
+   * Errors come back in the report rather than as a rejection: a flush that
+   * fails has already released its claim, so the data is safe and the caller
+   * is being told, not rescued.
+   */
+  flush(options?: FlushOptions): Promise<MetricFlushReport>
 
   /** The runtime column list a sink will receive, in order. */
   rowShape(): RowShape

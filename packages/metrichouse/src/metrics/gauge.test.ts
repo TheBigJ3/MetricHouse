@@ -2,7 +2,11 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { memory } from '../drivers/memory.js'
 import type { Driver } from '../drivers/types.js'
 import { json, str } from '../schema/types.js'
-import { type Gauge, gauge } from './gauge.js'
+import { type Gauge, type GaugeAggregate, type GaugeConfig, gauge } from './gauge.js'
+import type { WriteFn } from './types.js'
+
+/** A sink that keeps nothing — for declaration tests that never ship. */
+const discard: WriteFn = () => {}
 
 function expectRejected(fn: () => unknown): Error {
   let caught: unknown
@@ -15,18 +19,21 @@ function expectRejected(fn: () => unknown): Error {
   return caught as Error
 }
 
+type GaugeDims = { bowlId: ReturnType<typeof str>; room: ReturnType<typeof str> }
+
 const B1 = { bowlId: 'b1', room: 'kitchen' } as const
 
 let clock: number
 let driver: Driver
 const now = () => clock
 
-const make = (overrides = {}) =>
+const make = (overrides: Partial<GaugeConfig<GaugeDims>> = {}) =>
   gauge('bowl_level', {
     dims: { bowlId: str(), room: str() },
     resolution: '10s',
     flush: '1m',
     ...overrides,
+    write: overrides.write ?? discard,
   })
 
 function bound(
@@ -62,17 +69,21 @@ describe('declaration', () => {
 
   it('rejects an empty or unknown aggregate list', () => {
     expectRejected(() => make({ aggregate: [] }))
-    expect(expectRejected(() => make({ aggregate: ['avg'] })).message).toMatch(/avg/)
+    expect(
+      expectRejected(() => make({ aggregate: ['avg'] as unknown as GaugeAggregate[] })).message,
+    ).toMatch(/avg/)
   })
 
   it('runs the same declare-time checks as a counter', () => {
-    expectRejected(() => gauge('', { resolution: '1s', flush: '1s' }))
+    expectRejected(() => gauge('', { write: discard, resolution: '1s', flush: '1s' }))
     expectRejected(() => make({ resolution: '7s', flush: '1m' }))
-    expectRejected(() => gauge('g', { dims: { p: json() }, resolution: '1s', flush: '1s' }))
+    expectRejected(() =>
+      gauge('g', { write: discard, dims: { p: json() }, resolution: '1s', flush: '1s' }),
+    )
   })
 
   it('needs no dims', () => {
-    const metric = gauge('temp', { resolution: '1s', flush: '1s' })
+    const metric = gauge('temp', { write: discard, resolution: '1s', flush: '1s' })
     expect(metric.dims).toEqual({})
   })
 
@@ -155,7 +166,7 @@ describe('set and the fold', () => {
   })
 
   it('works with no dims at all', async () => {
-    const metric = gauge('temp', { resolution: '1s', flush: '1s' })
+    const metric = gauge('temp', { write: discard, resolution: '1s', flush: '1s' })
     metric.bind({ driver, now })
     metric.set(20)
     metric.set(22)

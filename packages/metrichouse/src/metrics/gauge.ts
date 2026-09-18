@@ -16,6 +16,7 @@
 
 import { type Cell, type Driver, type GaugeCell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
+import { metricFlush } from '../runtime/flush.js'
 import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
 import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
@@ -80,8 +81,8 @@ export interface GaugeConfig<D extends Shape> {
    * migration of what is already in flight.
    */
   readonly aggregate?: readonly GaugeAggregate[]
-  /** This gauge's sink. Falls back to the house's `write` when omitted. */
-  readonly write?: WriteFn
+  /** Where this gauge's rows go. Required — see the counter for why. */
+  readonly write: WriteFn
 }
 
 /**
@@ -105,7 +106,7 @@ export interface Gauge<D extends Shape, K extends MetricKind = 'gauge'> extends 
   readonly flushMs: number
   readonly graceMs: number
   readonly aggregate: readonly GaugeAggregate[]
-  readonly write: WriteFn | undefined
+  readonly write: WriteFn
   readonly isBound: boolean
 
   bind(binding: MetricBinding): void
@@ -235,13 +236,6 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
 
   async function shipOpen(bucketTs: number, dimKey: string): Promise<void> {
     const active = activeBinding()
-    const sink = config.write ?? active.write
-    if (!sink) {
-      throw new Error(
-        `${name}: delivery is 'immediate', so this gauge ships without waiting for flush() — ` +
-          'it needs a write() declared on the metric or on createHouse',
-      )
-    }
 
     await shipOpenSeries({
       metric: name,
@@ -252,7 +246,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       dimKey,
       materialize,
       totalOf,
-      sink,
+      sink: config.write,
     })
   }
 
@@ -332,7 +326,8 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     return merged
   }
 
-  return {
+  // named, so the flush mixin can reach the finished metric — see the counter
+  const self: Gauge<D, K> = {
     ...bucketedLifecycle({
       name,
       resolutionMs,
@@ -350,6 +345,14 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       now: nowMs,
       materialize,
       mergeValues,
+    }),
+
+    ...metricFlush({
+      name,
+      flushMs: effectiveFlushMs,
+      sink: () => config.write,
+      now: nowMs,
+      self: () => self,
     }),
 
     name,
@@ -456,4 +459,6 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       return { columns }
     },
   }
+
+  return self
 }

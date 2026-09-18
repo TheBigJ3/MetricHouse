@@ -9,6 +9,9 @@ import type { Row, WriteContext, WriteFn } from '../metrics/types.js'
 import { type Shape, str } from '../schema/types.js'
 import { createHouse, type House } from './house.js'
 
+/** A sink that keeps nothing — for declaration tests that never ship. */
+const discard: WriteFn = () => {}
+
 const A = { dogName: 'Willow' } as const
 
 let clock: number
@@ -21,7 +24,13 @@ const settle = () => {
 }
 
 const make = (name: string, overrides = {}): Counter<{ dogName: Shape[string] }> =>
-  counter(name, { dims: { dogName: str() }, resolution: '1s', flush: '5m', ...overrides })
+  counter(name, {
+    write: discard,
+    dims: { dogName: str() },
+    resolution: '1s',
+    flush: '5m',
+    ...overrides,
+  })
 
 beforeEach(() => {
   clock = 1_788_616_987_000
@@ -185,45 +194,18 @@ describe('the watermark', () => {
 })
 
 describe('the sink', () => {
-  it('prefers the metric write over the house fallback', async () => {
+  it('ships to the sink the metric declared, and to no other', async () => {
     const own = vi.fn()
-    const fallback = vi.fn()
+    const other = vi.fn()
     const metric = make('m', { write: own })
-    const house = createHouse({ driver, schema: [metric], now, write: fallback })
+    const house = createHouse({ driver, schema: [metric, make('n', { write: other })], now })
     metric.add(A)
     await house.drain()
     settle()
 
     await house.flush()
     expect(own).toHaveBeenCalledTimes(1)
-    expect(fallback).not.toHaveBeenCalled()
-  })
-
-  it('falls back to the house sink', async () => {
-    const fallback = vi.fn()
-    const metric = make('m')
-    const house = createHouse({ driver, schema: [metric], now, write: fallback })
-    metric.add(A)
-    await house.drain()
-    settle()
-
-    await house.flush()
-    expect(fallback).toHaveBeenCalledTimes(1)
-  })
-
-  it('fails loudly when there is no sink at all', async () => {
-    const metric = make('m')
-    const house = createHouse({ driver, schema: [metric], now })
-    metric.add(A)
-    await house.drain()
-    settle()
-
-    const report = await house.flush()
-    expect(report.ok).toBe(false)
-    expect(String(report.metrics.m?.error)).toMatch(/no write\(\)/)
-    // nothing was claimed, so nothing is at risk
-    expect(await metric.current(A)).toBe(0)
-    expect(await driver.readBuckets({ metric: 'm' })).toHaveLength(1)
+    expect(other).not.toHaveBeenCalled()
   })
 
   it('describes the batch it is handing over', async () => {
@@ -553,5 +535,107 @@ describe('mixed kinds', () => {
     expect(report.metrics.ok?.error).toBeUndefined()
     expect(report.metrics.broken?.error).toBeInstanceOf(Error)
     expect(() => report.throwIfFailed()).toThrow(/broken/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// the metric as the unit — no house in sight
+// ---------------------------------------------------------------------------
+
+describe('metric.flush()', () => {
+  it('ships to its own sink with no house involved in the flush', async () => {
+    const write = vi.fn()
+    const metric = make('m', { write })
+    metric.bind({ driver, now })
+
+    metric.add(A)
+    await metric.drain()
+    settle()
+
+    const report = await metric.flush()
+    expect(report).toMatchObject({ rows: 1, buckets: 1, skipped: false })
+    expect(write).toHaveBeenCalledTimes(1)
+    expect(write.mock.calls[0]?.[1]).toMatchObject({ metric: 'm', source: 'flush' })
+  })
+
+  it('honours its own cadence, and says how long until it will not', async () => {
+    const write = vi.fn()
+    const metric = make('m', { write, flush: '5m' })
+    metric.bind({ driver, now })
+
+    metric.add(A)
+    await metric.drain()
+    settle()
+    await metric.flush() // the one that actually ships
+
+    metric.add(A)
+    await metric.drain()
+    settle()
+
+    const report = await metric.flush()
+    expect(report).toMatchObject({ skipped: true, reason: 'cadence', rows: 0 })
+    expect(report.nextEligibleInMs).toBe(300_000 - 3_000)
+    expect(write).toHaveBeenCalledTimes(1)
+  })
+
+  it('ships anyway under force', async () => {
+    const write = vi.fn()
+    const metric = make('m', { write })
+    metric.bind({ driver, now })
+
+    metric.add(A)
+    await metric.drain()
+    settle()
+    await metric.flush()
+
+    metric.add(A)
+    await metric.drain()
+    settle()
+
+    expect((await metric.flush({ force: true })).rows).toBe(1)
+    expect(write).toHaveBeenCalledTimes(2)
+  })
+
+  it('counts its own attempts across a failing sink, without a house to hold them', async () => {
+    const write = vi.fn().mockRejectedValueOnce(new Error('sink down')).mockResolvedValue(undefined)
+    const metric = make('m', { write })
+    metric.bind({ driver, now })
+
+    metric.add(A)
+    await metric.drain()
+    settle()
+
+    const failed = await metric.flush()
+    expect(failed.error).toBeInstanceOf(Error)
+    expect(write.mock.calls[0]?.[1]).toMatchObject({ attempt: 1 })
+
+    // released, so the same rows come back — as a second attempt
+    const retried = await metric.flush()
+    expect(retried.rows).toBe(1)
+    expect(write.mock.calls[1]?.[1]).toMatchObject({ attempt: 2 })
+  })
+
+  it('refuses to flush before it is bound', async () => {
+    await expect(make('m').flush()).rejects.toThrow(/not bound to a house/)
+  })
+
+  it("keeps its cadence state to itself — one metric flushing does not spend another's", async () => {
+    const a = vi.fn()
+    const b = vi.fn()
+    const first = make('a', { write: a })
+    const second = make('b', { write: b })
+    const house = createHouse({ driver, schema: [first, second], now })
+
+    first.add(A)
+    second.add(A)
+    await house.drain()
+    settle()
+
+    await first.flush()
+    expect(a).toHaveBeenCalledTimes(1)
+    expect(b).not.toHaveBeenCalled()
+
+    await second.flush()
+    expect(b).toHaveBeenCalledTimes(1)
   })
 })

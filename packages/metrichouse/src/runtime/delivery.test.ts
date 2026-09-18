@@ -3,15 +3,18 @@ import { memory } from '../drivers/memory.js'
 import type { Driver } from '../drivers/types.js'
 import { rowId } from '../identity.js'
 import { counter } from '../metrics/counter.js'
-import { event } from '../metrics/event.js'
+import { type EventConfig, event } from '../metrics/event.js'
 import { gauge } from '../metrics/gauge.js'
 import { log } from '../metrics/log.js'
 import { timer } from '../metrics/timer.js'
-import type { Row, WriteContext } from '../metrics/types.js'
+import type { Row, WriteContext, WriteFn } from '../metrics/types.js'
 import { encodeDimKey } from '../schema/dims.js'
 import { str } from '../schema/types.js'
 import { resolveDelivery } from './delivery.js'
 import { createHouse } from './house.js'
+
+/** A sink that keeps nothing — for declaration tests that never ship. */
+const _discard: WriteFn = () => {}
 
 const DIMS = { park: str() }
 const RIVERSIDE = { park: 'riverside' } as const
@@ -52,7 +55,7 @@ describe('resolveDelivery', () => {
 
 describe('house delivery resolution', () => {
   it('exposes the resolved mode, never auto', () => {
-    const house = createHouse({ driver, delivery: 'auto', write })
+    const house = createHouse({ driver, delivery: 'auto' })
     expect(house.delivery).toBe('immediate') // memory() is not durable
   })
 
@@ -60,14 +63,13 @@ describe('house delivery resolution', () => {
     const house = createHouse({
       driver: durable({ capabilities: { durable: true, shared: true, atomicMerge: true } }),
       delivery: 'auto',
-      write,
     })
     expect(house.delivery).toBe('staged')
   })
 
   it('warns once about last-write-wins when immediate', () => {
     const onWarn = vi.fn()
-    createHouse({ driver, delivery: 'immediate', write, onWarn })
+    createHouse({ driver, delivery: 'immediate', onWarn })
     expect(onWarn.mock.calls.some(([message]) => /newest row per id/.test(message as string))).toBe(
       true,
     )
@@ -75,11 +77,12 @@ describe('house delivery resolution', () => {
 })
 
 describe('immediate delivery — bucketed kinds', () => {
-  const makeCounter = () => counter('dog_poops', { dims: DIMS, resolution: '1s', flush: '5m' })
+  const makeCounter = (sink: WriteFn = write) =>
+    counter('dog_poops', { write: sink, dims: DIMS, resolution: '1s', flush: '5m' })
 
   it('ships the open bucket without anyone calling flush()', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', write, now })
+    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', now })
 
     dogPoops.add(RIVERSIDE)
     await house.drain()
@@ -93,7 +96,7 @@ describe('immediate delivery — bucketed kinds', () => {
 
   it('sends the running total, never a delta', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', write, now })
+    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', now })
 
     // drained between writes so each send is its own observable step — the
     // whole point is that send two says `2`, not `1` again
@@ -109,7 +112,7 @@ describe('immediate delivery — bucketed kinds', () => {
 
   it('never goes backwards when writes overlap', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', write, now })
+    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', now })
 
     dogPoops.add(RIVERSIDE)
     dogPoops.add(RIVERSIDE)
@@ -129,7 +132,7 @@ describe('immediate delivery — bucketed kinds', () => {
 
   it('holds one stable id across every send', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', write, now })
+    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', now })
 
     dogPoops.add(RIVERSIDE)
     await house.drain()
@@ -143,7 +146,7 @@ describe('immediate delivery — bucketed kinds', () => {
 
   it('deletes nothing — the bucket stays live and readable', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', write, now })
+    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', now })
 
     dogPoops.add(3, RIVERSIDE)
     await house.drain()
@@ -153,7 +156,7 @@ describe('immediate delivery — bucketed kinds', () => {
 
   it('still needs flush() to retire the closed bucket, and it converges', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', write, now })
+    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', now })
 
     dogPoops.add(4, RIVERSIDE)
     await house.drain()
@@ -178,7 +181,7 @@ describe('immediate delivery — bucketed kinds', () => {
   it('only reads the series that changed', async () => {
     const dogPoops = makeCounter()
     const spy = vi.spyOn(driver, 'readBuckets')
-    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', write, now })
+    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', now })
 
     dogPoops.add({ park: 'central' })
     await house.drain()
@@ -190,8 +193,8 @@ describe('immediate delivery — bucketed kinds', () => {
   })
 
   it('folds a gauge before sending, so min and max are right', async () => {
-    const latency = gauge('latency', { dims: DIMS, resolution: '1s', flush: '5m' })
-    const house = createHouse({ driver, schema: [latency], delivery: 'immediate', write, now })
+    const latency = gauge('latency', { write, dims: DIMS, resolution: '1s', flush: '5m' })
+    const house = createHouse({ driver, schema: [latency], delivery: 'immediate', now })
 
     latency.set(10, RIVERSIDE)
     latency.set(2, RIVERSIDE)
@@ -201,8 +204,8 @@ describe('immediate delivery — bucketed kinds', () => {
   })
 
   it('covers a timer through the gauge underneath it', async () => {
-    const work = timer('work', { dims: DIMS, resolution: '1s', flush: '5m' })
-    const house = createHouse({ driver, schema: [work], delivery: 'immediate', write, now })
+    const work = timer('work', { write, dims: DIMS, resolution: '1s', flush: '5m' })
+    const house = createHouse({ driver, schema: [work], delivery: 'immediate', now })
 
     work.observe(12.5, RIVERSIDE)
     await house.drain()
@@ -212,35 +215,14 @@ describe('immediate delivery — bucketed kinds', () => {
     expect(sent[0]?.rows[0]).toMatchObject({ count: 1, sum: 12.5 })
   })
 
-  it('reports a missing sink through onError rather than at the caller', async () => {
-    const onError = vi.fn()
-    const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', onError, now })
-
-    expect(() => dogPoops.add(RIVERSIDE)).not.toThrow()
-    await house.drain()
-
-    expect(onError).toHaveBeenCalledWith(
-      expect.objectContaining({ message: expect.stringMatching(/needs a write\(\)/) }),
-      { metric: 'dog_poops' },
-    )
-  })
-
   it('leaves the data in place when the sink throws, and resends it next write', async () => {
     const onError = vi.fn()
     let failing = true
-    const dogPoops = makeCounter()
-    const house = createHouse({
-      driver,
-      schema: [dogPoops],
-      delivery: 'immediate',
-      onError,
-      now,
-      write: async (rows, context) => {
-        if (failing) throw new Error('sink down')
-        await write(rows, context)
-      },
+    const dogPoops = makeCounter(async (rows, context) => {
+      if (failing) throw new Error('sink down')
+      await write(rows, context)
     })
+    const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', onError, now })
 
     dogPoops.add(2, RIVERSIDE)
     await house.drain()
@@ -257,11 +239,12 @@ describe('immediate delivery — bucketed kinds', () => {
 })
 
 describe('immediate delivery — staged kinds', () => {
-  const makeEvent = (over = {}) => event('signups', { fields: { plan: str() }, ...over })
+  const makeEvent = (over: Partial<EventConfig<{ plan: ReturnType<typeof str> }>> = {}) =>
+    event('signups', { fields: { plan: str() }, ...over, write: over.write ?? write })
 
   it('ships a driver-staged event on record, with no flush()', async () => {
     const signups = makeEvent()
-    const house = createHouse({ driver, schema: [signups], delivery: 'immediate', write, now })
+    const house = createHouse({ driver, schema: [signups], delivery: 'immediate', now })
 
     signups.record({ plan: 'pro' })
     await house.drain()
@@ -275,7 +258,7 @@ describe('immediate delivery — staged kinds', () => {
 
   it('ships a locally staged event without waiting for batch.maxSize', async () => {
     const signups = makeEvent({ stage: 'local', batch: { maxSize: 500 } })
-    const house = createHouse({ driver, schema: [signups], delivery: 'immediate', write, now })
+    const house = createHouse({ driver, schema: [signups], delivery: 'immediate', now })
 
     signups.record({ plan: 'pro' })
     await house.drain()
@@ -286,13 +269,13 @@ describe('immediate delivery — staged kinds', () => {
 
   it('keeps stage independent of delivery — where is not when', async () => {
     const signups = makeEvent()
-    createHouse({ driver, schema: [signups], delivery: 'immediate', write, now })
+    createHouse({ driver, schema: [signups], delivery: 'immediate', now })
     expect(signups.stage).toBe('driver')
   })
 
   it('carries a log through the event underneath it', async () => {
-    const applog = log('app_log', { fields: { requestId: str() } })
-    const house = createHouse({ driver, schema: [applog], delivery: 'immediate', write, now })
+    const applog = log('app_log', { write, fields: { requestId: str() } })
+    const house = createHouse({ driver, schema: [applog], delivery: 'immediate', now })
 
     applog.info('started', { requestId: 'abc' })
     await house.drain()
@@ -304,7 +287,7 @@ describe('immediate delivery — staged kinds', () => {
 
   it('leaves flush() with nothing to do', async () => {
     const signups = makeEvent()
-    const house = createHouse({ driver, schema: [signups], delivery: 'immediate', write, now })
+    const house = createHouse({ driver, schema: [signups], delivery: 'immediate', now })
 
     signups.record({ plan: 'pro' })
     await house.drain()
@@ -317,17 +300,12 @@ describe('immediate delivery — staged kinds', () => {
 
   it('releases records back when the sink throws', async () => {
     const onError = vi.fn()
-    const signups = makeEvent()
-    const house = createHouse({
-      driver,
-      schema: [signups],
-      delivery: 'immediate',
-      onError,
-      now,
-      write: async () => {
+    const signups = makeEvent({
+      write: () => {
         throw new Error('sink down')
       },
     })
+    const house = createHouse({ driver, schema: [signups], delivery: 'immediate', onError, now })
 
     signups.record({ plan: 'pro' })
     await house.drain()
@@ -339,35 +317,34 @@ describe('immediate delivery — staged kinds', () => {
 
 describe('house defaults', () => {
   it('fills a cadence the metric omits', () => {
-    const dogPoops = counter('dog_poops', { dims: DIMS, resolution: '1s' })
-    createHouse({ driver, schema: [dogPoops], defaults: { flush: '2m' }, write })
+    const dogPoops = counter('dog_poops', { write, dims: DIMS, resolution: '1s' })
+    createHouse({ driver, schema: [dogPoops], defaults: { flush: '2m' } })
     expect(dogPoops.flushMs).toBe(120_000)
   })
 
   it('never overrides one the metric declares', () => {
-    const dogPoops = counter('dog_poops', { dims: DIMS, resolution: '1s', flush: '5m' })
-    createHouse({ driver, schema: [dogPoops], defaults: { flush: '2m' }, write })
+    const dogPoops = counter('dog_poops', { write, dims: DIMS, resolution: '1s', flush: '5m' })
+    createHouse({ driver, schema: [dogPoops], defaults: { flush: '2m' } })
     expect(dogPoops.flushMs).toBe(300_000)
   })
 
   it('fills grace, and still falls back to the shared default', () => {
-    const withHouse = counter('a', { dims: DIMS, resolution: '1s', flush: '1m' })
-    const bare = counter('b', { dims: DIMS, resolution: '1s', flush: '1m' })
+    const withHouse = counter('a', { write, dims: DIMS, resolution: '1s', flush: '1m' })
+    const bare = counter('b', { write, dims: DIMS, resolution: '1s', flush: '1m' })
 
-    createHouse({ driver, schema: [withHouse], defaults: { grace: '9s' }, write })
-    createHouse({ driver, schema: [bare], write })
+    createHouse({ driver, schema: [withHouse], defaults: { grace: '9s' } })
+    createHouse({ driver, schema: [bare] })
 
     expect(withHouse.graceMs).toBe(9_000)
     expect(bare.graceMs).toBe(2_000)
   })
 
   it('applies grace to the claim watermark, not just the field', async () => {
-    const dogPoops = counter('dog_poops', { dims: DIMS, resolution: '1s' })
+    const dogPoops = counter('dog_poops', { write, dims: DIMS, resolution: '1s' })
     const house = createHouse({
       driver,
       schema: [dogPoops],
       defaults: { flush: '1s', grace: '30s' },
-      write,
       now,
     })
 
@@ -382,29 +359,29 @@ describe('house defaults', () => {
   })
 
   it('reaches an event and a timer too', () => {
-    const signups = event('signups', { fields: { plan: str() } })
-    const work = timer('work', { dims: DIMS, resolution: '1s' })
-    createHouse({ driver, schema: [signups, work], defaults: { flush: '4m' }, write })
+    const signups = event('signups', { write, fields: { plan: str() } })
+    const work = timer('work', { write, dims: DIMS, resolution: '1s' })
+    createHouse({ driver, schema: [signups, work], defaults: { flush: '4m' } })
 
     expect(signups.flushMs).toBe(240_000)
     expect(work.flushMs).toBe(240_000)
   })
 
   it('throws at bind when nobody supplies a cadence', () => {
-    const dogPoops = counter('dog_poops', { dims: DIMS, resolution: '1s' })
-    expect(() => createHouse({ driver, schema: [dogPoops], write })).toThrow(/no flush cadence/)
+    const dogPoops = counter('dog_poops', { write, dims: DIMS, resolution: '1s' })
+    expect(() => createHouse({ driver, schema: [dogPoops] })).toThrow(/no flush cadence/)
   })
 
   it('checks resolution against a cadence that came from the house', () => {
-    const dogPoops = counter('dog_poops', { dims: DIMS, resolution: '7s' })
-    expect(() =>
-      createHouse({ driver, schema: [dogPoops], defaults: { flush: '10s' }, write }),
-    ).toThrow(/does not divide/)
+    const dogPoops = counter('dog_poops', { write, dims: DIMS, resolution: '7s' })
+    expect(() => createHouse({ driver, schema: [dogPoops], defaults: { flush: '10s' } })).toThrow(
+      /does not divide/,
+    )
   })
 
   it('still checks a declared cadence eagerly, at declare time', () => {
-    expect(() => counter('dog_poops', { dims: DIMS, resolution: '7s', flush: '10s' })).toThrow(
-      /does not divide/,
-    )
+    expect(() =>
+      counter('dog_poops', { write, dims: DIMS, resolution: '7s', flush: '10s' }),
+    ).toThrow(/does not divide/)
   })
 })

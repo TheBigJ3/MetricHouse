@@ -7,6 +7,9 @@ import type { Row, WriteFn } from '../metrics/types.js'
 import { oneOf, str } from '../schema/types.js'
 import { createHouse } from './house.js'
 
+/** A sink that keeps nothing — for declaration tests that never ship. */
+const discard: WriteFn = () => {}
+
 const WILLOW = { dogName: 'Willow', park: 'riverside', kind: 'solid' } as const
 const REX = { dogName: 'Rex', park: 'central', kind: 'liquid' } as const
 
@@ -16,6 +19,7 @@ const now = () => clock
 
 const makeCounter = (name = 'dog_poops', overrides = {}) =>
   counter(name, {
+    write: discard,
     dims: { dogName: str(), park: str(), kind: oneOf(['solid', 'liquid']) },
     resolution: '1s',
     flush: '5m',

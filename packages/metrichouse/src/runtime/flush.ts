@@ -1,19 +1,22 @@
 /**
- * The flush engine.
+ * Flush — one metric's trip to its own sink, and the house's fan-out over it.
  *
- * Decides *which* metrics ship and *when*; {@link shipClaim} does the shipping.
- * A metric's `flush` setting is a **minimum cadence**, not a schedule: calling
- * `house.flush()` every 10 seconds still ships a 5-minute metric every 5
- * minutes.
+ * A metric owns its cadence, its sink and its retry state, so `metric.flush()`
+ * is the whole unit:
  *
  * ```
- * cadence -> metric.claimBatch(now) -> shipClaim -> ack | release
+ * cadence -> claimBatch(now) -> shipClaim -> ack | release
  * ```
+ *
+ * {@link runFlush} is a loop over that and nothing else. The house is a
+ * convenience for callers holding a whole schema — a cron handler that wants
+ * everything — not the place the logic lives. Flushing one metric never needs
+ * a house at all.
  *
  * **Nothing in this file knows what a bucket is.** The metric turns `now` into
  * whatever claim its own storage model needs — a watermark over closed buckets
- * for a counter, the staged backlog for an event — so a new primitive is four
- * methods on {@link AnyMetric} and no edit here.
+ * for a counter, the staged backlog for an event — so a new primitive is the
+ * four {@link AnyMetric} batch methods plus this mixin, and no edit here.
  *
  * Spec: initialPlan/12-flush.md
  */
@@ -23,11 +26,16 @@ import { shipClaim } from './ship.js'
 
 export type FlushSkipReason = 'cadence' | 'not-selected'
 
+/** What {@link AnyMetric.flush} accepts. */
 export interface FlushOptions {
+  /** Ignore the cadence and ship everything closed now. */
+  readonly force?: boolean
+}
+
+/** What {@link runFlush} accepts, on top of the per-metric options. */
+export interface HouseFlushOptions extends FlushOptions {
   /** Restrict the flush to these metric names. */
   readonly only?: readonly string[]
-  /** Ignore the per-metric cadence and ship everything closed now. */
-  readonly force?: boolean
 }
 
 export interface MetricFlushReport {
@@ -48,11 +56,18 @@ export interface FlushReport {
   throwIfFailed(): void
 }
 
-/** Per-metric state the house owns across calls. */
-export interface MetricFlushState {
+/**
+ * The cadence and retry state one metric carries between its own flushes.
+ *
+ * Private to the metric now, rather than held by the house in a map keyed by
+ * name. A metric that ships itself — on a scheduler tick, from a cron, from a
+ * test — has to count its own attempts, and a second bookkeeper would disagree
+ * with the first the moment either was used alone.
+ */
+interface FlushState {
   /**
    * When this metric last actually shipped rows. Zero until the first one, so
-   * a fresh house ships as soon as anything is closed rather than sitting on
+   * a fresh metric ships as soon as anything is closed rather than sitting on
    * data for a full interval. An empty flush does not move it.
    */
   lastFlushMs: number
@@ -60,26 +75,113 @@ export interface MetricFlushState {
   attempt: number
 }
 
+/** What a metric supplies to get a {@link AnyMetric.flush} of its own. */
+export interface MetricFlushOptions {
+  readonly name: string
+  /** Read late: a cadence may come from the house, and a metric is declared before it is bound. */
+  readonly flushMs: () => number
+  /** This metric's sink. */
+  readonly sink: () => WriteFn
+  /** The bound clock. Throws if the metric has no house yet. */
+  readonly now: () => number
+  /**
+   * The metric itself, resolved at call time rather than captured.
+   *
+   * {@link shipClaim} needs the finished {@link AnyMetric} — including the
+   * four batch methods and any decoration a wrapper kind added on top — and
+   * this mixin is spread into that object while it is still being built.
+   */
+  readonly self: () => AnyMetric
+}
+
+/**
+ * The flush half of a metric, as a mixin.
+ *
+ * The counterpart to `bucketedLifecycle` and `stagedMetric` on the delivery
+ * side: those say what a claim *is* for a storage model, this says what
+ * happens to one. Every kind gets the identical cadence rule, the identical
+ * retry counting, and the identical "an empty flush is not a flush".
+ */
+export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush'> {
+  const state: FlushState = { lastFlushMs: 0, attempt: 1 }
+
+  return {
+    async flush(flushOptions: FlushOptions = {}): Promise<MetricFlushReport> {
+      const metric = options.self()
+      // reads the bound clock, so an unbound metric fails here rather than
+      // claiming against `Date.now` and a driver that does not exist
+      const now = options.now()
+
+      // 1. cadence — `flush` is a minimum, so a scheduler tick or a cron call
+      //    that arrives early is a no-op. `lastFlushMs` advances only on
+      //    success.
+      const flushMs = options.flushMs()
+      const elapsed = now - state.lastFlushMs
+      if (!flushOptions.force && elapsed < flushMs) {
+        return {
+          buckets: 0,
+          rows: 0,
+          skipped: true,
+          reason: 'cadence',
+          nextEligibleInMs: flushMs - elapsed,
+        }
+      }
+
+      // 2. claim — atomically invisible to live reads and to a second flusher.
+      //    What is claimable is the metric's judgement, not this file's.
+      const claim = await metric.claimBatch(now)
+
+      // 3. ship — materialize, write, then ack or release
+      const outcome = await shipClaim(metric, claim, options.sink(), {
+        attempt: state.attempt,
+        source: 'flush',
+      })
+
+      if (outcome.error !== undefined) {
+        state.attempt += 1
+        return {
+          buckets: outcome.buckets,
+          rows: outcome.rows,
+          skipped: false,
+          error: outcome.error,
+        }
+      }
+
+      if (outcome.rows === 0) {
+        // deliberately does NOT advance lastFlushMs. The cadence bounds how
+        // often this metric *ships*, and nothing shipped. Advancing here would
+        // let an empty flush eat the cadence, so data that closed a second
+        // later would then wait a full interval — the coarser the resolution,
+        // the worse it gets, because early flushes always find the only bucket
+        // still open.
+        return { buckets: 0, rows: 0, skipped: false }
+      }
+
+      state.lastFlushMs = now
+      state.attempt = 1
+
+      return { buckets: outcome.buckets, rows: outcome.rows, skipped: false }
+    },
+  }
+}
+
 export interface FlushContext {
   readonly now: () => number
   readonly metrics: readonly AnyMetric[]
-  /** The metric's own sink, or the house fallback. */
-  readonly sinkFor: (metric: AnyMetric) => WriteFn | undefined
-  readonly state: Map<string, MetricFlushState>
 }
 
-function stateFor(context: FlushContext, name: string): MetricFlushState {
-  let state = context.state.get(name)
-  if (!state) {
-    state = { lastFlushMs: 0, attempt: 1 }
-    context.state.set(name, state)
-  }
-  return state
-}
-
+/**
+ * Flush every metric in a house, in registration order, and collect the
+ * reports.
+ *
+ * Sequential rather than parallel: these are independent writes, but they are
+ * writes, and a cron handler flushing forty metrics at once into one database
+ * is a thundering herd the caller did not ask for. A caller who wants the
+ * concurrency has `metric.flush()` and `Promise.all`.
+ */
 export async function runFlush(
   context: FlushContext,
-  options: FlushOptions = {},
+  options: HouseFlushOptions = {},
 ): Promise<FlushReport> {
   const startedAt = context.now()
   const metrics: Record<string, MetricFlushReport> = {}
@@ -91,7 +193,7 @@ export async function runFlush(
       continue
     }
 
-    const report = await flushOne(context, metric, options)
+    const report = await metric.flush(options)
     metrics[metric.name] = report
     if (report.error !== undefined) ok = false
   }
@@ -110,69 +212,4 @@ export async function runFlush(
       throw new Error(`flush failed for ${failed.join(', ')}`)
     },
   }
-}
-
-async function flushOne(
-  context: FlushContext,
-  metric: AnyMetric,
-  options: FlushOptions,
-): Promise<MetricFlushReport> {
-  const state = stateFor(context, metric.name)
-  const now = context.now()
-
-  // 1. cadence — `flush` is a minimum, so most calls are a no-op for most
-  //    metrics. `lastFlushMs` advances only on success.
-  const elapsed = now - state.lastFlushMs
-  if (!options.force && elapsed < metric.flushMs) {
-    return {
-      buckets: 0,
-      rows: 0,
-      skipped: true,
-      reason: 'cadence',
-      nextEligibleInMs: metric.flushMs - elapsed,
-    }
-  }
-
-  const sink = context.sinkFor(metric)
-  if (!sink) {
-    // loudly, rather than skipping: a metric with nowhere to ship is a
-    // misconfiguration that would otherwise look like a quiet success
-    return {
-      buckets: 0,
-      rows: 0,
-      skipped: false,
-      error: new Error(
-        `${metric.name}: no write() — declare one on the metric or pass one to createHouse`,
-      ),
-    }
-  }
-
-  // 2. claim — atomically invisible to live reads and to a second flusher.
-  //    What is claimable is the metric's judgement, not this file's.
-  const claim = await metric.claimBatch(now)
-
-  // 3. ship — materialize, write, then ack or release
-  const outcome = await shipClaim(metric, claim, sink, {
-    attempt: state.attempt,
-    source: 'flush',
-  })
-
-  if (outcome.error !== undefined) {
-    state.attempt += 1
-    return { buckets: outcome.buckets, rows: outcome.rows, skipped: false, error: outcome.error }
-  }
-
-  if (outcome.rows === 0) {
-    // deliberately does NOT advance lastFlushMs. The cadence bounds how often
-    // this metric *ships*, and nothing shipped. Advancing here would let an
-    // empty flush eat the cadence, so data that closed a second later would
-    // then wait a full interval — the coarser the resolution, the worse it
-    // gets, because early flushes always find the only bucket still open.
-    return { buckets: 0, rows: 0, skipped: false }
-  }
-
-  state.lastFlushMs = now
-  state.attempt = 1
-
-  return { buckets: outcome.buckets, rows: outcome.rows, skipped: false }
 }

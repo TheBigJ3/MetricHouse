@@ -7,11 +7,14 @@ import { type Event, event } from '../metrics/event.js'
 import { type Gauge, gauge } from '../metrics/gauge.js'
 import { type Log, log } from '../metrics/log.js'
 import { timer } from '../metrics/timer.js'
-import type { AnyMetric, Row, WriteContext } from '../metrics/types.js'
+import type { AnyMetric, WriteFn } from '../metrics/types.js'
 import { encodeDimKey } from '../schema/dims.js'
 import { oneOf, str } from '../schema/types.js'
 import { createHouse } from './house.js'
 import { liveness, snapshotRange } from './live.js'
+
+/** A sink that keeps nothing — for declaration tests that never ship. */
+const discard: WriteFn = () => {}
 
 const DIMS = { park: str(), kind: oneOf(['solid', 'liquid'] as const) }
 const RIVERSIDE = { park: 'riverside', kind: 'solid' } as const
@@ -20,7 +23,6 @@ const CENTRAL = { park: 'central', kind: 'liquid' } as const
 let clock: number
 let driver: Driver
 const now = () => clock
-const write = async (_rows: Row[], _context: WriteContext): Promise<void> => {}
 
 beforeEach(() => {
   clock = 1_788_616_987_000 // exactly on a 1s boundary
@@ -74,7 +76,7 @@ describe('snapshotRange', () => {
 
 describe('counter.snapshot', () => {
   const makeCounter = () =>
-    counter('dog_poops', { dims: DIMS, resolution: '1s', flush: '5m', grace: '0s' })
+    counter('dog_poops', { write: discard, dims: DIMS, resolution: '1s', flush: '5m', grace: '0s' })
 
   /** Three buckets: two closed, one open, with a second series in the middle. */
   const seed = async (
@@ -92,7 +94,7 @@ describe('counter.snapshot', () => {
 
   it('returns every closed unflushed bucket, and not the open one', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     await seed(dogPoops, house)
 
     const rows = await dogPoops.snapshot()
@@ -104,7 +106,7 @@ describe('counter.snapshot', () => {
 
   it('includes the open bucket under complete: false, and says it is partial', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     await seed(dogPoops, house)
     clock += 400 // 40% into the open bucket
 
@@ -117,7 +119,7 @@ describe('counter.snapshot', () => {
 
   it('carries the id and bucket_ts a sink would receive', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     const at = clock
     dogPoops.add(2, RIVERSIDE)
     clock += 1_000
@@ -135,7 +137,7 @@ describe('counter.snapshot', () => {
 
   it('filters on a partial dim match', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     await seed(dogPoops, house)
 
     const rows = await dogPoops.snapshot({ dims: { park: 'riverside' } })
@@ -145,7 +147,7 @@ describe('counter.snapshot', () => {
 
   it('rejects a dim filter naming something undeclared', async () => {
     const dogPoops = makeCounter()
-    createHouse({ driver, schema: [dogPoops], write, now })
+    createHouse({ driver, schema: [dogPoops], now })
     await expect(dogPoops.snapshot({ dims: { pakr: 'riverside' } })).rejects.toThrow(
       /not a declared dim/,
     )
@@ -153,7 +155,7 @@ describe('counter.snapshot', () => {
 
   it('restricts the bucket range', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     const first = clock
     await seed(dogPoops, house)
 
@@ -163,7 +165,7 @@ describe('counter.snapshot', () => {
 
   it('rolls buckets up per series, dropping the identity that no longer applies', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     await seed(dogPoops, house)
 
     const rows = await dogPoops.snapshot({ rollup: 'sum' })
@@ -179,7 +181,7 @@ describe('counter.snapshot', () => {
 
   it('marks a rollup partial when any bucket in it is still open', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     await seed(dogPoops, house)
 
     const closed = await dogPoops.snapshot({ rollup: 'sum', dims: { park: 'riverside' } })
@@ -195,7 +197,7 @@ describe('counter.snapshot', () => {
 
   it('collapses to the dims named by groupBy', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     await seed(dogPoops, house)
 
     const rows = await dogPoops.snapshot({ groupBy: ['kind'], rollup: 'sum' })
@@ -208,7 +210,7 @@ describe('counter.snapshot', () => {
 
   it('keeps buckets while grouping dims when rollup is none', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     await seed(dogPoops, house)
 
     const rows = await dogPoops.snapshot({ groupBy: ['park'] })
@@ -218,13 +220,13 @@ describe('counter.snapshot', () => {
 
   it('rejects a groupBy naming something undeclared', async () => {
     const dogPoops = makeCounter()
-    createHouse({ driver, schema: [dogPoops], write, now })
+    createHouse({ driver, schema: [dogPoops], now })
     await expect(dogPoops.snapshot({ groupBy: ['nope'] })).rejects.toThrow(/not a declared dim/)
   })
 
   it('sorts before limiting, so limit means top-K', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     await seed(dogPoops, house)
 
     const top = await dogPoops.snapshot({ rollup: 'sum', orderBy: 'value', limit: 1 })
@@ -242,14 +244,14 @@ describe('counter.snapshot', () => {
 
   it('rejects an orderBy that is not a column on the rows', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     await seed(dogPoops, house)
     await expect(dogPoops.snapshot({ orderBy: 'nope' })).rejects.toThrow(/not a column/)
   })
 
   it('cannot see data a flush has claimed', async () => {
     const dogPoops = makeCounter()
-    const house = createHouse({ driver, schema: [dogPoops], write, now })
+    const house = createHouse({ driver, schema: [dogPoops], now })
     await seed(dogPoops, house)
 
     expect(await dogPoops.snapshot()).toHaveLength(3)
@@ -265,12 +267,13 @@ describe('counter.snapshot', () => {
 describe('gauge.snapshot', () => {
   it('merges folds the way the five aggregates merge', async () => {
     const latency = gauge('latency', {
+      write: discard,
       dims: { park: str() },
       resolution: '1s',
       flush: '5m',
       grace: '0s',
     })
-    const house = createHouse({ driver, schema: [latency], write, now })
+    const house = createHouse({ driver, schema: [latency], now })
 
     latency.set(10, { park: 'riverside' })
     latency.set(2, { park: 'riverside' })
@@ -292,13 +295,14 @@ describe('gauge.snapshot', () => {
 
   it('merges only the aggregates the gauge declares', async () => {
     const latency = gauge('latency', {
+      write: discard,
       dims: { park: str() },
       resolution: '1s',
       flush: '5m',
       grace: '0s',
       aggregate: ['min', 'count'],
     })
-    const house = createHouse({ driver, schema: [latency], write, now })
+    const house = createHouse({ driver, schema: [latency], now })
 
     latency.set(10, { park: 'riverside' })
     clock += 1_000
@@ -317,12 +321,13 @@ describe('gauge.snapshot', () => {
 describe('timer.snapshot', () => {
   it('reads through the gauge underneath it', async () => {
     const work = timer('work', {
+      write: discard,
       dims: { park: str() },
       resolution: '1s',
       flush: '5m',
       grace: '0s',
     })
-    const house = createHouse({ driver, schema: [work], write, now })
+    const house = createHouse({ driver, schema: [work], now })
 
     work.observe(12.5, { park: 'riverside' })
     clock += 1_000
@@ -340,11 +345,12 @@ describe('timer.snapshot', () => {
 // ---------------------------------------------------------------------------
 
 describe('staged snapshot', () => {
-  const makeEvent = (over = {}) => event('signups', { fields: { plan: str() }, ...over })
+  const makeEvent = (over = {}) =>
+    event('signups', { write: discard, fields: { plan: str() }, ...over })
 
   it('returns unshipped records, never partial', async () => {
     const signups = makeEvent()
-    const house = createHouse({ driver, schema: [signups], write, now })
+    const house = createHouse({ driver, schema: [signups], now })
 
     signups.record({ plan: 'pro' })
     signups.record({ plan: 'free' })
@@ -360,7 +366,7 @@ describe('staged snapshot', () => {
 
   it('honours from, to and limit', async () => {
     const signups = makeEvent()
-    const house = createHouse({ driver, schema: [signups], write, now })
+    const house = createHouse({ driver, schema: [signups], now })
 
     const first = clock
     signups.record({ plan: 'pro' })
@@ -375,7 +381,7 @@ describe('staged snapshot', () => {
 
   it('reads a local buffer the same way it reads the driver', async () => {
     const signups = makeEvent({ stage: 'local', batch: { maxSize: 500 } })
-    createHouse({ driver, schema: [signups], write, now })
+    createHouse({ driver, schema: [signups], now })
 
     // deliberately not drained: `drain()` ships a local buffer, which is the
     // whole point of it, so there would be nothing left to read
@@ -386,7 +392,7 @@ describe('staged snapshot', () => {
 
   it('ignores aggregate-only options rather than rejecting them', async () => {
     const signups = makeEvent()
-    const house = createHouse({ driver, schema: [signups], write, now })
+    const house = createHouse({ driver, schema: [signups], now })
     signups.record({ plan: 'pro' })
     await house.drain()
 
@@ -396,8 +402,8 @@ describe('staged snapshot', () => {
   })
 
   it('carries a log through the event underneath it', async () => {
-    const applog = log('app_log', { fields: { requestId: str() } })
-    const house = createHouse({ driver, schema: [applog], write, now })
+    const applog = log('app_log', { write: discard, fields: { requestId: str() } })
+    const house = createHouse({ driver, schema: [applog], now })
 
     applog.info('started', { requestId: 'abc' })
     await house.drain()
@@ -415,13 +421,14 @@ describe('staged snapshot', () => {
 describe('house.snapshot', () => {
   const build = () => {
     const dogPoops = counter('dog_poops', {
+      write: discard,
       dims: DIMS,
       resolution: '1s',
       flush: '5m',
       grace: '0s',
     })
-    const signups = event('signups', { fields: { plan: str() } })
-    const house = createHouse({ driver, schema: [dogPoops, signups], write, now })
+    const signups = event('signups', { write: discard, fields: { plan: str() } })
+    const house = createHouse({ driver, schema: [dogPoops, signups], now })
     return { dogPoops, signups, house }
   }
 
@@ -464,13 +471,14 @@ describe('house.snapshot', () => {
 describe('house.current', () => {
   it('reports the open bucket, and only bucketed kinds', async () => {
     const dogPoops = counter('dog_poops', {
+      write: discard,
       dims: DIMS,
       resolution: '1s',
       flush: '5m',
       grace: '0s',
     })
-    const signups = event('signups', { fields: { plan: str() } })
-    const house = createHouse({ driver, schema: [dogPoops, signups], write, now })
+    const signups = event('signups', { write: discard, fields: { plan: str() } })
+    const house = createHouse({ driver, schema: [dogPoops, signups], now })
 
     dogPoops.add(2, RIVERSIDE) // a closed bucket, once the clock moves
     clock += 1_000
@@ -487,9 +495,9 @@ describe('house.current', () => {
   })
 
   it('reads each metric against its own resolution', async () => {
-    const fast = counter('fast', { resolution: '1s', flush: '5m', grace: '0s' })
-    const slow = counter('slow', { resolution: '1m', flush: '5m', grace: '0s' })
-    const house = createHouse({ driver, schema: [fast, slow], write, now })
+    const fast = counter('fast', { write: discard, resolution: '1s', flush: '5m', grace: '0s' })
+    const slow = counter('slow', { write: discard, resolution: '1m', flush: '5m', grace: '0s' })
+    const house = createHouse({ driver, schema: [fast, slow], now })
 
     fast.add(1)
     slow.add(1)

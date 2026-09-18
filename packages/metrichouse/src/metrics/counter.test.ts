@@ -3,6 +3,10 @@ import { memory } from '../drivers/memory.js'
 import type { Driver } from '../drivers/types.js'
 import { float, int, json, oneOf, str } from '../schema/types.js'
 import { type Counter, type CounterRow, counter } from './counter.js'
+import type { WriteFn } from './types.js'
+
+/** A sink that keeps nothing — for declaration tests that never ship. */
+const discard: WriteFn = () => {}
 
 function expectRejected(fn: () => unknown): Error {
   let caught: unknown
@@ -37,6 +41,7 @@ function make(overrides: Partial<Parameters<typeof counter<Dims>>[1]> = {}): Cou
     resolution: '1s',
     flush: '5m',
     ...overrides,
+    write: overrides.write ?? discard,
   })
 }
 
@@ -84,6 +89,7 @@ describe('declaration', () => {
   it('rejects a json() dim — a payload cannot be a series key', () => {
     const err = expectRejected(() =>
       counter('dog_poops', {
+        write: discard,
         dims: { payload: json() },
         resolution: '1s',
         flush: '5m',
@@ -93,8 +99,12 @@ describe('declaration', () => {
   })
 
   it('rejects an empty name', () => {
-    expectRejected(() => counter('', { dims: makeDims(), resolution: '1s', flush: '5m' }))
-    expectRejected(() => counter('   ', { dims: makeDims(), resolution: '1s', flush: '5m' }))
+    expectRejected(() =>
+      counter('', { write: discard, dims: makeDims(), resolution: '1s', flush: '5m' }),
+    )
+    expectRejected(() =>
+      counter('   ', { write: discard, dims: makeDims(), resolution: '1s', flush: '5m' }),
+    )
   })
 
   it('rejects a malformed duration', () => {
@@ -102,13 +112,13 @@ describe('declaration', () => {
   })
 
   it('accepts a metric with no dims', () => {
-    const metric = counter('boots', { dims: {}, resolution: '1s', flush: '1s' })
+    const metric = counter('boots', { write: discard, dims: {}, resolution: '1s', flush: '1s' })
     expect(metric.name).toBe('boots')
   })
 })
 
 describe('dimensionless counters', () => {
-  const online = () => counter('online_users', { resolution: '1s', flush: '5m' })
+  const online = () => counter('online_users', { write: discard, resolution: '1s', flush: '5m' })
 
   it('needs no dims at all', () => {
     const metric = online()
@@ -245,6 +255,7 @@ describe('add', () => {
 
   it('applies dim defaults', async () => {
     const metric = counter('d', {
+      write: discard,
       dims: { a: str(), b: str().default('riverside') },
       resolution: '1s',
       flush: '5m',
@@ -411,7 +422,7 @@ describe('current() with no dims is the metric total', () => {
   })
 
   it('matches the single series when the counter has no dims', async () => {
-    const metric = counter('online', { resolution: '1s', flush: '5m' })
+    const metric = counter('online', { write: discard, resolution: '1s', flush: '5m' })
     metric.bind({ driver, now })
     metric.add(3)
     await metric.drain()
@@ -441,6 +452,7 @@ describe('rowShape', () => {
 
   it('marks optional dims optional', () => {
     const metric = counter('d', {
+      write: discard,
       dims: { a: str(), b: str().optional() },
       resolution: '1s',
       flush: '5m',

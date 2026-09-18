@@ -28,8 +28,9 @@
  *   and a store upserting on that id would keep the last `value: 1` it saw.
  *
  * That asymmetry means immediate delivery **replaces** flush for staged kinds
- * and **does not** for bucketed ones. A bucketed metric still needs `flush()`
- * to claim and delete its closed buckets, or they accumulate in the driver
+ * and **does not** for bucketed ones. A bucketed metric still needs
+ * `metric.flush()` — from a scheduler tick, a cron, or `house.flush()` — to
+ * claim and delete its closed buckets, or they accumulate in the driver
  * forever. The final flush row carries the same id and the complete fold, so it
  * supersedes every partial send — the two paths converge rather than fight.
  *
@@ -57,6 +58,10 @@ export type DeliveryConfig = DeliveryMode | 'auto'
  * carries money keeps it whatever the house says. Delivery *mode* is the one
  * thing a house overrides outright, because "this runtime cannot flush" is a
  * fact about the deployment that a schema file has no standing to contradict.
+ *
+ * A sink is **not** on this list. Where a metric's rows go is part of what the
+ * metric is, not of how the deployment delivers it, so `write` is declared on
+ * the metric and required there.
  */
 export interface HouseDefaults {
   readonly flushMs?: number

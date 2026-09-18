@@ -17,6 +17,7 @@
 import type { AppendOp, Claim, Driver, RecordClaim, StagedRecord } from '../drivers/types.js'
 import { isRecordClaim } from '../drivers/types.js'
 import { uuidv7 } from '../identity.js'
+import { metricFlush } from '../runtime/flush.js'
 import type { LiveFields, SnapshotOptions } from '../runtime/live.js'
 import { shipClaim } from '../runtime/ship.js'
 import { applyDimDefaults, validateDims } from '../schema/dims.js'
@@ -138,8 +139,8 @@ export interface EventConfig<F extends Shape> {
    * Set it when the backlog can outgrow what the sink will accept at once.
    */
   readonly claimLimit?: number
-  /** This event's sink. Falls back to the house's `write` when omitted. */
-  readonly write?: WriteFn
+  /** Where this event's rows go. Required — see the counter for why. */
+  readonly write: WriteFn
 }
 
 /**
@@ -154,7 +155,7 @@ export interface Event<F extends Shape, K extends MetricKind = 'event'> extends 
   readonly fields: F
   readonly stage: EventStage
   readonly flushMs: number
-  readonly write: WriteFn | undefined
+  readonly write: WriteFn
   readonly isBound: boolean
 
   bind(binding: MetricBinding): void
@@ -493,23 +494,18 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   /**
    * Claim and ship whatever is staged, right now.
    *
-   * Exactly what `house.flush()` does for this metric, minus the cadence
+   * Exactly what `flush()` does for this metric, minus the cadence
    * check — a staged record is complete the instant it is appended, so unlike
    * a bucketed kind there is no partial state to protect and the ordinary
    * claim/ack path is correct. Immediate delivery therefore *replaces* flush
    * here rather than running alongside it.
    */
   async function shipStaged(): Promise<void> {
-    const sink = config.write ?? binding?.write
-    if (!sink) {
-      throw new Error(
-        `${name}: delivery is 'immediate', so this event ships without waiting for flush() — ` +
-          'it needs a write() declared on the metric or on createHouse',
-      )
-    }
-
     const claim = await activeDriver().claimRecords(name, config.claimLimit)
-    const outcome = await shipClaim(self, claim, sink, { attempt: 1, source: 'immediate' })
+    const outcome = await shipClaim(self, claim, config.write, {
+      attempt: 1,
+      source: 'immediate',
+    })
     if (outcome.error !== undefined) throw outcome.error
   }
 
@@ -521,22 +517,11 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     }
     if (buffer.length === 0) return
 
-    const sink = config.write ?? binding?.write
-    if (!sink) {
-      reportDetached(
-        new Error(
-          `${name}: no write() — a locally staged event ships on its own, so it needs a sink ` +
-            'declared on the metric or on createHouse',
-        ),
-      )
-      return
-    }
-
     const claim = takeLocalClaim()
 
     track(
       (async (): Promise<void> => {
-        const outcome = await shipClaim(self, claim, sink, { attempt: 1, source })
+        const outcome = await shipClaim(self, claim, config.write, { attempt: 1, source })
         // a failed sink already released the records back into the buffer;
         // rethrow so the failure reaches onError rather than vanishing
         if (outcome.error !== undefined) throw outcome.error
@@ -608,6 +593,14 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   }
 
   const self: Event<F, K> = {
+    ...metricFlush({
+      name,
+      flushMs: effectiveFlushMs,
+      sink: () => config.write,
+      now: () => (activeBinding().now ?? Date.now)(),
+      self: () => self,
+    }),
+
     name,
     kind,
     storage: 'staged',

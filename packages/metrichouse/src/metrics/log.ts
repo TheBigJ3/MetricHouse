@@ -19,6 +19,7 @@
  */
 
 import type { Claim } from '../drivers/types.js'
+import type { FlushOptions, MetricFlushReport } from '../runtime/flush.js'
 import type { LiveFields, SnapshotOptions } from '../runtime/live.js'
 import type { InferShape, MarkOptional, Shape, ShapeArgs, Simplify } from '../schema/types.js'
 import { oneOf, str } from '../schema/types.js'
@@ -92,6 +93,7 @@ const RESERVED_LEVEL_NAMES: readonly string[] = [
   'rowShape',
   'bind',
   'drain',
+  'flush',
   'claimBatch',
   'materializeClaim',
   'ackBatch',
@@ -173,8 +175,8 @@ export interface LogConfig<F extends Shape, L extends readonly string[]> {
   readonly flush?: DurationInput
   /** Records one flush may carry. Unlimited by default. */
   readonly claimLimit?: number
-  /** This log's sink. Falls back to the house's `write` when omitted. */
-  readonly write?: WriteFn
+  /** Where this log's rows go. Required — see the counter for why. */
+  readonly write: WriteFn
 }
 
 /**
@@ -212,7 +214,7 @@ export type Log<F extends Shape, L extends readonly string[]> = Omit<AnyMetric, 
     readonly minLevel: L[number]
     readonly stage: EventStage
     readonly flushMs: number
-    readonly write: WriteFn | undefined
+    readonly write: WriteFn
     readonly isBound: boolean
 
     bind(binding: MetricBinding): void
@@ -276,7 +278,7 @@ function splitMessage(message: string | Error): { message: string; error_stack?:
 export function log<
   F extends Shape = Record<string, never>,
   const L extends readonly string[] = DefaultLogLevels,
->(name: string, config: LogConfig<F, L> = {}): Log<F, L> {
+>(name: string, config: LogConfig<F, L>): Log<F, L> {
   if (typeof name !== 'string' || name.trim() === '') {
     throw new Error('log: name must be a non-empty string')
   }
@@ -340,7 +342,7 @@ export function log<
       ...(config.batch !== undefined && { batch: config.batch }),
       ...(config.flush !== undefined && { flush: config.flush }),
       ...(config.claimLimit !== undefined && { claimLimit: config.claimLimit }),
-      ...(config.write !== undefined && { write: config.write }),
+      write: config.write,
     },
     'log',
   )
@@ -459,6 +461,11 @@ export function log<
 
     // the staged lifecycle, untouched — the flush engine talks to the event
     // underneath and never learns a log was involved
+    /** Delegated to the event underneath — see the timer for why. */
+    flush(options?: FlushOptions): Promise<MetricFlushReport> {
+      return inner.flush(options)
+    },
+
     claimBatch(nowMs: number): Promise<Claim> {
       return inner.claimBatch(nowMs)
     },

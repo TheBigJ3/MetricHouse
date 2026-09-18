@@ -7,7 +7,7 @@
  *         ok -> ack   fail -> release
  * ```
  *
- * Extracted because there are two callers, not one: `house.flush()` ships on a
+ * Extracted because there are two callers, not one: `metric.flush()` ships on a
  * cadence, and a locally staged event ships itself the moment `batch.maxSize`
  * is reached — nobody calls flush for that one. Both have to delete after the
  * write and only after it, and having that rule written down twice is how the
