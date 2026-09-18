@@ -7,8 +7,6 @@
  * Re-exporting the ioredis driver here costs nothing: it never imports the
  * `ioredis` package, only a structural description of the part of a client it
  * calls.
- *
- * Not implemented.
  */
 export * from './core.js'
 export * from './ioredis.js'

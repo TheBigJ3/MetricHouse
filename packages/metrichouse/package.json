@@ -1,8 +1,18 @@
 {
   "name": "metrichouse",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Metric collection that owns bucketing, aggregation and flush \u2014 and nothing a query can reconstruct.",
   "license": "MIT",
+  "author": "TheBigJ3",
+  "homepage": "https://github.com/TheBigJ3/MetricHouse#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TheBigJ3/MetricHouse.git",
+    "directory": "packages/metrichouse"
+  },
+  "bugs": {
+    "url": "https://github.com/TheBigJ3/MetricHouse/issues"
+  },
   "type": "module",
   "sideEffects": false,
   "engines": {

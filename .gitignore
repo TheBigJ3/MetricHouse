@@ -18,6 +18,9 @@ dist/
 .vscode/
 .idea/
 
+# packed tarballs
+*.tgz
+
 # build
 *.tsbuildinfo
 coverage/

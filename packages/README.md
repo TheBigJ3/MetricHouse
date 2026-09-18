@@ -11,16 +11,17 @@ keep an edge bundle down to the write path.
 | --- | --- | --- |
 | `metrichouse/core` | declare, write, drain, live read, identity, buckets | ✅ exported |
 | `metrichouse/memory` | `memory()` | ✅ exported |
+| `metrichouse/ioredis` | `ioredis()` | ✅ exported |
 | `metrichouse` | everything, for Node servers that do not care | ✅ exported |
-| `metrichouse/redis` | `redis()`, `httpRedis()` | planned |
 | `metrichouse/collector` | `createCollector()` | planned |
 | `metrichouse/testing` | assertion helpers, memory driver only | planned |
 
-Only the first three appear in `package.json`. **A subpath is added to the
+Only the four above appear in `package.json`. **A subpath is added to the
 exports map together with the code behind it, never ahead of it** — an entry
 resolving to an empty module is worse than an absent one, because the consumer
 importing it gets nothing and no error. The same rule governs
-`peerDependencies`: the Redis clients come back when `metrichouse/redis` does.
+`peerDependencies`: `ioredis` is optional, and declared only because
+`metrichouse/ioredis` exists.
 
 `dependencies` must stay near zero.
 

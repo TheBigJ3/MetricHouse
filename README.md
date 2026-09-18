@@ -14,8 +14,11 @@ flush — and refuses to own anything else.
 > logger, and `timer` is a gauge of durations with a `start()` handle, a scoped
 > `time()`, and an optional event for percentiles. Storage is now two drivers,
 > not one: `ioredis` joined `memory`, both measured against the same executable
-> driver contract, so at-least-once is real rather than best-effort. Still
-> missing: `level`/`distinct`, `ingest`/`backfill`, and the CLI. The specification in
+> driver contract, so at-least-once holds across a failed write rather than
+> just a failed call. It does not yet hold across a failed *process*: in-flight
+> claims are tracked but never swept, so a crash mid-flush strands that window.
+> Still missing: `level`/`distinct`, `ingest`/`backfill`, the claim sweeper,
+> and the CLI. The specification in
 > [`claude/initialPlan/`](claude/initialPlan/) describes the whole design;
 > [`claude/imagine/`](claude/imagine/) holds three hypothetical projects
 > written to break it.
@@ -37,7 +40,18 @@ design:
 - There is **no SQL**. MetricHouse emits none, diffs no schema and opens no
   connection — the table your rows land in is yours to create and evolve.
 
+## Install
+
+```bash
+npm install metrichouse
+```
+
+Node 20 or newer. `ioredis` is an optional peer dependency, required only if
+you import `metrichouse/ioredis`.
+
 ## What it looks like
+
+Declare a metric:
 
 ```ts
 // metrics/schema.ts
@@ -46,18 +60,41 @@ import { counter, str, oneOf } from 'metrichouse/core'
 export const dogPoops = counter('dog_poops', {
   dims: { dogName: str(), park: str(), kind: oneOf(['solid', 'liquid'] as const) },
   resolution: '1s',        // keep per-second fidelity
-  flush: '5m',             // but only ship every 5 minutes
+  flush: '5m',             // but ship no more often than every 5 minutes
 
   // you own this. MetricHouse owns everything above it.
   write: async (rows) => ch.insert('dog_poops', rows),
 })
 ```
 
+Bind it to a house once, at startup. A metric is an inert declaration until a
+house registers it — writing to an unbound metric throws rather than dropping
+data silently:
+
+```ts
+// metrics/house.ts
+import { createHouse } from 'metrichouse/core'
+import { memory } from 'metrichouse/memory'
+import * as schema from './schema.js'
+
+export const house = createHouse({ driver: memory(), schema })
+```
+
+Then write and read:
+
 ```ts
 dogPoops.add({ dogName: 'Willow', park: 'riverside', kind: 'solid' })
 
 await dogPoops.current({ dogName: 'Willow', park: 'riverside', kind: 'solid' })
 // -> 7        live, from the unflushed bucket, before anything hits the database
+```
+
+Nothing flushes on its own. `house.flush()` is called by you — from a cron, a
+worker, or a timer — and a metric's `flush` setting is a **minimum cadence**,
+not a schedule, so this still ships `dog_poops` only every 5 minutes:
+
+```ts
+setInterval(() => house.flush(), 10_000)
 ```
 
 ## Repository layout
@@ -110,7 +147,7 @@ Settled and stress-tested across three workloads: the chef rule, resolution
 independent of flush, deterministic row ids, explicit `flush()`, per-metric
 write functions, pre-declared dimensions.
 
-Open, and worth arguing about before any code is written:
+Open, and worth arguing about:
 
 - **`house.ingest()` is doing a lot of work.** It arrived for historical
   backfill, then answered edge federation and multi-region latency. That is
