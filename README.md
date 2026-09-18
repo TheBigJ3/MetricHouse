@@ -56,9 +56,9 @@ reference. Every snippet in it is checked against the built package.
 pnpm --filter @metrichouse/docs dev      # http://localhost:5173
 ```
 
-It deploys to GitHub Pages from
-[`.github/workflows/docs.yml`](.github/workflows/docs.yml) on every push to
-`main` that touches `docs/`.
+It is deployed on Vercel, which builds it from `docs/` on every push to `main`.
+[`docs/vercel.json`](docs/vercel.json) holds the build command and the output
+directory, and [`docs/README.md`](docs/README.md) explains the rest.
 
 ## What it looks like
 

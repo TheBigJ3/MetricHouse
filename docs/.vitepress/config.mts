@@ -2,17 +2,24 @@ import { defineConfig } from 'vitepress'
 import { writeCrawlerFiles } from './crawlers.js'
 
 /**
- * Set DOCS_BASE when the site is served from a sub path.
- * GitHub Pages at github.com/TheBigJ3/MetricHouse serves from /MetricHouse/.
- * Netlify, Vercel and Cloudflare Pages serve from the root, so leave it unset.
+ * Set DOCS_BASE only when the site is served from a sub path rather than the
+ * root of a domain. Vercel serves from the root, so it stays unset.
  */
 const base = process.env.DOCS_BASE ?? '/'
 
 /**
- * Where the site is served from, without a trailing slash. Used by the sitemap,
- * by robots.txt and by llms.txt, so all three agree about their own URLs.
+ * Where the site is served from, without a trailing slash. The sitemap,
+ * robots.txt and llms.txt all name it, so they agree about their own URLs.
+ *
+ * `DOCS_HOSTNAME` wins, and is the override for a host that cannot say where it
+ * serves from. Failing that, a Vercel build publishes its own production domain
+ * to the build, so nothing has to be configured there. Failing both, this is a
+ * local build, and the preview server is the honest answer: better a URL that
+ * is plainly local than one claiming a host the files never reached.
  */
-const SITE = (process.env.DOCS_HOSTNAME ?? 'https://thebigj3.github.io').replace(/\/$/, '')
+const vercelHost = process.env.VERCEL_PROJECT_PRODUCTION_URL
+const detected = vercelHost ? `https://${vercelHost}` : 'http://localhost:4173'
+const SITE = (process.env.DOCS_HOSTNAME ?? detected).replace(/\/$/, '')
 
 export default defineConfig({
   base,

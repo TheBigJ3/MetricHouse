@@ -31,6 +31,7 @@ guide/            concepts, from what it is to how to deploy it
 primitives/       one page per metric type
 examples/         complete small setups
 reference/        API index, field types, configuration, driver contract
+vercel.json       the build command and the output directory, for Vercel
 ```
 
 ## The logo
@@ -63,7 +64,9 @@ says what the library does. The mark is inline SVG coloured by
 Generated at the end of a build by `.vitepress/crawlers.ts`, not checked in,
 because each one has to name the host the site is served from. `DOCS_HOSTNAME`
 decides that once and the sitemap, the three files and the social tags all
-agree. It defaults to the GitHub Pages URL.
+agree. On Vercel it is not needed: the build reads its own production domain
+from `VERCEL_PROJECT_PRODUCTION_URL`. A build with neither uses
+`http://localhost:4173`, so a local build never claims a real host.
 
 | File | What it is |
 | --- | --- |
@@ -146,19 +149,28 @@ Figures are written as raw HTML so they can carry a caption:
 
 ## Deploying
 
-The site is static. `pnpm --filter @metrichouse/docs build` writes
-`docs/.vitepress/dist`, which any static host will serve.
+The site is static. A build writes `docs/.vitepress/dist`, which any static host
+will serve. No workflow deploys it: the host builds it from the repository on
+every push, and CI builds it too, so a broken site fails a check before it is
+published.
 
-**GitHub Pages** is wired up in `.github/workflows/docs.yml`. It builds on every
-push to `main` that touches `docs/`, and sets `DOCS_BASE=/MetricHouse/` so asset
-paths resolve under the repository sub path. Enable it once under Settings,
-Pages, Source, GitHub Actions.
+**Vercel** is where it is deployed. The project's root directory is `docs`, so
+Vercel reads `docs/vercel.json` and that file holds both settings it needs.
 
-**Netlify, Vercel or Cloudflare Pages** serve from the root, so leave `DOCS_BASE`
-unset.
+| Setting | Value | Where it comes from |
+| --- | --- | --- |
+| Root directory | `docs` | the Vercel project settings |
+| Build command | `pnpm run build` | `vercel.json` |
+| Output directory | `.vitepress/dist` | `vercel.json`, relative to the root directory |
 
-| Setting | Value |
-| --- | --- |
-| Build command | `pnpm install && pnpm --filter @metrichouse/docs build` |
-| Output directory | `docs/.vitepress/dist` |
-| Node version | 20 or newer |
+Two things are worth knowing about that layout. `pnpm install` runs against the
+workspace lockfile one level up and installs the site's own dependencies, which
+is all a build needs, because the pages are markdown and the playgrounds import
+nothing from the library. And the output directory is relative to the root
+directory, so it is `.vitepress/dist` rather than `docs/.vitepress/dist`. Naming
+`dist` is the mistake that looks right and fails.
+
+**Another host** needs the same two values, plus `DOCS_HOSTNAME` set to the URL
+it serves from, since only Vercel publishes its own domain to the build. Set
+`DOCS_BASE` as well if that host serves the site from a sub path rather than the
+root of a domain. Vercel serves from the root, so it stays unset.
