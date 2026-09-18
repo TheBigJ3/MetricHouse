@@ -45,7 +45,7 @@ export default defineConfig({
       {
         property: 'og:description',
         content:
-          'A metrics library for TypeScript that captures data now and lets you store it anywhere.',
+          'A metrics library for TypeScript that fits the stack you already have and lets you store the data anywhere.',
       },
     ],
     ['meta', { property: 'og:image', content: `${SITE}${base}logo-512.png` }],

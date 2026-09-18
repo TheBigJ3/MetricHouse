@@ -2,8 +2,8 @@
 layout: home
 
 hero:
-  text: Metrics you capture now, stored wherever you want
-  tagline: A small TypeScript library that counts things, records events and times operations. It hands you finished rows and lets you decide where they go.
+  text: Analytics that fit the stack you already have
+  tagline: A small TypeScript library that counts things, records events and times operations. You can read the numbers live, and it hands you finished rows to store however you like.
   actions:
     - theme: brand
       text: Get started
@@ -72,12 +72,17 @@ await pageViews.current({ path: '/pricing' })   // 1
 
 ## What it is for
 
-Some information is gone forever if you do not record it as it happens. How many
-requests arrived in a given second. How many were errors. How long each one
-took. You cannot go back and work those out later.
+Adding analytics to a project usually means adopting someone else's stack: a
+hosted service that keeps your data, a cluster you run yourself, or a collector
+service to feed. Those tools expect to be chosen early, and fitting one into an
+application that already exists is hard.
 
-MetricHouse captures that information cheaply, groups it into time windows, and
-hands you the finished rows. It does not query, chart or store anything itself.
+MetricHouse is a TypeScript library that runs inside your own code. You call
+`add()` wherever something happens. It groups those calls into time windows and
+keeps a running total for each one, which your code can read at any moment.
+When it is time to write, it hands your function finished rows to store however
+your storage needs. Querying, charting and long term storage stay with the tools
+you already use.
 
 If you want a full explanation of the idea before writing code, read
 [What MetricHouse is](/guide/what-is-metrichouse). If you would rather see it

@@ -1,8 +1,22 @@
 # metrichouse
 
-A metric collection layer for TypeScript that owns the parts of metrics a query
-can never reconstruct — bucket boundaries, atomic aggregation, durable staging,
-flush — and refuses to own anything else.
+A metric collection layer for TypeScript that fits into the stack you already
+have. It collects your counts, events and timings, lets you read them live, and
+hands you finished rows to store however your storage needs.
+
+## Why
+
+Most analytics tools want to be chosen before the rest of your stack. Hosted
+ones keep your data and report it late. Self hosted ones bring a cluster to run,
+such as ClickHouse, Kafka and Postgres. Observability libraries expect a
+collector or a Prometheus server around them. And none of them lets your own
+code ask what the number is right now, across every server.
+
+MetricHouse is a library with no runtime dependencies, and it runs in your
+process. You keep the most important part: how the data is written, where it
+lives and what you do with it. MetricHouse handles collection: bucketing, atomic
+aggregation, durable staging and flush. The full comparison is in
+[What MetricHouse is](https://www.metrichouse.dev/guide/what-is-metrichouse).
 
 ```bash
 npm install metrichouse
@@ -14,8 +28,9 @@ Full documentation: **[www.metrichouse.dev](https://www.metrichouse.dev/guide/ge
 
 > The chef cooks the food. Someone else plates it.
 
-MetricHouse owns anything **lost forever if not captured at write time**. It
-refuses anything **derivable at query time**.
+MetricHouse handles the work that can only happen **at write time**. Work that
+is **derivable at query time**, such as an average or a percentile, stays with
+your database.
 
 - There is a `counter` primitive, because discarded increments cannot be
   recovered. There is **no histogram**, because `quantile()` is a `SELECT`.

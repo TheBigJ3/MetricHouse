@@ -1,7 +1,7 @@
 {
   "name": "metrichouse",
   "version": "0.1.0",
-  "description": "Metric collection that owns bucketing, aggregation and flush \u2014 and nothing a query can reconstruct.",
+  "description": "Lightweight metric collection for TypeScript that fits the stack you already have: it buckets, aggregates and hands you rows to store anywhere.",
   "license": "MIT",
   "author": "TheBigJ3",
   "homepage": "https://github.com/TheBigJ3/MetricHouse#readme",
