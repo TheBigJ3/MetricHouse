@@ -1,6 +1,7 @@
 # API index
 
-Everything the package exports, grouped by what you would reach for it.
+Everything the package exports, and every method on the objects those exports
+return, grouped by what you would reach for it.
 
 ## Entry points
 
@@ -43,19 +44,127 @@ in [Field types](/reference/field-types).
 
 | Export | What it does |
 | --- | --- |
-| `createHouse(config)` | Binds a driver to a schema |
+| `createHouse(config)` | Binds a driver to a schema and returns a house. Its methods are in [The house](#the-house) below |
 | `createScheduler(options)` | The timer machinery behind `house.start()` |
+
+A house makes its own scheduler, so you only need `createScheduler()` to put
+metrics on timers without a house. It returns a `Scheduler` with these members.
+
+| Member | What it does |
+| --- | --- |
+| `scheduler.start()` | Starts one interval per metric, at that metric's `flushMs`. Calling it again does nothing |
+| `scheduler.add(metric)` | Schedules a metric that arrived after `start()`. Does nothing while stopped |
+| `scheduler.stop()` | Clears every interval. It does not flush |
+| `scheduler.running` | `true` between `start()` and `stop()` |
+
+## The house
+
+Everything on the object `createHouse()` returns.
+[The house](/guide/the-house) walks through each one with examples, and
+[Flushing](/guide/flushing) covers the scheduler behind `start()` and `stop()`.
+
+| Member | Returns | What it does |
+| --- | --- | --- |
+| `house.register(...metrics)` | `void` | Adds metrics after startup. Throws if a metric is already bound to a house, this one included, or if another metric has its name |
+| `house.metrics()` | `AnyMetric[]` | Every registered metric, in the order they were registered |
+| `house.get(name)` | `AnyMetric \| undefined` | One metric by name |
+| `house.delivery` | `DeliveryMode` | `'staged'` or `'immediate'`. A house configured with `'auto'` has already picked one |
+| `house.flush(options?)` | `Promise<FlushReport>` | Flushes every metric, one after another. Each still waits for its own cadence unless you pass `force` |
+| `house.start()` | `void` | Gives every metric a timer that flushes it at its own cadence. Calling it again does nothing |
+| `house.running` | `boolean` | `true` between `start()` and `stop()` |
+| `house.stop()` | `Promise<FlushReport>` | Clears the timers, waits for queued writes to reach the driver, then flushes every metric ignoring cadence |
+| `house.drain()` | `Promise<void>` | Resolves once every queued write has reached the driver |
+| `house.snapshot(options?)` | `Promise<HouseSnapshot>` | Every metric's unshipped rows, keyed by metric name |
+| `house.current()` | `Promise<HouseSnapshot>` | Only the windows still filling, for counters, gauges and timers |
+
+`start()` is for a server that stays running. On serverless and edge platforms
+the process is frozen between requests, so the timers never fire. Call
+`house.flush()` from a scheduled job there instead.
+
+## Every metric
+
+Every metric type has these members, whatever it measures.
+
+| Member | Returns | What it does |
+| --- | --- | --- |
+| `metric.name` | `string` | The name it was declared with |
+| `metric.kind` | `MetricKind` | `'counter'`, `'gauge'`, `'event'`, `'log'` or `'timer'` |
+| `metric.storage` | `StorageModel` | `'bucketed'` for types that fold writes into time windows, `'staged'` for types that keep every record |
+| `metric.dims` | `Shape` | The declared dimensions |
+| `metric.resolutionMs` | `number` | How wide one time window is, in milliseconds |
+| `metric.flushMs` | `number` | The shortest gap allowed between two shipments, in milliseconds |
+| `metric.graceMs` | `number` | How long a late write may still land in a closed window, in milliseconds |
+| `metric.isBound` | `boolean` | Whether a house has registered it yet |
+| `metric.write` | `WriteFn` | The write function it was declared with |
+| `metric.flush(options?)` | `Promise<MetricFlushReport>` | Ships everything finished to its write function, if its cadence allows. Needs no house |
+| `metric.drain()` | `Promise<void>` | Resolves once this metric's queued writes have reached the driver |
+| `metric.snapshot(options?)` | `Promise<LiveRow[]>` | Everything unshipped, as rows |
+| `metric.rowShape()` | `RowShape` | The columns your write function will receive, in order |
+| `metric.bind(binding)` | `void` | Connects the metric to a house's driver, clock and defaults. `createHouse()` and `house.register()` call it for you |
+
+An event or a log keeps records whole rather than folding them into windows, so
+it reports an empty `dims`, a `resolutionMs` of `1` and a `graceMs` of `0`.
+
+Five more methods move a batch through a flush: `recoverBatch()`,
+`claimBatch(nowMs)`, `materializeClaim(claim)`, `ackBatch(claim)` and
+`releaseBatch(claim)`. `metric.flush()` calls the first three in that order,
+then `ackBatch()` when the write function succeeds or `releaseBatch()` when it
+throws. You only write them yourself when adding a new metric type. See
+[Extension points](#extension-points).
+
+Some types add properties of their own.
+
+| Property | On | What it holds |
+| --- | --- | --- |
+| `isFloat` | counter | `true` when declared with `value: float()`, so fractional deltas are allowed |
+| `aggregate` | gauge, timer | The aggregates each window stores |
+| `record` | timer | The name of the event it also records each timing to, or `undefined` |
+| `fields` | event, log | The declared record fields |
+| `stage` | event, log | Where records wait, `'driver'` or `'local'` |
+| `levels` | log | The declared levels, lowest severity first |
+| `minLevel` | log | The lowest level it keeps |
+
+## Writing
+
+| Method | What it does |
+| --- | --- |
+| `counter.add(delta?, dims?)` | Adds `delta` to the open window, or 1 when you leave it out. `delta` may be negative |
+| `gauge.set(value, dims?)` | Records one observation into the open window |
+| `timer.time(dims?, fn)` | Runs `fn`, records how long it took, and returns what `fn` returned |
+| `timer.start(dims?)` | Starts a timing and returns a handle |
+| `handle.end(dims?)` | Stops the timing, records it, and returns the milliseconds. A second call records nothing |
+| `handle.elapsed()` | Milliseconds so far, without stopping |
+| `timer.observe(ms, dims?)` | Records a duration measured somewhere else |
+| `event.record(fields, options?)` | Stages one record. `options.at` sets its timestamp |
+| `event.recordMany(records, options?)` | Stages several records in one round trip |
+| `log.info(message, fields?)` | One method per declared level, so `log.info()` exists only when `info` is declared. The default levels are `debug`, `info`, `warn` and `error` |
+| `log.at(level, message, fields?)` | Writes at a level chosen while the program runs. Throws if the level was not declared |
+| `log.child(fields)` | A logger that adds `fields` to every line it writes |
+
+`dims?` may be left out only on a metric that declares no dimensions, or on a
+timer handle whose `start()` already supplied them. A log `message` may be a
+string or an `Error`, and an `Error` fills the `error_stack` column. A child
+logger has the same level methods, `at()` and `child()`, plus `bound`, the
+fields it adds to every line.
+
+Every write method returns before storage has confirmed anything. Call `drain()`
+on the metric or the house when you need to know a write landed. The page for
+each type has the details: [counter](/primitives/counter),
+[gauge](/primitives/gauge), [timer](/primitives/timer),
+[event](/primitives/event) and [log](/primitives/log).
 
 ## Reading
 
-| Export | What it does |
+| Method | What it does |
 | --- | --- |
-| `metric.current(...)` | The window still filling |
+| `counter.current(dims?)` | The open window for one series, or every series added together when you leave out `dims` |
+| `gauge.current(dims?)`, `timer.current(dims?)` | The open window's fold for one series, or `undefined` if nothing was observed |
+| `gauge.totals()`, `timer.totals()` | Every series in the open window merged into one fold, without `last` |
 | `metric.snapshot(options?)` | Everything unshipped, as rows |
 | `house.snapshot(options?)` | The same across every metric |
 | `house.current()` | Just the open windows, folded metrics only |
-| `event.pending()` | How many records are staged |
-| `event.peek(n?)` | The first n staged records, without consuming them |
+| `event.pending()`, `log.pending()` | How many records are staged |
+| `event.peek(n?)`, `log.peek(n?)` | The first n staged records, without consuming them |
 
 ## Identity
 
@@ -93,6 +202,7 @@ were written by the old one and will never converge with new ones.
 | `isBucketClaim(claim)` | Is this claim folded data |
 | `isRecordClaim(claim)` | Is this claim staged records |
 | `isEmptyClaim(claim)` | Does this claim carry nothing |
+| `NOTHING_RECOVERED` | A `RecoveryReport` of zeros, for a driver whose `recover()` has nothing to put back |
 
 ## Extension points
 
@@ -123,6 +233,7 @@ All of these are exported as types from `metrichouse/core`.
 `Counter`, `CounterConfig`, `CounterRow`, `CounterLiveRow`,
 `Gauge`, `GaugeConfig`, `GaugeRow`, `GaugeLiveRow`, `GaugeAggregate`, `GaugeTotals`,
 `Event`, `EventConfig`, `EventRow`, `EventLiveRow`, `EventStage`, `EventBatchConfig`,
+`DeriveFn`, `DeriveTarget`,
 `Log`, `LogConfig`, `LogLiveRow`, `LogWriters`, `ChildLog`, `LogFieldsArgs`, `DefaultLogLevels`,
 `Timer`, `TimerConfig`, `TimerHandle`, `TimeArgs`
 
@@ -149,7 +260,11 @@ All of these are exported as types from `metrichouse/core`.
 **Drivers**
 `Driver`, `DriverCapabilities`, `Cell`, `GaugeCell`, `BucketRow`, `BucketQuery`,
 `PendingQuery`, `StagedRecord`, `Claim`, `BucketClaim`, `RecordClaim`,
-`ClaimedBucket`, `IncrOp`, `GaugeOp`, `AppendOp`, `Hasher`
+`ClaimedBucket`, `IncrOp`, `GaugeOp`, `AppendOp`, `RecoveryReport`, `Hasher`
+
+**Extension points**
+`BatchLifecycle`, `BucketedOptions`, `BucketedReader`, `BucketedReaderOptions`,
+`OpenSeriesShip`, `ShipOutcome`
 
 **Driver entry points**
 `MemoryDriverOptions` from `metrichouse/memory`.
