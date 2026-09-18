@@ -8,3 +8,9 @@ field types and the driver contract. There is no separate spec.
   same change. Docs describe what the code does, never what is planned.
 - Follow the writing rules in `docs/README.md`.
 - `pnpm check` runs everything CI runs.
+
+
+# Commits
+
+When working on a feature commit as you go (unless instructed not to) 
+Never add yourself as a contributor
