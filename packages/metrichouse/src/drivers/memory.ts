@@ -21,7 +21,10 @@ import {
   type GaugeOp,
   type IncrOp,
   isGaugeCell,
+  isLevelCell,
   isRecordClaim,
+  type LevelOp,
+  type LevelSeries,
   NOTHING_RECOVERED,
   type PendingQuery,
   type RecordClaim,
@@ -37,9 +40,12 @@ import {
  * aggregates merge without caring about order.
  */
 function mergeCells(older: Cell, newer: Cell): Cell {
-  if (!isGaugeCell(older) && !isGaugeCell(newer)) return older + newer
+  // a level does not accumulate: two cells for one window are the same
+  // reading taken twice, and the later one is the one that is still true
+  if (isLevelCell(older) && isLevelCell(newer)) return newer
+  if (typeof older === 'number' && typeof newer === 'number') return older + newer
   if (!isGaugeCell(older) || !isGaugeCell(newer)) {
-    throw new Error('memory driver: cannot merge a counter cell with a gauge cell')
+    throw new Error('memory driver: cannot merge cells of two different kinds')
   }
 
   return {
@@ -103,6 +109,16 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
    */
   const staged = new Map<string, StagedRecord[]>()
 
+  /**
+   * metric -> dimKey -> the value that series holds, and how far it has been
+   * carried.
+   *
+   * Beside the bucket tree rather than in it, because a claim must never take
+   * it: the whole reason a level can report a window nobody wrote to is that
+   * this survives the flush that shipped the last one.
+   */
+  const levels = new Map<string, Map<string, LevelSeries>>()
+
   const inFlight = new Map<string, Claim>()
   let claimSeq = 0
 
@@ -116,6 +132,15 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       staged.set(metric, records)
     }
     return records
+  }
+
+  function levelsFor(metric: string): Map<string, LevelSeries> {
+    let series = levels.get(metric)
+    if (!series) {
+      series = new Map()
+      levels.set(metric, series)
+    }
+    return series
   }
 
   /** Staged plus in-flight — a claim that is never acked still occupies memory. */
@@ -206,9 +231,10 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           bucket.set(op.dimKey, op.delta)
           continue
         }
-        if (isGaugeCell(existing)) {
+        if (typeof existing !== 'number') {
           throw new Error(
-            `memory driver: ${op.metric} holds gauge cells — increment is a counter op`,
+            `memory driver: ${op.metric} holds ${isGaugeCell(existing) ? 'gauge' : 'level'} ` +
+              'cells — increment is a counter op',
           )
         }
 
@@ -232,7 +258,10 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           continue
         }
         if (!isGaugeCell(existing)) {
-          throw new Error(`memory driver: ${op.metric} holds counter cells — observe is a gauge op`)
+          throw new Error(
+            `memory driver: ${op.metric} holds ${isLevelCell(existing) ? 'level' : 'counter'} ` +
+              'cells — observe is a gauge op',
+          )
         }
 
         // read-modify-write: min, max and last are not increments
@@ -244,6 +273,76 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           count: existing.count + 1,
         })
       }
+    },
+
+    async setLevel(ops: readonly LevelOp[]): Promise<void> {
+      for (const op of ops) {
+        const series = levelsFor(op.metric)
+        const held = series.get(op.dimKey)
+
+        if (op.mode === 'hold') {
+          // nothing held is nothing to carry. A zero here would draw a line
+          // on a chart for a series that has never been written
+          if (!held) continue
+
+          const bucket = cellSlot(op.metric, op.bucketTs, op.dimKey)
+          // an observed value always beats a carried one, so a window that
+          // already has a cell keeps it
+          if (!bucket.has(op.dimKey)) bucket.set(op.dimKey, { level: held.value })
+
+          series.set(op.dimKey, {
+            ...held,
+            heldThrough: Math.max(held.heldThrough, op.bucketTs),
+          })
+          continue
+        }
+
+        if (!held && series.size >= maxSeries) {
+          throw new Error(
+            `memory driver: ${op.metric} exceeded maxSeries (${maxSeries}) — ` +
+              'a dim with unbounded values will do this; put it on an event instead',
+          )
+        }
+
+        const value = op.mode === 'add' ? (held?.value ?? 0) + op.value : op.value
+
+        // the bucket first, because `cellSlot` is the other thing that can
+        // refuse on the cap, and a held value written before it would name a
+        // window that holds nothing
+        const bucket = cellSlot(op.metric, op.bucketTs, op.dimKey)
+        const occupant = bucket.get(op.dimKey)
+        if (occupant !== undefined && !isLevelCell(occupant)) {
+          throw new Error(
+            `memory driver: ${op.metric} holds ${isGaugeCell(occupant) ? 'gauge' : 'counter'} ` +
+              'cells — set is a level op',
+          )
+        }
+        bucket.set(op.dimKey, { level: value })
+
+        series.set(op.dimKey, {
+          dimKey: op.dimKey,
+          value,
+          writtenAt: Math.max(held?.writtenAt ?? op.bucketTs, op.bucketTs),
+          // a write never moves the pointer. The windows between this write
+          // and the last one are still owed a row, and only a `hold` may say
+          // they have had one
+          heldThrough: held?.heldThrough ?? op.bucketTs,
+        })
+      }
+    },
+
+    async readLevels(metric: string): Promise<LevelSeries[]> {
+      const series = levels.get(metric)
+      if (!series) return []
+      return [...series.values()].sort((a, b) => (a.dimKey < b.dimKey ? -1 : 1))
+    },
+
+    async dropLevels(metric: string, dimKeys: readonly string[]): Promise<void> {
+      const series = levels.get(metric)
+      if (!series) return
+
+      for (const dimKey of dimKeys) series.delete(dimKey)
+      if (series.size === 0) levels.delete(metric)
     },
 
     async append(ops: readonly AppendOp[]): Promise<void> {

@@ -38,6 +38,8 @@ import {
   type GaugeOp,
   type IncrOp,
   isRecordClaim,
+  type LevelOp,
+  type LevelSeries,
   NOTHING_RECOVERED,
   type PendingQuery,
   type RecordClaim,
@@ -60,6 +62,7 @@ export interface IoredisClient {
   hget(key: string, field: string): Promise<string | null>
   hgetall(key: string): Promise<Record<string, string>>
   hkeys(key: string): Promise<string[]>
+  hdel(key: string, ...fields: string[]): Promise<number>
   llen(key: string): Promise<number>
   lrange(key: string, start: number, stop: number): Promise<string[]>
   zrangebyscore(key: string, min: string | number, max: string | number): Promise<string[]>
@@ -139,8 +142,11 @@ const DEFAULT_RECOVER_AFTER = 300_000
  * the trip unchanged.
  */
 const LUA_HELPERS = `
+-- nil when the field is empty, a five-number table for a gauge fold, the
+-- string 'level' for a level cell, and false for a counter's bare scalar
 local function mh_parse(v)
   if v == false or v == nil then return nil end
+  if string.sub(v, 1, 1) == '@' then return 'level' end
   local a,b,c,d,e = string.match(v, '^([^|]+)|([^|]+)|([^|]+)|([^|]+)|([^|]+)$')
   if a == nil then return false end
   return { tonumber(a), tonumber(b), tonumber(c), tonumber(d), tonumber(e) }
@@ -148,6 +154,16 @@ end
 
 local function mh_pack(l, mn, mx, s, c)
   return string.format('%.17g|%.17g|%.17g|%.17g|%.17g', l, mn, mx, s, c)
+end
+
+-- a level cell wears an '@' so storage can tell it from a counter's scalar,
+-- which is otherwise the same digits meaning the opposite thing on a merge
+local function mh_pack_level(v)
+  return '@' .. string.format('%.17g', v)
+end
+
+local function mh_is_level(v)
+  return v ~= false and v ~= nil and string.sub(v, 1, 1) == '@'
 end
 `
 
@@ -170,6 +186,9 @@ for i = 2, #ARGV, 2 do
   if cur == false then
     return redis.error_reply('MHKIND holds counter cells - observe is a gauge op')
   end
+  if cur == 'level' then
+    return redis.error_reply('MHKIND holds level cells - observe is a gauge op')
+  end
 
   if cur == nil then
     redis.call('HSET', KEYS[1], field, mh_pack(v, v, v, v, 1))
@@ -185,6 +204,114 @@ for i = 2, #ARGV, 2 do
 end
 redis.call('ZADD', KEYS[2], ARGV[1], ARGV[1])
 return 1
+`
+
+/**
+ * The level state for one series, packed as `value|writtenAt|heldThrough`.
+ *
+ * Its own hash per metric, never touched by a claim. That is the whole reason
+ * a level can ship a row for a window nobody wrote to: the number outlives
+ * the flush that shipped the last one.
+ */
+const LUA_LEVEL_STATE = `
+local function mh_read_state(key, field)
+  local raw = redis.call('HGET', key, field)
+  if raw == false then return nil end
+  local v, w, h = string.match(raw, '^([^|]+)|([^|]+)|([^|]+)$')
+  if v == nil then return nil end
+  return { tonumber(v), tonumber(w), tonumber(h) }
+end
+
+local function mh_write_state(key, field, value, writtenAt, heldThrough)
+  redis.call('HSET', key, field, string.format('%.17g|%d|%d', value, writtenAt, heldThrough))
+end
+`
+
+/**
+ * Put a level at a value, or move it by one, and record the same number in
+ * the bucket the write landed in.
+ *
+ * One script rather than two round trips because the two have to agree: a
+ * held value written without its bucket reports a level no window carries,
+ * and a bucket written without the held value is a level that forgets itself
+ * at the next flush.
+ *
+ * The pointer is deliberately left alone. Windows between this write and the
+ * previous one are still owed a row, and only a hold may say they have had
+ * one.
+ *
+ * KEYS: bucket hash, bucket index, level hash. ARGV: bucketTs, mode, then
+ * dimKey/value pairs.
+ */
+const SET_LEVEL = `${LUA_HELPERS}${LUA_LEVEL_STATE}
+local bucketTs = tonumber(ARGV[1])
+
+for i = 3, #ARGV, 2 do
+  local field = ARGV[i]
+  local v = tonumber(ARGV[i + 1])
+  local state = mh_read_state(KEYS[3], field)
+
+  local value = v
+  if ARGV[2] == 'add' then
+    value = v
+    if state ~= nil then value = state[1] + v end
+  end
+
+  local cur = redis.call('HGET', KEYS[1], field)
+  if cur ~= false and not mh_is_level(cur) then
+    local held = 'counter'
+    if mh_parse(cur) ~= false then held = 'gauge' end
+    return redis.error_reply('MHKIND holds ' .. held .. ' cells - set is a level op')
+  end
+
+  redis.call('HSET', KEYS[1], field, mh_pack_level(value))
+
+  local writtenAt = bucketTs
+  local heldThrough = bucketTs
+  if state ~= nil then
+    if state[2] > writtenAt then writtenAt = state[2] end
+    heldThrough = state[3]
+  end
+  mh_write_state(KEYS[3], field, value, writtenAt, heldThrough)
+end
+
+redis.call('ZADD', KEYS[2], ARGV[1], ARGV[1])
+return 1
+`
+
+/**
+ * Carry each series' held value into one window that has none.
+ *
+ * Write-if-absent, so an observed value always beats a carried one: a set
+ * that raced this hold into the same window keeps the number somebody
+ * actually wrote.
+ *
+ * A series the metric asked to hold but storage has never seen is skipped.
+ * There is nothing to carry, and a zero would put a line on a chart for a
+ * queue that has never existed.
+ *
+ * KEYS: bucket hash, bucket index, level hash. ARGV: bucketTs, then dim keys.
+ */
+const HOLD_LEVEL = `${LUA_HELPERS}${LUA_LEVEL_STATE}
+local bucketTs = tonumber(ARGV[1])
+local carried = 0
+
+for i = 2, #ARGV do
+  local field = ARGV[i]
+  local state = mh_read_state(KEYS[3], field)
+
+  if state ~= nil then
+    if redis.call('HSETNX', KEYS[1], field, mh_pack_level(state[1])) == 1 then
+      carried = carried + 1
+    end
+    local heldThrough = state[3]
+    if bucketTs > heldThrough then heldThrough = bucketTs end
+    mh_write_state(KEYS[3], field, state[1], state[2], heldThrough)
+  end
+end
+
+if carried > 0 then redis.call('ZADD', KEYS[2], ARGV[1], ARGV[1]) end
+return carried
 `
 
 /**
@@ -276,7 +403,11 @@ local function mh_restore_buckets(inflight, prefix, idx)
     else
       local h = mh_parse(held)
       local c = mh_parse(cur)
-      if h == false and c == false then
+      if h == 'level' and c == 'level' then
+        -- a level does not accumulate. Both cells are the same window read
+        -- twice, and the one already live is the later of the two
+        local noop = true
+      elseif h == false and c == false then
         redis.call('HINCRBYFLOAT', key, field, held)
       elseif type(h) == 'table' and type(c) == 'table' then
         redis.call('HSET', key, field, mh_pack(
@@ -287,7 +418,7 @@ local function mh_restore_buckets(inflight, prefix, idx)
           h[5] + c[5]
         ))
       else
-        error(redis.error_reply('MHKIND cannot merge a counter cell with a gauge cell'))
+        error(redis.error_reply('MHKIND cannot merge cells of two different kinds'))
       end
     end
 
@@ -465,8 +596,10 @@ function decodeRecord(json: string): StagedRecord {
   }) as StagedRecord
 }
 
-/** A packed gauge fold, or a counter's scalar. */
+/** A packed gauge fold, a level's held value, or a counter's scalar. */
 function decodeCell(raw: string): Cell {
+  if (raw.startsWith('@')) return { level: Number(raw.slice(1)) }
+
   const parts = raw.split('|')
   if (parts.length !== 5) return Number(raw)
   return {
@@ -497,7 +630,9 @@ function typedError(error: unknown, metric: string): Error {
     return new Error(`ioredis driver: ${metric} ${message.slice(kind + 'MHKIND'.length).trim()}`)
   }
   if (message.includes('not a float') || message.includes('not an integer')) {
-    return new Error(`ioredis driver: ${metric} holds gauge cells — increment is a counter op`)
+    return new Error(
+      `ioredis driver: ${metric} holds gauge or level cells — increment is a counter op`,
+    )
   }
   return error instanceof Error ? error : new Error(message)
 }
@@ -511,6 +646,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     bucket: (metric: string, bucketTs: number | string) => `${ns}:b:${metric}:${bucketTs}`,
     bucketPrefix: (metric: string) => `${ns}:b:${metric}:`,
     idx: (metric: string) => `${ns}:idx:${metric}`,
+    levels: (metric: string) => `${ns}:lvl:${metric}`,
     records: (metric: string) => `${ns}:e:${metric}`,
     inflight: (claimId: string) => `${ns}:inflight:${claimId}`,
     claims: (metric: string) => `${ns}:claims:${metric}`,
@@ -719,6 +855,79 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       } catch (error) {
         throw typedError(error, ops[0]?.metric ?? 'unknown')
       }
+    },
+
+    async setLevel(ops: readonly LevelOp[]): Promise<void> {
+      if (ops.length === 0) return
+
+      // grouped by bucket for the same reason `observe` is: one script, one
+      // hash, so the held value and the cell it names move together
+      interface Group {
+        readonly metric: string
+        readonly bucketTs: number
+        readonly mode: LevelOp['mode']
+        readonly args: (string | number)[]
+      }
+      const groups = new Map<string, Group>()
+
+      for (const op of ops) {
+        const groupKey = `${op.mode}\u0000${key.bucket(op.metric, op.bucketTs)}`
+        let group = groups.get(groupKey)
+        if (!group) {
+          group = {
+            metric: op.metric,
+            bucketTs: op.bucketTs,
+            mode: op.mode,
+            args: op.mode === 'hold' ? [op.bucketTs] : [op.bucketTs, op.mode],
+          }
+          groups.set(groupKey, group)
+        }
+        // a hold carries whatever storage already holds, so it sends no value
+        if (op.mode === 'hold') group.args.push(op.dimKey)
+        else group.args.push(op.dimKey, op.value)
+      }
+
+      try {
+        await runScripts(
+          [...groups.values()].map((group) => ({
+            script: group.mode === 'hold' ? HOLD_LEVEL : SET_LEVEL,
+            keys: [
+              key.bucket(group.metric, group.bucketTs),
+              key.idx(group.metric),
+              key.levels(group.metric),
+            ],
+            args: group.args,
+          })),
+          'setLevel',
+        )
+      } catch (error) {
+        throw typedError(error, ops[0]?.metric ?? 'unknown')
+      }
+    },
+
+    async readLevels(metric: string): Promise<LevelSeries[]> {
+      const client = await connect()
+      const flat = await client.hgetall(key.levels(metric))
+
+      const series: LevelSeries[] = []
+      for (const [dimKey, packed] of Object.entries(flat)) {
+        const parts = packed.split('|')
+        if (parts.length !== 3) continue
+        series.push({
+          dimKey,
+          value: Number(parts[0]),
+          writtenAt: Number(parts[1]),
+          heldThrough: Number(parts[2]),
+        })
+      }
+
+      return series.sort((a, b) => (a.dimKey < b.dimKey ? -1 : 1))
+    },
+
+    async dropLevels(metric: string, dimKeys: readonly string[]): Promise<void> {
+      if (dimKeys.length === 0) return
+      const client = await connect()
+      await client.hdel(key.levels(metric), ...dimKeys)
     },
 
     async append(ops: readonly AppendOp[]): Promise<void> {
