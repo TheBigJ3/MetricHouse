@@ -24,18 +24,18 @@ it lands in your database.
 
 ## Two storage styles
 
-The five metric types split into two groups, and the difference explains most of
+The six metric types split into two groups, and the difference explains most of
 the behaviour you will meet.
 
 <figure class="mh-figure">
   <img src="/diagrams/two-storage-models.svg" alt="Folded storage adds writes together into one number. Kept whole storage queues each record separately." />
-  <figcaption>Counters, gauges and timers fold. Events and logs stay whole.</figcaption>
+  <figcaption>Counters, gauges, levels and timers fold. Events and logs stay whole.</figcaption>
 </figure>
 
-**Folded.** A counter, a gauge and a timer combine writes into one value per
-window. A thousand increments in one second become one row that says `1000`.
-Memory use depends on how many different label combinations you have, not on how
-much traffic you get.
+**Folded.** A counter, a gauge, a level and a timer combine writes into one
+value per window. A thousand increments in one second become one row that says
+`1000`. Memory use depends on how many different label combinations you have,
+not on how much traffic you get.
 
 **Kept whole.** An event and a log keep every record. Two identical events are
 two rows, because the reason to use an event at all is the detail, and detail

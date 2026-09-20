@@ -5,7 +5,7 @@
  * driver *is* the specification: it is the one implementation small enough to
  * read in a sitting, and its behaviour is what the rest of the library was
  * written against. A new backend is not "a driver" because it satisfies the
- * TypeScript interface — a stub of thirteen `async () => {}` methods does that.
+ * TypeScript interface — a stub of sixteen `async () => {}` methods does that.
  * It is a driver when it passes this file.
  *
  * ```

@@ -103,7 +103,8 @@ resolves once every queued write has reached the driver.
 | Primitive | Measures | Storage |
 | --- | --- | --- |
 | `counter` | increments that cannot be recovered if discarded | aggregated |
-| `gauge` | a value over time, folded to `last`/`min`/`max`/`sum`/`count` | aggregated |
+| `gauge` | a value you sample, folded to `last`/`min`/`max`/`sum`/`count` | aggregated |
+| `level` | a value that holds between writes, carried into the windows nobody wrote to | aggregated |
 | `event` | records staged and shipped whole, never folded | staged |
 | `log` | an event with a level, a `minLevel` filter and a bound `child()` | staged |
 | `timer` | a gauge of durations, with `start()`, `time()` and `observe()` | aggregated |

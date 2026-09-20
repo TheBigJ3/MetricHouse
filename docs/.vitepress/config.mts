@@ -105,6 +105,7 @@ export default defineConfig({
           { text: 'Choosing one', link: '/primitives/' },
           { text: 'counter', link: '/primitives/counter' },
           { text: 'gauge', link: '/primitives/gauge' },
+          { text: 'level', link: '/primitives/level' },
           { text: 'event', link: '/primitives/event' },
           { text: 'log', link: '/primitives/log' },
           { text: 'timer', link: '/primitives/timer' },

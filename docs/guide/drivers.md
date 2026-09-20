@@ -184,7 +184,7 @@ export const house = createHouse({ driver, schema })
 
 ## Writing your own
 
-The `Driver` interface is thirteen methods. It is exported, so a driver for
+The `Driver` interface is sixteen methods. It is exported, so a driver for
 DynamoDB, Cloudflare Durable Objects, Postgres or anything else is an ordinary
 object.
 

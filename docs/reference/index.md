@@ -21,6 +21,7 @@ The package is marked side effect free, so a bundler removes what you do not use
 | --- | --- |
 | `counter` | `counter(name, config): Counter` |
 | `gauge` | `gauge(name, config): Gauge` |
+| `level` | `level(name, config): Level` |
 | `event` | `event(name, config): Event` |
 | `log` | `log(name, config): Log` |
 | `timer` | `timer(name, config): Timer` |
@@ -75,7 +76,7 @@ Everything on the object `createHouse()` returns.
 | `house.stop()` | `Promise<FlushReport>` | Clears the timers, waits for queued writes to reach the driver, then flushes every metric ignoring cadence |
 | `house.drain()` | `Promise<void>` | Resolves once every queued write has reached the driver |
 | `house.snapshot(options?)` | `Promise<HouseSnapshot>` | Every metric's unshipped rows, keyed by metric name |
-| `house.current()` | `Promise<HouseSnapshot>` | Only the windows still filling, for counters, gauges and timers |
+| `house.current()` | `Promise<HouseSnapshot>` | Only the windows still filling, for counters, gauges, levels and timers |
 
 `start()` is for a server that stays running. On serverless and edge platforms
 the process is frozen between requests, so the timers never fire. Call
@@ -88,7 +89,7 @@ Every metric type has these members, whatever it measures.
 | Member | Returns | What it does |
 | --- | --- | --- |
 | `metric.name` | `string` | The name it was declared with |
-| `metric.kind` | `MetricKind` | `'counter'`, `'gauge'`, `'event'`, `'log'` or `'timer'` |
+| `metric.kind` | `MetricKind` | `'counter'`, `'gauge'`, `'level'`, `'event'`, `'log'` or `'timer'` |
 | `metric.storage` | `StorageModel` | `'bucketed'` for types that fold writes into time windows, `'staged'` for types that keep every record |
 | `metric.dims` | `Shape` | The declared dimensions |
 | `metric.resolutionMs` | `number` | How wide one time window is, in milliseconds |
@@ -116,8 +117,9 @@ Some types add properties of their own.
 
 | Property | On | What it holds |
 | --- | --- | --- |
-| `isFloat` | counter | `true` when declared with `value: float()`, so fractional deltas are allowed |
+| `isFloat` | counter, level | `true` when fractional writes are allowed. A counter is whole by default, a level fractional |
 | `aggregate` | gauge, timer | The aggregates each window stores |
+| `holdForMs` | level | How long a series keeps reporting after its last write, or `undefined` for forever |
 | `record` | timer | The name of the event it also records each timing to, or `undefined` |
 | `fields` | event, log | The declared record fields |
 | `stage` | event, log | Where records wait, `'driver'` or `'local'` |
@@ -130,6 +132,8 @@ Some types add properties of their own.
 | --- | --- |
 | `counter.add(delta?, dims?)` | Adds `delta` to the open window, or 1 when you leave it out. `delta` may be negative |
 | `gauge.set(value, dims?)` | Records one observation into the open window |
+| `level.set(value, dims?)` | Puts the series at `value`, where it stays until something changes it |
+| `level.inc(delta?, dims?)`, `level.dec(delta?, dims?)` | Moves the series by `delta`, or by 1. A series nothing has written to starts at zero |
 | `timer.time(dims?, fn)` | Runs `fn`, records how long it took, and returns what `fn` returned |
 | `timer.start(dims?)` | Starts a timing and returns a handle |
 | `handle.end(dims?)` | Stops the timing, records it, and returns the milliseconds. A second call records nothing |
@@ -150,8 +154,9 @@ fields it adds to every line.
 Every write method returns before storage has confirmed anything. Call `drain()`
 on the metric or the house when you need to know a write landed. The page for
 each type has the details: [counter](/primitives/counter),
-[gauge](/primitives/gauge), [timer](/primitives/timer),
-[event](/primitives/event) and [log](/primitives/log).
+[gauge](/primitives/gauge), [level](/primitives/level),
+[timer](/primitives/timer), [event](/primitives/event) and
+[log](/primitives/log).
 
 ## Reading
 
@@ -160,6 +165,8 @@ each type has the details: [counter](/primitives/counter),
 | `counter.current(dims?)` | The open window for one series, or every series added together when you leave out `dims` |
 | `gauge.current(dims?)`, `timer.current(dims?)` | The open window's fold for one series, or `undefined` if nothing was observed |
 | `gauge.totals()`, `timer.totals()` | Every series in the open window merged into one fold, without `last` |
+| `level.current(dims?)` | What one series is at now, or `undefined` if nothing has ever written to it. Read from the held value, not from the open window |
+| `level.totals()` | Every series added up, or `undefined` if none has been written to |
 | `metric.snapshot(options?)` | Everything unshipped, as rows |
 | `house.snapshot(options?)` | The same across every metric |
 | `house.current()` | Just the open windows, folded metrics only |
@@ -198,7 +205,8 @@ were written by the old one and will never converge with new ones.
 
 | Export | What it does |
 | --- | --- |
-| `isGaugeCell(cell)` | Is this stored value a gauge fold rather than a counter |
+| `isGaugeCell(cell)` | Is this stored value a gauge fold |
+| `isLevelCell(cell)` | Is this stored value a level's held value |
 | `isBucketClaim(claim)` | Is this claim folded data |
 | `isRecordClaim(claim)` | Is this claim staged records |
 | `isEmptyClaim(claim)` | Does this claim carry nothing |
@@ -221,6 +229,7 @@ the package. Most applications never touch them.
 | `snapshotRange(options, resolutionMs, nowMs)` | The window a snapshot should ask for |
 | `liveness(bucketTs, resolutionMs, nowMs)` | Is this window open, and how far into it are we |
 | `resolveDelivery(config, capabilities)` | Turn `'auto'` into a concrete mode |
+| `MAX_CARRY_BUCKETS` | The most windows one flush carries a level through, so returning from downtime leaves a gap |
 
 `log` is built on `stagedMetric`, and `timer` on `gauge`, so both are worked
 examples of what these are for.
@@ -232,6 +241,7 @@ All of these are exported as types from `metrichouse/core`.
 **Metric shapes**
 `Counter`, `CounterConfig`, `CounterRow`, `CounterLiveRow`,
 `Gauge`, `GaugeConfig`, `GaugeRow`, `GaugeLiveRow`, `GaugeAggregate`, `GaugeTotals`,
+`Level`, `LevelConfig`, `LevelRow`, `LevelLiveRow`,
 `Event`, `EventConfig`, `EventRow`, `EventLiveRow`, `EventStage`, `EventBatchConfig`,
 `DeriveFn`, `DeriveTarget`,
 `Log`, `LogConfig`, `LogRow`, `LogLiveRow`, `LogWriters`, `ChildLog`, `LogFieldsArgs`, `DefaultLogLevels`,
@@ -258,9 +268,9 @@ All of these are exported as types from `metrichouse/core`.
 `RequiredKeys`, `MarkOptional`, `Simplify`
 
 **Drivers**
-`Driver`, `DriverCapabilities`, `Cell`, `GaugeCell`, `BucketRow`, `BucketQuery`,
+`Driver`, `DriverCapabilities`, `Cell`, `GaugeCell`, `LevelCell`, `LevelSeries`, `BucketRow`, `BucketQuery`,
 `PendingQuery`, `StagedRecord`, `Claim`, `BucketClaim`, `RecordClaim`,
-`ClaimedBucket`, `IncrOp`, `GaugeOp`, `AppendOp`, `RecoveryReport`, `Hasher`
+`ClaimedBucket`, `IncrOp`, `GaugeOp`, `LevelOp`, `AppendOp`, `RecoveryReport`, `Hasher`
 
 **Extension points**
 `BatchLifecycle`, `BucketedOptions`, `BucketedReader`, `BucketedReaderOptions`,
