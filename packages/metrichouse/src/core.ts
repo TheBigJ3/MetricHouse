@@ -18,6 +18,9 @@ export type {
   GaugeCell,
   GaugeOp,
   IncrOp,
+  LevelCell,
+  LevelOp,
+  LevelSeries,
   PendingQuery,
   RecordClaim,
   RecoveryReport,
@@ -28,6 +31,7 @@ export {
   isBucketClaim,
   isEmptyClaim,
   isGaugeCell,
+  isLevelCell,
   isRecordClaim,
   NOTHING_RECOVERED,
 } from './drivers/types.js'
@@ -72,6 +76,13 @@ export type {
   GaugeTotals,
 } from './metrics/gauge.js'
 export { GAUGE_AGGREGATES, gauge } from './metrics/gauge.js'
+export type {
+  Level,
+  LevelConfig,
+  LevelLiveRow,
+  LevelRow,
+} from './metrics/level.js'
+export { level, MAX_CARRY_BUCKETS } from './metrics/level.js'
 export type {
   ChildLog,
   DefaultLogLevels,
