@@ -209,8 +209,11 @@ export function counter<D extends Shape = Record<never, never>>(
 
   /** The driver stores whatever a metric wrote; a counter only writes numbers. */
   function asCount(cell: Cell): number {
-    if (isGaugeCell(cell)) {
-      throw new Error(`${name}: expected a counter cell but the driver returned a gauge fold`)
+    if (typeof cell !== 'number') {
+      throw new Error(
+        `${name}: expected a counter cell but the driver returned a ` +
+          `${isGaugeCell(cell) ? 'gauge fold' : 'level'}`,
+      )
     }
     return cell
   }

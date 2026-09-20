@@ -25,12 +25,14 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Driver, DriverCapabilities, GaugeCell } from './types.js'
-import { isGaugeCell } from './types.js'
+import { isGaugeCell, isLevelCell } from './types.js'
 
 /** A counter metric, and two series inside it. */
 const M = 'dog_poops'
 /** A gauge metric. Separate from {@link M}: one metric holds one kind. */
 const G = 'dog_weight'
+/** A level metric. Separate again, for the same reason. */
+const L = 'dogs_in_park'
 const WILLOW = 'Willow|riverside'
 const REX = 'Rex|central'
 
@@ -75,6 +77,24 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       if (!row) throw new Error(`no cell at ${bucketTs}/${dimKey}`)
       if (!isGaugeCell(row.value)) throw new Error(`expected a gauge cell, got ${row.value}`)
       return row.value
+    }
+
+    const put = (bucketTs: number, dimKey: string, value: number) =>
+      driver.setLevel([{ metric: L, bucketTs, dimKey, value, mode: 'set' }])
+
+    const move = (bucketTs: number, dimKey: string, value: number) =>
+      driver.setLevel([{ metric: L, bucketTs, dimKey, value, mode: 'add' }])
+
+    const hold = (bucketTs: number, dimKey: string) =>
+      driver.setLevel([{ metric: L, bucketTs, dimKey, value: 0, mode: 'hold' }])
+
+    /** The one cell at a bucket and series, narrowed to a level. */
+    const levelAt = async (bucketTs: number, dimKey: string): Promise<number | undefined> => {
+      const rows = await driver.readBuckets({ metric: L, dimKey })
+      const row = rows.find((r) => r.bucketTs === bucketTs)
+      if (!row) return undefined
+      if (!isLevelCell(row.value)) throw new Error(`expected a level cell, got ${row.value}`)
+      return row.value.level
     }
 
     const rec = (id: string, ts: number, fields: Record<string, unknown> = {}) => ({
@@ -243,6 +263,171 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await expect(
           driver.increment([{ metric: G, bucketTs: 1000, dimKey: WILLOW, delta: 1 }]),
         ).rejects.toThrow()
+      })
+    })
+
+    describe('setLevel', () => {
+      it('puts a series at a value and records it in that bucket', async () => {
+        await put(1000, WILLOW, 42)
+
+        expect(await levelAt(1000, WILLOW)).toBe(42)
+        expect(await driver.readLevels(L)).toEqual([
+          { dimKey: WILLOW, value: 42, writtenAt: 1000, heldThrough: 1000 },
+        ])
+      })
+
+      it('replaces rather than accumulates within one bucket', async () => {
+        await put(1000, WILLOW, 42)
+        await put(1000, WILLOW, 7)
+
+        expect(await levelAt(1000, WILLOW)).toBe(7)
+      })
+
+      it('moves a series by a delta, treating an untouched one as zero', async () => {
+        await move(1000, WILLOW, 3)
+        await move(1000, WILLOW, 4)
+        await move(1000, WILLOW, -2)
+
+        expect(await levelAt(1000, WILLOW)).toBe(5)
+      })
+
+      it('carries the held value into the next bucket on a hold', async () => {
+        await put(1000, WILLOW, 42)
+        await hold(2000, WILLOW)
+
+        expect(await levelAt(2000, WILLOW)).toBe(42)
+      })
+
+      it('leaves a bucket that already holds a value alone', async () => {
+        // an observed value beats a carried one, whichever lands second
+        await put(1000, WILLOW, 42)
+        await put(2000, WILLOW, 7)
+        await hold(2000, WILLOW)
+
+        expect(await levelAt(2000, WILLOW)).toBe(7)
+      })
+
+      it('holds nothing for a series it has never seen', async () => {
+        await hold(1000, WILLOW)
+
+        expect(await levelAt(1000, WILLOW)).toBeUndefined()
+        expect(await driver.readLevels(L)).toEqual([])
+      })
+
+      it('moves the pointer on a hold and never on a write', async () => {
+        await put(1000, WILLOW, 42)
+        await put(5000, WILLOW, 7)
+
+        // the windows between the two writes are still owed a row
+        expect((await driver.readLevels(L))[0]?.heldThrough).toBe(1000)
+
+        await hold(2000, WILLOW)
+        expect((await driver.readLevels(L))[0]?.heldThrough).toBe(2000)
+      })
+
+      it('keeps the newest write time', async () => {
+        await put(1000, WILLOW, 42)
+        await put(5000, WILLOW, 7)
+
+        expect((await driver.readLevels(L))[0]?.writtenAt).toBe(5000)
+      })
+
+      it('keeps series apart', async () => {
+        await put(1000, WILLOW, 42)
+        await put(1000, REX, 7)
+
+        expect(await driver.readLevels(L)).toEqual([
+          { dimKey: REX, value: 7, writtenAt: 1000, heldThrough: 1000 },
+          { dimKey: WILLOW, value: 42, writtenAt: 1000, heldThrough: 1000 },
+        ])
+      })
+
+      it('handles negative and fractional values', async () => {
+        await put(1000, WILLOW, -2.5)
+        await move(1000, WILLOW, 1.25)
+
+        expect(await levelAt(1000, WILLOW)).toBeCloseTo(-1.25)
+      })
+
+      it('keeps full float precision', async () => {
+        await put(1000, WILLOW, 0.1)
+        await move(1000, WILLOW, 0.2)
+
+        expect(await levelAt(1000, WILLOW)).toBe(0.30000000000000004)
+      })
+
+      it('does nothing on an empty batch', async () => {
+        await driver.setLevel([])
+        expect(await driver.readBuckets({ metric: L })).toEqual([])
+      })
+
+      it('refuses to set a series holding cells of another kind', async () => {
+        await driver.increment([{ metric: L, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+        await expect(put(1000, WILLOW, 5)).rejects.toThrow()
+      })
+
+      it('refuses to increment or observe a series holding level cells', async () => {
+        await put(1000, WILLOW, 5)
+
+        await expect(
+          driver.increment([{ metric: L, bucketTs: 1000, dimKey: WILLOW, delta: 1 }]),
+        ).rejects.toThrow()
+        await expect(
+          driver.observe([{ metric: L, bucketTs: 1000, dimKey: WILLOW, value: 1 }]),
+        ).rejects.toThrow()
+      })
+    })
+
+    describe('readLevels', () => {
+      it('is empty for a metric nothing has written', async () => {
+        expect(await driver.readLevels(L)).toEqual([])
+      })
+
+      it('outlives the claim that shipped the buckets', async () => {
+        // the whole reason a level can report a window nobody wrote to
+        await put(1000, WILLOW, 42)
+
+        const claim = await driver.claim(L, 2000)
+        await driver.ack(claim)
+
+        expect(await driver.readBuckets({ metric: L })).toEqual([])
+        expect(await driver.readLevels(L)).toEqual([
+          { dimKey: WILLOW, value: 42, writtenAt: 1000, heldThrough: 1000 },
+        ])
+      })
+    })
+
+    describe('dropLevels', () => {
+      it('forgets a series entirely', async () => {
+        await put(1000, WILLOW, 42)
+        await put(1000, REX, 7)
+
+        await driver.dropLevels(L, [WILLOW])
+
+        expect(await driver.readLevels(L)).toEqual([
+          { dimKey: REX, value: 7, writtenAt: 1000, heldThrough: 1000 },
+        ])
+      })
+
+      it('leaves buckets the series already filled', async () => {
+        await put(1000, WILLOW, 42)
+        await driver.dropLevels(L, [WILLOW])
+
+        expect(await levelAt(1000, WILLOW)).toBe(42)
+      })
+
+      it('holds nothing for a dropped series', async () => {
+        await put(1000, WILLOW, 42)
+        await driver.dropLevels(L, [WILLOW])
+        await hold(2000, WILLOW)
+
+        expect(await levelAt(2000, WILLOW)).toBeUndefined()
+      })
+
+      it('ignores a series it does not hold, and an empty list', async () => {
+        await driver.dropLevels(L, [WILLOW])
+        await driver.dropLevels(L, [])
+        expect(await driver.readLevels(L)).toEqual([])
       })
     })
 
