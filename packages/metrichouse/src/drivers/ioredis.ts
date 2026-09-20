@@ -217,13 +217,14 @@ const LUA_LEVEL_STATE = `
 local function mh_read_state(key, field)
   local raw = redis.call('HGET', key, field)
   if raw == false then return nil end
-  local v, w, h = string.match(raw, '^([^|]+)|([^|]+)|([^|]+)$')
+  local v, c, w, h = string.match(raw, '^([^|]+)|([^|]+)|([^|]+)|([^|]+)$')
   if v == nil then return nil end
-  return { tonumber(v), tonumber(w), tonumber(h) }
+  return { tonumber(v), tonumber(c), tonumber(w), tonumber(h) }
 end
 
-local function mh_write_state(key, field, value, writtenAt, heldThrough)
-  redis.call('HSET', key, field, string.format('%.17g|%d|%d', value, writtenAt, heldThrough))
+local function mh_write_state(key, field, value, carried, writtenAt, heldThrough)
+  redis.call('HSET', key, field,
+    string.format('%.17g|%.17g|%d|%d', value, carried, writtenAt, heldThrough))
 end
 `
 
@@ -252,10 +253,7 @@ for i = 3, #ARGV, 2 do
   local state = mh_read_state(KEYS[3], field)
 
   local value = v
-  if ARGV[2] == 'add' then
-    value = v
-    if state ~= nil then value = state[1] + v end
-  end
+  if ARGV[2] == 'add' and state ~= nil then value = state[1] + v end
 
   local cur = redis.call('HGET', KEYS[1], field)
   if cur ~= false and not mh_is_level(cur) then
@@ -266,13 +264,16 @@ for i = 3, #ARGV, 2 do
 
   redis.call('HSET', KEYS[1], field, mh_pack_level(value))
 
+  -- a first write is also the first thing there is to carry
+  local carried = value
   local writtenAt = bucketTs
   local heldThrough = bucketTs
   if state ~= nil then
-    if state[2] > writtenAt then writtenAt = state[2] end
-    heldThrough = state[3]
+    carried = state[2]
+    if state[3] > writtenAt then writtenAt = state[3] end
+    heldThrough = state[4]
   end
-  mh_write_state(KEYS[3], field, value, writtenAt, heldThrough)
+  mh_write_state(KEYS[3], field, value, carried, writtenAt, heldThrough)
 end
 
 redis.call('ZADD', KEYS[2], ARGV[1], ARGV[1])
@@ -290,28 +291,30 @@ return 1
  * There is nothing to carry, and a zero would put a line on a chart for a
  * queue that has never existed.
  *
- * KEYS: bucket hash, bucket index, level hash. ARGV: bucketTs, then dim keys.
+ * KEYS: bucket hash, bucket index, level hash. ARGV: bucketTs, then
+ * dimKey/value pairs.
  */
 const HOLD_LEVEL = `${LUA_HELPERS}${LUA_LEVEL_STATE}
 local bucketTs = tonumber(ARGV[1])
-local carried = 0
+local written = 0
 
-for i = 2, #ARGV do
+for i = 2, #ARGV, 2 do
   local field = ARGV[i]
+  local value = tonumber(ARGV[i + 1])
   local state = mh_read_state(KEYS[3], field)
 
   if state ~= nil then
-    if redis.call('HSETNX', KEYS[1], field, mh_pack_level(state[1])) == 1 then
-      carried = carried + 1
+    if redis.call('HSETNX', KEYS[1], field, mh_pack_level(value)) == 1 then
+      written = written + 1
     end
-    local heldThrough = state[3]
+    local heldThrough = state[4]
     if bucketTs > heldThrough then heldThrough = bucketTs end
-    mh_write_state(KEYS[3], field, state[1], state[2], heldThrough)
+    mh_write_state(KEYS[3], field, state[1], value, state[3], heldThrough)
   end
 end
 
-if carried > 0 then redis.call('ZADD', KEYS[2], ARGV[1], ARGV[1]) end
-return carried
+if written > 0 then redis.call('ZADD', KEYS[2], ARGV[1], ARGV[1]) end
+return written
 `
 
 /**
@@ -882,9 +885,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           }
           groups.set(groupKey, group)
         }
-        // a hold carries whatever storage already holds, so it sends no value
-        if (op.mode === 'hold') group.args.push(op.dimKey)
-        else group.args.push(op.dimKey, op.value)
+        group.args.push(op.dimKey, op.value)
       }
 
       try {
@@ -912,12 +913,13 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       const series: LevelSeries[] = []
       for (const [dimKey, packed] of Object.entries(flat)) {
         const parts = packed.split('|')
-        if (parts.length !== 3) continue
+        if (parts.length !== 4) continue
         series.push({
           dimKey,
           value: Number(parts[0]),
-          writtenAt: Number(parts[1]),
-          heldThrough: Number(parts[2]),
+          carried: Number(parts[1]),
+          writtenAt: Number(parts[2]),
+          heldThrough: Number(parts[3]),
         })
       }
 

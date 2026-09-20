@@ -281,17 +281,18 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         const held = series.get(op.dimKey)
 
         if (op.mode === 'hold') {
-          // nothing held is nothing to carry. A zero here would draw a line
-          // on a chart for a series that has never been written
+          // a series storage has never seen has nothing to carry, and a hold
+          // must not be what brings one into existence
           if (!held) continue
 
           const bucket = cellSlot(op.metric, op.bucketTs, op.dimKey)
-          // an observed value always beats a carried one, so a window that
+          // a written value always beats a carried one, so a window that
           // already has a cell keeps it
-          if (!bucket.has(op.dimKey)) bucket.set(op.dimKey, { level: held.value })
+          if (!bucket.has(op.dimKey)) bucket.set(op.dimKey, { level: op.value })
 
           series.set(op.dimKey, {
             ...held,
+            carried: op.value,
             heldThrough: Math.max(held.heldThrough, op.bucketTs),
           })
           continue
@@ -322,6 +323,8 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         series.set(op.dimKey, {
           dimKey: op.dimKey,
           value,
+          // a first write is also the first thing there is to carry
+          carried: held?.carried ?? value,
           writtenAt: Math.max(held?.writtenAt ?? op.bucketTs, op.bucketTs),
           // a write never moves the pointer. The windows between this write
           // and the last one are still owed a row, and only a `hold` may say

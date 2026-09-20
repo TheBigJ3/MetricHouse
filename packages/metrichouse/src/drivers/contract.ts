@@ -85,8 +85,8 @@ export function describeDriverContract(name: string, options: DriverContractOpti
     const move = (bucketTs: number, dimKey: string, value: number) =>
       driver.setLevel([{ metric: L, bucketTs, dimKey, value, mode: 'add' }])
 
-    const hold = (bucketTs: number, dimKey: string) =>
-      driver.setLevel([{ metric: L, bucketTs, dimKey, value: 0, mode: 'hold' }])
+    const hold = (bucketTs: number, dimKey: string, value: number) =>
+      driver.setLevel([{ metric: L, bucketTs, dimKey, value, mode: 'hold' }])
 
     /** The one cell at a bucket and series, narrowed to a level. */
     const levelAt = async (bucketTs: number, dimKey: string): Promise<number | undefined> => {
@@ -272,7 +272,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
 
         expect(await levelAt(1000, WILLOW)).toBe(42)
         expect(await driver.readLevels(L)).toEqual([
-          { dimKey: WILLOW, value: 42, writtenAt: 1000, heldThrough: 1000 },
+          { dimKey: WILLOW, value: 42, carried: 42, writtenAt: 1000, heldThrough: 1000 },
         ])
       })
 
@@ -291,24 +291,35 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(await levelAt(1000, WILLOW)).toBe(5)
       })
 
-      it('carries the held value into the next bucket on a hold', async () => {
+      it('carries a value into a bucket on a hold', async () => {
         await put(1000, WILLOW, 42)
-        await hold(2000, WILLOW)
+        await hold(2000, WILLOW, 42)
 
         expect(await levelAt(2000, WILLOW)).toBe(42)
       })
 
+      it('carries the value it was given, not the one the series is at', async () => {
+        // the window being filled is in the past, and the series has moved
+        await put(1000, WILLOW, 42)
+        await put(5000, WILLOW, 7)
+        await hold(2000, WILLOW, 42)
+
+        expect(await levelAt(2000, WILLOW)).toBe(42)
+        expect((await driver.readLevels(L))[0]?.value).toBe(7)
+        expect((await driver.readLevels(L))[0]?.carried).toBe(42)
+      })
+
       it('leaves a bucket that already holds a value alone', async () => {
-        // an observed value beats a carried one, whichever lands second
+        // a written value beats a carried one, whichever lands second
         await put(1000, WILLOW, 42)
         await put(2000, WILLOW, 7)
-        await hold(2000, WILLOW)
+        await hold(2000, WILLOW, 42)
 
         expect(await levelAt(2000, WILLOW)).toBe(7)
       })
 
       it('holds nothing for a series it has never seen', async () => {
-        await hold(1000, WILLOW)
+        await hold(1000, WILLOW, 42)
 
         expect(await levelAt(1000, WILLOW)).toBeUndefined()
         expect(await driver.readLevels(L)).toEqual([])
@@ -321,7 +332,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         // the windows between the two writes are still owed a row
         expect((await driver.readLevels(L))[0]?.heldThrough).toBe(1000)
 
-        await hold(2000, WILLOW)
+        await hold(2000, WILLOW, 42)
         expect((await driver.readLevels(L))[0]?.heldThrough).toBe(2000)
       })
 
@@ -337,8 +348,8 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await put(1000, REX, 7)
 
         expect(await driver.readLevels(L)).toEqual([
-          { dimKey: REX, value: 7, writtenAt: 1000, heldThrough: 1000 },
-          { dimKey: WILLOW, value: 42, writtenAt: 1000, heldThrough: 1000 },
+          { dimKey: REX, value: 7, carried: 7, writtenAt: 1000, heldThrough: 1000 },
+          { dimKey: WILLOW, value: 42, carried: 42, writtenAt: 1000, heldThrough: 1000 },
         ])
       })
 
@@ -392,7 +403,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
 
         expect(await driver.readBuckets({ metric: L })).toEqual([])
         expect(await driver.readLevels(L)).toEqual([
-          { dimKey: WILLOW, value: 42, writtenAt: 1000, heldThrough: 1000 },
+          { dimKey: WILLOW, value: 42, carried: 42, writtenAt: 1000, heldThrough: 1000 },
         ])
       })
     })
@@ -405,7 +416,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await driver.dropLevels(L, [WILLOW])
 
         expect(await driver.readLevels(L)).toEqual([
-          { dimKey: REX, value: 7, writtenAt: 1000, heldThrough: 1000 },
+          { dimKey: REX, value: 7, carried: 7, writtenAt: 1000, heldThrough: 1000 },
         ])
       })
 
@@ -419,7 +430,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       it('holds nothing for a dropped series', async () => {
         await put(1000, WILLOW, 42)
         await driver.dropLevels(L, [WILLOW])
-        await hold(2000, WILLOW)
+        await hold(2000, WILLOW, 42)
 
         expect(await levelAt(2000, WILLOW)).toBeUndefined()
       })

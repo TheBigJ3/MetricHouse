@@ -54,9 +54,14 @@ export interface GaugeOp {
  *
  * - `set` puts the series at `value`.
  * - `add` moves it by `value`, treating an untouched series as zero.
- * - `hold` ignores `value` and carries whatever the series already holds into
- *   `bucketTs`, leaving an existing cell alone. This is the one a flush issues
- *   for windows nobody wrote to.
+ * - `hold` writes `value` into `bucketTs` only if that window has no cell
+ *   yet, and moves the pointer. This is the one a flush issues for windows
+ *   nobody wrote to.
+ *
+ * A hold names its value rather than reading the held one because the window
+ * it fills is in the past, and the series may have moved since. Filling the
+ * three minutes before a write with the value that write introduced would
+ * report a queue that changed earlier than it did.
  */
 export interface LevelOp {
   readonly metric: string
@@ -77,6 +82,14 @@ export interface LevelSeries {
   readonly dimKey: string
   /** What the series is at right now. */
   readonly value: number
+  /**
+   * What the series was at in the window `heldThrough` names.
+   *
+   * The starting point for the next carry, and not always `value`: a write
+   * that lands after the last carried window moves one and not the other,
+   * and the windows in between belong to the older number.
+   */
+  readonly carried: number
   /**
    * The bucket the last `set` or `add` landed in.
    *

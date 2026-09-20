@@ -16,7 +16,7 @@ import type { InferShape, Shape, TypeKind } from '../schema/types.js'
  * Every primitive, in declaration order. A single list rather than a bare
  * union so {@link isMetric} cannot drift out of sync with the type.
  */
-export const METRIC_KINDS = ['counter', 'gauge', 'event', 'log', 'timer'] as const
+export const METRIC_KINDS = ['counter', 'gauge', 'level', 'event', 'log', 'timer'] as const
 
 export type MetricKind = (typeof METRIC_KINDS)[number]
 
@@ -25,7 +25,7 @@ export type MetricKind = (typeof METRIC_KINDS)[number]
  *
  * The distinction the whole library is built around, finally said out loud
  * rather than inferred. `'bucketed'` folds writes into a window — counter,
- * gauge, timer; `'staged'` appends them to a run — event, log. Everything that
+ * gauge, level, timer; `'staged'` appends them to a run — event, log. Everything that
  * has to branch on it was otherwise branching on `kind` against a hardcoded
  * list, which is the drift {@link METRIC_KINDS} exists to prevent.
  */
