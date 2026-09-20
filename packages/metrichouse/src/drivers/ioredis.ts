@@ -222,9 +222,12 @@ local function mh_read_state(key, field)
   return { tonumber(v), tonumber(c), tonumber(w), tonumber(h) }
 end
 
+-- '%.0f' and not '%d' for the two timestamps: they are whole numbers held in
+-- a double, and '%d' in Lua asks for an integer cast that is a different
+-- question on every build
 local function mh_write_state(key, field, value, carried, writtenAt, heldThrough)
   redis.call('HSET', key, field,
-    string.format('%.17g|%.17g|%d|%d', value, carried, writtenAt, heldThrough))
+    string.format('%.17g|%.17g|%.0f|%.0f', value, carried, writtenAt, heldThrough))
 end
 `
 
