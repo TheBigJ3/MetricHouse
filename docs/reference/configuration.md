@@ -1,6 +1,11 @@
 # Configuration
 
-Every setting in one place.
+Every setting in one place, with its default. Each one is explained on the page
+for the type that takes it, and the arguments shared by several types have
+pages of their own: [dims](/reference/dims), [fields](/reference/fields),
+[Field types](/reference/field-types), [Durations](/reference/durations),
+[Snapshot options](/reference/snapshot-options) and
+[Flush options](/reference/flush-options).
 
 ## createHouse
 
@@ -32,6 +37,8 @@ keeps it.
 
 ## counter
 
+The page: [counter](/primitives/counter).
+
 ```ts
 counter(name, { dims, resolution, flush, grace, value, write })
 ```
@@ -47,6 +54,8 @@ counter(name, { dims, resolution, flush, grace, value, write })
 
 ## gauge
 
+The page: [gauge](/primitives/gauge).
+
 ```ts
 gauge(name, { dims, resolution, flush, grace, aggregate, write })
 ```
@@ -60,7 +69,29 @@ gauge(name, { dims, resolution, flush, grace, aggregate, write })
 | `aggregate` | array | `['last','min','max','sum','count']` | Which columns reach your sink |
 | `write` | `WriteFn` | required | Where the rows go |
 
+## level
+
+The page: [level](/primitives/level).
+
+```ts
+level(name, { dims, resolution, flush, grace, holdFor, value, write })
+```
+
+| Option | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `dims` | shape | none | Labels to break the value down by |
+| `resolution` | duration | required | How wide one window is |
+| `flush` | duration | house default | The fastest this may ship |
+| `grace` | duration | `'2s'` | How long a late write may still land |
+| `holdFor` | duration | forever | How long a series keeps reporting after its last write |
+| `value` | `float()` or `int()` | `float()` | Whether fractions are allowed |
+| `write` | `WriteFn` | required | Where the rows go |
+
+`holdFor` has to be at least one `resolution`.
+
 ## timer
+
+The page: [timer](/primitives/timer).
 
 ```ts
 timer(name, { dims, resolution, flush, grace, aggregate, record, write })
@@ -79,6 +110,8 @@ timer(name, { dims, resolution, flush, grace, aggregate, record, write })
 A dimension may not be named `duration_ms`.
 
 ## event
+
+The page: [event](/primitives/event).
 
 ```ts
 event(name, { fields, stage, batch, flush, timestamp, sample, derive, claimLimit, write })
@@ -100,6 +133,8 @@ event(name, { fields, stage, batch, flush, timestamp, sample, derive, claimLimit
 A field may not be named `id`, `ts`, `_ingested_at` or `_sample_rate`.
 
 ## log
+
+The page: [log](/primitives/log).
 
 ```ts
 log(name, { fields, levels, minLevel, stage, batch, flush, claimLimit, write })
@@ -155,27 +190,15 @@ one ships those rows twice. See
 
 ## Durations
 
-Every time based setting takes the same format.
+Every time based setting takes a whole number followed by a lowercase unit, or
+a plain number of milliseconds.
 
-| Unit | Meaning | Example |
-| --- | --- | --- |
-| `ms` | milliseconds | `'500ms'` |
-| `s` | seconds | `'30s'` |
-| `m` | minutes | `'5m'` |
-| `h` | hours | `'2h'` |
-| `d` | days | `'7d'` |
+```ts
+'500ms'   '30s'   '5m'   '2h'   '7d'   5_000
+```
 
-A plain `number` is taken as milliseconds. Whitespace around the string is
-trimmed.
-
-Rejected, each with an error naming the input:
-
-| Rejected | Why |
-| --- | --- |
-| `'1.5m'` | Fractions are not allowed. Write `'90s'` |
-| `'5M'` | Uppercase is ambiguous between minutes and months |
-| `'5'` | A bare numeric string could mean anything. Use `5` or `'5s'` |
-| `'-5m'` | Negative durations are never meaningful |
+[Durations](/reference/durations) has the units, the rejected inputs and the
+rule that `resolution` must divide `flush`.
 
 ## Flush options
 
@@ -187,7 +210,10 @@ house.flush({ force, only })
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `force` | boolean | `false` | Ignore the cadence and ship everything finished |
-| `only` | array of names | every metric | Restrict the flush to these metrics |
+| `only` | array of names | every metric | Restrict the flush to these metrics. House only |
+
+[Flush options](/reference/flush-options) also covers every field of the report
+that comes back.
 
 ## Snapshot options
 
@@ -209,8 +235,8 @@ house.snapshot({ only, ...theSame })
 | `limit` | number | none | Take this many, after sorting |
 | `only` | array of names | every metric | House only |
 
-`rollup: 'sum'` drops `id` and `bucket_ts`, because neither survives the merge. A
-`groupBy` keeps `bucket_ts` and keeps `id` only where the grouping merged nothing.
+[Snapshot options](/reference/snapshot-options) covers what each metric type
+does with them, and how the row type follows.
 
 ## Validation that runs at startup
 

@@ -3,6 +3,12 @@
 Everything the package exports, and every method on the objects those exports
 return, grouped by what you would reach for it.
 
+The arguments that appear on more than one type have pages of their own:
+[dims](/reference/dims), [fields](/reference/fields),
+[Field types](/reference/field-types), [Durations](/reference/durations),
+[Snapshot options](/reference/snapshot-options) and
+[Flush options](/reference/flush-options).
+
 ## Entry points
 
 | Import path | Contains |
@@ -17,14 +23,18 @@ The package is marked side effect free, so a bundler removes what you do not use
 
 ## Declaring
 
-| Export | Signature |
-| --- | --- |
-| `counter` | `counter(name, config): Counter` |
-| `gauge` | `gauge(name, config): Gauge` |
-| `level` | `level(name, config): Level` |
-| `event` | `event(name, config): Event` |
-| `log` | `log(name, config): Log` |
-| `timer` | `timer(name, config): Timer` |
+| Export | Signature | Page |
+| --- | --- | --- |
+| `counter` | `counter(name, config): Counter` | [counter](/primitives/counter) |
+| `gauge` | `gauge(name, config): Gauge` | [gauge](/primitives/gauge) |
+| `level` | `level(name, config): Level` | [level](/primitives/level) |
+| `timer` | `timer(name, config): Timer` | [timer](/primitives/timer) |
+| `event` | `event(name, config): Event` | [event](/primitives/event) |
+| `log` | `log(name, config): Log` | [log](/primitives/log) |
+
+Each page lists that type's configuration one setting at a time, then every
+method it carries. [Configuration](/reference/configuration) has the same
+settings as one table per type.
 
 ## Field types
 
@@ -152,11 +162,11 @@ logger has the same level methods, `at()` and `child()`, plus `bound`, the
 fields it adds to every line.
 
 Every write method returns before storage has confirmed anything. Call `drain()`
-on the metric or the house when you need to know a write landed. The page for
-each type has the details: [counter](/primitives/counter),
-[gauge](/primitives/gauge), [level](/primitives/level),
-[timer](/primitives/timer), [event](/primitives/event) and
-[log](/primitives/log).
+on the metric or the house when you need to know a write landed. Each method,
+with its parameters and what it throws, is on the page for its type:
+[counter](/primitives/counter), [gauge](/primitives/gauge),
+[level](/primitives/level), [timer](/primitives/timer),
+[event](/primitives/event) and [log](/primitives/log).
 
 ## Reading
 

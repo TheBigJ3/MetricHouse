@@ -18,19 +18,25 @@ const PAGES: readonly { file: string; url: string }[] = [
   { file: 'guide/what-is-metrichouse.md', url: 'guide/what-is-metrichouse' },
   { file: 'guide/getting-started.md', url: 'guide/getting-started' },
   { file: 'guide/how-it-works.md', url: 'guide/how-it-works' },
+  { file: 'primitives/index.md', url: 'primitives/' },
+  { file: 'primitives/counter.md', url: 'primitives/counter' },
+  { file: 'primitives/gauge.md', url: 'primitives/gauge' },
+  { file: 'primitives/level.md', url: 'primitives/level' },
+  { file: 'primitives/timer.md', url: 'primitives/timer' },
+  { file: 'primitives/event.md', url: 'primitives/event' },
+  { file: 'primitives/log.md', url: 'primitives/log' },
+  { file: 'reference/dims.md', url: 'reference/dims' },
+  { file: 'reference/fields.md', url: 'reference/fields' },
+  { file: 'reference/field-types.md', url: 'reference/field-types' },
+  { file: 'reference/durations.md', url: 'reference/durations' },
+  { file: 'reference/snapshot-options.md', url: 'reference/snapshot-options' },
+  { file: 'reference/flush-options.md', url: 'reference/flush-options' },
   { file: 'guide/metrics-and-dimensions.md', url: 'guide/metrics-and-dimensions' },
   { file: 'guide/buckets-and-time.md', url: 'guide/buckets-and-time' },
   { file: 'guide/the-house.md', url: 'guide/the-house' },
   { file: 'guide/flushing.md', url: 'guide/flushing' },
   { file: 'guide/writing-a-sink.md', url: 'guide/writing-a-sink' },
   { file: 'guide/reading-live-data.md', url: 'guide/reading-live-data' },
-  { file: 'primitives/index.md', url: 'primitives/' },
-  { file: 'primitives/counter.md', url: 'primitives/counter' },
-  { file: 'primitives/gauge.md', url: 'primitives/gauge' },
-  { file: 'primitives/level.md', url: 'primitives/level' },
-  { file: 'primitives/event.md', url: 'primitives/event' },
-  { file: 'primitives/log.md', url: 'primitives/log' },
-  { file: 'primitives/timer.md', url: 'primitives/timer' },
   { file: 'guide/drivers.md', url: 'guide/drivers' },
   { file: 'guide/delivery.md', url: 'guide/delivery' },
   { file: 'guide/reliability.md', url: 'guide/reliability' },
@@ -42,7 +48,6 @@ const PAGES: readonly { file: string; url: string }[] = [
   { file: 'examples/background-jobs.md', url: 'examples/background-jobs' },
   { file: 'examples/serverless-analytics.md', url: 'examples/serverless-analytics' },
   { file: 'reference/index.md', url: 'reference/' },
-  { file: 'reference/field-types.md', url: 'reference/field-types' },
   { file: 'reference/configuration.md', url: 'reference/configuration' },
   { file: 'reference/driver-contract.md', url: 'reference/driver-contract' },
 ]
@@ -105,7 +110,7 @@ function llms(site: string): string {
 > connection and ships no dashboard: you supply one function that receives an
 > array of plain objects, and everything after that is yours.
 
-Package: \`metrichouse\` on npm. MIT licensed. Node 20 or newer. Version 0.2.0.
+Package: \`metrichouse\` on npm. MIT licensed. Node 20 or newer. Version 0.4.0.
 Source: https://github.com/TheBigJ3/MetricHouse
 
 ## The problem it solves
@@ -260,7 +265,12 @@ request and a cron calling \`house.flush()\`.
 - [Getting started](${site}guide/getting-started): a working counter in about twenty lines, with the table to store it in.
 - [How it works](${site}guide/how-it-works): the path from \`add()\` to your database.
 - [Buckets and time](${site}guide/buckets-and-time): what a bucket is as a database row, why summarising beats one row per event, and how to choose resolution against flush.
-- [Metrics and dimensions](${site}guide/metrics-and-dimensions): declaring metrics, and why a dimension must have a small set of values.
+- [Declaring a metric](${site}guide/metrics-and-dimensions): the shape of a declaration, what is checked when, and reading one back.
+- [dims](${site}reference/dims): the labels a folded metric breaks its number down by, the argument at each call site, the series key, and what cardinality costs.
+- [fields](${site}reference/fields): the columns an event or a log writes per record, and how they differ from dims.
+- [Durations](${site}reference/durations): the format every time based setting takes, and what is rejected.
+- [Snapshot options](${site}reference/snapshot-options): every option \`snapshot()\` accepts, per metric type.
+- [Flush options](${site}reference/flush-options): the arguments \`flush()\` takes and every field of the report it returns.
 - [The house](${site}guide/the-house): binding metrics to a driver, defaults, and lifecycle.
 - [Flushing](${site}guide/flushing): cadence, reports, schedulers and cron.
 - [Writing a sink](${site}guide/writing-a-sink): the one function you write, the rows it receives, and making retries harmless.
@@ -270,7 +280,7 @@ request and a cron calling \`house.flush()\`.
 - [Reliability](${site}guide/reliability): exactly what is guaranteed, what is not, and what to watch.
 - [Deployment targets](${site}guide/production): Node, Vercel, Cloudflare Workers, AWS Lambda, and testing.
 - [Metric types](${site}primitives/): choosing between counter, gauge, level, event, log and timer.
-- [counter](${site}primitives/counter) · [gauge](${site}primitives/gauge) · [level](${site}primitives/level) · [event](${site}primitives/event) · [log](${site}primitives/log) · [timer](${site}primitives/timer)
+- [counter](${site}primitives/counter) · [gauge](${site}primitives/gauge) · [level](${site}primitives/level) · [timer](${site}primitives/timer) · [event](${site}primitives/event) · [log](${site}primitives/log)
 - [Examples](${site}examples/): complete small setups for online users, dogs walked, API requests, background jobs and serverless analytics.
 - [API reference](${site}reference/): every export, grouped by what you reach for it.
 - [Field types](${site}reference/field-types) · [Configuration](${site}reference/configuration) · [Driver contract](${site}reference/driver-contract)

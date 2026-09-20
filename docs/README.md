@@ -28,9 +28,18 @@ public/
   logo-dark.svg   the mark, dark theme
   favicon.svg     and favicon-32.png, apple-touch-icon.png, logo-512.png
 guide/            concepts, from what it is to how to deploy it
-primitives/       one page per metric type
+primitives/       one page per metric type, written as reference
 examples/         complete small setups
-reference/        API index, field types, configuration, driver contract
+reference/        the shared arguments, plus the API index and the contracts
+  dims.md         the labels a folded metric is broken down by
+  fields.md       the columns an event or a log writes per record
+  field-types.md  str(), int(), oneOf() and the rest, with their modifiers
+  durations.md    the format every time based setting takes
+  snapshot-options.md   every option snapshot() accepts
+  flush-options.md      the arguments flush() takes, and its report
+  configuration.md      every setting in one table per type
+  driver-contract.md    what a driver has to implement
+  index.md        the API index
 vercel.json       the build command and the output directory, for Vercel
 ```
 
@@ -110,6 +119,36 @@ Three rules keep them working:
   `noUnusedImports` are turned off for `.vue` in `biome.json`. Every other rule
   still applies.
 
+## Page shapes
+
+Two layouts carry most of the site, and keeping to them is what stops a page
+turning back into an essay.
+
+**A metric type page** is reference, in this order. Every heading is a thing you
+can call or pass, so the outline on the right reads as a list of them.
+
+```
+# counter                    what it is, in two sentences
+                             the minimal declaration, then the minimal write
+                             a table: import, answers, storage, row, read, write
+## counter()                 the declaration, with a parameter table
+### name                     one H3 per configuration setting, in signature order
+### dims                     ...each with its type, default, and what it decides
+## counter.add()             one H2 per method, named receiver.method()
+                             signature, parameter table, returns, throws, example
+## Properties                what the metric reports about itself
+## The row                   the columns a sink receives, then the table schema
+## Patterns                  the production shaped examples
+## Playground                the interactive components, last
+```
+
+**A shared argument page** covers one argument that appears on several types:
+where it is accepted, how it is declared, what each call site does with it, and
+the errors it raises. `dims`, `fields`, `Durations`, `Snapshot options` and
+`Flush options` are the five, and a metric page links to them rather than
+repeating them. Anything that would be written twice belongs on one of these
+pages instead.
+
 ## Writing rules
 
 These are house style for this site, and worth keeping.
@@ -126,6 +165,12 @@ These are house style for this site, and worth keeping.
   not say it. Check `packages/metrichouse/src/`.
 - **Say what is missing.** A feature that does not exist yet is named as not
   existing, not left for someone to discover.
+- **The feature comes before the story.** A page opens with what the thing is
+  and how to call it. The reasoning behind a design goes after the API it
+  explains, as its own section, rather than in front of it.
+- **Say it once.** An argument that appears on more than one page gets a
+  reference page, and every other page links to it. A second explanation drifts
+  from the first.
 
 ## Diagrams
 

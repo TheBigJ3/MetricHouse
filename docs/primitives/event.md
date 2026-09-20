@@ -1,9 +1,8 @@
 # event
 
-An event is a record kept whole. It is the home for everything a counter has to
-throw away: user ids, request ids, free text, JSON payloads. Two identical events
-are two rows, because the point of an event is the detail, and detail does not
-survive being added together.
+An event keeps each record whole. It is the home for everything a counter has
+to throw away: user ids, request ids, free text, JSON payloads. Two identical
+events are two rows.
 
 ```ts
 import { event, int, json, oneOf, str } from 'metrichouse/core'
@@ -32,40 +31,147 @@ checkoutAttempted.record({
 })
 ```
 
-## Use it for
+| | |
+| --- | --- |
+| Import | `import { event } from 'metrichouse/core'` |
+| Answers | What exactly happened, with all the detail |
+| Storage | Staged whole, never merged |
+| Row | `{ id, ts, ...fields, _ingested_at, _sample_rate? }` |
+| Write with | [`record()`](#event-record), [`recordMany()`](#event-recordmany) |
+| Read with | [`pending()`](#event-pending), [`peek()`](#event-peek), [`snapshot()`](#event-snapshot) |
+| Use it for | Purchases, signups, feature use, audit records, page views, API calls |
 
-Anything with per item detail. Purchases, signups, feature use, audit records,
-page views, API calls with a request id, webhook deliveries.
+An event declares [`fields`](/reference/fields) where a folded metric declares
+[`dims`](/reference/dims). Fields are never used to build a series key, so
+values that are unique per record are ordinary here.
 
-## Fields, not dimensions
-
-An event declares `fields` rather than `dims`, and the difference matters:
-
-- Fields are not used to build a label key, so high cardinality is fine. A `userId`
-  field is normal. A `userId` dimension is a mistake.
-- `json()` is allowed on a field and rejected on a dimension.
-- Nothing is merged, so every field reaches your table exactly as written.
-
-## Writing
+## event()
 
 ```ts
-checkoutAttempted.record({ userId: 'u_1', plan: 'pro', outcome: 'paid', amountCents: 4999 })
-
-// Several in one round trip.
-checkoutAttempted.recordMany([
-  { userId: 'u_1', plan: 'pro', outcome: 'paid', amountCents: 4999 },
-  { userId: 'u_2', plan: 'starter', outcome: 'failed', amountCents: 900 },
-])
+event<F>(name: string, config: EventConfig<F>): Event<F>
 ```
 
-`record()` returns immediately. Use `drain()` when you need to know it landed.
+Declares an event. It is inert until a [house](/guide/the-house) binds it, and
+recording to an unbound event throws.
 
-### Choosing the timestamp
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `name` | `string` | yes | [The metric name](#name) |
+| `config.fields` | shape | yes | [The record schema](#fields) |
+| `config.stage` | `'driver'` or `'local'` | no | [Where records wait](#stage) |
+| `config.batch` | object | no | [Local staging size and age limits](#batch) |
+| `config.flush` | duration | no | [The fastest this may ship](#flush) |
+| `config.timestamp` | `'auto'` or a field name | no | [Where `ts` comes from](#timestamp) |
+| `config.sample` | number or function | no | [The fraction to keep](#sample) |
+| `config.derive` | record of functions | no | [Counters this event also increments](#derive) |
+| `config.claimLimit` | number | no | [Records one flush may carry](#claimlimit) |
+| `config.write` | function | yes | [Where the rows go](#write) |
 
-Every record gets a `ts`. By default it is stamped when you call `record()`.
+### name
 
 ```ts
-// Take it from a declared ts() field instead.
+event('checkout_attempted', { ... })
+```
+
+A non empty string, unique inside a house. It is also the name a
+[`derive`](#derive) target or a timer's [`record`](/primitives/timer#record)
+setting uses to find this event.
+
+### fields
+
+```ts
+fields: Record<string, FieldType>      // required
+```
+
+The record schema. Every one of the seven
+[field types](/reference/field-types) is legal here, including `json()`.
+
+```ts
+fields: {
+  userId: str(),
+  plan: oneOf(['starter', 'pro', 'enterprise']),
+  amountCents: int(),
+  failureReason: str().optional(),
+  processor: json<{ name: string; latencyMs: number }>().optional(),
+}
+```
+
+A field may not take one of the reserved column names, and the check runs at
+declaration. [fields](/reference/fields) covers the argument in full.
+
+### stage
+
+```ts
+stage?: 'driver' | 'local'      // default: 'driver'
+```
+
+Where records wait between `record()` and your `write` function.
+
+| | `'driver'` | `'local'` |
+| --- | --- | --- |
+| Where a record sits | The bound driver | An array in this process |
+| Cost per record | One driver write | Pushing onto an array |
+| Survives a crash | Yes, with a durable driver | No |
+| Shared across processes | Yes, with a shared driver | No |
+| Ships on | `flush()` | [`batch.maxSize`](#batch), [`batch.maxAge`](#batch), `flush()` or `drain()` |
+
+```ts
+export const pageViewed = event('page_viewed', {
+  fields: { path: str(), userId: str().optional() },
+  stage: 'local',
+  batch: { maxSize: 500, maxAge: '10s' },
+  write: toClickHouse('page_viewed'),
+})
+```
+
+Local staging costs nothing per event and loses everything on a crash. Use it
+for page views, and use `'driver'` for money.
+
+### batch
+
+```ts
+batch?: { maxSize?: number; maxAge?: DurationInput }
+// defaults: { maxSize: 500, maxAge: '10s' }
+```
+
+Local staging only, and ignored entirely when `stage: 'driver'`.
+
+| Setting | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `maxSize` | `number` | `500` | Ship once this many records are buffered |
+| `maxAge` | duration | `'10s'` | Ship this long after the first record in a batch |
+
+The age clock starts at the first record of a batch, so `maxAge` bounds how
+long the oldest record waits rather than the newest. A `maxSize` that is not a
+positive whole number throws at declaration.
+
+### flush
+
+```ts
+flush?: DurationInput      // default: the house default, then '30s'
+```
+
+The fastest this event may ship when something calls `flush()`. An event has no
+resolution for a cadence to divide, so any duration is legal and a default is
+always available.
+
+This is separate from [`batch`](#batch), which ships a locally staged buffer
+without anyone calling `flush()`.
+
+### timestamp
+
+```ts
+timestamp?: 'auto' | (keyof F & string)      // default: 'auto'
+```
+
+Where each record's `ts` column comes from.
+
+| Value | Meaning |
+| --- | --- |
+| `'auto'` | Stamped from the house clock when `record()` runs |
+| a field name | Taken from that field, which has to be declared `ts()` |
+
+```ts
 export const deviceReading = event('device_reading', {
   fields: {
     occurredAt: ts(),
@@ -77,7 +183,7 @@ export const deviceReading = event('device_reading', {
   write,
 })
 
-// Now a backlog uploaded hours later still lands on the right timestamps.
+// A backlog uploaded hours later still lands on the right timestamps.
 deviceReading.record({
   occurredAt: new Date('2026-09-17T09:14:02Z'),
   deviceId: 'dev_88',
@@ -85,68 +191,28 @@ deviceReading.record({
 })
 ```
 
-Override either one at the call site:
+Naming a field that is not declared, or one that is not `ts()`, throws at
+declaration. An optional `ts()` field that a call site leaves out falls back to
+the clock rather than stamping the epoch.
+
+Whatever this says, [`record(fields, { at })`](#event-record) overrides it for
+one call.
+
+### sample
 
 ```ts
-checkoutAttempted.record(fields, { at: new Date('2026-09-17T09:14:02Z') })
+sample?: number | ((fields: InferShape<F>) => number)      // default: keep everything
 ```
 
-There is also a `_ingested_at` column on every row, stamped when `record()` ran.
-Comparing it with `ts` is how you tell a backfilled row from a live one.
-
-## Where records wait
+The fraction of records to keep, from `0` to `1`. A rate outside that range
+throws, at declaration for a number and at `record()` for a function.
 
 ```ts
-stage: 'driver'    // the default
-stage: 'local'
+sample: 0.05      // keep one in twenty
 ```
 
-**`'driver'`** appends each record to the bound driver and claims it on flush. It
-is as durable and as shared as that driver is. On Redis, that means a record
-survives a crash. Use it for anything that matters.
-
-**`'local'`** buffers records in an array inside your process and ships them when
-one of four things happens: the buffer reaches `batch.maxSize`, `batch.maxAge`
-passes, you call `flush()`, or you call `drain()`.
-
-```ts
-export const pageViewed = event('page_viewed', {
-  fields: { path: str(), userId: str().optional() },
-  stage: 'local',
-  batch: { maxSize: 500, maxAge: '10s' },
-  write: toClickHouse('page_viewed'),
-})
-```
-
-Local staging costs nothing per event and loses everything on a crash. Use it for
-page views, not for money.
-
-| | `'driver'` | `'local'` |
-| --- | --- | --- |
-| Cost per record | One driver write | Pushing onto an array |
-| Survives a crash | Yes, with a durable driver | No |
-| Shared across processes | Yes, with a shared driver | No |
-| Ships on | `flush()` | Size, age, `flush()` or `drain()` |
-
-## Sampling
-
-Keep a fraction of events. The counters you derive stay exact either way, because
-derive runs before sampling.
-
-```ts
-export const pageViewed = event('page_viewed', {
-  fields: { path: str(), statusCode: int() },
-
-  // A flat rate.
-  sample: 0.05,
-
-  flush: '30s',
-  write,
-})
-```
-
-A function is evaluated per event, so you can keep everything interesting and
-sample the rest:
+A function is evaluated per record, so the interesting traffic stays whole
+while the rest is thinned.
 
 ```ts
 export const apiCall = event('api_call', {
@@ -164,8 +230,8 @@ export const apiCall = event('api_call', {
 })
 ```
 
-The rate that applied lands in a `_sample_rate` column, so a query can scale the
-numbers back up:
+The rate that applied lands in a `_sample_rate` column, so a query can scale
+the numbers back up.
 
 ```sql
 SELECT route, sum(1 / _sample_rate) AS estimated_calls
@@ -173,41 +239,20 @@ FROM api_call
 GROUP BY route;
 ```
 
-## Tune it
+The function sees the complete record, with defaults already filled in, and it
+runs after [`derive`](#derive). Counters fed by this event therefore stay exact
+whatever fraction of the event table you keep.
 
-Events are not folded, so the settings that matter are different ones: where
-records wait, what moves them, and how many you keep.
-
-<MhEventFlow metric="checkout_attempted" kind="event" />
-
-Two things to try:
-
-- **Set `stage` to `'local'` and drop the rate.** The batch stops filling before
-  `maxAge` fires, so age becomes the trigger rather than size.
-- **Pull `sample` down to 5 percent.** The stored rows fall by twenty times. The
-  counters you derive from this event do not move at all, because derive runs
-  before sampling.
-
-## Deriving counters
-
-An event can increment counters as a side effect of being recorded, which removes
-the hand written second write path that people forget to keep in step.
+### derive
 
 ```ts
-export const checkouts = counter('checkouts', {
-  dims: { plan: oneOf(['starter', 'pro', 'enterprise']), outcome: oneOf(['paid', 'failed']) },
-  resolution: '1m',
-  flush: '1m',
-  write: toClickHouse('checkouts'),
-})
+derive?: Record<string, (fields: InferShape<F>) => DeriveTarget | DeriveTarget[]>
+```
 
-export const revenue = counter('revenue_cents', {
-  dims: { plan: oneOf(['starter', 'pro', 'enterprise']) },
-  resolution: '1m',
-  flush: '1m',
-  write: toClickHouse('revenue_cents'),
-})
+Counters this event also increments, keyed by metric name. It replaces the hand
+written second write path that people forget to keep in step.
 
+```ts
 export const checkoutAttempted = event('checkout_attempted', {
   fields: {
     userId: str(),
@@ -232,30 +277,213 @@ export const checkoutAttempted = event('checkout_attempted', {
 })
 ```
 
-Rules worth knowing:
+Each function returns one target, several targets, or none.
 
-- Targets are named by metric name and resolved lazily, so schema files can be
-  declared in any order.
-- Only counters can be derive targets.
-- **Derive runs before sampling, always.** The counters stay exact and unbiased
-  while the event table holds a representative slice. That ordering is the whole
-  value of the feature and cannot be changed.
-- Returning an array records several increments from one event.
-- A broken derive is reported through `onError` and the event is still recorded.
-  A mistake in a derived counter must not lose the underlying fact.
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `dims` | the target's declared dims | `{}` | The labels for the increment |
+| `value` | `number` | `1` | How much to add |
 
-## Reading
+| Rule | Detail |
+| --- | --- |
+| Targets are named, not passed | Resolved at the first `record()`, so schema files may be declared in any order |
+| Only a counter can be a target | Anything else throws when the first record resolves it |
+| Derive runs before sampling | Always, and this is not configurable. It is the whole value of the feature |
+| An array records several increments | One fact can feed two counters, or one counter twice |
+| A broken derive goes to `onError` | The event is still recorded. A mistake in a derived counter must not lose the underlying fact |
+
+### claimLimit
 
 ```ts
-await checkoutAttempted.pending()     // 128 records staged, not yet shipped
-await checkoutAttempted.peek(10)      // the first 10 as rows, without consuming
-await checkoutAttempted.snapshot({ limit: 50 })
+claimLimit?: number      // default: unlimited
 ```
 
-Every snapshot row reads `bucket_open: false`. A record is complete the instant
-it is written, so there is no partial window to exclude.
+How many records one flush may carry. By default a claim takes the whole
+backlog, the same way a counter's claim takes every closed window.
 
-## The rows you receive
+```ts
+claimLimit: 10_000
+```
+
+Set it when the backlog can outgrow what your database will accept in one
+statement. After a long outage an unbounded claim is one enormous insert, and
+the rest of the backlog ships on the following flush either way.
+
+A limit that is not a positive whole number throws at declaration.
+
+### write
+
+```ts
+write: (rows: EventRow<F>[], context: WriteContext) => Promise<void> | void
+```
+
+Where the rows go. Required.
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `rows` | `EventRow<F>[]` | Every declared field typed as declared, plus the reserved columns |
+| `context` | `WriteContext` | Which metric, the span of record timestamps, how many, and which attempt |
+
+`context.buckets` is `0` here, because an event has no windows.
+`context.total` is the number of rows.
+[Writing a sink](/guide/writing-a-sink) covers the whole contract.
+
+## event.record()
+
+```ts
+record(fields: InferShape<F>, options?: { at?: Date | number }): void
+```
+
+Stages one record.
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `fields` | the declared shape | yes | [The values for this record](/reference/fields#the-fields-argument) |
+| `options.at` | `Date` or epoch milliseconds | no | The `ts` for this record, overriding [`timestamp`](#timestamp) |
+
+```ts
+checkoutAttempted.record({ userId: 'u_1', plan: 'pro', outcome: 'paid', amountCents: 4_999 })
+
+checkoutAttempted.record(fields, { at: new Date('2026-09-17T09:14:02Z') })
+```
+
+**Returns** nothing, and returns before storage has acknowledged anything. Use
+[`drain()`](#event-drain) when you need to know it landed.
+
+**Throws immediately** on an unbound event, an unknown or ill typed field, a
+missing required field, an `at` that is neither a `Date` nor finite epoch
+milliseconds, or a `sample` function returning something outside `[0, 1]`.
+
+What happens inside one call, in order: defaults are filled in, fields are
+checked, `ts` is chosen, [`derive`](#derive) runs, [`sample`](#sample) decides,
+and the record is staged with its `id` and `_ingested_at`.
+
+## event.recordMany()
+
+```ts
+recordMany(fields: readonly InferShape<F>[], options?: { at?: Date | number }): void
+```
+
+Stages several records in one round trip to the driver.
+
+```ts
+checkoutAttempted.recordMany([
+  { userId: 'u_1', plan: 'pro', outcome: 'paid', amountCents: 4_999 },
+  { userId: 'u_2', plan: 'starter', outcome: 'failed', amountCents: 900 },
+])
+```
+
+Each record is checked, derived and sampled on its own, so one call can stage
+some records and drop others. `at` applies to all of them.
+
+## event.pending()
+
+```ts
+pending(): Promise<number>
+```
+
+How many records are staged and not yet shipped.
+
+```ts
+await checkoutAttempted.pending()     // 128
+```
+
+This is the number to watch on a health endpoint. A backlog that climbs between
+flushes means the sink is slower than the traffic.
+[What to watch](/guide/reliability#backlog) covers the alarm worth setting.
+
+## event.peek()
+
+```ts
+peek(n?: number): Promise<Row[]>
+```
+
+The first `n` staged records as rows, without consuming them.
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `n` | `number` | every staged record | How many to return |
+
+```ts
+await checkoutAttempted.peek(10)
+```
+
+Records come back in the order they were staged, as the rows your `write`
+function would receive. Nothing is claimed, so the next flush still ships them.
+
+## event.snapshot()
+
+```ts
+snapshot(options?: SnapshotOptions): Promise<EventLiveRow<F>[]>
+```
+
+Unshipped records as live rows: `peek()` with the rest of the snapshot
+vocabulary.
+
+```ts
+await checkoutAttempted.snapshot({ limit: 50 })
+await checkoutAttempted.snapshot({ from: Date.now() - 60_000, orderBy: 'ts', direction: 'asc' })
+```
+
+Every row reads `bucket_open: false` and `bucket_elapsed_ms: 0`. A record is
+complete the instant it is staged, so there is no partial window to exclude.
+
+The options that only mean something to a window, which are `dims`, `complete`,
+`rollup` and `groupBy`, are ignored rather than rejected, so one options object
+works across a mixed schema. See
+[Snapshot options](/reference/snapshot-options#where-they-are-accepted).
+
+## event.flush()
+
+```ts
+flush(options?: FlushOptions): Promise<MetricFlushReport>
+```
+
+Claims the staged backlog, up to [`claimLimit`](#claimlimit), and ships it.
+[Flush options](/reference/flush-options) covers the argument and the report.
+
+## event.drain()
+
+```ts
+drain(): Promise<void>
+```
+
+Resolves once every `record()` issued so far has reached the driver. On a
+locally staged event it also ships whatever is buffered, because that buffer is
+the only place those records exist.
+
+## event.rowShape()
+
+```ts
+rowShape(): RowShape
+```
+
+```ts
+checkoutAttempted.rowShape().columns.map((c) => c.name)
+// ['id', 'ts', 'userId', 'plan', 'outcome', 'amountCents', 'failureReason',
+//  'processor', '_ingested_at', '_sample_rate']
+```
+
+`_sample_rate` appears only on an event that declares [`sample`](#sample).
+
+## Properties
+
+| Property | Type | Value |
+| --- | --- | --- |
+| `name` | `string` | The name it was declared with |
+| `kind` | `'event'` | |
+| `storage` | `'staged'` | It keeps each record whole |
+| `fields` | `Shape` | The declared fields |
+| `stage` | `'driver'` or `'local'` | Where records wait |
+| `flushMs` | `number` | `flush`, parsed, including one taken from the house |
+| `isBound` | `boolean` | `true` once a house has registered it |
+| `write` | `WriteFn` | The function it was declared with |
+
+An event reports an empty `dims`, a `resolutionMs` of `1` and a `graceMs` of
+`0`, because it has no windows. Those three exist so a house can hold every
+metric type in one list.
+
+## The row
 
 ```ts
 {
@@ -271,13 +499,18 @@ it is written, so there is no partial window to exclude.
 }
 ```
 
-The id is a UUID version 7, so it sorts by time. It is minted when you call
-`record()` rather than at flush time, which is what makes a retried batch resend
-the same rows instead of new ones.
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `id` | `string` | A UUID version 7, so it sorts by time. Minted at `record()`, which is what makes a retried batch resend the same rows |
+| `ts` | `Date` | When the record happened. See [`timestamp`](#timestamp) |
+| one per field | as declared | Your values. A `json()` field arrives as a string |
+| `_ingested_at` | `Date` | When `record()` ran. Comparing it with `ts` tells a backfilled row from a live one |
+| `_sample_rate` | `number` | The rate that applied, present only when the event samples |
 
-Inside `write`, each row is an `EventRow`, with every field typed as you declared
-it. `processor` is the one to watch: its type is the object you recorded, and it
-arrives as a string. See [Rows are typed](../guide/writing-a-sink.md#rows-are-typed).
+Inside `write`, each row is an `EventRow<F>`. See
+[Rows are typed](/guide/writing-a-sink#rows-are-typed).
+
+### Table schema
 
 ::: code-group
 
@@ -316,40 +549,18 @@ CREATE INDEX ON checkout_attempted (ts);
 
 :::
 
-## Reserved column names
+### Reserved column names
 
 A field may not be named `id`, `ts`, `_ingested_at` or `_sample_rate`.
-MetricHouse owns those on every event row, and the check runs at declaration time.
 
 ```ts
 import { RESERVED_EVENT_COLUMNS } from 'metrichouse/core'
 // ['id', 'ts', '_ingested_at', '_sample_rate']
 ```
 
-## Settings
+## Patterns
 
-| Setting | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `fields` | shape | required | The record schema. `json()` is allowed |
-| `stage` | `'driver'` or `'local'` | `'driver'` | Where records wait |
-| `batch.maxSize` | number | `500` | Local staging: ship at this many |
-| `batch.maxAge` | duration | `'10s'` | Local staging: ship this long after the first |
-| `flush` | duration | `'30s'` | The fastest this may ship |
-| `timestamp` | `'auto'` or a field name | `'auto'` | Where `ts` comes from |
-| `sample` | number or function | keep everything | The fraction to keep |
-| `derive` | record of functions | none | Counters this event also increments |
-| `claimLimit` | number | unlimited | Records one flush may carry |
-| `write` | function | required | Where the rows go |
-
-::: tip Set claimLimit if your backlog can get large
-By default a claim takes the whole backlog. After a long outage that can be more
-rows than your database will accept in one statement. `claimLimit: 10_000` bounds
-it, and the rest ships on the following flush.
-:::
-
-## In production
-
-Product analytics that feeds exact counters and a sampled detail table.
+### An exact counter beside a sampled detail table
 
 ```ts
 // metrics/schema.ts
@@ -458,4 +669,19 @@ LIMIT 20;
 ```
 
 The counter answers "how many", exactly and cheaply. The event answers "which
-ones and why", on a slice of the traffic. Neither has to be kept in step by hand.
+ones and why", on a slice of the traffic. Neither has to be kept in step by
+hand.
+
+## Playground
+
+Events are not folded, so the settings that matter are different ones: where
+records wait, what moves them, and how many you keep.
+
+<MhEventFlow metric="checkout_attempted" kind="event" />
+
+Two things to try:
+
+- **Set `stage` to `'local'` and drop the rate.** The batch stops filling before
+  `maxAge` fires, so age becomes the trigger rather than size.
+- **Pull `sample` down to 5 percent.** The stored rows fall by twenty times, and
+  the counters derived from this event do not move at all.

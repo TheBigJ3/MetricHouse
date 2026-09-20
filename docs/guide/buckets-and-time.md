@@ -166,7 +166,8 @@ an [event](/primitives/event) instead.
 
 **You cannot add a dimension retroactively.** The grouping happened before the
 row was written, so a dimension you did not declare was never captured. Adding
-one later affects new rows only.
+one later affects new rows only, and reordering the ones you have is a breaking
+change. [dims](/reference/dims#reordering-is-a-breaking-change) covers both.
 
 **Changing resolution splits your history.** Old rows keep their old boundaries.
 That is fine for any query that groups to something coarser than both, which is

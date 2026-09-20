@@ -152,11 +152,11 @@ The loop back is the most important element. It should read clearly as a cycle.
 
 ## 6. dimensions-to-series.svg
 
-**Used on:** How it works, Metrics and dimensions.
+**Used on:** How it works, dims.
 **Captions on the page** (do not repeat these inside the image):
 
 - How it works: "Three dimensions with a few values each produce a handful of rows per bucket."
-- Metrics and dimensions: "Each distinct combination of values you write becomes one row per bucket."
+- dims: "Each distinct combination of values you write becomes one row per window."
 
 **Size:** 900 x 290.
 

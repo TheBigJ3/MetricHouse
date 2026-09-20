@@ -62,6 +62,7 @@ Four things are worth noticing:
 - **`write` is required.** A metric that measures something and ships it nowhere
   is almost always a mistake, so the type system will not let you declare one.
 - **`dims` is optional.** Leave it out for a metric that is a single number.
+  [dims](/reference/dims) covers what makes a good label and what one costs.
 
 ## Step 2: create a house
 

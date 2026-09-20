@@ -120,8 +120,8 @@ await pageViews.snapshot({
 })
 ```
 
-A filter naming a dimension the metric does not declare throws. A typo would
-otherwise match nothing and render as an empty chart, which looks like an outage.
+Every option, what each metric type does with it, and the errors they raise are
+in [Snapshot options](/reference/snapshot-options).
 
 ### Common shapes
 
@@ -154,24 +154,23 @@ kept only where the grouping happened to merge nothing.
 
 ### Types follow the options
 
-Rows are typed to the metric that produced them, and the type changes with the
-options you pass.
+Rows are typed to the metric that produced them, and the row type changes with
+the options you pass.
 
 ```ts
 const rows = await httpRequests.snapshot()
 rows[0].route      // string
 rows[0].status     // '2xx' | '4xx' | '5xx'
-rows[0].value      // number
-rows[0].bucket_ts  // Date
 
 const rolled = await httpRequests.snapshot({ rollup: 'sum' })
 rolled[0].bucket_ts
 //        ^^^^^^^^^ Type error: this row has no bucket_ts
 ```
 
-Pass the options object inline for this to work. If you build it in a variable
-typed as `SnapshotOptions` first, the type has nothing left to read and you get
-the unrolled shape.
+Pass the options object inline for this to work.
+[How the type changes with the options](/reference/snapshot-options#how-the-type-changes-with-the-options)
+explains why a variable typed as `SnapshotOptions` gives you the unrolled
+shape.
 
 ## Across a whole house
 

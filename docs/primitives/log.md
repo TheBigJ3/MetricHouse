@@ -1,13 +1,10 @@
 # log
 
-A log is an event with three reserved fields: `ts`, `level` and `message`. It
-adds no storage of its own. Underneath it stages, batches, claims and flushes
-exactly like an [event](/primitives/event), because it is one.
-
-What it adds is the part that usually makes people install a second library: a
-severity level, a filter that drops the noisy half before it costs anything, an
-`Error` overload that puts the stack somewhere you can query, and a child logger
-that carries context.
+A log is an [event](/primitives/event) with three reserved columns: `ts`,
+`level` and `message`. Underneath it stages, batches, claims and flushes
+exactly as an event does, and on top it adds a severity level, a filter that
+drops the noisy half before it costs anything, an `Error` overload that puts
+the stack somewhere queryable, and a child logger that carries context.
 
 ```ts
 import { log, str } from 'metrichouse/core'
@@ -26,26 +23,81 @@ appLog.warn('payment processor slow', { service: 'checkout' })
 appLog.error(new Error('card declined'), { service: 'checkout' })
 ```
 
-## Why it is here
+| | |
+| --- | --- |
+| Import | `import { log } from 'metrichouse/core'` |
+| Answers | What did the application say, and how serious was it |
+| Storage | Staged whole, never merged |
+| Row | `{ id, ts, level, message, error_stack?, ...fields, _ingested_at }` |
+| Write with | [the level methods](#log-level), [`at()`](#log-at), [`child()`](#log-child) |
+| Read with | [`pending()`](#log-pending), [`peek()`](#log-peek), [`snapshot()`](#log-snapshot) |
+| Use it for | Application messages, request lines, audit trails |
 
-Logs are the one signal that matters most in the minute a process is dying. A
-separate logging library means a second transport, a second flush schedule and
-second crash behaviour to reason about. Sharing the event pipeline means a log
-inherits the staging guarantees rather than reimplementing them.
+Logs matter most in the minute a process is dying, which is why they share the
+event pipeline rather than arriving with a second transport, a second cadence
+and second crash behaviour to reason about.
 
-## Levels
-
-The default levels are `['debug', 'info', 'warn', 'error']`, and each one becomes
-a method.
+## log()
 
 ```ts
-appLog.debug('cache miss', { service: 'api' })
-appLog.info('order placed', { service: 'api' })
-appLog.warn('retrying upstream', { service: 'api' })
-appLog.error('upstream unavailable', { service: 'api' })
+log<F, L>(name: string, config: LogConfig<F, L>): Log<F, L>
 ```
 
-Declare your own set and the type narrows to exactly what you list.
+Declares a log. It is inert until a [house](/guide/the-house) binds it, and
+writing to an unbound log throws.
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `name` | `string` | yes | [The metric name](#name) |
+| `config.fields` | shape | no | [Extra columns beyond the reserved ones](#fields) |
+| `config.levels` | array of strings | no | [The closed set of levels](#levels) |
+| `config.minLevel` | one of `levels` | no | [The lowest level kept](#minlevel) |
+| `config.stage` | `'driver'` or `'local'` | no | [Where lines wait](#stage) |
+| `config.batch` | object | no | [Local staging size and age limits](#batch) |
+| `config.flush` | duration | no | [The fastest this may ship](#flush) |
+| `config.claimLimit` | number | no | [Lines one flush may carry](#claimlimit) |
+| `config.write` | function | yes | [Where the rows go](#write) |
+
+### name
+
+```ts
+log('app_log', { ... })
+```
+
+A non empty string, unique inside a house.
+
+### fields
+
+```ts
+fields?: Record<string, FieldType>      // default: none
+```
+
+Extra columns, alongside the reserved three. Every
+[field type](/reference/field-types) is legal, including `json()`.
+
+```ts
+fields: {
+  service: str(),
+  env: str().default('production'),
+  requestId: str().optional(),
+}
+```
+
+A field may not be named `id`, `ts`, `level`, `message`, `error_stack`,
+`_ingested_at` or `_sample_rate`, and the check runs at declaration.
+[fields](/reference/fields) covers the argument in full.
+
+### levels
+
+```ts
+levels?: readonly string[]      // default: ['debug', 'info', 'warn', 'error']
+```
+
+The closed set of levels, in ascending severity. The order is what
+[`minLevel`](#minlevel) compares on, so it is a declaration rather than a
+formality.
+
+Each level becomes a method, and the type narrows to exactly what you list.
 
 ```ts
 export const auditLog = log('audit_log', {
@@ -62,13 +114,23 @@ auditLog.info('...')
 //       ^^^^ Type error: this log has no 'info' method
 ```
 
-Order is severity, lowest first. That is the only ordering that works for a
-custom set, so it is a declaration rather than a formality.
+```ts
+import { DEFAULT_LOG_LEVELS } from 'metrichouse/core'
+// ['debug', 'info', 'warn', 'error']
+```
+
+Three things throw at declaration: an empty set, a level declared twice, and a
+level that would shadow a method on the logger. `levels: ['debug', 'drain']` is
+the third one, and catching it here is better than having `logger.drain()`
+quietly write a log line.
 
 ### minLevel
 
-Anything below `minLevel` is dropped before its fields are checked and before
-anything is queued.
+```ts
+minLevel?: L[number]      // default: the lowest declared level
+```
+
+Drops anything below this level before it reaches the driver.
 
 ```ts
 export const appLog = log('app_log', {
@@ -82,34 +144,105 @@ export const appLog = log('app_log', {
 appLog.debug('request headers', { service: 'api' })
 ```
 
-Dropped means dropped. No record is created, no field is validated and nothing is
-queued.
+Dropped means dropped. No record is created, no field is validated and nothing
+is queued, so a filtered call costs one comparison.
 
-### Choosing a level at runtime
+A `minLevel` that is not one of the declared levels throws at declaration.
+
+### stage
 
 ```ts
-appLog.at(level, 'message from upstream', { service: 'gateway' })
+stage?: 'driver' | 'local'      // default: 'driver'
 ```
 
-`at()` throws if the level is not one you declared. A log line with a level
-nothing queries is worse than a loud failure at the one call site that could have
-a typo.
+Where lines wait between the call and your `write` function. Identical to
+[the event's](/primitives/event#stage).
 
-### Try it
+Prefer `'driver'` on a durable driver. A crash is the moment the last thirty
+seconds of logs are worth the most, and local staging is the one setting that
+would lose them.
 
-`minLevel` is the setting with the largest effect on what a log costs. Drag it
-and watch both the volume and the bill.
+### batch
 
-<MhLogFilter />
+```ts
+batch?: { maxSize?: number; maxAge?: DurationInput }
+// defaults: { maxSize: 500, maxAge: '10s' }
+```
 
-Moving `minLevel` from `debug` to `info` in a busy service usually removes most
-of the volume, and the dropped lines cost one array index each. Nothing is
-built, nothing is validated, nothing is queued.
+Local staging only, and ignored when `stage: 'driver'`. Identical to
+[the event's](/primitives/event#batch).
 
-## Errors
+### flush
 
-Any level accepts an `Error` instead of a string. The message goes in the
-`message` column and the stack goes in a reserved `error_stack` column.
+```ts
+flush?: DurationInput      // default: the house default, then '30s'
+```
+
+The fastest this log may ship. A log has no resolution for a cadence to divide,
+so any duration is legal.
+
+### claimLimit
+
+```ts
+claimLimit?: number      // default: unlimited
+```
+
+How many lines one flush may carry. Identical to
+[the event's](/primitives/event#claimlimit), and worth setting on a log that
+uploads a file per flush.
+
+### write
+
+```ts
+write: (rows: LogRow<F, L>[], context: WriteContext) => Promise<void> | void
+```
+
+Where the rows go. Required.
+
+| Parameter | Type | Meaning |
+| --- | --- | --- |
+| `rows` | `LogRow<F, L>[]` | The reserved columns, your declared fields, and `level` typed to the levels you declared |
+| `context` | `WriteContext` | Which metric, the span of line timestamps, how many, and which attempt |
+
+MetricHouse prints nothing of its own. A `write` function that also calls
+`console.log` is how you get both, and
+[Also writing to the console](#also-writing-to-the-console) shows one.
+
+## Level methods {#log-level}
+
+```ts
+info(message: string | Error, fields?: InferShape<F>): void
+```
+
+One method per declared level. With the default levels that is `debug()`,
+`info()`, `warn()` and `error()`.
+
+| Parameter | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `message` | `string` or `Error` | yes | The line. An `Error` also fills `error_stack` |
+| `fields` | the declared shape | when any field is required | [The values for this line](/reference/fields#on-a-log) |
+
+```ts
+appLog.debug('cache miss', { service: 'api' })
+appLog.info('order placed', { service: 'api' })
+appLog.warn('retrying upstream', { service: 'api' })
+appLog.error('upstream unavailable', { service: 'api' })
+```
+
+The fields argument may be left out once nothing in the shape is still
+required, which is what makes `log.info('started')` legal on a log whose fields
+are all optional or bound by a [`child()`](#log-child).
+
+**Returns** nothing. A line below [`minLevel`](#minlevel) returns immediately
+and stages nothing.
+
+**Throws** on an unbound log, or on a field that is unknown, missing or ill
+typed. The message itself never throws, which is the next section.
+
+### An Error as the message
+
+Any level accepts an `Error` in place of a string. The message goes in
+`message` and the stack goes in the reserved `error_stack` column.
 
 ```ts
 try {
@@ -127,17 +260,42 @@ try {
 }
 ```
 
+An error that arrives without a stack, which happens with a rethrown or cross
+realm error, still gets a header line, because that is worth more than an empty
+column.
+
 ::: tip A logger never takes down a request
-Every other call in MetricHouse throws on a bad value. A log message does not. If
-you pass something that is neither a string nor an `Error`, it is turned into a
-string. That call is made from inside `catch` blocks, and a logger that throws
-there replaces the error you were handling.
+Every other call in MetricHouse throws on a bad value. A log message does not.
+Something that is neither a string nor an `Error` is turned into a string. This
+call is made from inside `catch` blocks, and a logger that throws there
+replaces the error you were handling.
 :::
 
-## Child loggers
+## log.at()
 
-`child()` returns a logger that merges fields into every call it makes. It is how
-a request id reaches every line without being threaded through every function.
+```ts
+at(level: L[number], message: string | Error, fields?: InferShape<F>): void
+```
+
+Writes at a level chosen while the program runs: one parsed from an upstream
+payload, or carried in a variable.
+
+```ts
+appLog.at(level, 'message from upstream', { service: 'gateway' })
+```
+
+**Throws** when `level` is not one of the declared levels. A log line with a
+level nothing queries is worse than a loud failure at the one call site that
+could have a typo.
+
+## log.child()
+
+```ts
+child(fields: Partial<InferShape<F>>): ChildLog
+```
+
+Returns a logger that merges `fields` into every call it makes. It is how a
+request id reaches every line without being threaded through every function.
 
 ```ts
 const requestLog = appLog.child({ service: 'checkout', requestId: 'req_9f21' })
@@ -156,35 +314,113 @@ const requestLog = serviceLog.child({ requestId: 'req_9f21' })
 const userLog = requestLog.child({ userId: 'u_42' })
 ```
 
-A bound field becomes optional rather than absent in the child's type. That means
-`child({ service })` satisfies a required field, and overriding it at one call
-site is still allowed:
+A bound field becomes omittable rather than absent in the child's type, so
+`child({ service })` satisfies a required field and a call site may still
+override it.
 
 ```ts
 requestLog.info('retrying', { requestId: 'req_9f22' })   // the call site wins
 ```
 
-A child is not a metric. It stages into the log that made it and shares its batch
-settings and its write function.
+A child carries the same level methods, `at()` and `child()`, plus `bound`,
+which is a frozen copy of the fields it adds.
 
-## Tune it
+| Member | Type | Meaning |
+| --- | --- | --- |
+| `name` | `string` | The log this child writes into |
+| `bound` | `Readonly<Record<string, unknown>>` | The fields merged into every call |
 
-Underneath, a log stages and batches exactly like an event, so the same controls
-apply.
+A child is not a metric. It stages into the log that made it and shares its
+batch settings, its cadence and its `write` function.
 
-<MhEventFlow metric="app_log" kind="log" />
-
-## Reading
+## log.pending()
 
 ```ts
-await appLog.pending()          // lines staged, not yet shipped
-await appLog.peek(20)           // the first 20 as rows, without consuming
-await appLog.snapshot({ limit: 100 })
+pending(): Promise<number>
 ```
 
-A snapshot row's `level` is typed to the levels you declared.
+How many lines are staged and not yet shipped.
 
-## The rows you receive
+```ts
+await appLog.pending()     // 128
+```
+
+## log.peek()
+
+```ts
+peek(n?: number): Promise<Row[]>
+```
+
+The first `n` staged lines as rows, without consuming them. Identical to
+[the event's](/primitives/event#event-peek).
+
+```ts
+await appLog.peek(20)
+```
+
+## log.snapshot()
+
+```ts
+snapshot(options?: SnapshotOptions): Promise<LogLiveRow<F, L>[]>
+```
+
+Unshipped lines as typed rows, with `level` narrowed to the levels you
+declared.
+
+```ts
+await appLog.snapshot({ limit: 100 })
+await appLog.snapshot({ from: Date.now() - 60_000, orderBy: 'ts', direction: 'asc' })
+```
+
+Never partial, for the reason [an event gives](/primitives/event#event-snapshot).
+Options are in [Snapshot options](/reference/snapshot-options).
+
+## log.flush()
+
+```ts
+flush(options?: FlushOptions): Promise<MetricFlushReport>
+```
+
+Claims the staged lines, up to [`claimLimit`](#claimlimit), and ships them.
+[Flush options](/reference/flush-options) covers the argument and the report.
+
+## log.drain()
+
+```ts
+drain(): Promise<void>
+```
+
+Resolves once every line written so far has reached the driver. On a locally
+staged log it also ships what is buffered.
+
+## log.rowShape()
+
+```ts
+rowShape(): RowShape
+```
+
+```ts
+appLog.rowShape().columns.map((c) => c.name)
+// ['id', 'ts', 'level', 'message', 'error_stack', 'service', 'requestId',
+//  '_ingested_at']
+```
+
+## Properties
+
+| Property | Type | Value |
+| --- | --- | --- |
+| `name` | `string` | The name it was declared with |
+| `kind` | `'log'` | |
+| `storage` | `'staged'` | It keeps each line whole |
+| `fields` | `Shape` | The fields you declared. The reserved three are not among them |
+| `levels` | `readonly string[]` | The declared levels, lowest severity first |
+| `minLevel` | `string` | The lowest level kept |
+| `stage` | `'driver'` or `'local'` | Where lines wait |
+| `flushMs` | `number` | `flush`, parsed, including one taken from the house |
+| `isBound` | `boolean` | `true` once a house has registered it |
+| `write` | `WriteFn` | The function it was declared with |
+
+## The row
 
 ```ts
 {
@@ -199,11 +435,23 @@ A snapshot row's `level` is typed to the levels you declared.
 }
 ```
 
-Column order is `id, ts, level, message, error_stack`, then your fields, then
-`_ingested_at`.
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `id` | `string` | A UUID version 7, minted when the line was written |
+| `ts` | `Date` | When the line was written |
+| `level` | one of `levels` | The severity |
+| `message` | `string` | The line |
+| `error_stack` | `string` | Present only on a line written with an `Error` |
+| one per field | as declared | Your values |
+| `_ingested_at` | `Date` | When the call ran |
 
-Inside `write`, each row is a `LogRow`, and its `level` is typed to the levels you
-declared, the same as a snapshot row. See [Rows are typed](../guide/writing-a-sink.md#rows-are-typed).
+Column order is `id, ts, level, message, error_stack`, then your fields, then
+`_ingested_at`. A log never samples, so there is no `_sample_rate`.
+
+Inside `write`, each row is a `LogRow<F, L>`, with `level` typed to the levels
+you declared. See [Rows are typed](/guide/writing-a-sink#rows-are-typed).
+
+### Table schema
 
 ::: code-group
 
@@ -240,37 +488,40 @@ CREATE INDEX ON app_log (level, ts DESC);
 
 :::
 
-## Reserved names
-
-A declared field may not be named `id`, `ts`, `level`, `message`, `error_stack`,
-`_ingested_at` or `_sample_rate`.
+### Reserved names
 
 ```ts
 import { RESERVED_LOG_COLUMNS } from 'metrichouse/core'
+// ['id', 'ts', 'level', 'message', 'error_stack', '_ingested_at', '_sample_rate']
 ```
 
-A level name may not shadow a method on the logger, so `levels: ['debug', 'drain']`
-is rejected at declaration time rather than turning `logger.drain()` into
-something that writes a log line.
+A declared field may not take one of those names. A level may not shadow a
+method on the logger. Both are checked at declaration.
 
-## Settings
+### Queries
 
-| Setting | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `fields` | shape | none | Extra fields beyond the reserved ones |
-| `levels` | array of strings | `['debug','info','warn','error']` | Ascending severity |
-| `minLevel` | one of `levels` | the lowest | Drop anything below this |
-| `stage` | `'driver'` or `'local'` | `'driver'` | Where lines wait |
-| `batch.maxSize` | number | `500` | Local staging: ship at this many |
-| `batch.maxAge` | duration | `'10s'` | Local staging: ship this long after the first |
-| `flush` | duration | `'30s'` | The fastest this may ship |
-| `claimLimit` | number | unlimited | Lines one flush may carry |
-| `write` | function | required | Where the rows go |
+```sql
+-- Error rate by service, per hour.
+SELECT
+  toStartOfHour(ts) AS hour,
+  service,
+  countIf(level IN ('error', 'fatal')) AS errors,
+  count()                              AS lines
+FROM app_log
+WHERE ts >= now() - INTERVAL 1 DAY
+GROUP BY hour, service
+ORDER BY errors DESC;
 
-## In production
+-- Every line for one request.
+SELECT ts, level, message, error_stack
+FROM app_log
+WHERE requestId = 'req_9f21'
+ORDER BY ts;
+```
 
-A request scoped logger wired into Express, shipping to S3 as newline delimited
-JSON.
+## Patterns
+
+### A request scoped logger
 
 ```ts
 // metrics/schema.ts
@@ -279,8 +530,8 @@ import { log, str } from 'metrichouse/core'
 const LEVELS = ['debug', 'info', 'warn', 'error', 'fatal'] as const
 type Level = (typeof LEVELS)[number]
 
-// Validate the environment variable here, so a typo is a startup failure with a
-// clear message rather than a log that silently drops everything.
+// Validate the environment variable here, so a typo is a startup failure with
+// a clear message rather than a log that silently drops everything.
 function configuredLevel(): Level {
   const value = process.env.LOG_LEVEL ?? 'info'
   if (!LEVELS.includes(value as Level)) {
@@ -380,7 +631,7 @@ app.post('/orders', async (req, res) => {
 
 ### Also writing to the console
 
-MetricHouse does not print anything. In development you usually want both.
+MetricHouse prints nothing. In development you usually want both.
 
 ```ts
 function withConsole(name: string) {
@@ -395,24 +646,24 @@ function withConsole(name: string) {
 }
 ```
 
-Or print at the call site for immediate feedback, and let MetricHouse handle
-storage.
+Printing at the call site is the other option, and it gives immediate feedback
+while MetricHouse handles storage.
 
-```sql
--- Error rate by service, per hour.
-SELECT
-  toStartOfHour(ts) AS hour,
-  service,
-  countIf(level IN ('error', 'fatal')) AS errors,
-  count()                              AS lines
-FROM app_log
-WHERE ts >= now() - INTERVAL 1 DAY
-GROUP BY hour, service
-ORDER BY errors DESC;
+## Playground
 
--- Every line for one request.
-SELECT ts, level, message, error_stack
-FROM app_log
-WHERE requestId = 'req_9f21'
-ORDER BY ts;
-```
+### The filter
+
+`minLevel` is the setting with the largest effect on what a log costs. Drag it
+and watch both the volume and the bill.
+
+<MhLogFilter />
+
+Moving `minLevel` from `debug` to `info` in a busy service usually removes most
+of the volume, and each dropped line costs one array index.
+
+### Staging and batching
+
+Underneath, a log stages and batches exactly like an event, so the same
+controls apply.
+
+<MhEventFlow metric="app_log" kind="log" />

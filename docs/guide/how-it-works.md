@@ -78,8 +78,8 @@ its own row.
 </figure>
 
 This is the setting that decides how much data you generate, so it is worth
-understanding before you ship. See
-[Metrics and dimensions](/guide/metrics-and-dimensions).
+understanding before you ship. [dims](/reference/dims) covers the declaration,
+the argument at each call site and what cardinality costs.
 
 ## The flush handshake
 

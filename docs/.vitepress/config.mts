@@ -62,6 +62,12 @@ export default defineConfig({
     nav: [
       { text: 'Guide', link: '/guide/what-is-metrichouse', activeMatch: '/guide/' },
       { text: 'Metric types', link: '/primitives/', activeMatch: '/primitives/' },
+      {
+        text: 'Arguments',
+        link: '/reference/dims',
+        activeMatch:
+          '/reference/(dims|fields|durations|snapshot-options|flush-options|field-types)',
+      },
       { text: 'Examples', link: '/examples/', activeMatch: '/examples/' },
       { text: 'Reference', link: '/reference/', activeMatch: '/reference/' },
       {
@@ -87,18 +93,6 @@ export default defineConfig({
         ],
       },
       {
-        text: 'Core concepts',
-        collapsed: false,
-        items: [
-          { text: 'Metrics and dimensions', link: '/guide/metrics-and-dimensions' },
-          { text: 'Buckets and time', link: '/guide/buckets-and-time' },
-          { text: 'The house', link: '/guide/the-house' },
-          { text: 'Flushing', link: '/guide/flushing' },
-          { text: 'Writing a sink', link: '/guide/writing-a-sink' },
-          { text: 'Reading live data', link: '/guide/reading-live-data' },
-        ],
-      },
-      {
         text: 'Metric types',
         collapsed: false,
         items: [
@@ -106,9 +100,33 @@ export default defineConfig({
           { text: 'counter', link: '/primitives/counter' },
           { text: 'gauge', link: '/primitives/gauge' },
           { text: 'level', link: '/primitives/level' },
+          { text: 'timer', link: '/primitives/timer' },
           { text: 'event', link: '/primitives/event' },
           { text: 'log', link: '/primitives/log' },
-          { text: 'timer', link: '/primitives/timer' },
+        ],
+      },
+      {
+        text: 'Arguments',
+        collapsed: false,
+        items: [
+          { text: 'dims', link: '/reference/dims' },
+          { text: 'fields', link: '/reference/fields' },
+          { text: 'Field types', link: '/reference/field-types' },
+          { text: 'Durations', link: '/reference/durations' },
+          { text: 'Snapshot options', link: '/reference/snapshot-options' },
+          { text: 'Flush options', link: '/reference/flush-options' },
+          { text: 'The write function', link: '/guide/writing-a-sink' },
+        ],
+      },
+      {
+        text: 'Core concepts',
+        collapsed: false,
+        items: [
+          { text: 'Declaring a metric', link: '/guide/metrics-and-dimensions' },
+          { text: 'Buckets and time', link: '/guide/buckets-and-time' },
+          { text: 'The house', link: '/guide/the-house' },
+          { text: 'Flushing', link: '/guide/flushing' },
+          { text: 'Reading live data', link: '/guide/reading-live-data' },
         ],
       },
       {
@@ -138,7 +156,6 @@ export default defineConfig({
         collapsed: false,
         items: [
           { text: 'API index', link: '/reference/' },
-          { text: 'Field types', link: '/reference/field-types' },
           { text: 'Configuration', link: '/reference/configuration' },
           { text: 'Driver contract', link: '/reference/driver-contract' },
         ],
