@@ -1,6 +1,6 @@
 # Diagram briefs
 
-Thirteen diagrams appear across the site. Every one currently has a plain
+Fourteen diagrams appear across the site. Every one currently has a plain
 placeholder SVG in `public/diagrams/`, generated so nothing on the site is
 broken while the real versions are made.
 
@@ -61,14 +61,14 @@ boundary is the write function.
 **Used on:** How it works, Choosing a metric type.
 **Captions on the page** (do not repeat these inside the image):
 
-- How it works: "Counters, gauges and timers fold. Events and logs stay whole."
+- How it works: "Counters, gauges, levels and timers fold. Events and logs stay whole."
 - Choosing a metric type: "The split that explains most of the behaviour you will meet."
 
 **Size:** 900 x 300.
 
 Two rows, separated by a thin divider.
 
-**Top row, headed `Folded · counter, gauge, timer`:**
+**Top row, headed `Folded · counter, gauge, level, timer`:**
 Three small white boxes reading `+1`, `+1`, `+3`, an arrow labelled `add up`,
 then one blue box reading `one number: 5` with the subtitle `per time window`.
 To the right, two lines of muted text: "Three writes become one row." and "Memory
@@ -362,6 +362,33 @@ that helps.
 
 ---
 
+## 14. level-carry.svg
+
+**Used on:** level.
+**Captions on the page** (do not repeat these inside the image):
+
+- level: "The same three writes, stored two ways."
+
+**Size:** 900 x 300.
+
+Seven windows across, drawn as faint vertical rules, and three rows down.
+
+- **Row one, `written`:** boxes only in windows 1, 5 and 7, holding `42`, `38`
+  and `51`. The other four windows are empty.
+- **Row two, `gauge`:** the same three boxes, and in the four empty windows a
+  dashed grey box reading `no row`.
+- **Row three, `level`:** all seven filled, `42 42 42 42 38 38 51`. The three
+  that were written are solid blue; the four carried ones are the same blue,
+  lighter and dashed, so the eye can tell a written value from a carried one.
+
+Below, one line of muted text: "A dashed box is a window nobody wrote to. The
+gauge has no row for it, the level carries the last value in."
+
+The point the image has to make: the gauge row should read as broken and the
+level row as continuous. That contrast is the whole argument for the type.
+
+---
+
 ## Two more worth having
 
 Not referenced by any page yet. Add the image and the figure block together if
@@ -383,13 +410,14 @@ dimensions.
 ### choosing.svg
 
 A decision tree for picking a metric type. One question per node, ending on one of
-the five names.
+the six names.
 
 ```
-Are you tallying occurrences?              -> counter
-Are you sampling a value?                  -> gauge
-Are you measuring how long something took? -> timer
-Do you need per item detail?               -> event
+Are you tallying occurrences?               -> counter
+Are you sampling a value?                   -> gauge
+Does the value hold between writes?         -> level
+Are you measuring how long something took?  -> timer
+Do you need per item detail?                -> event
 Is it an application message with severity? -> log
 ```
 

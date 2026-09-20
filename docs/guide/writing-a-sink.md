@@ -198,7 +198,7 @@ The second argument describes the batch.
 ```ts
 interface WriteContext {
   metric: string        // 'http_requests'
-  kind: 'counter' | 'gauge' | 'event' | 'log' | 'timer'
+  kind: 'counter' | 'gauge' | 'level' | 'event' | 'log' | 'timer'
   bucketFrom: number    // oldest window start, or oldest record timestamp
   bucketTo: number      // one window past the newest, so the range is [from, to)
   total: number         // this batch's headline number

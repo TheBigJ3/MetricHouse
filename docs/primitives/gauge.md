@@ -1,7 +1,8 @@
 # gauge
 
 A gauge records values you sample. Where a counter asks "how many times", a gauge
-asks "what was it when we looked".
+asks "what was it when we looked". For a value that holds between the times you
+look, see [`level`](/primitives/level).
 
 ```ts
 import { gauge, oneOf } from 'metrichouse/core'
@@ -20,8 +21,12 @@ onlineUsers.set(1_284, { region: 'us-east' })
 
 ## Use it for
 
-Users online, queue depth, connection pool size, cache hit ratio, temperature,
-disk usage, memory in use. Anything that has a value at a moment in time.
+Users online, cache hit ratio, temperature, disk usage, memory in use, request
+latency you measured yourself. Anything you take a reading of, where the spread
+of readings inside a window is worth keeping.
+
+For queue depth, connections in use and anything else that holds its value
+between readings, use [`level`](/primitives/level) instead.
 
 ## What it keeps
 
@@ -91,8 +96,8 @@ observations in the same window all contribute to the fold.
 For a gauge with no dimensions the argument is optional:
 
 ```ts
-const queueDepth = gauge('queue_depth', { resolution: '10s', flush: '1m', write })
-queueDepth.set(42)
+const heapUsedMb = gauge('heap_used_mb', { resolution: '10s', flush: '1m', write })
+heapUsedMb.set(process.memoryUsage().heapUsed / 1024 / 1024)
 ```
 
 ## Reading
@@ -220,17 +225,17 @@ That is right for something you sample. It is wrong for a quantity that persists
 between observations, such as queue depth, where "no observation" means the value
 did not change rather than that it stopped existing.
 
-A dedicated metric for that is planned but not built. Today, sample on a fixed
-timer so every window has at least one observation:
+[`level`](/primitives/level) is the type for that. It keeps one value per series
+and carries it into every window nobody wrote to, so the chart draws a line.
 
 ```ts
-setInterval(() => {
-  queueDepth.set(queue.size())
-}, 10_000)
+const queueDepth = level('queue_depth', { resolution: '1m', flush: '1m', write })
+
+queueDepth.set(42)   // every minute reports 42 until this changes
 ```
 
-With `resolution: '1m'` that gives six observations a minute, and no window is
-ever empty.
+Use a gauge when you are sampling something and want the spread inside each
+window. Use a level when the gap between writes is the part you need filled.
 
 ## In production
 

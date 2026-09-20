@@ -8,7 +8,7 @@ const props = withDefaults(
   defineProps<{
     /** Shown in the row preview and in the error text. */
     metric?: string
-    kind?: 'counter' | 'gauge' | 'timer'
+    kind?: 'counter' | 'gauge' | 'level' | 'timer'
     resolution?: string
     flush?: string
     grace?: string
@@ -173,8 +173,10 @@ const bucketBarW = computed(() => GRACE_W - graceBarW.value)
 
 // ---------------------------------------------------------------- row preview
 
+// a counter and a level both carry one number per row; a gauge and a timer
+// carry the fold
 const valueColumns = computed(() =>
-  props.kind === 'counter' ? ['value'] : ['min', 'max', 'sum', 'count'],
+  props.kind === 'counter' || props.kind === 'level' ? ['value'] : ['min', 'max', 'sum', 'count'],
 )
 
 const snippet = computed(() => {

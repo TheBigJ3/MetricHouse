@@ -8,8 +8,9 @@
  *
  * **Not a level.** A gauge answers "what values were observed in this bucket".
  * A bucket with no observations is *absent*, which on a chart is a hole rather
- * than a held value. For a quantity that persists between observations — queue
- * depth, in-flight requests — use `level()`.
+ * than a held value. For a quantity that persists between observations, such as
+ * queue depth or requests in flight, `level()` is the primitive: it keeps one
+ * value per series and carries it into the buckets nobody wrote to.
  */
 
 import { type Cell, type Driver, type GaugeCell, isGaugeCell } from '../drivers/types.js'

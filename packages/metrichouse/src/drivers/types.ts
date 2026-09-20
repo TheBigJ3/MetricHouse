@@ -5,7 +5,9 @@
  * **Deliberately small.** The spec lists seventeen methods, covering
  * primitives and drivers that do not exist yet. Writing them now would enshrine
  * guesses about shapes nothing has exercised. Each one gets added when a second
- * driver or a second primitive actually forces it.
+ * driver or a second primitive actually forces it — `setLevel`, `readLevels`
+ * and `dropLevels` are here because `level()` forced them, and for no other
+ * reason.
  *
  * There are two storage models here, and the split is the whole shape of the
  * file:

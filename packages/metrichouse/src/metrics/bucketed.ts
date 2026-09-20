@@ -1,11 +1,12 @@
 /**
  * The batch lifecycle shared by every aggregate primitive.
  *
- * Counter and gauge differ in what a cell *is* and what a row looks like, and
- * in nothing else: both bucket by resolution, both claim on a watermark, both
- * hand the driver's claim/ack/release back untouched. That common part lives
- * here so a third aggregate kind — `level()` is the one coming — implements
- * `materialize` and `totalOf` and inherits the rest.
+ * Counter, gauge and level differ in what a cell *is* and what a row looks
+ * like, and in almost nothing else: all three bucket by resolution, claim on a
+ * watermark, and hand the driver's claim/ack/release back untouched. That
+ * common part lives here, so a kind supplies `materialize` and `totalOf` and
+ * inherits the rest. A level is the one that adds anything on top, and what it
+ * adds is a step before the claim rather than a change to one.
  */
 
 import {

@@ -18,8 +18,8 @@ lives and what you do with it. MetricHouse handles collection: bucketing, atomic
 aggregation, durable staging and flush. The full comparison is in
 [What MetricHouse is](https://www.metrichouse.dev/guide/what-is-metrichouse).
 
-> **Status: five primitives run.** `counter`, `gauge`, `event`, `log` and
-> `timer` all write through the memory driver, live-read, and flush to your
+> **Status: six primitives run.** `counter`, `gauge`, `level`, `event`, `log`
+> and `timer` all write through the memory driver, live-read, and flush to your
 > `write()` with stable row ids — the snippet below is a working program, not a
 > sketch. `event` brought the second storage model with it: records are staged
 > and shipped whole, never folded, so the driver contract covers both
@@ -31,8 +31,11 @@ aggregation, durable staging and flush. The full comparison is in
 > driver contract, so at-least-once holds across a failed write rather than
 > just a failed call. On `ioredis` it now holds across a failed *process* too:
 > a flush puts back any claim held longer than `recoverAfter` before it claims,
-> so a crash mid-flush delays that window rather than stranding it. Still
-> missing: `level`/`distinct`, `ingest`/`backfill`, and the CLI.
+> so a crash mid-flush delays that window rather than stranding it. `level` is
+> the newest, and the first primitive to need storage a claim never takes: it
+> keeps one value per series beside the buckets and carries it into every
+> window nobody wrote to, which is the hole a gauge leaves and cannot fill.
+> Still missing: `distinct`, `ingest`/`backfill`, and the CLI.
 
 ## The rule
 

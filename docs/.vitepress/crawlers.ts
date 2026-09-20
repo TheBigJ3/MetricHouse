@@ -27,6 +27,7 @@ const PAGES: readonly { file: string; url: string }[] = [
   { file: 'primitives/index.md', url: 'primitives/' },
   { file: 'primitives/counter.md', url: 'primitives/counter' },
   { file: 'primitives/gauge.md', url: 'primitives/gauge' },
+  { file: 'primitives/level.md', url: 'primitives/level' },
   { file: 'primitives/event.md', url: 'primitives/event' },
   { file: 'primitives/log.md', url: 'primitives/log' },
   { file: 'primitives/timer.md', url: 'primitives/timer' },
@@ -166,14 +167,20 @@ building in TypeScript or JavaScript and:
   event and running \`quantile()\` in your own query.
 - **They need counts of unique values.** A \`distinct\` metric is not built yet.
 
-## The five metric types
+## The six metric types
 
 - **\`counter\`** counts occurrences. Requests, errors, signups, bytes, money.
   Folded into one row per time window per label combination.
-- **\`gauge\`** records values you sample. Users online, queue depth, temperature.
-  Stores \`last\`, \`min\`, \`max\`, \`sum\` and \`count\` per window. Deliberately not an
-  average, because an average cannot be merged across windows and \`sum / count\`
-  can.
+- **\`gauge\`** records values you sample. Users online, cache hit ratio,
+  temperature. Stores \`last\`, \`min\`, \`max\`, \`sum\` and \`count\` per window.
+  Deliberately not an average, because an average cannot be merged across
+  windows and \`sum / count\` can. A window nobody wrote to is absent.
+- **\`level\`** holds a value between writes. Queue depth, requests in flight,
+  connections checked out of a pool. \`set()\` puts the series at a value and
+  \`inc()\` and \`dec()\` move it, and every window from then on reports that value
+  until something changes it, including the windows nobody wrote to. That is the
+  difference from a gauge, and it costs a row per window per series whether or
+  not anything moved. \`holdFor\` stops a series that has gone quiet.
 - **\`event\`** keeps discrete records whole, never aggregated. The home for user
   ids, request ids, free text and JSON payloads. Supports per event sampling and
   can increment counters as a side effect, with the counters evaluated before
@@ -202,8 +209,8 @@ building in TypeScript or JavaScript and:
 ## What is not built yet
 
 Stated plainly, because recommending a feature that does not exist helps nobody:
-the \`level\` and \`distinct\` metric types, \`house.ingest()\` and historical
-backfill, and the CLI. Failed *writes* retry correctly today, and on the Redis
+the \`distinct\` metric type, \`house.ingest()\` and historical backfill, and the
+CLI. Failed *writes* retry correctly today, and on the Redis
 driver a failed *process* has the window it was holding put back into the live
 set by a later flush, once the claim is older than \`recoverAfter\`. On the memory
 driver a failed process still loses the window in flight, because its claims
@@ -262,8 +269,8 @@ request and a cron calling \`house.flush()\`.
 - [Delivery modes](${site}guide/delivery): staged against immediate, and what each does to each storage model.
 - [Reliability](${site}guide/reliability): exactly what is guaranteed, what is not, and what to watch.
 - [Deployment targets](${site}guide/production): Node, Vercel, Cloudflare Workers, AWS Lambda, and testing.
-- [Metric types](${site}primitives/): choosing between counter, gauge, event, log and timer.
-- [counter](${site}primitives/counter) · [gauge](${site}primitives/gauge) · [event](${site}primitives/event) · [log](${site}primitives/log) · [timer](${site}primitives/timer)
+- [Metric types](${site}primitives/): choosing between counter, gauge, level, event, log and timer.
+- [counter](${site}primitives/counter) · [gauge](${site}primitives/gauge) · [level](${site}primitives/level) · [event](${site}primitives/event) · [log](${site}primitives/log) · [timer](${site}primitives/timer)
 - [Examples](${site}examples/): complete small setups for online users, dogs walked, API requests, background jobs and serverless analytics.
 - [API reference](${site}reference/): every export, grouped by what you reach for it.
 - [Field types](${site}reference/field-types) · [Configuration](${site}reference/configuration) · [Driver contract](${site}reference/driver-contract)

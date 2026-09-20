@@ -185,7 +185,7 @@ decides outright, because "this platform cannot flush" is a fact about the
 deployment that a schema file has no standing to argue with.
 
 ::: tip A metric with no cadence anywhere is an error
-A counter, gauge or timer that declares no `flush` and is registered with a house
+A counter, gauge, level or timer that declares no `flush` and is registered with a house
 that supplies no `defaults.flush` throws at startup. Events and logs fall back to
 `'30s'`, since they have no resolution for a cadence to divide.
 :::

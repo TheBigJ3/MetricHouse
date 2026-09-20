@@ -1,11 +1,12 @@
 # Choosing a metric type
 
-There are five. Pick by the question you want to answer later.
+There are six. Pick by the question you want to answer later.
 
 | Type | Answers | Storage |
 | --- | --- | --- |
 | [`counter`](/primitives/counter) | How many times did this happen | Folded |
 | [`gauge`](/primitives/gauge) | What was this value when we looked | Folded |
+| [`level`](/primitives/level) | What is this value now, and what was it in between | Folded |
 | [`event`](/primitives/event) | What exactly happened, with all the detail | Kept whole |
 | [`log`](/primitives/log) | What did the application say, and how serious was it | Kept whole |
 | [`timer`](/primitives/timer) | How long did this take | Folded |
@@ -15,8 +16,12 @@ There are five. Pick by the question you want to answer later.
 **Are you tallying occurrences?** Use a `counter`. Requests served, errors,
 signups, emails sent, bytes transferred, money taken.
 
-**Are you sampling a value that exists whether or not you look?** Use a `gauge`.
-Users online, queue depth, cache hit ratio, temperature, disk usage.
+**Are you sampling a value, and do you want the spread of your readings?** Use a
+`gauge`. Users online, cache hit ratio, temperature, disk usage.
+
+**Does the value hold between the times you write to it?** Use a `level`. Queue
+depth, requests in flight, connections checked out of a pool. A gauge leaves a
+hole in every window nobody wrote to, and a level carries the last value in.
 
 **Are you measuring how long something took?** Use a `timer`. It is a gauge with
 the clock handling built in.
@@ -37,6 +42,10 @@ event with a level, a filter and a bound child logger.
 **Folded** metrics combine writes into one value per time window. Memory use
 depends on how many label combinations you have, not on how much traffic you get.
 A thousand increments in one second become one row.
+
+A level folds too, and differs in one way worth knowing before you pick it: it
+writes a row for every window whether or not anything happened, because a held
+value is only useful if it is there in the windows nobody touched.
 
 **Kept whole** metrics keep every record. Memory use grows with traffic until the
 records ship, which is why they have batching settings and a backlog you can
@@ -95,12 +104,6 @@ are combined. `sum / count` is exact and one division away.
 **No `set` and no `distinct`.** Counting unique users is not implemented yet.
 Record a `userId` to an event and use `uniq()` in your query.
 
-**No level metric.** A gauge answers "what values were observed in this window".
-A window with no observations is absent, which on a chart is a gap rather than a
-held line. A metric for a quantity that persists between observations, such as
-queue depth, is planned but not built. Today, sample it on a timer and write a
-gauge.
-
 ## Shared settings
 
 Every metric type takes these.
@@ -109,10 +112,10 @@ Every metric type takes these.
 | --- | --- | --- |
 | `write` | All | The function that receives rows. Required |
 | `flush` | All | The fastest this metric may ship |
-| `dims` | counter, gauge, timer | Labels to break the number down by |
+| `dims` | counter, gauge, level, timer | Labels to break the number down by |
 | `fields` | event, log | The record schema. `json()` is allowed here |
-| `resolution` | counter, gauge, timer | How wide one time window is. Required |
-| `grace` | counter, gauge, timer | How long a late write may still land. Default `'2s'` |
+| `resolution` | counter, gauge, level, timer | How wide one time window is. Required |
+| `grace` | counter, gauge, level, timer | How long a late write may still land. Default `'2s'` |
 | `stage` | event, log | Where records wait. `'driver'` or `'local'` |
 | `batch` | event, log | Local staging only. Size and age limits |
 
@@ -120,7 +123,7 @@ And every metric exposes these.
 
 ```ts
 metric.name
-metric.kind          // 'counter' | 'gauge' | 'event' | 'log' | 'timer'
+metric.kind          // 'counter' | 'gauge' | 'level' | 'event' | 'log' | 'timer'
 metric.storage       // 'bucketed' | 'staged'
 metric.flushMs
 metric.isBound

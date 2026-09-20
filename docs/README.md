@@ -86,7 +86,7 @@ They are registered globally, so a page drops one in with a single tag.
 
 | Component | Controls | Used on |
 | --- | --- | --- |
-| `MhBucketExplorer` | resolution, flush, grace, label combinations | counter, gauge, timer, Buckets and time |
+| `MhBucketExplorer` | resolution, flush, grace, label combinations | counter, gauge, level, timer, Buckets and time |
 | `MhFoldExplorer` | the observations in one bucket, and which aggregates are stored | gauge, timer |
 | `MhEventFlow` | stage, rate, sample, flush, batch size and age | event, log |
 | `MhLogFilter` | minLevel, bytes per line, volume at each level | log |

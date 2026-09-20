@@ -1,7 +1,7 @@
 # Driver contract
 
 A driver is where running totals and staged records live between a write and a
-flush. The interface is thirteen methods. Implementing it is how you put
+flush. The interface is sixteen methods. Implementing it is how you put
 MetricHouse on storage it does not ship with.
 
 ```ts
@@ -20,7 +20,11 @@ export function myDriver(): Driver {
 
     async increment(ops) {},
     async observe(ops) {},
+    async setLevel(ops) {},
     async append(ops) {},
+
+    async readLevels(metric) { return [] },
+    async dropLevels(metric, dimKeys) {},
 
     async readBuckets(query) { return [] },
     async readPending(query) { return [] },
@@ -55,13 +59,14 @@ There are two storage shapes, and a driver has to support both.
 ```
 folded    metric -> bucket -> series key -> one cell     claim(metric, watermark)
 staged    metric -> an append only list of records       claimRecords(metric, limit)
+levels    metric -> series key -> one held value         never claimed
 ```
 
-A cell is either a `number`, which came from a counter, or a fold, which came from
-a gauge or a timer.
+A cell is a `number` from a counter, a fold from a gauge or a timer, or a held
+value from a level.
 
 ```ts
-type Cell = number | GaugeCell
+type Cell = number | GaugeCell | LevelCell
 
 interface GaugeCell {
   last: number
@@ -70,11 +75,25 @@ interface GaugeCell {
   sum: number
   count: number
 }
+
+interface LevelCell {
+  level: number
+}
 ```
+
+A level's value is boxed rather than stored bare so that storage can tell it
+from a counter's scalar. The two are the same digits meaning the opposite thing
+when a released claim has to be merged back: two counter cells for one window
+add, two level cells do not, because a level that read 42 twice still reads 42.
 
 The driver never interprets a cell. It stores what a metric wrote and hands it
 back. Deciding which kind it is belongs to the metric, because the metric is the
 only thing that knows its own type.
+
+The third row is the one piece of state a claim never touches. A level has to
+report a window nobody wrote to, so the number has to outlive the flush that
+shipped the last one. Everything else a driver holds is claimed and then
+deleted.
 
 ## Writing
 
@@ -111,6 +130,67 @@ count = existing.count + 1
 Unlike `increment`, this is a read, modify and write. On shared storage it has to
 be atomic, or two writers lose observations. The Redis driver uses a Lua script
 for exactly this.
+
+### setLevel
+
+```ts
+setLevel(ops: readonly LevelOp[]): Promise<void>
+// LevelOp: { metric, bucketTs, dimKey, value, mode }
+// mode: 'set' | 'add' | 'hold'
+```
+
+Two things move per operation, and they move together or not at all: the
+series' held value, and the cell in the window the operation names.
+
+| `mode` | Held value becomes | Cell at `bucketTs` becomes |
+| --- | --- | --- |
+| `set` | `value` | `value` |
+| `add` | held plus `value`, treating an unseen series as zero | the new held value |
+| `hold` | unchanged | `value`, but only if that window has no cell yet |
+
+A `hold` is what a flush issues for the windows nobody wrote to. It names its
+own value rather than reading the held one, because the window it fills is in
+the past and the series may have moved since. It leaves an existing cell alone,
+so a written value always beats a carried one. A `hold` for a series the driver
+has never seen does nothing at all, and must not bring one into existence.
+
+Each series also carries two timestamps, both handed to the driver rather than
+read from a clock it owns:
+
+```ts
+interface LevelSeries {
+  dimKey: string
+  value: number        // what it is at now
+  carried: number      // what it was at in the window `heldThrough` names
+  writtenAt: number    // the window the last set or add landed in
+  heldThrough: number  // the newest window a hold has carried it through
+}
+```
+
+`heldThrough` moves only on a `hold`, never on a `set` or an `add`. A series
+written at noon and again at three is still owed a row for every window in
+between, and a pointer that jumped to the later write would skip them.
+
+`carried` is the value the next carry starts from, and it is not always `value`
+for the same reason.
+
+### readLevels
+
+```ts
+readLevels(metric: string): Promise<LevelSeries[]>
+```
+
+Every series the metric currently holds, ascending by dim key. Unaffected by
+claims, because this is the state beside the buckets rather than in them.
+
+### dropLevels
+
+```ts
+dropLevels(metric: string, dimKeys: readonly string[]): Promise<void>
+```
+
+Forget those series entirely. What a `holdFor` expiry calls. Windows they have
+already filled are untouched; what goes is the reason to keep filling more.
 
 ### append
 
@@ -329,7 +409,20 @@ A driver has to satisfy all of these.
 - An empty batch does nothing.
 - A series key containing the separator or a backslash round trips intact.
 - A gauge fold keeps full floating point precision.
-- Observing into a series holding counter cells throws, and the reverse throws.
+- Writing a cell of one kind into a series that holds another throws, whichever
+  two kinds they are.
+
+**Levels**
+
+- A `set` puts the series at a value, a second `set` replaces it.
+- An `add` treats a series nothing has written to as zero.
+- A `hold` writes only into a window that has no cell, and writes the value it
+  was given rather than the one the series is at.
+- A `hold` for a series storage has never seen does nothing and creates nothing.
+- `heldThrough` moves on a hold and never on a write; `writtenAt` moves on a
+  write and never on a hold.
+- Held values survive the claim and the ack that ship their windows.
+- `dropLevels` forgets a series without touching the windows it already filled.
 
 **Reading**
 
@@ -500,9 +593,12 @@ export function tinyDriver(): Driver {
     // with the process. A durable driver sweeps its claim registry here.
     async recover() { return NOTHING_RECOVERED },
 
-    // The staged half is left out for brevity. A real driver implements all
-    // thirteen methods.
+    // The staged and level halves are left out for brevity. A real driver
+    // implements all sixteen methods.
     async observe() { throw new Error('not implemented') },
+    async setLevel() { throw new Error('not implemented') },
+    async readLevels() { return [] },
+    async dropLevels() {},
     async append() { throw new Error('not implemented') },
     async readPending() { return [] },
     async countPending() { return 0 },
