@@ -1,6 +1,6 @@
 {
   "name": "metrichouse",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Lightweight metric collection for TypeScript that fits the stack you already have: it buckets, aggregates and hands you rows to store anywhere.",
   "license": "MIT",
   "author": "TheBigJ3",
