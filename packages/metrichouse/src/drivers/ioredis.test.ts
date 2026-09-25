@@ -46,7 +46,14 @@ const client = await probe()
 
 /** The per-namespace counters a driver keeps between claims, by design. */
 function survives(ns: string, key: string): boolean {
-  return key === `${ns}:seq` || key.startsWith(`${ns}:wm:`) || key.startsWith(`${ns}:eseq:`)
+  return (
+    key === `${ns}:seq` ||
+    key.startsWith(`${ns}:wm:`) ||
+    key.startsWith(`${ns}:eseq:`) ||
+    // a writer's record of the writes it has applied, which expires a day
+    // after its last write
+    key.startsWith(`${ns}:w:`)
+  )
 }
 
 const M = 'dog_poops'
@@ -560,6 +567,60 @@ if (!client) {
       expect(await driver.readBuckets({ metric: M })).toEqual([
         { bucketTs: 1000, dimKey: WILLOW, value: 50 },
       ])
+
+      await wipe(ns)
+    })
+
+    it('applies a write once when Redis receives it twice', async () => {
+      // what ioredis does after a reconnect: a command whose reply was lost
+      // is sent again, although it may already have run
+      const ns = fresh()
+      const twice = new Proxy(live, {
+        get(target, prop, receiver) {
+          if (prop !== 'pipeline') return Reflect.get(target, prop, receiver)
+          return () => {
+            const pipeline = target.pipeline()
+            const evalsha = pipeline.evalsha.bind(pipeline)
+            pipeline.evalsha = ((...args: Parameters<typeof evalsha>) => {
+              evalsha(...args)
+              return evalsha(...args)
+            }) as typeof pipeline.evalsha
+            return pipeline
+          }
+        },
+      })
+      const driver = ioredis(twice, { namespace: ns })
+
+      await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 5 }])
+      await driver.observe([{ metric: G, bucketTs: 1000, dimKey: WILLOW, value: 3 }])
+      await driver.setLevel([
+        { metric: 'lvl', bucketTs: 1000, dimKey: WILLOW, value: 2, mode: 'add' },
+      ])
+      await driver.append([{ metric: 'ev', id: 'a', ts: 1000, fields: {} }])
+
+      expect((await driver.readBuckets({ metric: M }))[0]?.value).toBe(5)
+      expect((await driver.readBuckets({ metric: G }))[0]?.value).toMatchObject({ count: 1 })
+      expect((await driver.readLevels('lvl'))[0]?.value).toBe(2)
+      expect(await driver.countPending('ev')).toBe(1)
+
+      await wipe(ns)
+    })
+
+    it('ages a claim by Redis time, whatever the recovering host believes', async () => {
+      const ns = fresh()
+      const claimer = ioredis(live, { namespace: ns })
+      await claimer.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await claimer.claim(M, 2000)
+
+      // a host whose clock runs two minutes fast
+      const now = Date.now
+      Date.now = () => now() + 120_000
+      try {
+        const fast = ioredis(live, { namespace: ns, recoverAfter: '5s' })
+        expect(await fast.recover(M)).toMatchObject({ claims: 0 })
+      } finally {
+        Date.now = now
+      }
 
       await wipe(ns)
     })

@@ -322,6 +322,47 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect((await driver.readLevels(L))[0]?.carried).toBe(7)
       })
 
+      it('applies an add that arrives late to the windows after it', async () => {
+        // two processes moving one series across a boundary: the later
+        // window's add lands first. Every window must still end right
+        await put(1000, WILLOW, 10)
+        await move(3000, WILLOW, 1)
+        await move(2000, WILLOW, 1)
+
+        expect(await levelAt(2000, WILLOW)).toBe(11)
+        expect(await levelAt(3000, WILLOW)).toBe(12)
+        expect((await driver.readLevels(L))[0]).toMatchObject({ value: 12, carried: 10 })
+      })
+
+      it('applies a late add to carried when the pointer has passed its window', async () => {
+        await put(1000, WILLOW, 10)
+        await hold(2000, WILLOW, 10)
+        await move(3000, WILLOW, 5)
+        await move(2000, WILLOW, 1)
+
+        expect(await levelAt(2000, WILLOW)).toBe(11)
+        expect(await levelAt(3000, WILLOW)).toBe(16)
+        expect((await driver.readLevels(L))[0]).toMatchObject({ value: 16, carried: 11 })
+      })
+
+      it('lets a late set fill its own window without replacing a newer value', async () => {
+        await put(1000, WILLOW, 5)
+        await put(3000, WILLOW, 9)
+        await put(2000, WILLOW, 7)
+
+        expect(await levelAt(2000, WILLOW)).toBe(7)
+        expect((await driver.readLevels(L))[0]).toMatchObject({ value: 9, carried: 5 })
+      })
+
+      it('ignores a hold for a window older than the pointer', async () => {
+        // a flusher whose clock runs behind carries late, after a newer one
+        await put(1000, WILLOW, 5)
+        await hold(3000, WILLOW, 7)
+        await hold(2000, WILLOW, 5)
+
+        expect((await driver.readLevels(L))[0]).toMatchObject({ carried: 7, heldThrough: 3000 })
+      })
+
       it('keeps the carried value when a write lands past the pointer', async () => {
         // the windows between the pointer and the new write still belong to
         // the older number

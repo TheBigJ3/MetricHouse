@@ -57,6 +57,70 @@ function mergeCells(older: Cell, newer: Cell): Cell {
   }
 }
 
+/**
+ * What one level `set` or `add` does to its series and its cells.
+ *
+ * The rule a shared driver has to follow as well, written once here in plain
+ * code; the Redis driver's Lua mirrors it line for line.
+ *
+ * - `add` is a change, so it applies to every window from the one it lands
+ *   in onwards: the landing cell, every later cell that already exists, the
+ *   held value, and `carried` when the pointer is at or past the landing
+ *   window. That is what keeps an `inc` and a `dec` from two processes right
+ *   whichever order they arrive in.
+ * - `set` is a reading. It becomes the landing cell. It becomes the held value
+ *   and `carried` only if nothing newer has been written: a later window that
+ *   already has a cell was written after this reading was taken.
+ */
+function planLevelWrite(
+  op: LevelOp,
+  bucketTs: number,
+  held: LevelSeries | undefined,
+  landingCell: number | undefined,
+  later: readonly number[],
+  valueBefore: () => number,
+  cellAt: (bucketTs: number) => number,
+): { cells: [number, number][]; series: LevelSeries } {
+  const pointer = held?.heldThrough ?? bucketTs
+  const writtenAt = Math.max(held?.writtenAt ?? bucketTs, bucketTs)
+
+  if (op.mode === 'add') {
+    const base = landingCell ?? (held === undefined ? 0 : valueBefore())
+    const cells: [number, number][] = [[bucketTs, base + op.value]]
+    for (const at of later) cells.push([at, cellAt(at) + op.value])
+    const value = (held?.value ?? 0) + op.value
+    return {
+      cells,
+      series: {
+        dimKey: op.dimKey,
+        value,
+        carried:
+          held === undefined ? value : bucketTs <= pointer ? held.carried + op.value : held.carried,
+        writtenAt,
+        heldThrough: pointer,
+      },
+    }
+  }
+
+  const superseded = later.length > 0
+  const newerAtPointer = later.some((at) => at <= pointer)
+  return {
+    cells: [[bucketTs, op.value]],
+    series: {
+      dimKey: op.dimKey,
+      value: held !== undefined && superseded ? held.value : op.value,
+      carried:
+        held === undefined
+          ? op.value
+          : bucketTs <= pointer && !newerAtPointer
+            ? op.value
+            : held.carried,
+      writtenAt,
+      heldThrough: pointer,
+    },
+  }
+}
+
 export interface MemoryDriverOptions {
   /**
    * Distinct dim keys held per metric, live or in flight, before writes are
@@ -347,11 +411,12 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
             if (!bucket.has(op.dimKey)) bucket.set(op.dimKey, { level: plainZero(op.value) })
           }
 
-          series.set(op.dimKey, {
-            ...held,
-            carried: op.value,
-            heldThrough: Math.max(held.heldThrough, op.bucketTs),
-          })
+          // `carried` belongs to the pointer's window. A hold for an older
+          // window, from a flusher whose clock runs behind, arrives after the
+          // pointer has passed it and must not drag `carried` back with it
+          if (op.bucketTs >= held.heldThrough) {
+            series.set(op.dimKey, { ...held, carried: op.value, heldThrough: op.bucketTs })
+          }
           continue
         }
 
@@ -362,39 +427,61 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           )
         }
 
-        const value = plainZero(op.mode === 'add' ? (held?.value ?? 0) + op.value : op.value)
-        assertFinite(value, op.metric, 'level')
         const bucketTs = landing(op.metric, op.bucketTs)
+        const byBucket = bucketsFor(op.metric)
+        const cellAt = (at: number): number | undefined => {
+          const cell = byBucket.get(at)?.get(op.dimKey)
+          if (cell === undefined) return undefined
+          if (!isLevelCell(cell)) {
+            throw new Error(
+              `memory driver: ${op.metric} holds ${isGaugeCell(cell) ? 'gauge' : 'counter'} ` +
+                'cells — set is a level op',
+            )
+          }
+          return cell.level
+        }
+
+        // windows after this one that already hold a value for the series.
+        // Two processes writing across a boundary can land the later window
+        // first, and the rule below keeps both windows right whichever
+        // arrives second
+        const later = [...byBucket.keys()]
+          .filter((at) => at > bucketTs && cellAt(at) !== undefined)
+          .sort((a, b) => a - b)
+
+        const plan = planLevelWrite(
+          op,
+          bucketTs,
+          held,
+          cellAt(bucketTs),
+          later,
+          () => {
+            // the value in effect just before this window: the newest cell
+            // between the pointer and here, or what the pointer carried
+            let before: number | undefined
+            let newest = Number.NEGATIVE_INFINITY
+            for (const at of byBucket.keys()) {
+              const level = at < bucketTs && at > (held?.heldThrough ?? -1) ? cellAt(at) : undefined
+              if (level !== undefined && at > newest) {
+                newest = at
+                before = level
+              }
+            }
+            return before ?? held?.carried ?? 0
+          },
+          (at) => cellAt(at) as number,
+        )
+
+        for (const [, level] of plan.cells) assertFinite(level, op.metric, 'level')
+        assertFinite(plan.series.value, op.metric, 'level')
 
         // the bucket first, because `cellSlot` is the other thing that can
         // refuse on the cap, and a held value written before it would name a
         // window that holds nothing
-        const bucket = cellSlot(op.metric, bucketTs, op.dimKey)
-        const occupant = bucket.get(op.dimKey)
-        if (occupant !== undefined && !isLevelCell(occupant)) {
-          throw new Error(
-            `memory driver: ${op.metric} holds ${isGaugeCell(occupant) ? 'gauge' : 'counter'} ` +
-              'cells — set is a level op',
-          )
+        for (const [at, level] of plan.cells) {
+          cellSlot(op.metric, at, op.dimKey).set(op.dimKey, { level: plainZero(level) })
         }
-        bucket.set(op.dimKey, { level: value })
-
-        series.set(op.dimKey, {
-          dimKey: op.dimKey,
-          value,
-          // `carried` is what the series was at in the window `heldThrough`
-          // names. A first write lands in that window, and so does a second
-          // write to the same one, so both replace it: the window ends at the
-          // newest value, not the first. A write to a later window leaves it
-          // alone, because the windows in between still belong to the older
-          // number
-          carried: held === undefined || bucketTs <= held.heldThrough ? value : held.carried,
-          writtenAt: Math.max(held?.writtenAt ?? bucketTs, bucketTs),
-          // a write never moves the pointer. The windows between this write
-          // and the last one are still owed a row, and only a `hold` may say
-          // they have had one
-          heldThrough: held?.heldThrough ?? bucketTs,
-        })
+        series.set(op.dimKey, { ...plan.series, value: plainZero(plan.series.value) })
       }
     },
 

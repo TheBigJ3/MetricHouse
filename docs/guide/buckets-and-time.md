@@ -391,6 +391,13 @@ cost is that the write is counted a window or two later than it happened. A
 table that treats `id` as unique handles this with no special work, whether it
 keeps the first row per id or the newest.
 
+The same rule has a consequence when a server's clock runs ahead. A flusher on
+that server claims windows that are still open everywhere else, and the writes
+of correctly clocked servers for those windows move forward to the fast
+server's idea of now. Nothing is lost, and totals stay exact, but those writes
+land in windows up to the size of the skew ahead of their own. Keep your servers
+on NTP.
+
 ## Flush is a minimum, not a schedule
 
 The `flush` setting says how fast a metric is allowed to ship. It does not make

@@ -110,3 +110,16 @@ lists each rule, and the shared test suite checks them.
 - A Redis namespace may no longer contain a colon or whitespace. Namespace
   `org:idx` shared its `org:idx:seq` key with the index of a metric named `seq`
   in namespace `org`.
+- On Redis, a restart or dropped connection could count a write twice: ioredis
+  resends a command after reconnecting, and the first send may already have
+  run. Every write now carries its writer's id and a sequence number, and Redis
+  applies each one once. After `NOSCRIPT`, only the calls Redis did not know are
+  sent again.
+- A level `inc` or `dec` that reached Redis after a write for a later window
+  left that window, and every carried window after it, one off. A late `add`
+  now applies from its window onwards, and a late `set` no longer replaces a
+  newer value.
+- A carry from a flusher whose clock ran behind could move a level's carried
+  value backwards.
+- A claim's age is now measured with Redis's clock, so a host whose clock runs
+  fast no longer takes back claims that are seconds old.

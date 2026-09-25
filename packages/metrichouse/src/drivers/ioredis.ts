@@ -25,6 +25,7 @@
  * right.
  */
 
+import { uuidv7 } from '../identity.js'
 import { isDate } from '../schema/types.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
 import {
@@ -210,6 +211,56 @@ local MH_RANGE = 'MHRANGE would pass the largest number a metric can store, so t
 `
 
 /**
+ * Apply a write script at most once, however many times it reaches Redis.
+ *
+ * ioredis resends a command that got no reply before a reconnect. If that
+ * command had already run, the resend runs it again, and a counter counts the
+ * same increment twice. So every write carries its writer's id and a sequence
+ * number, the last key and the last argument, and the script records the
+ * number beside the data it writes. A number already recorded means the write
+ * already happened, and the script returns without doing it again.
+ *
+ * The record stays small: each call also sends the lowest sequence number the
+ * writer is still waiting on, the second to last argument, and everything below
+ * it is removed, because nothing below it can be resent. The whole record
+ * expires a day after its writer's last write.
+ *
+ * `MH_N` is the index of the last argument that belongs to the script itself.
+ */
+const LUA_ONCE = `
+local MH_N = #ARGV - 2
+
+local function mh_seen()
+  return redis.call('ZSCORE', KEYS[#KEYS], ARGV[#ARGV]) ~= false
+end
+
+local function mh_mark()
+  local w = KEYS[#KEYS]
+  redis.call('ZREMRANGEBYSCORE', w, '-inf', '(' .. ARGV[#ARGV - 1])
+  redis.call('ZADD', w, ARGV[#ARGV], ARGV[#ARGV])
+  redis.call('EXPIRE', w, 86400)
+end
+`
+
+/**
+ * Redis's own clock, in milliseconds.
+ *
+ * Claims are stamped and aged by this rather than by the clock of whichever
+ * process claims or recovers, so two hosts whose clocks disagree still agree
+ * on how old a claim is. Asking for the time is not deterministic, which a
+ * script that also writes may only do under effects replication: the default
+ * from Redis 5, and switched on here for anything older.
+ */
+const LUA_NOW = `
+if redis.replicate_commands then redis.replicate_commands() end
+
+local function mh_now()
+  local t = redis.call('TIME')
+  return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+end
+`
+
+/**
  * Add counter increments to one bucket atomically.
  *
  * A script rather than a pipeline of `HINCRBYFLOAT`, for three reasons: the
@@ -224,13 +275,14 @@ local MH_RANGE = 'MHRANGE would pass the largest number a metric can store, so t
  * KEYS: bucket index, watermark. ARGV: bucket key prefix, bucketTs, then
  * dimKey/delta pairs.
  */
-const INCREMENT = `${LUA_HELPERS}
+const INCREMENT = `${LUA_HELPERS}${LUA_ONCE}
+if mh_seen() then return 0 end
 local target = mh_landing(KEYS[2], ARGV[2])
 local key = ARGV[1] .. target
 local totals = {}
 local order = {}
 
-for i = 3, #ARGV, 2 do
+for i = 3, MH_N, 2 do
   local field = ARGV[i]
   local total = totals[field]
   if total == nil then
@@ -255,6 +307,7 @@ for _, field in ipairs(order) do
   redis.call('HSET', key, field, mh_num(totals[field]))
 end
 redis.call('ZADD', KEYS[1], target, target)
+mh_mark()
 return 1
 `
 
@@ -269,13 +322,14 @@ return 1
  * KEYS: bucket index, watermark. ARGV: bucket key prefix, bucketTs, then
  * dimKey/value pairs.
  */
-const MERGE_GAUGE = `${LUA_HELPERS}
+const MERGE_GAUGE = `${LUA_HELPERS}${LUA_ONCE}
+if mh_seen() then return 0 end
 local target = mh_landing(KEYS[2], ARGV[2])
 local key = ARGV[1] .. target
 local folds = {}
 local order = {}
 
-for i = 3, #ARGV, 2 do
+for i = 3, MH_N, 2 do
   local field = ARGV[i]
   local v = tonumber(ARGV[i + 1])
   local cur = folds[field]
@@ -306,6 +360,7 @@ for _, field in ipairs(order) do
   redis.call('HSET', key, field, mh_pack(f[1], f[2], f[3], f[4], f[5]))
 end
 redis.call('ZADD', KEYS[1], target, target)
+mh_mark()
 return 1
 `
 
@@ -351,54 +406,101 @@ end
  * KEYS: bucket index, watermark, level hash. ARGV: bucket key prefix,
  * bucketTs, mode, then dimKey/value pairs.
  */
-const SET_LEVEL = `${LUA_HELPERS}${LUA_LEVEL_STATE}
+const SET_LEVEL = `${LUA_HELPERS}${LUA_LEVEL_STATE}${LUA_ONCE}
+if mh_seen() then return 0 end
 local target = mh_landing(KEYS[2], ARGV[2])
 local bucketTs = tonumber(target)
-local key = ARGV[1] .. target
-local states = {}
-local seen = {}
-local order = {}
+local prefix = ARGV[1]
+local add = ARGV[3] == 'add'
 
-for i = 4, #ARGV, 2 do
+-- the level one window holds for a series, or nil when it holds nothing
+local function level_at(at, field)
+  local cur = redis.call('HGET', prefix .. at, field)
+  if cur == false then return nil end
+  if not mh_is_level(cur) then
+    local held = 'counter'
+    if mh_parse(cur) ~= false then held = 'gauge' end
+    error(redis.error_reply('MHKIND holds ' .. held .. ' cells - set is a level op'))
+  end
+  return tonumber(string.sub(cur, 2))
+end
+
+for i = 4, MH_N, 2 do
   local field = ARGV[i]
   local v = tonumber(ARGV[i + 1])
-
-  if not seen[field] then
-    seen[field] = true
-    order[#order + 1] = field
-    local cur = redis.call('HGET', key, field)
-    if cur ~= false and not mh_is_level(cur) then
-      local held = 'counter'
-      if mh_parse(cur) ~= false then held = 'gauge' end
-      return redis.error_reply('MHKIND holds ' .. held .. ' cells - set is a level op')
-    end
-    states[field] = mh_read_state(KEYS[3], field)
-  end
-
-  local state = states[field]
-  local value = v
-  if ARGV[3] == 'add' and state ~= nil then value = state[1] + v end
-  if not mh_finite(value) then return redis.error_reply(MH_RANGE) end
-
-  -- a first write is also the first thing there is to carry, and a write to
-  -- the window the pointer names replaces what that window ends at
-  local carried = value
+  local state = mh_read_state(KEYS[3], field)
+  local landing = level_at(target, field)
+  local pointer = bucketTs
   local writtenAt = bucketTs
-  local heldThrough = bucketTs
   if state ~= nil then
-    if bucketTs > state[4] then carried = state[2] end
+    pointer = state[4]
     if state[3] > writtenAt then writtenAt = state[3] end
-    heldThrough = state[4]
   end
-  states[field] = { value, carried, writtenAt, heldThrough }
+
+  -- windows after this one that already hold a value for the series
+  local later = {}
+  for _, at in ipairs(redis.call('ZRANGEBYSCORE', KEYS[1], '(' .. target, '+inf')) do
+    local level = level_at(at, field)
+    if level ~= nil then later[#later + 1] = { at, level } end
+  end
+
+  -- the same rule as planLevelWrite in the memory driver: an add is a
+  -- change that applies from its window onwards, a set is a reading that
+  -- only becomes the held value if nothing newer has been written
+  local cells = {}
+  local value
+  local carried
+  if add then
+    local base = landing
+    if base == nil then
+      base = 0
+      if state ~= nil then
+        base = state[2]
+        for _, at in ipairs(redis.call('ZREVRANGEBYSCORE', KEYS[1], '(' .. target, '(' .. state[4])) do
+          local level = level_at(at, field)
+          if level ~= nil then
+            base = level
+            break
+          end
+        end
+      end
+    end
+    cells[1] = { target, base + v }
+    for _, c in ipairs(later) do cells[#cells + 1] = { c[1], c[2] + v } end
+    value = v
+    carried = v
+    if state ~= nil then
+      value = state[1] + v
+      carried = state[2]
+      if bucketTs <= pointer then carried = state[2] + v end
+    end
+  else
+    cells[1] = { target, v }
+    value = v
+    carried = v
+    if state ~= nil then
+      if #later > 0 then value = state[1] end
+      local newerAtPointer = false
+      for _, c in ipairs(later) do
+        if tonumber(c[1]) <= pointer then newerAtPointer = true end
+      end
+      if bucketTs > pointer or newerAtPointer then carried = state[2] end
+    end
+  end
+
+  if not mh_finite(value) then return redis.error_reply(MH_RANGE) end
+  for _, c in ipairs(cells) do
+    if not mh_finite(c[2]) then return redis.error_reply(MH_RANGE) end
+  end
+
+  for _, c in ipairs(cells) do
+    redis.call('HSET', prefix .. c[1], field, mh_pack_level(c[2]))
+    redis.call('ZADD', KEYS[1], c[1], c[1])
+  end
+  mh_write_state(KEYS[3], field, value, carried, writtenAt, pointer)
 end
 
-for _, field in ipairs(order) do
-  local st = states[field]
-  redis.call('HSET', key, field, mh_pack_level(st[1]))
-  mh_write_state(KEYS[3], field, st[1], st[2], st[3], st[4])
-end
-redis.call('ZADD', KEYS[1], target, target)
+mh_mark()
 return 1
 `
 
@@ -433,9 +535,11 @@ for i = 3, #ARGV, 2 do
     if not claimed and redis.call('HSETNX', key, field, mh_pack_level(value)) == 1 then
       written = written + 1
     end
-    local heldThrough = state[4]
-    if bucketTs > heldThrough then heldThrough = bucketTs end
-    mh_write_state(KEYS[3], field, state[1], value, state[3], heldThrough)
+    -- carried belongs to the pointer's window, so a hold for an older one,
+    -- from a flusher whose clock runs behind, leaves both alone
+    if bucketTs >= state[4] then
+      mh_write_state(KEYS[3], field, state[1], value, state[3], bucketTs)
+    end
   end
 end
 
@@ -477,9 +581,10 @@ return dropped
  * between the move and the raise.
  *
  * KEYS: index, in-flight hash, claims, watermark. ARGV: watermark, claimId,
- * claimedAt, bucket key prefix.
+ * bucket key prefix. Returns Redis's time and the claimed cells.
  */
-const CLAIM_BUCKETS = `
+const CLAIM_BUCKETS = `${LUA_NOW}
+local claimedAt = mh_now()
 local wm = redis.call('GET', KEYS[4])
 if wm == false or tonumber(ARGV[1]) > tonumber(wm) then
   redis.call('SET', KEYS[4], ARGV[1])
@@ -488,7 +593,7 @@ end
 local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', '(' .. ARGV[1])
 for i = 1, #ids do
   local bucketTs = ids[i]
-  local data = redis.call('HGETALL', ARGV[4] .. bucketTs)
+  local data = redis.call('HGETALL', ARGV[3] .. bucketTs)
   local flat = {}
   for j = 1, #data, 2 do
     flat[#flat + 1] = bucketTs .. ':' .. data[j]
@@ -500,11 +605,11 @@ for i = 1, #ids do
     for m = j, math.min(j + 999, #flat) do chunk[#chunk + 1] = flat[m] end
     redis.call('HSET', KEYS[2], unpack(chunk))
   end
-  redis.call('DEL', ARGV[4] .. bucketTs)
+  redis.call('DEL', ARGV[3] .. bucketTs)
   redis.call('ZREM', KEYS[1], bucketTs)
 end
-redis.call('ZADD', KEYS[3], ARGV[3], ARGV[2])
-return redis.call('HGETALL', KEYS[2])
+redis.call('ZADD', KEYS[3], claimedAt, ARGV[2])
+return { claimedAt, redis.call('HGETALL', KEYS[2]) }
 `
 
 /**
@@ -602,16 +707,18 @@ end
  *
  * KEYS: records, sequence. ARGV: the encoded records.
  */
-const APPEND_RECORDS = `
-local last = redis.call('INCRBY', KEYS[2], #ARGV)
-local first = last - #ARGV
-for i = 1, #ARGV, 1000 do
+const APPEND_RECORDS = `${LUA_ONCE}
+if mh_seen() then return 0 end
+local last = redis.call('INCRBY', KEYS[2], MH_N)
+local first = last - MH_N
+for i = 1, MH_N, 1000 do
   local chunk = {}
-  for j = i, math.min(i + 999, #ARGV) do
+  for j = i, math.min(i + 999, MH_N) do
     chunk[#chunk + 1] = string.format('%016.0f', first + j) .. '|' .. ARGV[j]
   end
   redis.call('RPUSH', KEYS[1], unpack(chunk))
 end
+mh_mark()
 return last
 `
 
@@ -708,9 +815,14 @@ return 1
  * what bounds a backlog larger than the sink will take, and `-1` means all of
  * it.
  *
- * KEYS: records, in-flight list, claims. ARGV: limit, claimId, claimedAt.
+ * The reply is everything in the in-flight list, not only what this call
+ * took, so a claim resent after a reconnect, which runs twice, still hands
+ * back every record it holds. Returns Redis's time and the records.
+ *
+ * KEYS: records, in-flight list, claims. ARGV: limit, claimId.
  */
-const CLAIM_RECORDS = `
+const CLAIM_RECORDS = `${LUA_NOW}
+local claimedAt = mh_now()
 local n = tonumber(ARGV[1])
 local len = redis.call('LLEN', KEYS[1])
 if n < 0 or n > len then n = len end
@@ -726,8 +838,8 @@ if n > 0 then
   end
 end
 
-redis.call('ZADD', KEYS[3], ARGV[3], ARGV[2])
-return taken
+redis.call('ZADD', KEYS[3], claimedAt, ARGV[2])
+return { claimedAt, redis.call('LRANGE', KEYS[2], 0, -1) }
 `
 
 /**
@@ -759,8 +871,9 @@ return 1
  *
  * KEYS: claims, index, records. ARGV: cutoff, in-flight prefix, bucket prefix.
  */
-const RECOVER_CLAIMS = `${LUA_RESTORE_BUCKETS}${LUA_RESTORE_RECORDS}
-local abandoned = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'WITHSCORES')
+const RECOVER_CLAIMS = `${LUA_NOW}${LUA_RESTORE_BUCKETS}${LUA_RESTORE_RECORDS}
+local cutoff = mh_now() - tonumber(ARGV[1])
+local abandoned = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', cutoff, 'WITHSCORES')
 local claims = 0
 local buckets = 0
 local records = 0
@@ -974,7 +1087,23 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     readonly script: string
     readonly keys: readonly string[]
     readonly args: readonly (string | number)[]
+    /**
+     * A write that must apply at most once. The script is built with
+     * LUA_ONCE, and gets this writer's record key and a sequence number
+     * added to its keys and arguments.
+     */
+    readonly once?: boolean
   }
+
+  /**
+   * This driver's identity as a writer, for LUA_ONCE, and the sequence
+   * numbers it is still waiting on a reply for. The lowest of those is the
+   * floor sent with each write: nothing below it can be resent, so the
+   * record of it can go.
+   */
+  const writerKey = `${ns}:w:${uuidv7(Date.now())}`
+  let writeSeq = 0
+  const unanswered = new Set<number>()
 
   /**
    * Run scripts pipelined, reloading them if Redis has forgotten.
@@ -995,22 +1124,50 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     const out: unknown[] = []
     for (let start = 0; start < calls.length; start += maxPipeline) {
       const chunk = calls.slice(start, start + maxPipeline)
+      // one number per write, kept across a NOSCRIPT retry: the retried call
+      // is the same write, so if it did run after all, the script sees it
+      const seqs = chunk.map((call) => (call.once ? ++writeSeq : 0))
+      for (const seq of seqs) if (seq > 0) unanswered.add(seq)
 
-      const attempt = async (): Promise<[error: Error | null, result: unknown][] | null> => {
-        const resolved = await Promise.all(chunk.map((call) => shaFor(client, call.script)))
+      const send = async (
+        indexes: readonly number[],
+      ): Promise<[error: Error | null, result: unknown][] | null> => {
+        const resolved = await Promise.all(
+          indexes.map((i) => shaFor(client, (chunk[i] as ScriptCall).script)),
+        )
+        // the floor is taken after the await, as late as possible, so it
+        // accounts for every write still waiting at the moment this one goes
+        const floor = Math.min(...unanswered)
         const pipeline = client.pipeline()
-        chunk.forEach((call, index) => {
-          pipeline.evalsha(resolved[index] as string, call.keys.length, ...call.keys, ...call.args)
+        indexes.forEach((i, n) => {
+          const call = chunk[i] as ScriptCall
+          const seq = seqs[i] as number
+          const keys = seq > 0 ? [...call.keys, writerKey] : call.keys
+          const args = seq > 0 ? [...call.args, floor, seq] : call.args
+          pipeline.evalsha(resolved[n] as string, keys.length, ...keys, ...args)
         })
         return pipeline.exec()
       }
 
-      let results = await attempt()
-      if (results?.some(([error]) => isNoScript(error))) {
-        shas.clear()
-        results = await attempt()
+      try {
+        const every = chunk.map((_, i) => i)
+        let results = await send(every)
+        const missing = every.filter((i) => isNoScript(results?.[i]?.[0]))
+        if (results !== null && missing.length > 0) {
+          // only the calls Redis did not recognise go again. The others ran,
+          // and running them twice is the very thing LUA_ONCE guards against
+          shas.clear()
+          const retried = await send(missing)
+          const merged = [...results]
+          missing.forEach((i, n) => {
+            merged[i] = retried?.[n] ?? [new Error('ioredis driver: retry was discarded'), null]
+          })
+          results = merged
+        }
+        out.push(...unwrap(results, what))
+      } finally {
+        for (const seq of seqs) if (seq > 0) unanswered.delete(seq)
       }
-      out.push(...unwrap(results, what))
     }
     return out
   }
@@ -1122,6 +1279,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         await runScripts(
           grouped(ops, (op) => [op.dimKey, op.delta]).map((group) => ({
             script: INCREMENT,
+            once: true,
             keys: [key.idx(group.metric), key.watermark(group.metric)],
             args: [key.bucketPrefix(group.metric), group.bucketTs, ...group.args],
           })),
@@ -1141,6 +1299,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         await runScripts(
           grouped(ops, (op) => [op.dimKey, op.value]).map((group) => ({
             script: MERGE_GAUGE,
+            once: true,
             keys: [key.idx(group.metric), key.watermark(group.metric)],
             args: [key.bucketPrefix(group.metric), group.bucketTs, ...group.args],
           })),
@@ -1184,6 +1343,8 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         await runScripts(
           groups.map((group) => ({
             script: group.mode === 'hold' ? HOLD_LEVEL : SET_LEVEL,
+            // a hold is safe to run twice; a set or an add is not
+            once: group.mode !== 'hold',
             keys: [key.idx(group.metric), key.watermark(group.metric), key.levels(group.metric)],
             args: [
               key.bucketPrefix(group.metric),
@@ -1250,6 +1411,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       await runScripts(
         [...byMetric].map(([metric, encoded]) => ({
           script: APPEND_RECORDS,
+          once: true,
           keys: [key.records(metric), key.recordSeq(metric)],
           args: encoded,
         })),
@@ -1357,52 +1519,52 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
     async claim(metric: string, upToBucketTs: number): Promise<BucketClaim> {
       const id = await nextClaimId(metric)
-      // one instant, used twice: the score in the claims ZSET is what will
-      // decide whether this claim is stale, and a claim that disagrees with
-      // the registry about its own age is a claim recovery cannot reason about
-      const claimedAt = Date.now()
 
-      const [flat] = await runScripts(
+      // stamped by Redis, inside the script: the score in the claims ZSET is
+      // what decides whether this claim is stale, and a stamp from this
+      // host's clock would be compared later against another host's
+      const [reply] = await runScripts(
         [
           {
             script: CLAIM_BUCKETS,
             keys: [key.idx(metric), key.inflight(id), key.claims(metric), key.watermark(metric)],
-            args: [upToBucketTs, id, claimedAt, key.bucketPrefix(metric)],
+            args: [upToBucketTs, id, key.bucketPrefix(metric)],
           },
         ],
         'claim',
       )
+      const [claimedAt, flat] = (reply ?? [0, []]) as [number, string[]]
 
       return {
         kind: 'buckets',
         id,
         metric,
-        claimedAt,
-        buckets: unflatten((flat ?? []) as string[]),
+        claimedAt: Number(claimedAt),
+        buckets: unflatten(flat ?? []),
       }
     },
 
     async claimRecords(metric: string, limit?: number): Promise<RecordClaim> {
       const id = await nextClaimId(metric)
-      const claimedAt = Date.now()
 
-      const [taken] = await runScripts(
+      const [reply] = await runScripts(
         [
           {
             script: CLAIM_RECORDS,
             keys: [key.records(metric), key.inflight(id), key.claims(metric)],
-            args: [limit === undefined ? -1 : Math.max(0, limit), id, claimedAt],
+            args: [limit === undefined ? -1 : Math.max(0, limit), id],
           },
         ],
         'claimRecords',
       )
+      const [claimedAt, taken] = (reply ?? [0, []]) as [number, string[]]
 
       return {
         kind: 'records',
         id,
         metric,
-        claimedAt,
-        records: ((taken ?? []) as string[]).map(decodeRecord),
+        claimedAt: Number(claimedAt),
+        records: (taken ?? []).map(decodeRecord),
       }
     },
 
@@ -1450,10 +1612,9 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     },
 
     async recover(metric: string): Promise<RecoveryReport> {
-      // one instant for the whole pass, and the same clock `claim` stamped the
-      // registry with, so "older than the cutoff" is a comparison between two
-      // readings of one clock rather than between two machines' ideas of now
-      const cutoff = Date.now() - recoverAfterMs
+      // the cutoff is worked out inside the script from Redis's clock, the
+      // same clock `claim` stamped the registry with, so "older than the
+      // cutoff" never compares two machines' ideas of now
 
       let raw: unknown
       try {
@@ -1464,7 +1625,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
               keys: [key.claims(metric), key.idx(metric), key.records(metric)],
               // `inflight('')` rather than a literal, so the prefix cannot
               // drift from the key the claim was actually written to
-              args: [cutoff, key.inflight(''), key.bucketPrefix(metric)],
+              args: [recoverAfterMs, key.inflight(''), key.bucketPrefix(metric)],
             },
           ],
           'recover',

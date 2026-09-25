@@ -184,22 +184,38 @@ written at noon and again at three is still owed a row for every window in
 between, and a pointer that jumped to the later write would skip them.
 
 `carried` is the value the next carry starts from, and it is not always `value`
-for the same reason. The rule for a `set` or an `add`:
+for the same reason.
 
-| Where the write lands | `carried` becomes |
-| --- | --- |
-| a series the driver has not seen | the new value |
-| the window `heldThrough` names, or an earlier one | the new value, because that window now ends at it |
-| a window after `heldThrough` | unchanged, because the windows in between belong to the older number |
+Two processes writing to one series near a window boundary can deliver the later
+window's write first. The rules below keep every window right whichever arrives
+second. An `add` is a change, so it applies from the window it lands in onwards.
+A `set` is a reading, and a window after it that already has a cell was written
+later.
 
-Getting the middle row wrong is easy and shows up as a bug nobody notices for a
-while: `set(5)` then `set(3)` in one window carries `5` into every empty window
-after it.
+| | `add` of `delta` | `set` to `value` |
+| --- | --- | --- |
+| Cell in the landing window | the value in effect just before it, plus `delta` | `value` |
+| Cells already in later windows | each plus `delta` | unchanged |
+| Held `value` | plus `delta` | `value`, unless a later window already has a cell |
+| `carried` | plus `delta` when the landing window is at or before `heldThrough` | `value` when the landing window is at or before `heldThrough` and no later cell is too |
+
+"The value in effect just before" is the newest cell between `heldThrough` and
+the landing window, or `carried` when there is none, or `0` for a series the
+driver has never seen. For a first write, `carried` and the held value are the
+new value.
+
+Getting these wrong is easy and shows up as a bug nobody notices for a while:
+`set(5)` then `set(3)` in one window carrying `5` into every empty window after
+it, or an `inc` from one process and a `dec` from another leaving every carried
+window one off.
 
 A `set` or an `add` aimed below the claimed watermark lands at the watermark,
 and the rule above uses the window it landed in. A `hold` aimed below it writes
 no cell, because a claim has already taken that window, and still moves
-`heldThrough`. An `add` whose result would not be a finite number is refused.
+`heldThrough`. A `hold` for a window before `heldThrough` changes neither
+`heldThrough` nor `carried`: it comes from a flusher running behind, and
+`carried` belongs to the pointer's window. An `add` whose result would not be a
+finite number is refused.
 
 ### readLevels
 
@@ -326,6 +342,13 @@ qualifies, return an empty claim rather than null.
 The driver knows nothing about time here. It is handed a watermark and claims
 everything below it. Deciding what "finished" means belongs to the metric, which
 is the only thing that knows its own resolution and grace.
+
+**Stamp the claim with storage's own clock** where there is one. The age of a
+claim decides whether [`recover`](#recover) takes it back, and a stamp from the
+claiming host's clock would later be compared against the recovering host's.
+Two hosts whose clocks disagree by a minute would then take back claims that
+are seconds old. The Redis driver reads Redis's `TIME` inside the claim script
+and inside recovery.
 
 **Remember the highest watermark any claim of a metric has used**, even a claim
 that found nothing, and never lower it. From then on, every `increment`,
@@ -463,6 +486,10 @@ A driver has to satisfy all of these.
 - Metrics are independent.
 - An empty batch does nothing.
 - A series key containing the separator or a backslash round trips intact.
+- A write that reaches shared storage twice applies once. A client that resends
+  a command after a reconnect cannot know whether the first send ran, so
+  `increment`, `observe`, a level `set` or `add`, and `append` each carry
+  something that lets storage recognise the second arrival.
 - A gauge fold and a counter total keep full floating point precision.
 - A total, sum or level that would not be a finite number is refused, and
   nothing changes.

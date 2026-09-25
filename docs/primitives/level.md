@@ -421,6 +421,11 @@ Three consequences worth knowing:
 - **The window a series was written in ends at its last write.** Set a queue
   to 5 and then to 3 inside one window, or `inc(5)` then `dec(2)`, and that
   window and every empty one after it hold 3.
+- **`inc()` and `dec()` from several processes add up in any order.** When one
+  server's `inc()` for a window reaches Redis after another server's `inc()` for
+  the next window, the late one still counts in its own window and in every
+  window after it. A `set()` that arrives late fills its own window and does not
+  replace a value written for a later one.
 
 ## What it costs
 
