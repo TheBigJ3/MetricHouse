@@ -168,3 +168,9 @@ describe('InferShape', () => {
     expect(true).toBe(true)
   })
 })
+
+describe('json() defaults', () => {
+  it('refuses a default JSON cannot hold', () => {
+    expect(() => json().default(1n as never)).toThrow(/json\(\)/)
+  })
+})

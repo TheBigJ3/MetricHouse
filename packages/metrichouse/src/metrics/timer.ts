@@ -24,7 +24,7 @@
  * reads pure CPU work as zero.
  */
 
-import type { Claim, GaugeCell } from '../drivers/types.js'
+import type { Claim, GaugeCell, RecoveryReport } from '../drivers/types.js'
 import type { FlushOptions, MetricFlushReport } from '../runtime/flush.js'
 import type { SnapshotOptions } from '../runtime/live.js'
 import { encodeDimKey } from '../schema/dims.js'
@@ -47,6 +47,7 @@ import {
 } from './gauge.js'
 import type {
   AnyMetric,
+  ClaimOptions,
   DimsArgs,
   MaterializedBatch,
   MetricBinding,
@@ -54,6 +55,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
+import { assertMetricName, assertSink } from './types.js'
 
 /**
  * What a timer ships unless told otherwise: the gauge's five, minus `last`.
@@ -77,7 +79,10 @@ export interface TimerConfig<D extends Shape> {
   readonly resolution: DurationInput
   /** Minimum shipping cadence. Omit it to take `defaults.flush` from the house. */
   readonly flush?: DurationInput
-  /** How long past a boundary a late timing still lands in the closed bucket. Default `'2s'`. */
+  /**
+   * How long a window waits after it ends before a flush may claim it, so
+   * timings recorded inside it have time to reach storage. Default `'2s'`.
+   */
   readonly grace?: DurationInput
   /** Which aggregates reach your sink. Default {@link TIMER_AGGREGATES}. */
   readonly aggregate?: readonly GaugeAggregate[]
@@ -231,9 +236,8 @@ export function timer<D extends Shape = Record<never, never>>(
   name: string,
   config: TimerConfig<D>,
 ): Timer<D> {
-  if (typeof name !== 'string' || name.trim() === '') {
-    throw new Error('timer: name must be a non-empty string')
-  }
+  assertMetricName(name, 'timer')
+  assertSink(config.write, name)
 
   const dims = (config.dims ?? {}) as D
 
@@ -281,7 +285,7 @@ export function timer<D extends Shape = Record<never, never>>(
   /** The partial check `start()` can make: every key given must be declared and well-typed. */
   function assertKnownDims(values: Record<string, unknown>): void {
     for (const [key, value] of Object.entries(values)) {
-      const type = dims[key]
+      const type = Object.hasOwn(dims, key) ? dims[key] : undefined
       if (!type) {
         throw new Error(
           `unknown dim ${JSON.stringify(key)} — declared dims are [${Object.keys(dims).join(', ')}]`,
@@ -395,8 +399,11 @@ export function timer<D extends Shape = Record<never, never>>(
         if (recorded !== undefined) return recorded
 
         const ms = toMicros(performance.now() - startedAt)
-        // the end's dims win: it knows more than the start did
-        recordTiming(ms, { ...bound, ...values })
+        // the end's dims win: it knows more than the start did. A key the end
+        // passes as `undefined` has nothing to say, so it leaves the start's
+        // value in place rather than erasing it
+        const given = Object.entries(values ?? {}).filter(([, value]) => value !== undefined)
+        recordTiming(ms, { ...bound, ...Object.fromEntries(given) })
         // set only once the write is accepted, so a throw leaves the handle open
         recorded = ms
         return ms
@@ -434,6 +441,12 @@ export function timer<D extends Shape = Record<never, never>>(
       // the gauge refuses a second house; only remember a binding it accepted
       inner.bind(next)
       binding = next
+    },
+
+    unbind(): void {
+      inner.unbind()
+      binding = undefined
+      recordTarget = undefined
     },
 
     start,
@@ -513,8 +526,12 @@ export function timer<D extends Shape = Record<never, never>>(
       return inner.flush(options)
     },
 
-    claimBatch(nowMs: number): Promise<Claim> {
-      return inner.claimBatch(nowMs)
+    recoverBatch(): Promise<RecoveryReport> {
+      return inner.recoverBatch()
+    },
+
+    claimBatch(nowMs: number, options?: ClaimOptions): Promise<Claim> {
+      return inner.claimBatch(nowMs, options)
     },
 
     materializeClaim(claim: Claim): MaterializedBatch {

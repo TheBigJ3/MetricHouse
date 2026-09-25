@@ -67,7 +67,8 @@ interface MetricFlushReport {
   skipped: boolean
   reason?: 'cadence' | 'not-selected'
   nextEligibleInMs?: number   // when the cadence will allow the next attempt
-  error?: unknown             // set if your write function threw
+  error?: unknown             // set if your write function threw, or the claim failed
+  ackError?: unknown          // set if the rows shipped and settling the claim failed
   recovered?: RecoveryReport  // set if a dead flusher's batch was put back
   recoveryError?: unknown     // set if that repair failed. The flush still ran
 }
@@ -130,6 +131,12 @@ early empty call would block the next real one for a full interval, which is
 worst on metrics with coarse resolutions.
 :::
 
+The cadence is measured from the last flush that shipped rows. Before the first
+one there is nothing to measure from, so the first flush always goes ahead,
+whatever the clock reads. If the clock steps backwards, say an NTP correction of
+an hour, the next flush goes ahead too, instead of waiting for the clock to catch
+back up.
+
 ## Only finished windows ship
 
 A flush takes buckets that have ended and outlived their grace period. The bucket
@@ -176,8 +183,15 @@ house.start()     // calling again does nothing
 await house.stop()
 ```
 
-Clears the timers, drains writes still on their way to the driver, then forces a
-final flush past every cadence. It returns the report from that final flush.
+Clears the timers, waits for any flush a timer already started, drains writes
+still on their way to the driver, then makes a
+[final flush](/reference/flush-options#final): past every cadence, and past
+grace, so every window that has ended ships. It returns the report from that
+final flush.
+
+Waiting for a running flush matters. If its `write` function fails after
+`stop()` was called, the rows go back to the driver, and the final flush is what
+ships them.
 
 ```ts
 process.on('SIGTERM', async () => {

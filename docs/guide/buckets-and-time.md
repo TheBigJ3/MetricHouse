@@ -351,29 +351,45 @@ a short grace period first.
 
 <figure class="mh-figure">
   <img src="/diagrams/grace-period.svg" alt="A bucket runs from 10:00:06 to 10:00:07, then a two second grace period, and only then is it claimable." />
-  <figcaption>Grace covers work that started inside the window and finishes just after it.</figcaption>
+  <figcaption>Grace gives a write made inside the window time to reach storage before the window ships.</figcaption>
 </figure>
 
-The reason is ordinary. A request that begins at 10:00:06.980 and records its
-result at 10:00:07.010 belongs in the `10:00:06` bucket, but by the time it
-writes, that bucket has already ended. Grace holds the bucket open a little
-longer so the write still lands where it belongs.
+A write is stamped with its window at the moment you call `add()`, `set()` or
+`end()`. Reaching storage takes a little longer. On Redis it is a network round
+trip, and a busy process can hold a write in its queue for a while before it
+goes out. So a write stamped `10:00:06.990` can reach Redis at `10:00:07.050`,
+after its window has ended. Grace holds the window back from the flush until
+writes like that have had time to arrive.
 
-The default is 2 seconds. Raise it if your writes are queued behind slow work.
+Grace does not move a write into an earlier window. A request that starts at
+`10:00:06.980` and calls `add()` at `10:00:07.010` is counted in the
+`10:00:07` window, because that is when it was recorded. A
+[timer](/primitives/timer) works the same way: a timing lands in the window its
+`end()` is called in.
+
+The default is 2 seconds. Raise it if your writes queue behind slow work, or if
+your servers' clocks disagree by more than that.
 
 ```ts
 const slowJobs = counter('slow_jobs', {
   resolution: '1m',
   flush: '5m',
-  grace: '30s',        // these records can arrive well after the minute ends
+  grace: '30s',        // this queue can take a while to reach Redis
   write: async (rows) => db.insert(rows),
 })
 ```
 
-A write that arrives after grace has passed lands in a bucket that has already
-shipped, and that bucket ships again on the next flush with the same row id and a
-larger value. A table that treats `id` as unique and keeps the newest row handles
-this correctly. See [Reliability](/guide/reliability).
+### A write that misses its window
+
+Sometimes a write arrives after its window has already been claimed by a flush:
+grace was too short, or the server that made it has a clock running behind. That
+write is moved forward into the oldest window that has not shipped yet, and it
+ships with that window.
+
+The total stays exact, and every row id still ships with one final value. The
+cost is that the write is counted a window or two later than it happened. A
+table that treats `id` as unique handles this with no special work, whether it
+keeps the first row per id or the newest.
 
 ## Flush is a minimum, not a schedule
 

@@ -23,7 +23,7 @@ await httpRequests.snapshot({
 | --- | --- | --- |
 | [`counter.snapshot()`](/primitives/counter#counter-snapshot) | all of them | |
 | [`gauge.snapshot()`](/primitives/gauge#gauge-snapshot) | all of them | a rollup merges folds |
-| [`level.snapshot()`](/primitives/level#level-snapshot) | all of them | a rollup takes the latest value per series |
+| [`level.snapshot()`](/primitives/level#level-snapshot) | all of them | a rollup takes the latest value per series, and carried windows are included |
 | [`timer.snapshot()`](/primitives/timer#timer-snapshot) | all of them | same merge as a gauge |
 | [`event.snapshot()`](/primitives/event#event-snapshot) | `from`, `to`, `orderBy`, `direction`, `limit` | the rest are ignored |
 | [`log.snapshot()`](/primitives/log#log-snapshot) | the same as an event | |
@@ -140,7 +140,7 @@ Each metric type merges the way its own numbers merge.
 | Type | How a rollup merges |
 | --- | --- |
 | counter | values are added |
-| gauge, timer | `sum` and `count` add, `min` and `max` take the extreme, `last` takes the latest window |
+| gauge, timer | `sum` and `count` add, `min` and `max` take the extreme, `last` takes the latest window when one series holds it |
 | level | the latest value per series, then series added together |
 | event, log | ignored, because records are never merged |
 
@@ -160,6 +160,15 @@ await httpRequests.snapshot({ rollup: 'sum', groupBy: ['route'] })
 `bucket_ts` survives a `groupBy`. `id` survives only on a row where the
 grouping merged nothing, which is a fact about the data rather than about the
 options, so the type reports it as optional.
+
+A merged row covers each of its windows once. Three series merged inside one
+ten second window that is five seconds old report `bucket_elapsed_ms: 5000`,
+not 15000, so the projection above still works on a grouped row.
+
+A gauge or timer row that merged several series inside its newest window has no
+`last`. A fold does not record which series was observed most recently, so there
+is no honest answer, and `totals()` leaves `last` out for the same reason. A
+group whose newest window holds a single series keeps it.
 
 Naming a dim the metric does not declare throws, exactly as `dims` does.
 

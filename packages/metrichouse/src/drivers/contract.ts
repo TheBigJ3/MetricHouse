@@ -157,6 +157,28 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect((await driver.readBuckets({ metric: M }))[0]?.value).toBeCloseTo(0.75)
       })
 
+      it('keeps every bit of a fractional total, as a double sum would', async () => {
+        // three adds of 7.77e-9 in plain doubles, which is what memory holds
+        for (let i = 0; i < 3; i++) await incr(1000, WILLOW, 7.77e-9)
+        await incr(1000, REX, 1e-310)
+
+        expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: 1000, dimKey: REX, value: 1e-310 },
+          { bucketTs: 1000, dimKey: WILLOW, value: 7.77e-9 + 7.77e-9 + 7.77e-9 },
+        ])
+      })
+
+      it('refuses a total past the largest number a double holds', async () => {
+        await incr(1000, WILLOW, Number.MAX_VALUE)
+        await expect(incr(1000, WILLOW, Number.MAX_VALUE)).rejects.toThrow(/largest number/)
+        expect((await driver.readBuckets({ metric: M }))[0]?.value).toBe(Number.MAX_VALUE)
+      })
+
+      it('stores a negative zero as zero', async () => {
+        await incr(1000, WILLOW, -0)
+        expect(Object.is((await driver.readBuckets({ metric: M }))[0]?.value, 0)).toBe(true)
+      })
+
       it('keeps metrics independent', async () => {
         await driver.increment([{ metric: 'a', bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
         await driver.increment([{ metric: 'b', bucketTs: 1000, dimKey: WILLOW, delta: 9 }])
@@ -248,6 +270,12 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect((await gaugeAt(1000, WILLOW)).sum).toBe(0.30000000000000004)
       })
 
+      it('refuses a sum past the largest number a double holds', async () => {
+        await obs(1000, WILLOW, Number.MAX_VALUE)
+        await expect(obs(1000, WILLOW, Number.MAX_VALUE)).rejects.toThrow(/largest number/)
+        expect((await gaugeAt(1000, WILLOW)).count).toBe(1)
+      })
+
       it('does nothing on an empty batch', async () => {
         await driver.observe([])
         expect(await driver.readBuckets({ metric: G })).toEqual([])
@@ -281,6 +309,31 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await put(1000, WILLOW, 7)
 
         expect(await levelAt(1000, WILLOW)).toBe(7)
+      })
+
+      it('carries the last write in the pointer window, not the first', async () => {
+        // the window the pointer names ends at the newest value, and the
+        // empty windows after it repeat that one
+        await put(1000, WILLOW, 5)
+        await put(1000, WILLOW, 3)
+        expect((await driver.readLevels(L))[0]?.carried).toBe(3)
+
+        await move(1000, WILLOW, 4)
+        expect((await driver.readLevels(L))[0]?.carried).toBe(7)
+      })
+
+      it('keeps the carried value when a write lands past the pointer', async () => {
+        // the windows between the pointer and the new write still belong to
+        // the older number
+        await put(1000, WILLOW, 42)
+        await put(5000, WILLOW, 7)
+        expect((await driver.readLevels(L))[0]?.carried).toBe(42)
+      })
+
+      it('refuses an add that would pass the largest number a double holds', async () => {
+        await put(1000, WILLOW, Number.MAX_VALUE)
+        await expect(move(1000, WILLOW, Number.MAX_VALUE)).rejects.toThrow(/largest number/)
+        expect(await levelAt(1000, WILLOW)).toBe(Number.MAX_VALUE)
       })
 
       it('moves a series by a delta, treating an untouched one as zero', async () => {
@@ -440,6 +493,79 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await driver.dropLevels(L, [])
         expect(await driver.readLevels(L)).toEqual([])
       })
+
+      it('keeps a series written since the cutoff', async () => {
+        // the flush decided WILLOW expired from an older read. The write that
+        // landed after that read must survive the drop
+        await put(1000, WILLOW, 42)
+        await put(1000, REX, 7)
+        await put(9000, WILLOW, 9)
+
+        await driver.dropLevels(L, [WILLOW, REX], 5000)
+
+        expect((await driver.readLevels(L)).map((one) => one.dimKey)).toEqual([WILLOW])
+        expect((await driver.readLevels(L))[0]?.value).toBe(9)
+      })
+    })
+
+    describe('writes below the claimed watermark', () => {
+      it('moves a counter increment forward to the watermark', async () => {
+        await incr(1000, WILLOW, 5)
+        await driver.ack(await driver.claim(M, 3000))
+
+        await incr(1000, WILLOW, 2)
+        await incr(2000, WILLOW, 1)
+        expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: 3000, dimKey: WILLOW, value: 3 },
+        ])
+      })
+
+      it('moves a gauge observation forward to the watermark', async () => {
+        await obs(1000, WILLOW, 5)
+        await driver.ack(await driver.claim(G, 2000))
+
+        await obs(1000, WILLOW, 9)
+        expect(await gaugeAt(2000, WILLOW)).toEqual({ last: 9, min: 9, max: 9, sum: 9, count: 1 })
+      })
+
+      it('moves a level write forward, and carries it from there', async () => {
+        await put(1000, WILLOW, 5)
+        await driver.ack(await driver.claim(L, 2000))
+
+        await put(1000, WILLOW, 8)
+        expect(await levelAt(2000, WILLOW)).toBe(8)
+        expect((await driver.readLevels(L))[0]).toMatchObject({ value: 8, writtenAt: 2000 })
+      })
+
+      it('lets a hold move the pointer without refilling a claimed window', async () => {
+        await put(1000, WILLOW, 5)
+        await driver.ack(await driver.claim(L, 3000))
+
+        await hold(2000, WILLOW, 5)
+        expect(await levelAt(2000, WILLOW)).toBeUndefined()
+        expect((await driver.readLevels(L))[0]?.heldThrough).toBe(2000)
+      })
+
+      it('raises the watermark even for a claim that found nothing', async () => {
+        await driver.ack(await driver.claim(M, 5000))
+        await incr(1000, WILLOW)
+        expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: 5000, dimKey: WILLOW, value: 1 },
+        ])
+      })
+
+      it('never lowers the watermark', async () => {
+        await driver.ack(await driver.claim(M, 5000))
+        await driver.ack(await driver.claim(M, 2000))
+        await incr(3000, WILLOW)
+        expect((await driver.readBuckets({ metric: M }))[0]?.bucketTs).toBe(5000)
+      })
+
+      it('keeps metrics apart', async () => {
+        await driver.ack(await driver.claim(M, 5000))
+        await obs(1000, WILLOW, 1)
+        expect((await driver.readBuckets({ metric: G }))[0]?.bucketTs).toBe(1000)
+      })
     })
 
     describe('readBuckets', () => {
@@ -585,47 +711,30 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect([...(second.buckets[0]?.values ?? [])]).toEqual([[WILLOW, 7]])
       })
 
-      it('merges a write that landed while the bucket was claimed', async () => {
-        // a straggler or a backdated write can reach a claimed bucket.
-        // Overwriting on release would silently drop it.
+      it('keeps a released window apart from a late write that moved forward', async () => {
+        // the late write went to the watermark while the window was claimed,
+        // so putting the window back merges nothing into it: a retry ships
+        // exactly what the first attempt did
         await incr(1000, WILLOW, 5)
         const claim = await driver.claim(M, 2000)
         await incr(1000, WILLOW, 2)
 
         await driver.release(claim)
         expect(await driver.readBuckets({ metric: M })).toEqual([
-          { bucketTs: 1000, dimKey: WILLOW, value: 7 },
-        ])
-      })
-
-      it('merges a new series that appeared while the bucket was claimed', async () => {
-        await incr(1000, WILLOW, 5)
-        const claim = await driver.claim(M, 2000)
-        await incr(1000, REX, 3)
-
-        await driver.release(claim)
-        expect(await driver.readBuckets({ metric: M })).toEqual([
-          { bucketTs: 1000, dimKey: REX, value: 3 },
           { bucketTs: 1000, dimKey: WILLOW, value: 5 },
+          { bucketTs: 2000, dimKey: WILLOW, value: 2 },
         ])
       })
 
-      it('merges a gauge fold that kept folding while it was claimed', async () => {
-        // the claimed fold is the older half; `last` belongs to whatever landed
-        // after it, and the other four aggregates merge without caring
+      it('keeps a released gauge fold apart from observations that moved forward', async () => {
         await obs(1000, WILLOW, 5)
         await obs(1000, WILLOW, 2)
         const claim = await driver.claim(G, 2000)
         await obs(1000, WILLOW, 9)
 
         await driver.release(claim)
-        expect(await gaugeAt(1000, WILLOW)).toEqual({
-          last: 9,
-          min: 2,
-          max: 9,
-          sum: 16,
-          count: 3,
-        })
+        expect(await gaugeAt(1000, WILLOW)).toEqual({ last: 2, min: 2, max: 5, sum: 7, count: 2 })
+        expect(await gaugeAt(2000, WILLOW)).toEqual({ last: 9, min: 9, max: 9, sum: 9, count: 1 })
       })
 
       it('restores a gauge fold into a bucket nothing touched', async () => {
@@ -830,7 +939,46 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         const claim = await driver.claimRecords(M, 2)
         expect(claim.records.map((r) => r.id)).toEqual(['r0', 'r1'])
         // the rest stay visible, so a backlog drains across flushes
+        expect((await driver.readPending({ metric: M })).map((r) => r.id)).toEqual([
+          'r2',
+          'r3',
+          'r4',
+        ])
+      })
+
+      it('counts claimed records as pending until the claim is settled', async () => {
+        // a sink that hangs holds its records in a claim, and they have not
+        // shipped. A backlog that read zero then would hide the hang
+        await seed(5)
+        const claim = await driver.claimRecords(M, 2)
+        expect(await driver.countPending(M)).toBe(5)
+
+        await driver.ack(claim)
         expect(await driver.countPending(M)).toBe(3)
+      })
+
+      it('puts back two released claims in the order they were taken', async () => {
+        // the older claim released first lands at the front; the newer one
+        // released after it must go in behind it, not ahead
+        await seed(4)
+        const older = await driver.claimRecords(M, 2)
+        const newer = await driver.claimRecords(M, 2)
+        await driver.append([{ metric: M, id: 'later', ts: 9000, fields: {} }])
+
+        await driver.release(older)
+        await driver.release(newer)
+        expect((await driver.readPending({ metric: M })).map((r) => r.id)).toEqual([
+          'r0',
+          'r1',
+          'r2',
+          'r3',
+          'later',
+        ])
+      })
+
+      it('reads nothing for a limit of zero', async () => {
+        await seed(2)
+        expect(await driver.readPending({ metric: M, limit: 0 })).toEqual([])
       })
 
       it('ack discards the claim for good', async () => {

@@ -34,6 +34,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
+import { assertMetricName, assertSink } from './types.js'
 
 /** The five stored aggregates, in column order. */
 export const GAUGE_AGGREGATES = ['last', 'min', 'max', 'sum', 'count'] as const
@@ -71,7 +72,10 @@ export interface GaugeConfig<D extends Shape> {
   readonly resolution: DurationInput
   /** Minimum shipping cadence. Omit it to take `defaults.flush` from the house. */
   readonly flush?: DurationInput
-  /** How long past a boundary a late write still lands in the closed bucket. Default `'2s'`. */
+  /**
+   * How long a window waits after it ends before a flush may claim it, so
+   * writes stamped inside it have time to reach storage. Default `'2s'`.
+   */
   readonly grace?: DurationInput
   /**
    * Which aggregates reach your sink. Defaults to all five.
@@ -170,9 +174,8 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
   config: GaugeConfig<D>,
   kind: K = 'gauge' as K,
 ): Gauge<D, K> {
-  if (typeof name !== 'string' || name.trim() === '') {
-    throw new Error('gauge: name must be a non-empty string')
-  }
+  assertMetricName(name, 'gauge')
+  assertSink(config.write, name)
 
   const dims = (config.dims ?? {}) as D
   assertDimsLegal(dims, name)
@@ -303,10 +306,10 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
    * ascending bucket order.
    *
    * Merging across *series* takes the same path, and `last` is the one column
-   * it cannot answer honestly: with several series there is no single latest
-   * observation. It reports the last one in bucket order rather than inventing
-   * a rule, which is why `totals()` drops `last` and a `groupBy` that keeps
-   * every dim does not.
+   * it cannot always answer: inside one window, a fold does not record which
+   * series was observed most recently. So `last` is kept when one series holds
+   * the newest window in the group, and left off the row when several do,
+   * which is the same reason `totals()` has no `last`.
    */
   function mergeValues(rows: readonly Row[]): Record<string, unknown> {
     const merged: Record<string, unknown> = {}
@@ -315,14 +318,18 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
 
     for (const column of aggregate) {
       switch (column) {
-        case 'last':
-          merged.last = rows.at(-1)?.last
+        case 'last': {
+          const newest = lastOf(rows)
+          if (newest !== undefined) merged.last = newest
           break
+        }
         case 'min':
-          merged.min = Math.min(...numbers('min'))
+          // a loop and not Math.min(...values): a spread of a hundred thousand
+          // rows is a hundred thousand arguments, which overflows the stack
+          merged.min = numbers('min').reduce((low, value) => Math.min(low, value), Infinity)
           break
         case 'max':
-          merged.max = Math.max(...numbers('max'))
+          merged.max = numbers('max').reduce((high, value) => Math.max(high, value), -Infinity)
           break
         case 'sum':
           merged.sum = totalOf(rows)
@@ -333,6 +340,20 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       }
     }
     return merged
+  }
+
+  /** `last` of the newest window, if only one series holds that window. */
+  function lastOf(rows: readonly Row[]): number | undefined {
+    const newest = rows.at(-1)
+    if (newest === undefined) return undefined
+    const newestAt = (newest.bucket_ts as Date).getTime()
+    const dimNames = Object.keys(dims)
+    const series = new Set<string>()
+    for (const row of rows) {
+      if ((row.bucket_ts as Date).getTime() !== newestAt) continue
+      series.add(JSON.stringify(dimNames.map((dim) => row[dim])))
+    }
+    return series.size === 1 ? (newest.last as number | undefined) : undefined
   }
 
   // named, so the flush mixin can reach the finished metric — see the counter
@@ -391,6 +412,10 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       }
       binding = next
       if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs())
+    },
+
+    unbind(): void {
+      binding = undefined
     },
 
     set(value: number, ...args: DimsArgs<D>): void {

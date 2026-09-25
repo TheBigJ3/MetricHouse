@@ -550,3 +550,26 @@ describe('in a house', () => {
     ).toEqual(['id', 'bucket_ts', 'route', 'status', 'min', 'max', 'sum', 'count'])
   })
 })
+
+describe('end() with a dim it leaves undefined', () => {
+  it('keeps the value start() bound', async () => {
+    const rows: Row[] = []
+    const t = timer('op', {
+      dims: { route: str(), status: int() },
+      resolution: '1s',
+      flush: '1m',
+      write: (batch) => {
+        rows.push(...batch)
+      },
+    })
+    let at = 1_788_616_987_000
+    createHouse({ driver: memory(), schema: [t], now: () => at })
+
+    const handle = t.start({ route: '/a', status: 200 })
+    expect(() => handle.end({ status: undefined } as never)).not.toThrow()
+    await t.drain()
+    at += 5_000
+    await t.flush()
+    expect(rows[0]).toMatchObject({ route: '/a', status: 200 })
+  })
+})

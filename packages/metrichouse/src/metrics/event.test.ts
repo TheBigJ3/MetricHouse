@@ -87,15 +87,21 @@ describe('declaration', () => {
   it('refuses a timestamp field that is not declared', () => {
     expect(
       expectRejected(() =>
-        event('e', { write: discard, fields: { a: str() }, timestamp: 'nope' as 'a' }),
+        event('e', { write: discard, fields: { a: str() }, timestamp: 'nope' as never }),
       ).message,
     ).toMatch(/not a declared field/)
   })
 
   it('refuses a timestamp field that is not ts()', () => {
     expect(
-      expectRejected(() => event('e', { write: discard, fields: { a: str() }, timestamp: 'a' }))
-        .message,
+      expectRejected(() =>
+        event('e', {
+          write: discard,
+          fields: { a: str() },
+          // @ts-expect-error the types already refuse a field that is not ts()
+          timestamp: 'a',
+        }),
+      ).message,
     ).toMatch(/declares str\(\).*must be ts\(\)/)
   })
 
@@ -516,16 +522,19 @@ describe('peek and pending', () => {
     expect(await walks.peek(2)).toHaveLength(2)
   })
 
-  it('pending excludes what a claim has taken', async () => {
+  it('pending still counts what a claim has taken, until it is settled', async () => {
+    // records a flush is writing have not shipped. A sink that hangs should
+    // show up as a backlog, not as zero
     const walks = bound()
     walks.recordMany([WALK, WALK])
     await walks.drain()
 
     const claim = await walks.claimBatch(clock)
-    expect(await walks.pending()).toBe(0)
-
-    await walks.releaseBatch(claim)
     expect(await walks.pending()).toBe(2)
+    expect(await walks.peek()).toEqual([])
+
+    await walks.ackBatch(claim)
+    expect(await walks.pending()).toBe(0)
   })
 })
 
@@ -717,5 +726,279 @@ describe('claim safety', () => {
     const claim = await walks.claimBatch(clock)
     await walks.ackBatch(claim)
     await expect(walks.ackBatch(claim)).rejects.toThrow(/not in flight/)
+  })
+})
+
+describe('what record() guarantees', () => {
+  const BASE_MS = 1_788_616_980_000
+  let driver: Driver
+  let clock: number
+
+  beforeEach(() => {
+    driver = memory()
+    clock = BASE_MS
+  })
+
+  function checkout(write: WriteFn = discard) {
+    const sold = counter('tickets_sold', {
+      dims: { tier: str() },
+      resolution: '1m',
+      flush: '1m',
+      write: discard,
+    })
+    const order = event('checkout', {
+      fields: { tier: str(), qty: int(), order: json().optional() },
+      derive: { tickets_sold: (fields) => ({ value: fields.qty, dims: { tier: fields.tier } }) },
+      write,
+    })
+    const house = createHouse({ driver, schema: [sold, order], now: () => clock })
+    return { sold, order, house }
+  }
+
+  it('rejects a json value JSON cannot hold, at the call', () => {
+    const { order } = checkout()
+    const cycle: Record<string, unknown> = {}
+    cycle.self = cycle
+
+    expect(() => order.record({ tier: 'vip', qty: 1, order: { big: 1n } })).toThrow(/json\(\)/)
+    expect(() => order.record({ tier: 'vip', qty: 1, order: cycle })).toThrow(/json\(\)/)
+    expect(() => order.record({ tier: 'vip', qty: 1, order: () => 1 })).toThrow(/json\(\)/)
+  })
+
+  it('ships the other records in a batch when one call was rejected', async () => {
+    const shipped: Row[] = []
+    const { order, house } = checkout((rows) => {
+      shipped.push(...rows)
+    })
+    order.record({ tier: 'vip', qty: 1, order: { ok: true } })
+    expect(() => order.record({ tier: 'vip', qty: 1, order: { big: 1n } })).toThrow()
+    order.record({ tier: 'vip', qty: 2 })
+    await house.drain()
+
+    const report = await house.flush({ force: true })
+    expect(report.ok).toBe(true)
+    expect(shipped.map((row) => row.qty)).toEqual([1, 2])
+  })
+
+  it('increments nothing when the call throws', async () => {
+    const { sold, order, house } = checkout()
+    expect(() => order.record({ tier: 'vip', qty: 'four' as unknown as number })).toThrow()
+    expect(() =>
+      order.recordMany([
+        { tier: 'vip', qty: 1 },
+        { tier: 'vip', qty: 2 },
+        { tier: 'vip', qty: -0.5 },
+      ]),
+    ).toThrow()
+    await house.drain()
+
+    expect(await sold.current()).toBe(0)
+    expect(await order.pending()).toBe(0)
+  })
+
+  it('increments nothing when sample returns something that is not a rate', async () => {
+    const sold = counter('sold', { resolution: '1m', flush: '1m', write: discard })
+    const order = event('order', {
+      fields: { qty: int() },
+      sample: () => 2,
+      derive: { sold: (fields) => ({ value: fields.qty }) },
+      write: discard,
+    })
+    const house = createHouse({ driver, schema: [sold, order], now: () => clock })
+
+    expect(() => order.record({ qty: 5 })).toThrow(/not a rate/)
+    await house.drain()
+    expect(await sold.current()).toBe(0)
+  })
+
+  it('applies all of a derive result or none of it', async () => {
+    const errors: unknown[] = []
+    const sold = counter('sold', {
+      dims: { tier: str() },
+      resolution: '1m',
+      flush: '1m',
+      write: discard,
+    })
+    const order = event('order', {
+      fields: { qty: int() },
+      derive: {
+        sold: () => [
+          { value: 1, dims: { tier: 'a' } },
+          { value: 1, dims: { tier: 'b' } },
+          { value: 1, dims: { nope: 'c' } },
+        ],
+      },
+      write: discard,
+    })
+    const house = createHouse({
+      driver,
+      schema: [sold, order],
+      now: () => clock,
+      onError: (error) => errors.push(error),
+    })
+
+    order.record({ qty: 1 })
+    await house.drain()
+    expect(await sold.current()).toBe(0)
+    expect(String(errors[0])).toMatch(/derive for "sold".*unknown dim "nope"/)
+    // the event is still staged: a broken derive never loses the evidence
+    expect(await order.pending()).toBe(1)
+  })
+
+  it('names a derive that returned nothing, or a value that is not a number', async () => {
+    const errors: unknown[] = []
+    const sold = counter('sold', { resolution: '1m', flush: '1m', write: discard })
+    const empty = event('empty', {
+      fields: {},
+      derive: { sold: () => undefined as never },
+      write: discard,
+    })
+    const text = event('text', {
+      fields: {},
+      derive: { sold: () => ({ value: '5' as unknown as number }) },
+      write: discard,
+    })
+    createHouse({
+      driver,
+      schema: [sold, empty, text],
+      now: () => clock,
+      onError: (error) => errors.push(error),
+    })
+
+    empty.record({})
+    text.record({})
+    expect(String(errors[0])).toMatch(/must return \{ value\?, dims\? \}/)
+    expect(String(errors[1])).toMatch(/value must be a finite number, got "5"/)
+  })
+
+  it('ships what was recorded, even if the caller changes the object afterwards', async () => {
+    const shipped: Row[] = []
+    const { order, house } = checkout((rows) => {
+      shipped.push(...rows)
+    })
+    const payload = { status: 'paid' }
+    order.record({ tier: 'vip', qty: 1, order: payload })
+    payload.status = 'refunded'
+    await house.drain()
+    await house.flush({ force: true })
+
+    expect(shipped[0]?.order).toBe('{"status":"paid"}')
+  })
+
+  it('ships a payload shaped like a driver marker unchanged', async () => {
+    const shipped: Row[] = []
+    const { order, house } = checkout((rows) => {
+      shipped.push(...rows)
+    })
+    order.record({ tier: 'vip', qty: 1, order: { __mh_date: 5 } })
+    await house.drain()
+    await house.flush({ force: true })
+
+    expect(shipped[0]?.order).toBe('{"__mh_date":5}')
+  })
+
+  it('gives a batch window that covers a backfilled record', async () => {
+    const contexts: WriteContext[] = []
+    const { order, house } = checkout((_rows, context) => {
+      contexts.push(context)
+    })
+    order.record({ tier: 'vip', qty: 1 })
+    order.record({ tier: 'vip', qty: 1 }, { at: BASE_MS - 60_000 })
+    await house.drain()
+    await house.flush({ force: true })
+
+    expect(contexts[0]?.bucketFrom).toBe(BASE_MS - 60_000)
+    expect(contexts[0]?.bucketTo).toBe(BASE_MS + 1)
+  })
+})
+
+describe('local staging after a failure', () => {
+  it('counts attempts up on batch sends, and back to 1 after a success', async () => {
+    const attempts: number[] = []
+    let fail = true
+    const pageViews = event('page_view', {
+      fields: { path: str() },
+      stage: 'local',
+      batch: { maxSize: 1 },
+      write: (_rows, context) => {
+        attempts.push(context.attempt)
+        if (fail) throw new Error('down')
+      },
+    })
+    const house = createHouse({ driver: memory(), schema: [pageViews], onError: () => {} })
+
+    pageViews.record({ path: '/' })
+    await house.drain()
+    pageViews.record({ path: '/a' })
+    await house.drain()
+    fail = false
+    pageViews.record({ path: '/b' })
+    await house.drain()
+    pageViews.record({ path: '/c' })
+    await house.drain()
+
+    // drain() ships the buffer too, so each record is followed by a second
+    // try at whatever failed; every one of them counts
+    expect(attempts).toEqual([1, 2, 3, 4, 5, 1])
+  })
+
+  it('retries maxAge after a failed send, without a new record or a flush', async () => {
+    vi.useFakeTimers()
+    try {
+      const sent: number[] = []
+      let fail = true
+      const pageViews = event('page_view', {
+        fields: { path: str() },
+        stage: 'local',
+        batch: { maxAge: '200ms' },
+        write: (rows) => {
+          if (fail) throw new Error('down')
+          sent.push(rows.length)
+        },
+      })
+      createHouse({ driver: memory(), schema: [pageViews], onError: () => {} })
+
+      pageViews.recordMany([{ path: '/' }, { path: '/a' }])
+      await vi.advanceTimersByTimeAsync(250)
+      expect(sent).toEqual([])
+
+      fail = false
+      await vi.advanceTimersByTimeAsync(250)
+      expect(sent).toEqual([2])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('puts back two failed batches in the order they were recorded', async () => {
+    const release: (() => void)[] = []
+    const seen: string[][] = []
+    let fail = true
+    const pageViews = event('page_view', {
+      fields: { path: str() },
+      stage: 'local',
+      batch: { maxSize: 2 },
+      write: async (rows) => {
+        if (!fail) {
+          seen.push(rows.map((row) => row.path as string))
+          return
+        }
+        await new Promise<void>((resolve) => release.push(resolve))
+        throw new Error('down')
+      },
+    })
+    const house = createHouse({ driver: memory(), schema: [pageViews], onError: () => {} })
+
+    pageViews.recordMany([{ path: '1' }, { path: '2' }])
+    pageViews.recordMany([{ path: '3' }, { path: '4' }])
+    // the older batch fails first, then the newer one
+    release.shift()?.()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    release.shift()?.()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    fail = false
+    await house.flush({ force: true })
+    expect(seen.flat()).toEqual(['1', '2', '3', '4'])
   })
 })

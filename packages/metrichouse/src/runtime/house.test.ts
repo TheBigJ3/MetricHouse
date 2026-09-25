@@ -133,7 +133,14 @@ describe('register', () => {
     const house = createHouse({ driver })
     const dogPoops = makeCounter()
     house.register(dogPoops)
-    expect(() => house.register(dogPoops)).toThrow(/already bound/)
+    expect(() => house.register(dogPoops)).not.toThrow()
+    expect(house.metrics()).toEqual([dogPoops])
+  })
+
+  it('refuses a metric another house already holds', () => {
+    const dogPoops = makeCounter()
+    createHouse({ driver, schema: [dogPoops] })
+    expect(() => createHouse({ driver, schema: [dogPoops] })).toThrow(/already bound/)
   })
 })
 
@@ -249,5 +256,69 @@ describe('slice one — the whole path', () => {
     expect(batches).toHaveLength(2)
     expect(batches[0]?.map((r) => r.id)).toEqual(batches[1]?.map((r) => r.id))
     expect(batches[0]).toEqual(batches[1])
+  })
+})
+
+describe('registration is all or nothing', () => {
+  it('leaves no metric bound when a later one fails, so a retry works', () => {
+    const first = makeCounter('first')
+    // no flush of its own and no house default, so binding it throws
+    const broken = counter('broken', { resolution: '1s', write: discard })
+    expect(() => createHouse({ driver, schema: [first, broken] })).toThrow(/no flush cadence/)
+    expect(first.isBound).toBe(false)
+
+    expect(() => createHouse({ driver, schema: [first], defaults: { flush: '1m' } })).not.toThrow()
+  })
+
+  it('accepts a schema module that exports one metric under two names', () => {
+    const dogPoops = makeCounter()
+    const house = createHouse({ driver, schema: { dogPoops, alias: dogPoops } })
+    expect(house.metrics()).toEqual([dogPoops])
+  })
+})
+
+describe('flush keeps going when one metric fails', () => {
+  it('reports a failed ack as noise beside a success, and ships the next metric', async () => {
+    const shipped: string[] = []
+    const first = makeCounter('first', { write: () => shipped.push('first') })
+    const second = makeCounter('second', { write: () => shipped.push('second') })
+    const house = createHouse({ driver, schema: [first, second], now })
+    first.add(WILLOW)
+    second.add(WILLOW)
+    await house.drain()
+
+    // another flusher settles the claim while the sink is writing, as a
+    // recovery would
+    const ack = driver.ack.bind(driver)
+    driver.ack = async (claim) => {
+      if (claim.metric === 'first') {
+        await ack(claim)
+        throw new Error('claim first#1 is not in flight — already settled?')
+      }
+      return ack(claim)
+    }
+
+    clock += 5_000
+    const report = await house.flush()
+    expect(shipped).toEqual(['first', 'second'])
+    expect(report.ok).toBe(true)
+    expect(report.metrics.first?.ackError).toBeInstanceOf(Error)
+    expect(report.metrics.second?.rows).toBe(1)
+  })
+
+  it('reports a driver that cannot claim instead of throwing', async () => {
+    const first = makeCounter('first')
+    const second = makeCounter('second')
+    const house = createHouse({ driver, schema: [first, second], now })
+    const claim = driver.claim.bind(driver)
+    driver.claim = async (metric, upTo) => {
+      if (metric === 'first') throw new Error('connection refused')
+      return claim(metric, upTo)
+    }
+
+    const report = await house.flush({ force: true })
+    expect(report.ok).toBe(false)
+    expect(String(report.metrics.first?.error)).toMatch(/connection refused/)
+    expect(report.metrics.second?.error).toBeUndefined()
   })
 })

@@ -288,9 +288,11 @@ write: async (rows) => {
 }
 ```
 
-Use `DO UPDATE` rather than `DO NOTHING`. A resent aggregate row may carry a
-larger value than the first send if a late write landed in the meantime, and you
-want the newer number.
+Use `DO UPDATE` rather than `DO NOTHING`. With the default delivery a resent row
+carries exactly the value it carried the first time, so either would do. Under
+[immediate delivery](/guide/delivery) a row is sent again as its window fills,
+with the same id and a larger value, and you want the newer number. `DO UPDATE`
+is right in both cases.
 
 There is also a helper that names the columns your table should treat as unique:
 
@@ -320,6 +322,13 @@ When you throw:
 - Nothing is deleted.
 - The data goes back into the live set exactly as it was.
 - The next flush sends the same rows, with the same ids, and `attempt` goes up.
+
+`attempt` counts how many sends of this metric have failed in a row, plus one.
+Every path that sends rows shares the count: `flush()`, an event batch that
+ships on `batch.maxSize` or `batch.maxAge`, and immediate delivery. The first
+send that succeeds puts it back to `1`. It is kept in the process doing the
+sending, so a second process that picks up the same rows starts its own count
+at `1`.
 
 `attempt` is useful for changing behaviour after repeated failure:
 

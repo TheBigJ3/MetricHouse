@@ -523,3 +523,26 @@ function _dimlessCallSiteTypes(metric: Counter<Record<never, never>>): void {
 }
 void _dimlessCallSiteTypes
 void _callSiteTypes
+
+describe('declaration checks every kind shares', () => {
+  it('refuses a name with a colon or whitespace in it', () => {
+    const write: WriteFn = () => {}
+    expect(() => counter('e:checkout', { resolution: '1s', flush: '1m', write })).toThrow(
+      /may not contain a colon or whitespace/,
+    )
+    expect(() => counter('http requests', { resolution: '1s', flush: '1m', write })).toThrow(
+      /may not contain a colon or whitespace/,
+    )
+    expect(() =>
+      counter('http.requests-v2', { resolution: '1s', flush: '1m', write }),
+    ).not.toThrow()
+  })
+
+  it('refuses a metric declared without a sink', () => {
+    expect(() =>
+      counter('sold', { resolution: '1s', flush: '1m' } as unknown as Parameters<
+        typeof counter
+      >[1]),
+    ).toThrow(/write must be a function/)
+  })
+})

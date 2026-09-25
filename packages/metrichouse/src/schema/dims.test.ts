@@ -239,3 +239,43 @@ describe('validateDims', () => {
     expect(() => validateDims(d, { a: 'x' })).not.toThrow()
   })
 })
+
+describe('values that used to slip through', () => {
+  it('decodes a numeric oneOf member as the number it was declared as', () => {
+    const party = { size: oneOf([1, 2, 4]) }
+    expect(decodeDimKey(party, encodeDimKey(party, { size: 2 }))).toEqual({ size: 2 })
+  })
+
+  it('refuses a oneOf whose members print the same', () => {
+    expect(() => oneOf(['2', 2])).toThrow(/prints the same/)
+  })
+
+  it('treats keys named after Object.prototype as unknown, not as present', () => {
+    const plain = { tier: str() }
+    expect(() => validateDims(plain, { tier: 'vip', constructor: 'x' })).toThrow(/unknown dim/)
+    expect(() => validateDims(plain, JSON.parse('{"tier":"vip","__proto__":1}'))).toThrow(
+      /unknown dim/,
+    )
+  })
+
+  it('lets an optional dim named constructor be left out', () => {
+    const shape = { constructor: str().optional(), toString: str().default('x') }
+    expect(() => validateDims(shape, applyDimDefaults(shape, {}))).not.toThrow()
+    expect(decodeDimKey(shape, encodeDimKey(shape, {}))).toEqual({ toString: 'x' })
+  })
+
+  it('accepts a Date made in another realm', async () => {
+    const { runInNewContext } = await import('node:vm')
+    const foreign = runInNewContext('new Date(5000)') as Date
+    const shape = { at: ts() }
+    expect(decodeDimKey(shape, encodeDimKey(shape, { at: foreign }))).toEqual({
+      at: new Date(5000),
+    })
+  })
+
+  it('refuses a dim value holding half of a surrogate pair', () => {
+    const shape = { tenant: str() }
+    expect(() => encodeDimKey(shape, { tenant: 'a\uD83D' })).toThrow(/surrogate/)
+    expect(() => encodeDimKey(shape, { tenant: 'a😀' })).not.toThrow()
+  })
+})

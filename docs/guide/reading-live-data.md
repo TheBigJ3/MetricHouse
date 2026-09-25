@@ -191,7 +191,8 @@ const now = await house.current()
 ```
 
 `house.current()` reads only the window still filling, and only for folded
-metrics. Events and logs are absent from the result, because they have no open
+metrics. A level reports every series it holds, at the value it is at now, even
+when nothing was written in this window, because that is what a level is. Events and logs are absent from the result, because they have no open
 window. That is deliberate: present and empty would read as "nothing is
 happening" instead of "wrong question".
 

@@ -220,6 +220,59 @@ describe('house.stop()', () => {
     expect(write).not.toHaveBeenCalled()
   })
 
+  it('waits for a tick still inside its sink, and ships what that tick put back', async () => {
+    // the tick's sink fails after stop() has been called. Its rows go back to
+    // the driver, and the final flush that follows is what ships them
+    let calls = 0
+    let failTick: (() => void) | undefined
+    const shipped: unknown[] = []
+    const write: WriteFn = async (rows) => {
+      calls += 1
+      if (calls === 1) {
+        await new Promise<void>((resolve) => {
+          failTick = resolve
+        })
+        throw new Error('sink timed out')
+      }
+      shipped.push(...rows.map((row) => row.value))
+    }
+    const metric = make('m', write, '1m')
+    const house = createHouse({ driver, schema: [metric], now, onError: () => {} })
+
+    house.start()
+    metric.add(7, A)
+    await house.drain()
+    await tick(60_000) // the tick claims the window and waits in the sink
+
+    const stopped = house.stop()
+    failTick?.()
+    const report = await stopped
+
+    expect(shipped).toEqual([7])
+    expect(report.ok).toBe(true)
+  })
+
+  it('ships windows still inside grace, leaving only the open one', async () => {
+    const write = vi.fn()
+    const metric = counter('m', {
+      write,
+      dims: { dogName: str() },
+      resolution: '1s',
+      flush: '5m',
+      grace: '5s',
+    })
+    const house = createHouse({ driver, schema: [metric], now })
+
+    for (let n = 0; n < 5; n++) {
+      metric.add(A)
+      clock += 1_000
+    }
+    await house.drain()
+
+    const report = await house.stop()
+    expect(report.metrics.m).toMatchObject({ rows: 5 })
+  })
+
   it('schedules a staged kind too', async () => {
     const write = vi.fn()
     const signups = event('signups', { write, fields: { plan: str() }, flush: '1m' })

@@ -16,7 +16,7 @@
  * a log inherits the staging guarantees rather than reimplementing them badly.
  */
 
-import type { Claim } from '../drivers/types.js'
+import type { Claim, RecoveryReport } from '../drivers/types.js'
 import type { FlushOptions, MetricFlushReport } from '../runtime/flush.js'
 import type { LiveFields, SnapshotOptions } from '../runtime/live.js'
 import type { InferShape, MarkOptional, Shape, ShapeArgs, Simplify } from '../schema/types.js'
@@ -31,6 +31,7 @@ import {
 } from './event.js'
 import type {
   AnyMetric,
+  ClaimOptions,
   MaterializedBatch,
   MetricBinding,
   Row,
@@ -38,6 +39,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
+import { assertMetricName, assertSink } from './types.js'
 
 /** The levels a log declares when it does not say otherwise. */
 export const DEFAULT_LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const
@@ -74,6 +76,7 @@ export const RESERVED_LOG_COLUMNS = [
 const RESERVED_LEVEL_NAMES: readonly string[] = [
   'name',
   'kind',
+  'storage',
   'fields',
   'levels',
   'minLevel',
@@ -89,10 +92,15 @@ const RESERVED_LEVEL_NAMES: readonly string[] = [
   'bound',
   'pending',
   'peek',
+  'snapshot',
+  'record',
+  'recordMany',
   'rowShape',
   'bind',
+  'unbind',
   'drain',
   'flush',
+  'recoverBatch',
   'claimBatch',
   'materializeClaim',
   'ackBatch',
@@ -293,9 +301,8 @@ export function log<
   F extends Shape = Record<string, never>,
   const L extends readonly string[] = DefaultLogLevels,
 >(name: string, config: LogConfig<F, L>): Log<F, L> {
-  if (typeof name !== 'string' || name.trim() === '') {
-    throw new Error('log: name must be a non-empty string')
-  }
+  assertMetricName(name, 'log')
+  assertSink(config.write, name)
 
   const levels = (config.levels ?? DEFAULT_LOG_LEVELS) as unknown as L
   const fields = config.fields ?? ({} as F)
@@ -447,6 +454,10 @@ export function log<
       inner.bind(binding)
     },
 
+    unbind(): void {
+      inner.unbind()
+    },
+
     at(level: string, message: string | Error, values?: Record<string, unknown>): void {
       emit(level, message, values, {})
     },
@@ -482,8 +493,12 @@ export function log<
       return inner.flush(options)
     },
 
-    claimBatch(nowMs: number): Promise<Claim> {
-      return inner.claimBatch(nowMs)
+    recoverBatch(): Promise<RecoveryReport> {
+      return inner.recoverBatch()
+    },
+
+    claimBatch(nowMs: number, options?: ClaimOptions): Promise<Claim> {
+      return inner.claimBatch(nowMs, options)
     },
 
     materializeClaim(claim: Claim): MaterializedBatch {

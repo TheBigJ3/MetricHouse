@@ -40,7 +40,7 @@ describe('memory · maxStaged', () => {
     await capped.append([one('a'), one('b')])
     await capped.claimRecords(M)
 
-    expect(await capped.countPending(M)).toBe(0)
+    expect(await capped.readPending({ metric: M })).toEqual([])
     await expect(capped.append([one('c')])).rejects.toThrow(/maxStaged/)
   })
 
@@ -109,15 +109,16 @@ describe('memory · maxSeries', () => {
     ).rejects.toThrow(/maxSeries/)
   })
 
-  it('does not leak capacity when a release merges two holders into one', async () => {
+  it('does not leak capacity when a late write lands beside a released window', async () => {
     const capped = memory({ maxSeries: 1 })
     await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
     const claim = await capped.claim(M, 2000)
+    // moved forward to 2000: the same series, in a second window
     await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
     await capped.release(claim)
 
-    // one series, one holder — acking it must free the slot completely
-    await capped.ack(await capped.claim(M, 2000))
+    // one series in two windows, and acking both must free the slot completely
+    await capped.ack(await capped.claim(M, 3000))
     await expect(
       capped.increment([{ metric: M, bucketTs: 3000, dimKey: 'b', delta: 1 }]),
     ).resolves.toBeUndefined()

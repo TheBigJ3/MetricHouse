@@ -47,7 +47,7 @@ writing to an unbound gauge throws.
 | `config.dims` | shape | no | [Labels to break the value down by](#dims) |
 | `config.resolution` | duration | yes | [How wide one window is](#resolution) |
 | `config.flush` | duration | no | [The fastest this may ship](#flush) |
-| `config.grace` | duration | no | [How long a late observation may still land](#grace) |
+| `config.grace` | duration | no | [How long a window waits for observations on their way](#grace) |
 | `config.aggregate` | array | no | [Which of the five columns reach your sink](#aggregate) |
 | `config.write` | function | yes | [Where the rows go](#write) |
 
@@ -117,8 +117,9 @@ gauge with no cadence anywhere throws when the house registers it. Identical to
 grace?: DurationInput      // default: '2s'
 ```
 
-How long past a boundary a late observation still lands in the window that just
-closed. Identical to [the counter's](/primitives/counter#grace).
+How long a window waits after it ends before a flush may claim it, so
+observations made inside it have time to reach storage. Identical to
+[the counter's](/primitives/counter#grace).
 
 ### aggregate
 

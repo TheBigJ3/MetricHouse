@@ -21,7 +21,7 @@
 
 import type { RecoveryReport } from '../drivers/types.js'
 import type { AnyMetric, WriteFn } from '../metrics/types.js'
-import { shipClaim } from './ship.js'
+import { type ShipOutcome, shipClaim } from './ship.js'
 
 export type FlushSkipReason = 'cadence' | 'not-selected'
 
@@ -29,6 +29,17 @@ export type FlushSkipReason = 'cadence' | 'not-selected'
 export interface FlushOptions {
   /** Ignore the cadence and ship everything closed now. */
   readonly force?: boolean
+  /**
+   * The last flush this process will make. Implies `force`, and also ships
+   * windows that have ended but are still inside grace.
+   *
+   * Grace exists for writes still on their way to the driver. A process that
+   * is stopping has drained its own writes already, so the only window worth
+   * keeping back is the one still open. A write from another instance that
+   * arrives after this is moved into the oldest window that has not shipped,
+   * so nothing is lost by not waiting.
+   */
+  readonly final?: boolean
 }
 
 /** What {@link runFlush} accepts, on top of the per-metric options. */
@@ -60,6 +71,16 @@ export interface MetricFlushReport {
    * what it shipped.
    */
   readonly recoveryError?: unknown
+  /**
+   * Set when the sink took the rows but the claim could not be settled
+   * afterwards.
+   *
+   * The rows were written, so this flush still counts as a success. It
+   * usually means another flusher decided the claim was abandoned and put it
+   * back, which happens when a sink runs longer than `recoverAfter`. Those
+   * rows will arrive a second time with the same ids.
+   */
+  readonly ackError?: unknown
 }
 
 export interface FlushReport {
@@ -80,13 +101,32 @@ export interface FlushReport {
  */
 interface FlushState {
   /**
-   * When this metric last actually shipped rows. Zero until the first one, so
-   * a fresh metric ships as soon as anything is closed rather than sitting on
-   * data for a full interval. An empty flush does not move it.
+   * When this metric last actually shipped rows. Unset until the first one,
+   * so a fresh metric ships as soon as anything is closed rather than sitting
+   * on data for a full interval, whatever the clock reads. An empty flush
+   * does not move it.
    */
-  lastFlushMs: number
-  /** `1` on a first try, incremented each time a write fails and releases. */
-  attempt: number
+  lastFlushMs: number | undefined
+}
+
+/**
+ * How many times in a row this metric's writes have failed, plus one.
+ *
+ * An object rather than a number so every path that ships a metric can share
+ * it: `flush()`, a locally staged event shipping on `batch.maxSize`, and
+ * immediate delivery all report the same `attempt`, and a failure on one of
+ * them is counted by the next. Reset to `1` by the first write that succeeds.
+ *
+ * Counted in this process only. A second process shipping the same metric
+ * keeps its own count.
+ */
+export interface Attempts {
+  current: number
+}
+
+/** A fresh count, for a metric that has not failed yet. */
+export function createAttempts(): Attempts {
+  return { current: 1 }
 }
 
 /** What a metric supplies to get a {@link AnyMetric.flush} of its own. */
@@ -106,6 +146,11 @@ export interface MetricFlushOptions {
    * this mixin is spread into that object while it is still being built.
    */
   readonly self: () => AnyMetric
+  /**
+   * The failure count to share with the metric's other shipping paths. A kind
+   * that only ships through `flush()` can leave it out.
+   */
+  readonly attempts?: Attempts
 }
 
 /**
@@ -117,7 +162,8 @@ export interface MetricFlushOptions {
  * retry counting, and the identical "an empty flush is not a flush".
  */
 export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush'> {
-  const state: FlushState = { lastFlushMs: 0, attempt: 1 }
+  const state: FlushState = { lastFlushMs: undefined }
+  const attempts = options.attempts ?? createAttempts()
 
   return {
     async flush(flushOptions: FlushOptions = {}): Promise<MetricFlushReport> {
@@ -125,19 +171,27 @@ export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush
       // reads the bound clock, so an unbound metric fails here rather than
       // claiming against `Date.now` and a driver that does not exist
       const now = options.now()
+      const final = flushOptions.final === true
 
       // 1. cadence — `flush` is a minimum, so a scheduler tick or a cron call
       //    that arrives early is a no-op. `lastFlushMs` advances only on
       //    success.
+      //
+      //    A clock that has stepped backwards since the last flush reads a
+      //    negative elapsed time. That is not "too soon", it is "no longer
+      //    comparable", and holding the metric back until the clock caught up
+      //    would stall it for as long as the step was.
       const flushMs = options.flushMs()
-      const elapsed = now - state.lastFlushMs
-      if (!flushOptions.force && elapsed < flushMs) {
-        return {
-          buckets: 0,
-          rows: 0,
-          skipped: true,
-          reason: 'cadence',
-          nextEligibleInMs: flushMs - elapsed,
+      if (!flushOptions.force && !final && state.lastFlushMs !== undefined) {
+        const elapsed = now - state.lastFlushMs
+        if (elapsed >= 0 && elapsed < flushMs) {
+          return {
+            buckets: 0,
+            rows: 0,
+            skipped: true,
+            reason: 'cadence',
+            nextEligibleInMs: flushMs - elapsed,
+          }
         }
       }
 
@@ -164,18 +218,20 @@ export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush
         ...(recoveryError !== undefined && { recoveryError }),
       }
 
-      // 3. claim — atomically invisible to live reads and to a second flusher.
-      //    What is claimable is the metric's judgement, not this file's.
-      const claim = await metric.claimBatch(now)
-
-      // 4. ship — materialize, write, then ack or release
-      const outcome = await shipClaim(metric, claim, options.sink(), {
-        attempt: state.attempt,
-        source: 'flush',
-      })
+      // 3 and 4. claim, then ship. A driver that cannot be reached fails the
+      //    claim, and that comes back in the report like a sink failure does:
+      //    a caller flushing a whole house should hear about it and still see
+      //    every other metric flushed
+      let outcome: ShipOutcome
+      try {
+        // what is claimable is the metric's judgement, not this file's
+        const claim = await metric.claimBatch(now, { final })
+        outcome = await shipClaim(metric, claim, options.sink(), { attempts, source: 'flush' })
+      } catch (error) {
+        return { buckets: 0, rows: 0, skipped: false, error, ...repair }
+      }
 
       if (outcome.error !== undefined) {
-        state.attempt += 1
         return {
           buckets: outcome.buckets,
           rows: outcome.rows,
@@ -185,6 +241,11 @@ export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush
         }
       }
 
+      const settled = {
+        ...repair,
+        ...(outcome.ackError !== undefined && { ackError: outcome.ackError }),
+      }
+
       if (outcome.rows === 0) {
         // deliberately does NOT advance lastFlushMs. The cadence bounds how
         // often this metric *ships*, and nothing shipped. Advancing here would
@@ -192,13 +253,12 @@ export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush
         // later would then wait a full interval — the coarser the resolution,
         // the worse it gets, because early flushes always find the only bucket
         // still open.
-        return { buckets: 0, rows: 0, skipped: false, ...repair }
+        return { buckets: 0, rows: 0, skipped: false, ...settled }
       }
 
       state.lastFlushMs = now
-      state.attempt = 1
 
-      return { buckets: outcome.buckets, rows: outcome.rows, skipped: false, ...repair }
+      return { buckets: outcome.buckets, rows: outcome.rows, skipped: false, ...settled }
     },
   }
 }
@@ -231,7 +291,15 @@ export async function runFlush(
       continue
     }
 
-    const report = await metric.flush(options)
+    let report: MetricFlushReport
+    try {
+      report = await metric.flush(options)
+    } catch (error) {
+      // a metric's flush reports its own failures, so this is the rare one it
+      // could not: an unbound metric, or a release that failed after a sink
+      // did. It still must not stop the metrics after it from shipping
+      report = { buckets: 0, rows: 0, skipped: false, error }
+    }
     metrics[metric.name] = report
     if (report.error !== undefined) ok = false
   }

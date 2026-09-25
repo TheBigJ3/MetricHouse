@@ -437,3 +437,16 @@ describe('in a house', () => {
     expect(context).toMatchObject({ kind: 'log', source: 'batch' })
   })
 })
+
+describe('level names that would hide a method', () => {
+  it('refuses every property the logger already has', () => {
+    const write: WriteFn = () => {}
+    const built = log('app', { write })
+    const reserved = Object.keys(built).filter(
+      (key) => !['debug', 'info', 'warn', 'error'].includes(key),
+    )
+    for (const name of reserved) {
+      expect(() => log('app', { write, levels: ['info', name] }), name).toThrow(/shadow/)
+    }
+  })
+})

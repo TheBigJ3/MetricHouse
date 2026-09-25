@@ -396,9 +396,37 @@ describe('staged snapshot', () => {
     signups.record({ plan: 'pro' })
     await house.drain()
 
-    await expect(
-      signups.snapshot({ rollup: 'sum', groupBy: ['nope'], orderBy: 'nope' }),
-    ).resolves.toHaveLength(1)
+    await expect(signups.snapshot({ rollup: 'sum', groupBy: ['nope'] })).resolves.toHaveLength(1)
+  })
+
+  it('sorts on orderBy before it applies limit', async () => {
+    const signups = makeEvent()
+    const house = createHouse({ driver, schema: [signups], now })
+    signups.recordMany([{ plan: 'free' }, { plan: 'pro' }, { plan: 'team' }])
+    await house.drain()
+
+    const top = await signups.snapshot({ orderBy: 'plan', direction: 'desc', limit: 2 })
+    expect(top.map((row) => row.plan)).toEqual(['team', 'pro'])
+    const bottom = await signups.snapshot({ orderBy: 'plan', direction: 'asc', limit: 1 })
+    expect(bottom.map((row) => row.plan)).toEqual(['free'])
+  })
+
+  it('refuses an orderBy that names no column, as the aggregate kinds do', async () => {
+    const signups = makeEvent()
+    const house = createHouse({ driver, schema: [signups], now })
+    signups.record({ plan: 'pro' })
+    await house.drain()
+
+    await expect(signups.snapshot({ orderBy: 'nope' })).rejects.toThrow(/orderBy names "nope"/)
+  })
+
+  it('refuses a limit that is not a whole number of rows', async () => {
+    const signups = makeEvent()
+    createHouse({ driver, schema: [signups], now })
+    await expect(signups.snapshot({ limit: -1 })).rejects.toThrow(/non-negative integer/)
+    await expect(signups.snapshot({ limit: 1.5 })).rejects.toThrow(/non-negative integer/)
+    await expect(signups.peek(-1)).rejects.toThrow(/non-negative integer/)
+    await expect(signups.peek(0)).resolves.toEqual([])
   })
 
   it('carries a log through the event underneath it', async () => {
@@ -624,3 +652,36 @@ void [
   _stagedRowTypes,
   _erasedStaysErased,
 ]
+
+describe('merging series inside one window', () => {
+  it('counts a window once in bucket_elapsed_ms, however many series it holds', async () => {
+    const hits = counter('hits', { dims: DIMS, resolution: '10s', flush: '1m', write: discard })
+    createHouse({ driver, schema: [hits], now })
+    hits.add(RIVERSIDE)
+    hits.add(CENTRAL)
+    hits.add({ park: 'north', kind: 'solid' })
+    await hits.drain()
+
+    // five seconds into the window the three writes landed in
+    clock = Math.floor(clock / 10_000) * 10_000 + 5_000
+    const rows = await hits.snapshot({ complete: false, groupBy: ['kind'] })
+    const solid = rows.find((row) => row.kind === 'solid')
+    // two series merged into one window: still five seconds, not ten
+    expect(solid).toMatchObject({ value: 2, bucket_elapsed_ms: 5_000 })
+  })
+
+  it('leaves last off a gauge row that merged several series in its newest window', async () => {
+    const temp = gauge('temp', { dims: DIMS, resolution: '10s', flush: '1m', write: discard })
+    createHouse({ driver, schema: [temp], now })
+    temp.set(30, RIVERSIDE)
+    temp.set(10, CENTRAL)
+    await temp.drain()
+
+    const [merged] = await temp.snapshot({ complete: false, groupBy: [] })
+    expect(merged).not.toHaveProperty('last')
+    expect(merged).toMatchObject({ min: 10, max: 30, count: 2 })
+
+    const [one] = await temp.snapshot({ complete: false, groupBy: ['park'], dims: RIVERSIDE })
+    expect(one?.last).toBe(30)
+  })
+})

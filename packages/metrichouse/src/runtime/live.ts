@@ -23,7 +23,7 @@
  */
 
 import type { Row } from '../metrics/types.js'
-import type { InferShape, Shape, Simplify } from '../schema/types.js'
+import { type InferShape, isDate, type Shape, type Simplify } from '../schema/types.js'
 
 /**
  * How to collapse buckets before returning them.
@@ -159,7 +159,7 @@ export interface BucketedRow {
 export type MergeValues = (rows: readonly Row[]) => Record<string, unknown>
 
 function asMs(at: number | Date): number {
-  return at instanceof Date ? at.getTime() : at
+  return isDate(at) ? at.getTime() : at
 }
 
 /**
@@ -175,7 +175,7 @@ function assertDimsKnown(
   metric: string,
 ): void {
   for (const key of named) {
-    if (!(key in dims)) {
+    if (!Object.hasOwn(dims, key)) {
       const declared = Object.keys(dims)
       throw new Error(
         `${metric}: ${label} names ${JSON.stringify(key)}, which is not a declared dim` +
@@ -266,7 +266,7 @@ export function applySnapshot(
     ? collapse(matched, options, { dims, resolutionMs, nowMs, mergeValues, rollup })
     : matched.map((one) => ({ ...one.row, ...liveness(one.bucketTs, resolutionMs, nowMs) }))
 
-  return cut(live, options, metric)
+  return orderAndLimit(live, options, metric)
 }
 
 /**
@@ -320,8 +320,12 @@ function collapse(
       bucket_elapsed_ms: 0,
     }
 
-    for (const one of group) {
-      const state = liveness(one.bucketTs, resolutionMs, nowMs)
+    // once per bucket, not once per row: three series merged inside one
+    // window still cover that one window, and counting its elapsed time three
+    // times would make it look three times as long
+    const buckets = new Set(group.map((one) => one.bucketTs))
+    for (const bucketTs of buckets) {
+      const state = liveness(bucketTs, resolutionMs, nowMs)
       if (state.bucket_open) merged.bucket_open = true
       merged.bucket_elapsed_ms += state.bucket_elapsed_ms
     }
@@ -332,9 +336,30 @@ function collapse(
   return out
 }
 
-/** Sort, then take — in that order, so `limit` means top-K and not "the first K". */
-function cut(rows: LiveRow[], options: SnapshotOptions, metric: string): LiveRow[] {
+/**
+ * Check a `limit` before anything is read with it.
+ *
+ * @throws unless it is a whole number of rows, zero or more
+ */
+export function assertLimit(limit: unknown, metric: string, label = 'limit'): void {
+  if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 0) {
+    throw new Error(`${metric}: ${label} must be a non-negative integer, got ${String(limit)}`)
+  }
+}
+
+/**
+ * Sort, then take — in that order, so `limit` means top-K and not "the first K".
+ *
+ * Exported for the staged kinds, whose rows are records rather than buckets
+ * but sort and cut by the same rules.
+ */
+export function orderAndLimit<R extends Record<string, unknown>>(
+  rows: R[],
+  options: SnapshotOptions,
+  metric: string,
+): R[] {
   const { orderBy, limit } = options
+  if (limit !== undefined) assertLimit(limit, metric)
 
   if (orderBy !== undefined) {
     const sample = rows[0]
@@ -349,20 +374,13 @@ function cut(rows: LiveRow[], options: SnapshotOptions, metric: string): LiveRow
     rows.sort((a, b) => sign * compare(a[orderBy], b[orderBy]))
   }
 
-  if (limit !== undefined) {
-    if (!Number.isSafeInteger(limit) || limit < 0) {
-      throw new Error(`${metric}: limit must be a non-negative integer, got ${limit}`)
-    }
-    return rows.slice(0, limit)
-  }
-
-  return rows
+  return limit === undefined ? rows : rows.slice(0, limit)
 }
 
 /** Numbers and dates by value, everything else by its string form. */
 function compare(a: unknown, b: unknown): number {
-  const left = a instanceof Date ? a.getTime() : a
-  const right = b instanceof Date ? b.getTime() : b
+  const left = isDate(a) ? a.getTime() : a
+  const right = isDate(b) ? b.getTime() : b
 
   if (typeof left === 'number' && typeof right === 'number') return left - right
   return String(left).localeCompare(String(right))

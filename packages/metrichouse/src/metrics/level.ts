@@ -18,19 +18,26 @@
  * the gap between writes is the thing you need filled.
  */
 
-import type { Cell, Claim, Driver, LevelOp } from '../drivers/types.js'
+import type { Cell, Claim, Driver, LevelOp, LevelSeries } from '../drivers/types.js'
 import { isLevelCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
 import { metricFlush } from '../runtime/flush.js'
-import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
+import {
+  applySnapshot,
+  type LiveRow,
+  type LiveRowOf,
+  type SnapshotOptions,
+  snapshotRange,
+} from '../runtime/live.js'
 import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
 import { assertResolution, bucketRange, bucketStart, closedUpTo } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
-import { bucketedLifecycle, bucketedReader, DEFAULT_GRACE_MS } from './bucketed.js'
+import { bucketedLifecycle, DEFAULT_GRACE_MS } from './bucketed.js'
 import type {
   AnyMetric,
+  ClaimOptions,
   DimsArgs,
   MetricBinding,
   Row,
@@ -38,6 +45,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
+import { assertMetricName, assertSink } from './types.js'
 
 /**
  * The most windows one flush will carry a single series through.
@@ -68,11 +76,18 @@ export interface LevelConfig<D extends Shape> {
   readonly resolution: DurationInput
   /** Minimum shipping cadence. Omit it to take `defaults.flush` from the house. */
   readonly flush?: DurationInput
-  /** How long past a boundary a late write still lands in the closed bucket. Default `'2s'`. */
+  /**
+   * How long a window waits after it ends before a flush may claim it, so
+   * writes stamped inside it have time to reach storage. Default `'2s'`.
+   */
   readonly grace?: DurationInput
   /**
    * How long a series keeps reporting after its last write. Unbounded by
    * default, which is what "it holds until something changes it" means.
+   *
+   * The last window a series reports is the one `holdFor` after its last
+   * write falls in, so a `holdFor` that is not a whole number of windows
+   * rounds down to one that is.
    *
    * Set it when a series can go away: a worker that owned `worker: 'w-7'` and
    * then died leaves a queue depth that will otherwise be reported forever,
@@ -153,7 +168,11 @@ export interface Level<D extends Shape> extends AnyMetric {
    */
   totals(): Promise<number | undefined>
 
-  /** Every unflushed bucket, as typed rows. */
+  /**
+   * Every unflushed window, as typed rows: the ones written to, and the ones
+   * the next flush will carry a held value into. With `complete: false`, the
+   * open window too, at the value the series is at now.
+   */
   snapshot<const O extends SnapshotOptions = Record<never, never>>(
     options?: O,
   ): Promise<LevelLiveRow<D, O>[]>
@@ -178,9 +197,8 @@ export function level<D extends Shape = Record<never, never>>(
   name: string,
   config: LevelConfig<D>,
 ): Level<D> {
-  if (typeof name !== 'string' || name.trim() === '') {
-    throw new Error('level: name must be a non-empty string')
-  }
+  assertMetricName(name, 'level')
+  assertSink(config.write, name)
 
   const dims = (config.dims ?? {}) as D
   assertDimsLegal(dims, name)
@@ -365,11 +383,20 @@ export function level<D extends Shape = Record<never, never>>(
   }
 
   /**
-   * Carry every series through the windows it owes a row for, then claim as
-   * any bucketed kind does.
+   * The window after the last one a series reports, or `undefined` when it
+   * reports forever.
    *
-   * The whole of what makes a level a level, and the only method here that is
-   * not the counter's.
+   * The last window is the one `holdFor` after the last write falls in. Every
+   * caller asks this one function, which is what makes the rows a series
+   * ships the same however the flushes that carry it are spaced.
+   */
+  function holdUntil(one: LevelSeries): number | undefined {
+    if (holdForMs === undefined) return undefined
+    return bucketStart(one.writtenAt + holdForMs, resolutionMs) + resolutionMs
+  }
+
+  /**
+   * What each window from a series' pointer up to `until` holds.
    *
    * It walks forwards rather than stamping one number across the gap, because
    * a series can have been written several times since the last flush and
@@ -377,39 +404,92 @@ export function level<D extends Shape = Record<never, never>>(
    * and to 7 at three, and the windows in between are 42, not 7 — a queue
    * that changed at three did not change at noon.
    *
+   * The walk is capped at {@link MAX_CARRY_BUCKETS} windows back from
+   * `until`. The windows the cap skips still decide where the walk starts:
+   * the value it begins from is the newest write among them, or `carried`
+   * when there is none, so a series that changed during a long gap resumes
+   * at the value it changed to.
+   *
+   * `written` holds the cells already in storage for this series, by bucket.
+   */
+  function walkCarry(
+    one: LevelSeries,
+    written: ReadonlyMap<number, number> | undefined,
+    until: number,
+  ): { bucketTs: number; value: number; observed: boolean }[] {
+    const start = one.heldThrough + resolutionMs
+    const from = Math.max(start, until - MAX_CARRY_BUCKETS * resolutionMs)
+
+    // the value in effect at `heldThrough`, moved on by anything written in
+    // the windows the cap stepped over
+    let value = one.carried
+    if (written && from > start) {
+      let newest = Number.NEGATIVE_INFINITY
+      for (const [bucketTs, observed] of written) {
+        if (bucketTs >= start && bucketTs < from && bucketTs > newest) {
+          newest = bucketTs
+          value = observed
+        }
+      }
+    }
+
+    const windows: { bucketTs: number; value: number; observed: boolean }[] = []
+    for (const bucketTs of bucketRange(from, until, resolutionMs)) {
+      const observed = written?.get(bucketTs)
+      if (observed !== undefined) value = observed
+      windows.push({ bucketTs, value, observed: observed !== undefined })
+    }
+    return windows
+  }
+
+  /** Level cells by series, then by bucket. */
+  function byDimKey(rows: readonly { bucketTs: number; dimKey: string; value: Cell }[]) {
+    const written = new Map<string, Map<number, number>>()
+    for (const row of rows) {
+      let byBucket = written.get(row.dimKey)
+      if (!byBucket) {
+        byBucket = new Map()
+        written.set(row.dimKey, byBucket)
+      }
+      byBucket.set(row.bucketTs, asLevel(row.value))
+    }
+    return written
+  }
+
+  /**
+   * Carry every series through the windows it owes a row for, then claim as
+   * any bucketed kind does.
+   *
+   * The whole of what makes a level a level, and the only method here that is
+   * not the counter's.
+   *
    * The carry runs before the claim because the windows it writes have to be
    * in the live set for the claim to take them. That order is also what makes
    * a crash between the two harmless: the carry is durable, so the next flush
    * claims it.
    */
-  async function carryAndClaim(at: number, claim: () => Promise<Claim>): Promise<Claim> {
+  async function carryAndClaim(
+    at: number,
+    claimOptions: ClaimOptions,
+    claim: () => Promise<Claim>,
+  ): Promise<Claim> {
     const driver = activeDriver()
-    const watermark = closedUpTo(resolutionMs, at, effectiveGraceMs())
+    const grace = claimOptions.final ? 0 : effectiveGraceMs()
+    const watermark = closedUpTo(resolutionMs, at, grace)
 
     const series = await driver.readLevels(name)
     if (series.length === 0) return claim()
 
     const expired: string[] = []
-    const carrying: { series: (typeof series)[number]; from: number; until: number }[] = []
+    const carrying: { series: LevelSeries; until: number }[] = []
     let earliest = Number.POSITIVE_INFINITY
 
     for (const one of series) {
-      // where the carry has to start to fill every window this series owes,
-      // floored at the cap so coming back from downtime leaves a gap rather
-      // than a backfill of readings nobody took
-      const from = Math.max(
-        one.heldThrough + resolutionMs,
-        watermark - MAX_CARRY_BUCKETS * resolutionMs,
-      )
       // an expiring series is carried to its last window and no further
-      const until =
-        holdForMs === undefined
-          ? watermark
-          : Math.min(watermark, one.writtenAt + holdForMs + resolutionMs)
-
-      if (from < until) {
-        carrying.push({ series: one, from, until })
-        earliest = Math.min(earliest, from)
+      const until = Math.min(watermark, holdUntil(one) ?? watermark)
+      if (one.heldThrough + resolutionMs < until) {
+        carrying.push({ series: one, until })
+        earliest = Math.min(earliest, one.heldThrough + resolutionMs)
       }
 
       // a series past its hold stops reporting. Dropped rather than left
@@ -420,45 +500,104 @@ export function level<D extends Shape = Record<never, never>>(
       }
     }
 
+    // only a series whose last write is still this old is dropped. The read
+    // above is already a moment stale, and a `set` that landed since then is
+    // what keeps its series alive
+    const dropExpired = () =>
+      expired.length > 0 && holdForMs !== undefined
+        ? driver.dropLevels(name, expired, watermark - holdForMs)
+        : Promise.resolve()
+
     if (carrying.length === 0) {
-      if (expired.length > 0) await driver.dropLevels(name, expired)
+      await dropExpired()
       return claim()
     }
 
-    // what has actually been written inside the range being carried. Each
-    // one is where a series stopped being worth the previous number
-    const written = new Map<string, Map<number, number>>()
-    for (const row of await driver.readBuckets({ metric: name, from: earliest, to: watermark })) {
-      let byBucket = written.get(row.dimKey)
-      if (!byBucket) {
-        byBucket = new Map()
-        written.set(row.dimKey, byBucket)
-      }
-      byBucket.set(row.bucketTs, asLevel(row.value))
-    }
+    // what has actually been written inside the range being carried, from
+    // each pointer rather than from where a capped walk begins: a write in a
+    // skipped window still decides the value the walk starts with
+    const written = byDimKey(
+      await driver.readBuckets({ metric: name, from: earliest, to: watermark }),
+    )
 
     const ops: LevelOp[] = []
-    for (const { series: one, from, until } of carrying) {
-      const byBucket = written.get(one.dimKey)
-      // the value in effect at `heldThrough`, which is where this walk starts
-      let value = one.carried
-
-      for (const bucketTs of bucketRange(from, until, resolutionMs)) {
-        const observed = byBucket?.get(bucketTs)
-        if (observed !== undefined) value = observed
+    for (const { series: one, until } of carrying) {
+      for (const window of walkCarry(one, written.get(one.dimKey), until)) {
         // sent for a written window too, and written only if that window is
         // empty. It is what moves the pointer, and skipping it would leave
         // the next flush starting from the wrong place
-        ops.push({ metric: name, bucketTs, dimKey: one.dimKey, value, mode: 'hold' })
+        ops.push({
+          metric: name,
+          bucketTs: window.bucketTs,
+          dimKey: one.dimKey,
+          value: window.value,
+          mode: 'hold',
+        })
       }
     }
 
     // the carry first, so a series being dropped still ships the windows it
     // owed up to the moment it expired
     if (ops.length > 0) await driver.setLevel(ops)
-    if (expired.length > 0) await driver.dropLevels(name, expired)
+    await dropExpired()
 
     return claim()
+  }
+
+  /**
+   * Every unflushed window, including the ones the next flush will carry.
+   *
+   * A window nobody wrote to has no cell in storage until a flush carries
+   * into it, so reading storage alone would show a level that sat at 42 for
+   * five minutes as one row. This fills those windows the way the flush will,
+   * so a live read and the rows that later ship agree. The open window is
+   * filled too, with the value the series is at now, when `complete: false`
+   * asks for it.
+   */
+  async function snapshotWithCarry(options: SnapshotOptions = {}): Promise<LiveRow[]> {
+    const driver = activeDriver()
+    const now = nowMs()
+    const range = snapshotRange(options, resolutionMs, now)
+    // the newest window that can hold anything: the open one, unless the
+    // range or `complete` stops short of it
+    const upper = range.to ?? bucketStart(now, resolutionMs) + resolutionMs
+
+    const [series, stored] = await Promise.all([
+      driver.readLevels(name),
+      driver.readBuckets({ metric: name, ...(range.to !== undefined && { to: range.to }) }),
+    ])
+    const written = byDimKey(stored)
+
+    const rows = stored.map((row) => ({
+      bucketTs: row.bucketTs,
+      dimKey: row.dimKey,
+      cell: row.value,
+    }))
+    for (const one of series) {
+      const until = Math.min(upper, holdUntil(one) ?? upper)
+      for (const window of walkCarry(one, written.get(one.dimKey), until)) {
+        if (!window.observed) {
+          rows.push({
+            bucketTs: window.bucketTs,
+            dimKey: one.dimKey,
+            cell: { level: window.value },
+          })
+        }
+      }
+    }
+
+    const from = range.from
+    return applySnapshot(
+      rows
+        .filter((row) => from === undefined || row.bucketTs >= from)
+        .sort((a, b) => a.bucketTs - b.bucketTs || (a.dimKey < b.dimKey ? -1 : 1))
+        .map((row) => ({
+          bucketTs: row.bucketTs,
+          row: materialize(row.bucketTs, row.dimKey, row.cell),
+        })),
+      options,
+      { metric: name, dims, resolutionMs, nowMs: now, mergeValues },
+    )
   }
 
   // named, so the flush mixin can reach the finished metric — see the counter
@@ -473,16 +612,6 @@ export function level<D extends Shape = Record<never, never>>(
 
   const self: Level<D> = {
     ...lifecycle,
-
-    ...bucketedReader<D, { value: number }>({
-      name,
-      resolutionMs,
-      dims,
-      driver: activeDriver,
-      now: nowMs,
-      materialize,
-      mergeValues,
-    }),
 
     ...metricFlush({
       name,
@@ -522,9 +651,17 @@ export function level<D extends Shape = Record<never, never>>(
       if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs())
     },
 
-    claimBatch(at: number) {
-      return carryAndClaim(at, () => lifecycle.claimBatch(at))
+    unbind(): void {
+      binding = undefined
     },
+
+    claimBatch(at: number, claimOptions: ClaimOptions = {}) {
+      return carryAndClaim(at, claimOptions, () => lifecycle.claimBatch(at, claimOptions))
+    },
+
+    // replaces the plain bucket read spread in above, so live rows include the
+    // windows a flush would carry
+    snapshot: snapshotWithCarry as Level<D>['snapshot'],
 
     set(value: number, ...args: DimsArgs<D>): void {
       write('set', value, args[0])

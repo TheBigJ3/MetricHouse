@@ -23,6 +23,11 @@ dims: { route: str() }
 requests.add({ route: '/checkout' })
 ```
 
+As a dimension, a string cannot hold half of a surrogate pair, which is what you
+get when a string is cut in the middle of an emoji. Redis stores a dimension as
+UTF-8, which has no way to write that half, so two different values would become
+one series. The write throws instead. As an event field any string is fine.
+
 ### int
 
 ```ts
@@ -73,7 +78,9 @@ ts()
 ```
 
 Accepts a `Date`, and rejects an invalid one. Stored as epoch milliseconds and
-handed back to your sink as a `Date`.
+handed back to your sink as a `Date`. A `Date` made in another realm, inside
+`vm` or a worker, is accepted like any other, even though `instanceof Date` is
+false for it.
 
 ```ts
 fields: { occurredAt: ts() }
@@ -100,7 +107,13 @@ requests.add({ status: '200' })
 ```
 
 Writing `as const` is unnecessary but harmless. The set must have at least one
-member.
+member, and every member must be a string or a finite number.
+
+A member comes back as the value you declared, so `oneOf([1, 2, 4])` hands your
+sink the number `2`, not the text `"2"`, and a snapshot filter of
+`{ dims: { partySize: 2 } }` matches it. A dimension is stored as text, which is
+why two members that print the same are refused at declaration:
+`oneOf(['2', 2])` throws, since once stored the two could not be told apart.
 
 ```ts
 // Declare once and reuse, so the values stay in step across metrics.
@@ -115,9 +128,15 @@ dims: { status: oneOf(STATUS) }
 json<T>()
 ```
 
-Accepts anything. Legal on event and log fields, **rejected as a dimension**,
-because a payload cannot be turned into a label without either losing information
-or creating a different label for every write.
+Accepts any value `JSON.stringify` can turn into text: objects, arrays,
+strings, numbers, booleans and `null`. Legal on event and log fields,
+**rejected as a dimension**, because a payload cannot be turned into a label
+without either losing information or creating a different label for every
+write.
+
+A value JSON cannot hold throws at `record()`, naming the field: a `BigInt`, an
+object that contains itself, a function, a symbol, or `undefined` on its own. The
+same check runs on a `.default()` value when the field is declared.
 
 ```ts
 fields: { metadata: json<{ source: string; retries: number }>() }
@@ -125,8 +144,10 @@ fields: { metadata: json<{ source: string; retries: number }>() }
 purchase.record({ metadata: { source: 'mobile', retries: 0 } })
 ```
 
-The value arrives at your sink already turned into a string, so the column it
-wants is text or your database's own JSON type.
+The value is turned into its JSON text when you call `record()`, so it arrives
+at your sink as a string, and the column it wants is text or your database's
+own JSON type. Taking the text at the call also means changing the object
+afterwards does not change what ships.
 
 ```ts
 dims: { metadata: json() }

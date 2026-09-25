@@ -210,6 +210,15 @@ export interface AnyMetric {
    */
   write(rows: Row[], context: WriteContext): Promise<void> | void
   bind(binding: MetricBinding): void
+  /**
+   * Forget the house this metric was bound to.
+   *
+   * For a house undoing a registration that failed partway, so the same
+   * metrics can be registered again once the mistake is fixed. Not for
+   * moving a live metric between houses: writes already on their way keep
+   * the driver they started with.
+   */
+  unbind(): void
   drain(): Promise<void>
 
   /**
@@ -267,7 +276,7 @@ export interface AnyMetric {
    * that knows its own resolution and grace — an aggregate kind turns `nowMs`
    * into a watermark, a staged kind takes what is there.
    */
-  claimBatch(nowMs: number): Promise<Claim>
+  claimBatch(nowMs: number, options?: ClaimOptions): Promise<Claim>
 
   /** Turn a claim into rows, and the window and headline they represent. */
   materializeClaim(claim: Claim): MaterializedBatch
@@ -277,6 +286,52 @@ export interface AnyMetric {
 
   /** The write failed — return the claimed data to the live set. */
   releaseBatch(claim: Claim): Promise<void>
+}
+
+/**
+ * Check a metric name at declaration.
+ *
+ * A name is part of every storage key a driver builds, so a colon in it could
+ * make one metric's keys look like another's under a neighbouring namespace:
+ * namespace `org` with metric `e:checkout` and namespace `org:e` with metric
+ * `checkout` would both read and write `org:e:e:checkout`. Whitespace is
+ * refused for the same reason it is refused in a table name: it is almost
+ * always a typo, and it makes every key awkward to type into a shell.
+ *
+ * @throws naming the kind, so the message says which declaration is wrong
+ */
+export function assertMetricName(name: unknown, kind: MetricKind): asserts name is string {
+  if (typeof name !== 'string' || name.trim() === '') {
+    throw new Error(`${kind}: name must be a non-empty string`)
+  }
+  if (/[\s:]/.test(name)) {
+    throw new Error(
+      `${kind}: name ${JSON.stringify(name)} may not contain a colon or whitespace, because ` +
+        'a driver builds storage keys from it and both would make those keys ambiguous',
+    )
+  }
+}
+
+/**
+ * Check that a metric was given somewhere to send its rows.
+ *
+ * Checked at declaration like everything else about the shape of a metric.
+ * Left to the first flush, a missing sink shows up as "sink is not a function"
+ * minutes later, on every flush, with the data piling up behind it.
+ */
+export function assertSink(write: unknown, name: string): void {
+  if (typeof write !== 'function') {
+    throw new Error(`${name}: write must be a function that stores the rows, got ${typeof write}`)
+  }
+}
+
+/** What a flush tells a metric about the claim it is asking for. */
+export interface ClaimOptions {
+  /**
+   * Take windows that have ended even if they are still inside grace. Set by
+   * a `final` flush; a staged kind has no grace and ignores it.
+   */
+  readonly final?: boolean
 }
 
 /** Structural check, used to pick metrics out of an imported schema module. */

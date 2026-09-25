@@ -145,6 +145,12 @@ The age clock starts at the first record of a batch, so `maxAge` bounds how
 long the oldest record waits rather than the newest. A `maxSize` that is not a
 positive whole number throws at declaration.
 
+When a send fails, its records go back into the buffer ahead of anything newer,
+and the age clock starts again. They are retried `maxAge` later, whether or not
+another record arrives, so a sink that recovers is caught up without anyone
+calling `flush()`. Two batches that fail one after the other go back in the
+order they were recorded.
+
 ### flush
 
 ```ts
@@ -161,7 +167,7 @@ without anyone calling `flush()`.
 ### timestamp
 
 ```ts
-timestamp?: 'auto' | (keyof F & string)      // default: 'auto'
+timestamp?: 'auto' | TsFieldOf<F>      // default: 'auto'
 ```
 
 Where each record's `ts` column comes from.
@@ -191,8 +197,9 @@ deviceReading.record({
 })
 ```
 
-Naming a field that is not declared, or one that is not `ts()`, throws at
-declaration. An optional `ts()` field that a call site leaves out falls back to
+`TsFieldOf<F>` is the names of the fields declared `ts()`, so naming any other
+field is a type error. Naming a field that is not declared, or one that is not
+`ts()`, also throws at declaration, for code that gets past the types. An optional `ts()` field that a call site leaves out falls back to
 the clock rather than stamping the epoch.
 
 Whatever this says, [`record(fields, { at })`](#event-record) overrides it for
@@ -281,16 +288,23 @@ Each function returns one target, several targets, or none.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `dims` | the target's declared dims | `{}` | The labels for the increment |
-| `value` | `number` | `1` | How much to add |
+| `dims` | an object | `{}` | The labels for the increment, checked against the target counter's declared dims |
+| `value` | `number` | `1` | How much to add. A whole number unless the counter is declared `value: float()` |
+
+The types cannot tie `dims` to the counter's shape, because a target is named by
+a string. Every target is checked when it runs instead, and a wrong one is
+reported to `onError` with the event and the target in the message.
 
 | Rule | Detail |
 | --- | --- |
 | Targets are named, not passed | Resolved at the first `record()`, so schema files may be declared in any order |
 | Only a counter can be a target | Anything else throws when the first record resolves it |
 | Derive runs before sampling | Always, and this is not configurable. It is the whole value of the feature |
+| Derive runs after validation | A call that throws increments nothing. In `recordMany`, one bad record means nothing is derived for any of them |
 | An array records several increments | One fact can feed two counters, or one counter twice |
+| A function's targets apply together | Every target a function returns is checked first. If one is wrong, none of that function's increments are applied |
 | A broken derive goes to `onError` | The event is still recorded. A mistake in a derived counter must not lose the underlying fact |
+| The increment lands in the open window | The counter's window is the one `now` falls in, even for a record with an older `ts`. A counter cannot be written in the past |
 
 ### claimLimit
 
@@ -351,12 +365,20 @@ checkoutAttempted.record(fields, { at: new Date('2026-09-17T09:14:02Z') })
 [`drain()`](#event-drain) when you need to know it landed.
 
 **Throws immediately** on an unbound event, an unknown or ill typed field, a
-missing required field, an `at` that is neither a `Date` nor finite epoch
-milliseconds, or a `sample` function returning something outside `[0, 1]`.
+missing required field, a `json()` value JSON cannot hold, an `at` that is
+neither a `Date` nor finite epoch milliseconds, or a `sample` function returning
+something outside `[0, 1]`. A call that throws changes nothing: no record is
+staged and no derived counter moves.
 
 What happens inside one call, in order: defaults are filled in, fields are
-checked, `ts` is chosen, [`derive`](#derive) runs, [`sample`](#sample) decides,
-and the record is staged with its `id` and `_ingested_at`.
+checked, `ts` is chosen, [`sample`](#sample) decides, and the stored copy is
+made. Only once all of that has passed does [`derive`](#derive) run and the
+record get staged with its `id` and `_ingested_at`. `derive` still runs for a
+record that sampling dropped.
+
+The stored copy is taken at the call. A `json()` value is turned into its JSON
+text there and a `Date` is copied, so changing the object you passed afterwards
+does not change what ships.
 
 ## event.recordMany()
 
@@ -373,8 +395,10 @@ checkoutAttempted.recordMany([
 ])
 ```
 
-Each record is checked, derived and sampled on its own, so one call can stage
-some records and drop others. `at` applies to all of them.
+Every record is checked before any of them is derived or staged. If one of them
+is wrong the call throws and nothing happens, the same as a single `record()`.
+Each record is sampled on its own, so a call that succeeds can still stage some
+records and drop others. `at` applies to all of them.
 
 ## event.pending()
 
@@ -382,7 +406,9 @@ some records and drop others. `at` applies to all of them.
 pending(): Promise<number>
 ```
 
-How many records are staged and not yet shipped.
+How many records have not shipped yet: those waiting for a flush, plus those a
+flush has claimed and is still writing. A sink that hangs therefore shows up as
+a backlog rather than as zero.
 
 ```ts
 await checkoutAttempted.pending()     // 128
@@ -395,10 +421,11 @@ flushes means the sink is slower than the traffic.
 ## event.peek()
 
 ```ts
-peek(n?: number): Promise<Row[]>
+peek(n?: number): Promise<EventRow<F>[]>
 ```
 
-The first `n` staged records as rows, without consuming them.
+The first `n` records waiting for a flush, as rows, without consuming them.
+Records a flush has claimed and is still writing are not among them.
 
 | Parameter | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -410,6 +437,7 @@ await checkoutAttempted.peek(10)
 
 Records come back in the order they were staged, as the rows your `write`
 function would receive. Nothing is claimed, so the next flush still ships them.
+`peek(0)` returns nothing, and a negative or fractional `n` throws.
 
 ## event.snapshot()
 
@@ -427,6 +455,11 @@ await checkoutAttempted.snapshot({ from: Date.now() - 60_000, orderBy: 'ts', dir
 
 Every row reads `bucket_open: false` and `bucket_elapsed_ms: 0`. A record is
 complete the instant it is staged, so there is no partial window to exclude.
+
+`orderBy` sorts every waiting record before `limit` takes the first ones, so
+`{ orderBy: 'amountCents', limit: 10 }` is the ten largest. Without `orderBy`,
+`limit` takes the first records in the order they were staged. An `orderBy`
+naming a column the rows do not have throws, as it does for every other type.
 
 The options that only mean something to a window, which are `dims`, `complete`,
 `rollup` and `groupBy`, are ignored rather than rejected, so one options object

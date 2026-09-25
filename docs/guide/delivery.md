@@ -106,6 +106,13 @@ claimed and deleted, otherwise they pile up in the driver forever.
 The final flush sends the same id with the complete value, so it supersedes every
 partial send. The two paths agree rather than fight.
 
+With several processes writing to one Redis, each of them sends the running
+total it read, and two sends can arrive at your table in either order. A table
+that keeps the newest arrival can briefly hold an older total. Rows carry no
+version number to settle that. What settles it is the flush: it runs after the
+window has closed, so its row is the last one sent for that id, and it holds
+the complete value.
+
 | | Events and logs | Counters, gauges, timers |
 | --- | --- | --- |
 | Immediate delivery replaces flush | Yes | No |

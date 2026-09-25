@@ -110,9 +110,10 @@ export interface House {
   /**
    * Stop the scheduler and get everything out.
    *
-   * Clears the intervals, drains the writes still on their way to the driver,
-   * then forces a final flush past every cadence. What it cannot ship is the
-   * open bucket: it has not closed, and shipping a partial fold under the same
+   * Clears the intervals and waits for any flush they started, drains the
+   * writes still on their way to the driver, then makes a final flush past
+   * every cadence and every grace period. What it cannot ship is the open
+   * bucket: it has not closed, and shipping a partial fold under the same
    * row id is the corruption `delivery: 'immediate'` exists to handle.
    */
   stop(): Promise<FlushReport>
@@ -149,7 +150,9 @@ export interface House {
 function collect(schema: SchemaInput | undefined): AnyMetric[] {
   if (!schema) return []
   const values = Array.isArray(schema) ? schema : Object.values(schema)
-  return values.filter(isMetric)
+  // a module that exports one metric under two names, `export { a as b }`,
+  // lists it twice, and it is still one metric
+  return [...new Set(values.filter(isMetric))]
 }
 
 export function createHouse(config: HouseConfig): House {
@@ -193,24 +196,53 @@ export function createHouse(config: HouseConfig): House {
     )
   }
 
+  /**
+   * Bind every metric, or none of them.
+   *
+   * All or nothing because a bound metric cannot be bound again: if the
+   * fourth metric in a schema failed and the first three stayed bound, fixing
+   * the fourth and calling `createHouse` again would fail on the first three.
+   * So every check that can be made up front is made first, and a bind that
+   * still throws undoes the ones before it.
+   */
   function register(...metrics: AnyMetric[]): void {
-    for (const metric of metrics) {
-      const existing = registry.get(metric.name)
+    const incoming = [...new Set(metrics)].filter((metric) => registry.get(metric.name) !== metric)
+
+    const names = new Map<string, AnyMetric>()
+    for (const metric of incoming) {
+      const existing = registry.get(metric.name) ?? names.get(metric.name)
       if (existing && existing !== metric) {
         throw new Error(`createHouse: two metrics are both named ${JSON.stringify(metric.name)}`)
       }
+      if (metric.isBound) {
+        throw new Error(
+          `${metric.name}: already bound to a house — a metric belongs to exactly one`,
+        )
+      }
+      names.set(metric.name, metric)
+    }
 
-      // throws if the metric already belongs to another house
-      metric.bind({
-        driver: config.driver,
-        now,
-        delivery,
-        defaults,
-        // named, not captured: `register` can add a derive target after the
-        // event that names it, and a lazy lookup is what makes that legal
-        resolve: (target) => registry.get(target),
-        ...(config.onError && { onError: config.onError }),
-      })
+    const bound: AnyMetric[] = []
+    try {
+      for (const metric of incoming) {
+        metric.bind({
+          driver: config.driver,
+          now,
+          delivery,
+          defaults,
+          // named, not captured: `register` can add a derive target after the
+          // event that names it, and a lazy lookup is what makes that legal
+          resolve: (target) => registry.get(target),
+          ...(config.onError && { onError: config.onError }),
+        })
+        bound.push(metric)
+      }
+    } catch (error) {
+      for (const metric of bound) metric.unbind()
+      throw error
+    }
+
+    for (const metric of incoming) {
       registry.set(metric.name, metric)
       // a metric added while the scheduler is running gets its interval now,
       // rather than at the next start() that may never come
@@ -253,12 +285,16 @@ export function createHouse(config: HouseConfig): House {
     },
 
     async stop(): Promise<FlushReport> {
-      scheduler.stop()
-      // drain first: a write still in flight to the driver is not yet
+      // a tick still inside its sink finishes first. If it fails, its rows go
+      // back to the driver, and the final flush below is what ships them
+      await scheduler.stop()
+      // drain next: a write still in flight to the driver is not yet
       // claimable, and flushing before it lands would leave it behind in a
       // process that is about to exit
       await Promise.all([...registry.values()].map((metric) => metric.drain()))
-      return runFlush(flushContext, { force: true })
+      // final, so windows still inside grace go too. Only the open window is
+      // left, which is the one thing a stopping process cannot finish
+      return runFlush(flushContext, { force: true, final: true })
     },
 
     async snapshot(options: HouseSnapshotOptions = {}): Promise<HouseSnapshot> {

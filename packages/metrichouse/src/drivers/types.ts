@@ -374,8 +374,14 @@ export interface Driver {
    *
    * What a `holdFor` expiry calls. Their already-shipped buckets are
    * untouched; what goes is the reason to keep emitting new ones.
+   *
+   * With `writtenBefore`, a series is only dropped if its `writtenAt` is still
+   * below it, checked at the moment of the drop. A flush decides a series has
+   * expired from a read taken a little earlier, and a `set` can land between
+   * that read and this call. Checking again here is what stops the drop from
+   * erasing the write.
    */
-  dropLevels(metric: string, dimKeys: readonly string[]): Promise<void>
+  dropLevels(metric: string, dimKeys: readonly string[], writtenBefore?: number): Promise<void>
 
   /**
    * Stage records verbatim.
@@ -393,7 +399,8 @@ export interface Driver {
   readPending(query: PendingQuery): Promise<StagedRecord[]>
 
   /**
-   * How many records are staged and unclaimed.
+   * How many records have not shipped: staged, plus claimed and not yet
+   * settled.
    *
    * Separate from `readPending` because it is a different call on a real
    * driver — `XLEN` against an `XRANGE` — and counting by reading a million
@@ -401,7 +408,23 @@ export interface Driver {
    */
   countPending(metric: string): Promise<number>
 
-  /** Move every bucket **strictly below** `upToBucketTs` into a claim. */
+  /**
+   * Move every bucket **strictly below** `upToBucketTs` into a claim.
+   *
+   * Also remembers the highest `upToBucketTs` any claim of this metric has
+   * used, and from then on every write aimed below it (`increment`,
+   * `observe`, and a level `set` or `add`) lands in that window instead. A
+   * window below the watermark has already been claimed, and a write that
+   * reaches it late, from a slow request or a clock that runs behind, would
+   * otherwise start a second copy of a window that already shipped. That copy
+   * would carry the same row id and only the late part of the value, and a
+   * sink keeping the newest row per id would throw away the rest. Moving the
+   * write forward keeps every total exact, at the cost of counting it one
+   * window later than it happened.
+   *
+   * A level `hold` aimed below the watermark writes no cell and still moves
+   * the series' pointer, for the same reason.
+   */
   claim(metric: string, upToBucketTs: number): Promise<BucketClaim>
 
   /**

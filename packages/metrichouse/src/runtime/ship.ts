@@ -19,13 +19,26 @@
  */
 
 import { type Cell, type Claim, type Driver, isEmptyClaim } from '../drivers/types.js'
-import type { AnyMetric, MetricKind, Row, WriteContext, WriteFn } from '../metrics/types.js'
+import type {
+  AnyMetric,
+  MaterializedBatch,
+  MetricKind,
+  Row,
+  WriteContext,
+  WriteFn,
+} from '../metrics/types.js'
+import type { Attempts } from './flush.js'
 
 export interface ShipOutcome {
   readonly buckets: number
   readonly rows: number
   /** Set when the sink threw. The claim has been released by then. */
   readonly error?: unknown
+  /**
+   * Set when the sink succeeded and the ack after it failed. The rows were
+   * written; the claim was usually taken back by another flusher first.
+   */
+  readonly ackError?: unknown
 }
 
 /**
@@ -40,33 +53,50 @@ export async function shipClaim(
   metric: AnyMetric,
   claim: Claim,
   sink: WriteFn,
-  options: { attempt: number; source: WriteContext['source'] },
+  options: { attempts: Attempts; source: WriteContext['source'] },
 ): Promise<ShipOutcome> {
   if (isEmptyClaim(claim)) {
-    await metric.ackBatch(claim)
+    try {
+      await metric.ackBatch(claim)
+    } catch (ackError) {
+      return { buckets: 0, rows: 0, ackError }
+    }
     return { buckets: 0, rows: 0 }
   }
 
-  const batch = metric.materializeClaim(claim)
-
+  // inside the try with the sink: a claim that cannot be turned into rows has
+  // to go back to the live set exactly as a failed write does, or its data is
+  // left in a claim that nothing will ever settle
+  let batch: MaterializedBatch | undefined
   try {
+    batch = metric.materializeClaim(claim)
     await sink(batch.rows, {
       metric: metric.name,
       kind: metric.kind,
       bucketFrom: batch.bucketFrom,
       bucketTo: batch.bucketTo,
       total: batch.total,
-      attempt: options.attempt,
+      attempt: options.attempts.current,
       source: options.source,
     })
   } catch (error) {
+    // counted before the release, so a send that picks these rows up the
+    // moment they are back already sees the failure
+    options.attempts.current += 1
     // the data becomes claimable again, unchanged and with the same row ids
     await metric.releaseBatch(claim)
-    return { buckets: batch.buckets, rows: batch.rows.length, error }
+    return { buckets: batch?.buckets ?? 0, rows: batch?.rows.length ?? 0, error }
   }
 
-  // only now is anything deleted
-  await metric.ackBatch(claim)
+  options.attempts.current = 1
+
+  // only now is anything deleted. The rows are written by this point, so a
+  // failed ack is reported beside a success rather than as a failure
+  try {
+    await metric.ackBatch(claim)
+  } catch (ackError) {
+    return { buckets: batch.buckets, rows: batch.rows.length, ackError }
+  }
   return { buckets: batch.buckets, rows: batch.rows.length }
 }
 

@@ -139,6 +139,39 @@ describe('cadence', () => {
   })
 })
 
+describe('cadence when the clock misbehaves', () => {
+  it('ships on the first flush even with a clock near zero', async () => {
+    const write = vi.fn()
+    const metric = counter('m', { resolution: '1s', flush: '1m', write })
+    let at = 1_000
+    createHouse({ driver: memory(), schema: [metric], now: () => at })
+    metric.add()
+    await metric.drain()
+
+    at = 4_000
+    expect(await metric.flush()).toMatchObject({ rows: 1, skipped: false })
+  })
+
+  it('does not stall for the length of a backwards step', async () => {
+    const write = vi.fn()
+    const metric = counter('m', { resolution: '1s', flush: '1m', write })
+    let at = 1_788_616_987_000
+    createHouse({ driver: memory(), schema: [metric], now: () => at })
+    metric.add()
+    await metric.drain()
+    at += 5_000
+    await metric.flush()
+
+    // the clock is corrected back an hour, and a write lands after it
+    at -= 3_600_000
+    metric.add()
+    await metric.drain()
+    at += 5_000
+    const report = await metric.flush()
+    expect(report.skipped).toBe(false)
+  })
+})
+
 describe('only', () => {
   it('restricts the flush to the named metrics', async () => {
     const a = make('a', { write: vi.fn() })
@@ -526,26 +559,27 @@ describe('gauge', () => {
     expect(rows[0]?.value).toEqual({ last: 6, min: 2, max: 6, sum: 8, count: 2 })
   })
 
-  it('merges a fold with observations that landed while it was claimed', async () => {
+  it('keeps a claimed fold apart from an observation that arrives while it is claimed', async () => {
     const bowl = gauge('bowl_level', { resolution: '1s', flush: '5m', write: () => {} })
     createHouse({ driver, schema: [bowl], now })
 
     bowl.set(4)
     await bowl.drain()
 
-    const claim = await driver.claim('bowl_level', clock + 1)
-    bowl.set(1) // lands in the bucket while it is claimed
+    // claims the window the clock is in, as a flush running a second later would
+    const next = Math.floor(clock / 1000) * 1000 + 1000
+    const claim = await driver.claim('bowl_level', next)
+    bowl.set(1) // aimed at the claimed window, so it moves to `next`
     await bowl.drain()
     await driver.release(claim)
 
-    // min from the claim, last from the newer write, count from both
-    expect((await driver.readBuckets({ metric: 'bowl_level' }))[0]?.value).toEqual({
-      last: 1,
-      min: 1,
-      max: 4,
-      sum: 5,
-      count: 2,
-    })
+    // a retry ships the claimed fold unchanged, and the late observation has a
+    // window of its own
+    const rows = await driver.readBuckets({ metric: 'bowl_level' })
+    expect(rows.map((row) => [row.bucketTs, row.value])).toEqual([
+      [next - 1000, { last: 4, min: 4, max: 4, sum: 4, count: 1 }],
+      [next, { last: 1, min: 1, max: 1, sum: 1, count: 1 }],
+    ])
   })
 })
 

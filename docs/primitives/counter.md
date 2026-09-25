@@ -51,7 +51,7 @@ counter throws rather than dropping the write.
 | `config.dims` | shape | no | [Labels to break the number down by](#dims) |
 | `config.resolution` | duration | yes | [How wide one window is](#resolution) |
 | `config.flush` | duration | no | [The fastest this may ship](#flush) |
-| `config.grace` | duration | no | [How long a late write may still land](#grace) |
+| `config.grace` | duration | no | [How long a window waits for writes on their way](#grace) |
 | `config.value` | field type | no | [Whether fractions are allowed](#value) |
 | `config.write` | function | yes | [Where the rows go](#write) |
 
@@ -138,10 +138,15 @@ when the house registers it, naming both places the setting could come from.
 grace?: DurationInput      // default: '2s'
 ```
 
-How long past a boundary a late write still lands in the window that just
-closed. A request that started at `:09.998` and finished at `:10.001` belongs
-to the window it started in, and grace is what holds that window back from
-being claimed until it has had its chance.
+How long a window waits after it ends before a flush may claim it. A write is
+stamped with its window when `add()` is called and reaches storage a moment
+later, so a write stamped `:09.998` can arrive at `:10.001`. Grace holds the
+window back until writes like that have landed. It never moves a write into an
+earlier window: an `add()` called at `:10.001` counts in the `:10` window.
+
+A write that arrives after its window was claimed anyway is moved forward into
+the oldest window that has not shipped. See
+[Buckets and time](/guide/buckets-and-time#a-write-that-misses-its-window).
 
 ```ts
 grace: '5s'     // a slow upstream, so give writes longer to arrive

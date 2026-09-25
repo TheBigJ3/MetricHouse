@@ -62,7 +62,8 @@ You can pass an imported module, and the house picks out the metrics.
 import * as schema from './schema.js'
 
 const house = createHouse({ driver: memory(), schema })
-// exports that are not metrics are ignored
+// exports that are not metrics are ignored, and a metric exported under
+// two names is registered once
 ```
 
 An array works too, and so does registering later.
@@ -74,7 +75,13 @@ house.register(newMetric)     // bound immediately, and scheduled if start() has
 ```
 
 A metric belongs to exactly one house. Registering the same metric with a second
-house throws, rather than quietly redirecting its writes.
+house throws, rather than quietly redirecting its writes. Registering it again
+with the house that already holds it does nothing.
+
+Registration is all or nothing. If one metric in a schema cannot be registered,
+for example because it has no flush cadence and the house gives none either,
+`createHouse` throws and none of the metrics in that call stay bound. Fix the
+mistake and call `createHouse` again with the same metrics.
 
 ## Looking at what is registered
 
@@ -186,13 +193,19 @@ process.on('SIGTERM', async () => {
 })
 ```
 
-`stop()` does three things in order: clears the timers, drains writes still on
-their way to the driver, then forces a final flush past every cadence.
+`stop()` does four things in order: clears the timers, waits for any flush a
+timer already started, drains writes still on their way to the driver, then
+makes a [final flush](/reference/flush-options#final) past every cadence and
+every grace period.
 
 What it cannot ship is the window that is still open. It has not finished, and
 sending a partial value under the same row id is the exact problem that
 [immediate delivery](/guide/delivery) exists to handle. In practice that is at
 most one `resolution` of data.
+
+`stop()` does not close the driver's connection, because the final flush needs
+it. With `ioredis()` built from a factory, call `driver.close()` after `stop()`
+returns so the process can exit. See [Drivers](/guide/drivers).
 
 ## In production
 

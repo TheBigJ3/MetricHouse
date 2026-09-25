@@ -50,7 +50,7 @@ timing on an unbound timer throws.
 | `config.dims` | shape | no | [Labels to break the duration down by](#dims) |
 | `config.resolution` | duration | yes | [How wide one window is](#resolution) |
 | `config.flush` | duration | no | [The fastest this may ship](#flush) |
-| `config.grace` | duration | no | [How long a late timing may still land](#grace) |
+| `config.grace` | duration | no | [How long a window waits for timings on their way](#grace) |
 | `config.aggregate` | array | no | [Which columns reach your sink](#aggregate) |
 | `config.record` | event name | no | [An event every timing is also written to](#record) |
 | `config.write` | function | yes | [Where the rows go](#write) |
@@ -113,10 +113,11 @@ Identical to [the counter's](/primitives/counter#flush).
 grace?: DurationInput      // default: '2s'
 ```
 
-How long past a boundary a late timing still lands in the window that just
-closed. A timing lands in the window it finished in, so a slow operation can
-finish well after the window it started in, and grace is what covers the
-crossing.
+How long a window waits after it ends before a flush may claim it, so timings
+recorded inside it have time to reach storage. A timing lands in the window its
+`end()` is called in, not the one it started in, so a slow operation that
+crosses a boundary is counted in the later window. Grace does not change that.
+Identical to [the counter's](/primitives/counter#grace).
 
 ### aggregate
 

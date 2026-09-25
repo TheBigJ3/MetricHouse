@@ -47,7 +47,7 @@ writing to an unbound level throws.
 | `config.dims` | shape | no | [Labels to break the value down by](#dims) |
 | `config.resolution` | duration | yes | [How wide one window is](#resolution) |
 | `config.flush` | duration | no | [The fastest this may ship](#flush) |
-| `config.grace` | duration | no | [How long a late write may still land](#grace) |
+| `config.grace` | duration | no | [How long a window waits for writes on their way](#grace) |
 | `config.holdFor` | duration | no | [How long a quiet series keeps reporting](#holdfor) |
 | `config.value` | field type | no | [Whether fractions are allowed](#value) |
 | `config.write` | function | yes | [Where the rows go](#write) |
@@ -107,8 +107,9 @@ See [How carry works](#how-carry-works).
 grace?: DurationInput      // default: '2s'
 ```
 
-How long past a boundary a late write still lands in the window that just
-closed. Identical to [the counter's](/primitives/counter#grace).
+How long a window waits after it ends before a flush may claim it, so writes
+made inside it have time to reach storage. Identical to
+[the counter's](/primitives/counter#grace).
 
 ### holdFor
 
@@ -135,12 +136,18 @@ export const workerQueue = level('worker_queue', {
 ```
 
 Past `holdFor` the series is forgotten and produces no more rows. Writing to it
-again brings it back, starting from that write.
+again brings it back, starting from that write. A write that lands while a flush
+is deciding to forget the series wins: the flush checks again at the moment it
+drops a series, and keeps any series written since it looked.
 
 The clock runs from the window the last write landed in, so it rounds to whole
-windows rather than to the millisecond. It has to be at least one `resolution`
-long, and a shorter one throws at declaration, because it would drop a series
-before the window it was written in had closed.
+windows rather than to the millisecond. The last window a series reports is the
+one that `holdFor` after its last write falls in. With `resolution: '1m'` and
+`holdFor: '90s'`, a series written in the `00:00` window reports `00:00` and
+`00:01`, and the same two rows ship whether you flush every minute or once an
+hour later. `holdFor` has to be at least one `resolution` long, and a shorter
+one throws at declaration, because it would drop a series before the window it
+was written in had closed.
 
 Without `holdFor`, a dim whose values come and go grows without bound: every
 `worker` id that has ever appeared keeps writing a row every window. That is
@@ -211,6 +218,11 @@ fold together, and that difference is what separates the two types.
 **Throws immediately** on an unbound level, a value that is not finite, a
 fraction on a level declared `value: int()`, or dims that are missing, unknown
 or ill typed.
+
+A value too large for a JavaScript number cannot reach storage either. An
+`inc()` that would move a series past about `1.8e308` is refused by the driver,
+and because `inc()` has already returned by then, the error goes to the house's
+`onError`. The series keeps the value it had.
 
 ## level.inc()
 
@@ -301,7 +313,11 @@ its totals for the opposite reason.
 snapshot<O extends SnapshotOptions>(options?: O): Promise<LevelLiveRow<D, O>[]>
 ```
 
-Every unflushed window, as rows.
+Every unflushed window, as rows. That includes the windows the next flush will
+carry a held value into, not only the ones something wrote to, so a queue that
+sat at 42 for five minutes reads as five rows of 42, with the same ids those rows
+will ship under. With `complete: false`, the open window is included too, at the
+value the series is at right now.
 
 ```ts
 await queueDepth.snapshot()
@@ -394,7 +410,12 @@ Three consequences worth knowing:
   86,400 windows per series at `resolution: '1s'`, and writing them all would
   claim the queue was measured throughout a period when nothing was watching.
   Past `MAX_CARRY_BUCKETS`, which is 10,000, the older windows are skipped and
-  the gap stays in the data.
+  the gap stays in the data. A write inside the skipped stretch still counts:
+  the first window after the gap carries the newest value written before it,
+  not the value from before the gap began.
+- **The window a series was written in ends at its last write.** Set a queue
+  to 5 and then to 3 inside one window, or `inc(5)` then `dec(2)`, and that
+  window and every empty one after it hold 3.
 
 ## What it costs
 

@@ -48,7 +48,7 @@ counter(name, { dims, resolution, flush, grace, value, write })
 | `dims` | shape | none | Labels to break the number down by |
 | `resolution` | duration | required | How wide one window is |
 | `flush` | duration | house default | The fastest this may ship |
-| `grace` | duration | `'2s'` | How long a late write may still land |
+| `grace` | duration | `'2s'` | How long a window waits for writes on their way |
 | `value` | `int()` or `float()` | `int()` | Whether fractions are allowed |
 | `write` | `WriteFn` | required | Where the rows go |
 
@@ -65,7 +65,7 @@ gauge(name, { dims, resolution, flush, grace, aggregate, write })
 | `dims` | shape | none | Labels to break the value down by |
 | `resolution` | duration | required | How wide one window is |
 | `flush` | duration | house default | The fastest this may ship |
-| `grace` | duration | `'2s'` | How long a late observation may still land |
+| `grace` | duration | `'2s'` | How long a window waits for observations on their way |
 | `aggregate` | array | `['last','min','max','sum','count']` | Which columns reach your sink |
 | `write` | `WriteFn` | required | Where the rows go |
 
@@ -82,7 +82,7 @@ level(name, { dims, resolution, flush, grace, holdFor, value, write })
 | `dims` | shape | none | Labels to break the value down by |
 | `resolution` | duration | required | How wide one window is |
 | `flush` | duration | house default | The fastest this may ship |
-| `grace` | duration | `'2s'` | How long a late write may still land |
+| `grace` | duration | `'2s'` | How long a window waits for writes on their way |
 | `holdFor` | duration | forever | How long a series keeps reporting after its last write |
 | `value` | `float()` or `int()` | `float()` | Whether fractions are allowed |
 | `write` | `WriteFn` | required | Where the rows go |
@@ -102,7 +102,7 @@ timer(name, { dims, resolution, flush, grace, aggregate, record, write })
 | `dims` | shape | none | Labels to break the duration down by |
 | `resolution` | duration | required | How wide one window is |
 | `flush` | duration | house default | The fastest this may ship |
-| `grace` | duration | `'2s'` | How long a late timing may still land |
+| `grace` | duration | `'2s'` | How long a window waits for timings on their way |
 | `aggregate` | array | `['min','max','sum','count']` | Which columns reach your sink |
 | `record` | event name | none | An event every timing is also written to |
 | `write` | `WriteFn` | required | Where the rows go |
@@ -177,11 +177,13 @@ ioredis(clientOrFactory, { namespace, maxPipelineSize, recoverAfter })
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `namespace` | string | `'mh'` | Key prefix |
-| `maxPipelineSize` | number | `1000` | Commands per round trip |
+| `namespace` | string | `'mh'` | Key prefix. Two houses sharing one Redis need different ones |
+| `maxPipelineSize` | number | `1000` | Commands or Lua scripts per round trip |
 | `recoverAfter` | duration | `'5m'` | How long a claim may be held before a flush treats it as abandoned |
 
 Pass a function rather than a client to delay connecting until the first write.
+A client made that way belongs to the driver, so close it with `driver.close()`
+after `house.stop()`. A client you pass in yourself is yours to close.
 
 Keep `recoverAfter` above your sink's timeout. It is what separates a flusher
 that crashed from one that is merely slow, and taking a claim back from a slow
@@ -245,6 +247,10 @@ These all throw when the module is first imported, not at the first write.
 | Check | Message |
 | --- | --- |
 | Empty metric name | `counter: name must be a non-empty string` |
+| A colon or whitespace in a metric name | `name "e:checkout" may not contain a colon or whitespace` |
+| No `write` function | `sold: write must be a function that stores the rows, got undefined` |
+| A `oneOf` whose members print the same | `oneOf: "2" prints the same as another member` |
+| A `json()` default JSON cannot hold | `default for json(): json() needs a value JSON can hold` |
 | `json()` as a dimension | `dim "x" declares json(), which cannot be encoded into a series key` |
 | Resolution does not divide flush | `resolution 7s does not divide flush 1m evenly` |
 | Invalid duration | `parseDuration: "1.5m"` |
@@ -256,5 +262,5 @@ These all throw when the module is first imported, not at the first write.
 | A level shadowing a method | `level "flush" would shadow an existing property on the logger` |
 | A timer dimension named `duration_ms` | `dim "duration_ms" is reserved` |
 | Two metrics with the same name | `createHouse: two metrics are both named "x"` |
-| A metric registered twice | `already bound to a house` |
+| A metric registered with a second house | `already bound to a house` |
 | No cadence anywhere | `no flush cadence — declare flush on the counter, or defaults.flush on the house` |

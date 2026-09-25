@@ -9,7 +9,7 @@
  *
  * ```
  * house.start()   ->  setInterval(metric.flushMs) per metric
- * house.stop()    ->  clear, drain, final forced flush
+ * house.stop()    ->  clear, wait for running ticks, drain, final flush
  * ```
  *
  * **Opt-in, and started by you, because a timer is not portable.** On Workers,
@@ -42,8 +42,16 @@ export interface Scheduler {
   start(): void
   /** Schedule a metric registered after {@link start}. No-op while stopped. */
   add(metric: AnyMetric): void
-  /** Stop ticking. Settles in-flight ticks; does not flush. */
-  stop(): void
+  /**
+   * Stop ticking, and resolve once every tick already running has finished.
+   *
+   * Waiting matters because a tick is a flush in progress. If it is still
+   * inside the sink when the caller moves on to a final flush and then exits,
+   * a failed write goes back to the driver after the final flush has already
+   * looked, and a successful one is cut off when the process ends. Does not
+   * flush.
+   */
+  stop(): Promise<void>
 }
 
 export function createScheduler(options: SchedulerOptions): Scheduler {
@@ -57,29 +65,35 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
    * exactly when it is already struggling. Skipping is the right answer: the
    * next tick is one interval away, and the data is not going anywhere.
    */
-  const inFlight = new Set<string>()
+  const inFlight = new Map<string, Promise<void>>()
   let running = false
 
-  async function tick(metric: AnyMetric): Promise<void> {
-    if (inFlight.has(metric.name)) return
-    inFlight.add(metric.name)
+  async function run(metric: AnyMetric): Promise<void> {
     try {
       const report = await metric.flush()
       if (report.error !== undefined) options.onError?.(report.error, { metric: metric.name })
     } catch (error) {
-      // claimBatch itself failed — a driver problem, not a sink one. Same
-      // destination: there is no caller to hand it to.
+      // flush reports its own failures, so this is one it could not: an
+      // unbound metric, or a release that failed. Same destination: there is
+      // no caller to hand it to.
       options.onError?.(error, { metric: metric.name })
     } finally {
       inFlight.delete(metric.name)
     }
   }
 
+  function tick(metric: AnyMetric): void {
+    if (inFlight.has(metric.name)) return
+    // set before the first await inside `run`, so a second tick arriving
+    // while this one is in the sink sees it and skips
+    inFlight.set(metric.name, run(metric))
+  }
+
   function schedule(metric: AnyMetric): void {
     if (timers.has(metric.name)) return
 
     const timer = setInterval(() => {
-      void tick(metric)
+      tick(metric)
     }, metric.flushMs)
 
     // metrics should not be the reason a process stays alive. A server is held
@@ -106,10 +120,12 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       schedule(metric)
     },
 
-    stop(): void {
+    async stop(): Promise<void> {
       running = false
       for (const timer of timers.values()) clearInterval(timer)
       timers.clear()
+      // `run` never rejects, so this only waits
+      await Promise.all([...inFlight.values()])
     },
   }
 }

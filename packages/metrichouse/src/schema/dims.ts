@@ -100,17 +100,48 @@ export function unescapeDimValue(value: string): string {
   return out
 }
 
+/**
+ * Half of a UTF-16 surrogate pair with the other half missing.
+ *
+ * Legal in a JavaScript string and not in UTF-8. Redis stores a key as UTF-8,
+ * so the client replaces each one with U+FFFD on the way in, and two different
+ * values that differ only there end up as one series.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+
 export function encodeDimValue(type: FieldType, value: unknown): string {
   if (type.kind === 'ts') return String((value as Date).getTime())
   if (type.kind === 'bool') return value ? 'true' : 'false'
-  return String(value)
+
+  const text = String(value)
+  if (LONE_SURROGATE.test(text)) {
+    throw new Error(
+      `dim value ${JSON.stringify(text)} holds half of a surrogate pair, which cannot be ` +
+        'stored as UTF-8. It usually means a string was cut in the middle of an emoji',
+    )
+  }
+  return text
 }
 
 export function decodeDimValue(type: FieldType, raw: string): unknown {
   if (type.kind === 'ts') return new Date(Number(raw))
   if (type.kind === 'bool') return raw === 'true'
   if (type.kind === 'int' || type.kind === 'float') return Number(raw)
+  // a member comes back as the member, so `oneOf([1, 2, 4])` returns the
+  // number 2 and not the text "2" it was stored as
+  if (type.kind === 'oneOf') return type.values?.find((member) => String(member) === raw) ?? raw
   return raw
+}
+
+/**
+ * The caller's own value for `key`, and never one inherited from a prototype.
+ *
+ * `values.constructor` is `Object` on every object literal, so reading a dim
+ * named `constructor` without this check finds a function the caller never
+ * passed.
+ */
+function own(values: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(values, key) ? values[key] : undefined
 }
 
 export function encodeDimKey(dims: Shape, values: Record<string, unknown>): string {
@@ -119,7 +150,7 @@ export function encodeDimKey(dims: Shape, values: Record<string, unknown>): stri
 
   return dimOrder(dims)
     .map((key) => {
-      const value = filled[key]
+      const value = own(filled, key)
       if (value === undefined) return DIM_ABSENT
       return escapeDimValue(encodeDimValue(dims[key] as FieldType, value))
     })
@@ -164,7 +195,7 @@ export function applyDimDefaults(
   for (const [key, type] of Object.entries(dims)) {
     // only a genuinely absent key is filled — a falsy value the caller
     // supplied is theirs, and '' or 0 must survive
-    if (filled[key] === undefined && type.hasDefault) {
+    if (own(filled, key) === undefined && type.hasDefault) {
       filled[key] = type.defaultValue
     }
   }
@@ -182,7 +213,7 @@ export function applyDimDefaults(
  */
 export function validateDims(dims: Shape, values: Record<string, unknown>, noun = 'dim'): void {
   for (const key of Object.keys(values)) {
-    if (!(key in dims)) {
+    if (!Object.hasOwn(dims, key)) {
       throw new Error(
         `unknown ${noun} ${JSON.stringify(key)} — declared ${noun}s are ` +
           `[${dimOrder(dims).join(', ')}]`,
@@ -191,7 +222,7 @@ export function validateDims(dims: Shape, values: Record<string, unknown>, noun 
   }
 
   for (const [key, type] of Object.entries(dims)) {
-    const value = values[key]
+    const value = own(values, key)
 
     if (value === undefined) {
       if (!type.isOptional) {

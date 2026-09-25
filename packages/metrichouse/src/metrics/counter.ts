@@ -28,6 +28,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
+import { assertMetricName, assertSink } from './types.js'
 
 export type { DimsArgs, RowColumn, RowShape } from './types.js'
 
@@ -61,7 +62,10 @@ export interface CounterConfig<D extends Shape> {
    * have no opinion worth forcing on both.
    */
   readonly flush?: DurationInput
-  /** How long past a boundary a late write still lands in the closed bucket. Default `'2s'`. */
+  /**
+   * How long a window waits after it ends before a flush may claim it, so
+   * writes stamped inside it have time to reach storage. Default `'2s'`.
+   */
   readonly grace?: DurationInput
   /** `int()` (default) or `float()`. Decides whether `.add()` accepts fractions. */
   readonly value?: FieldType<number, false>
@@ -172,9 +176,8 @@ export function counter<D extends Shape = Record<never, never>>(
   name: string,
   config: CounterConfig<D>,
 ): Counter<D> {
-  if (typeof name !== 'string' || name.trim() === '') {
-    throw new Error('counter: name must be a non-empty string')
-  }
+  assertMetricName(name, 'counter')
+  assertSink(config.write, name)
 
   const dims = (config.dims ?? {}) as D
   assertDimsLegal(dims, name)
@@ -383,6 +386,10 @@ export function counter<D extends Shape = Record<never, never>>(
       // taken from the house is only knowable now, and createHouse is still
       // early enough to be a boot failure rather than a flush-time surprise
       if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs())
+    },
+
+    unbind(): void {
+      binding = undefined
     },
 
     add(first?: number | InferShape<D>, second?: InferShape<D>): void {

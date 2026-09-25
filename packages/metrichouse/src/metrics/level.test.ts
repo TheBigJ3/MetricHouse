@@ -227,8 +227,36 @@ describe('reading', () => {
     clock = at(2)
     await metric.flush()
 
-    expect(await metric.snapshot()).toEqual([])
+    // window 0 shipped. Window 1 has closed and is still inside grace, so the
+    // next flush will carry 42 into it, and the snapshot already shows that
+    const rows = await metric.snapshot()
+    expect(rows.map((row) => [row.bucket_ts.getTime(), row.value])).toEqual([[at(1), 42]])
     expect(await metric.current(EMAIL)).toBe(42)
+  })
+
+  it('shows every window the next flush will carry, with the ids they will ship under', async () => {
+    const sink = collector()
+    const metric = bound({ write: sink.write })
+    metric.set(42, EMAIL)
+    await metric.drain()
+
+    // five windows have closed and outlived grace; only the first was written
+    clock = at(5) + 3_000
+    const live = await metric.snapshot()
+    expect(live.map((row) => row.value)).toEqual([42, 42, 42, 42, 42])
+
+    await metric.flush()
+    expect(sink.rows.map((row) => row.id)).toEqual(live.map((row) => row.id))
+  })
+
+  it('shows the open window at the held value when complete is false', async () => {
+    const metric = bound()
+    metric.set(42, EMAIL)
+    await metric.drain()
+
+    clock = at(3) + 5_000
+    const open = await metric.snapshot({ complete: false, from: at(3) })
+    expect(open).toEqual([expect.objectContaining({ value: 42, bucket_open: true })])
   })
 })
 
@@ -557,5 +585,124 @@ describe('a level with no dims', () => {
     metric.dec(2)
     await metric.drain()
     expect(await metric.current()).toBe(4)
+  })
+})
+
+describe('regressions', () => {
+  it('carries the last value written in a window, not the first', async () => {
+    // inc(5) dec(2) in the first window used to carry 5 into every empty
+    // window after it
+    const sink = collector()
+    const metric = bound({ write: sink.write })
+    metric.inc(5, EMAIL)
+    metric.dec(2, EMAIL)
+    await metric.drain()
+
+    clock = at(4) + 3_000
+    await metric.flush()
+    expect(sink.shape).toEqual([
+      [at(0), 3],
+      [at(1), 3],
+      [at(2), 3],
+      [at(3), 3],
+    ])
+  })
+
+  it('carries the last of several sets in one window', async () => {
+    const sink = collector()
+    const metric = bound({ write: sink.write })
+    metric.set(5, EMAIL)
+    metric.set(3, EMAIL)
+    await metric.drain()
+
+    clock = at(3) + 3_000
+    await metric.flush()
+    expect(sink.shape.map(([, value]) => value)).toEqual([3, 3, 3])
+  })
+
+  it('resumes at the newest value after a gap longer than the carry cap', async () => {
+    // set 42 and ship it, set 38 in the next window, then stay away for
+    // longer than MAX_CARRY_BUCKETS windows. The first carried window after
+    // the gap is 38, the value the series actually changed to
+    const sink = collector()
+    const metric = bound({ write: sink.write })
+    metric.set(42, EMAIL)
+    await metric.drain()
+    clock = at(1) + 3_000
+    await metric.flush()
+
+    metric.set(38, EMAIL)
+    await metric.drain()
+
+    clock = at(MAX_CARRY_BUCKETS + 50) + 3_000
+    sink.batches.length = 0
+    await metric.flush()
+
+    const values = new Set(sink.rows.map((row) => row.value))
+    expect(values).toEqual(new Set([38]))
+    expect(await metric.current(EMAIL)).toBe(38)
+  })
+
+  it('keeps a series that is written while its expiry is being decided', async () => {
+    // the drop is decided from a read, and a set can land between that read
+    // and the drop. It must survive
+    const metric = bound({ holdFor: '30s' })
+    metric.set(1, EMAIL)
+    await metric.drain()
+
+    clock = at(10) + 3_000
+    const readLevels = driver.readLevels.bind(driver)
+    driver.readLevels = async (name: string) => {
+      const series = await readLevels(name)
+      metric.set(9, EMAIL)
+      await metric.drain()
+      return series
+    }
+    await metric.flush()
+    driver.readLevels = readLevels
+
+    expect(await metric.current(EMAIL)).toBe(9)
+  })
+
+  it('ships the same rows for a holdFor between two windows, however flushes are spaced', async () => {
+    // holdFor 15s on 10s windows reports the written window and one more
+    const everyWindow = collector()
+    const spaced = bound({ write: everyWindow.write, holdFor: '15s' })
+    spaced.set(7, EMAIL)
+    await spaced.drain()
+    for (let n = 1; n <= 5; n++) {
+      clock = at(n) + 3_000
+      await spaced.flush()
+    }
+
+    driver = memory()
+    clock = BASE
+    const once = collector()
+    const single = bound({ write: once.write, holdFor: '15s' })
+    single.set(7, EMAIL)
+    await single.drain()
+    clock = at(5) + 3_000
+    await single.flush()
+
+    expect(everyWindow.shape).toEqual([
+      [at(0), 7],
+      [at(1), 7],
+    ])
+    expect(once.shape).toEqual(everyWindow.shape)
+  })
+
+  it('ships windows still inside grace on a final flush', async () => {
+    const sink = collector()
+    const metric = bound({ write: sink.write })
+    metric.set(4, EMAIL)
+    await metric.drain()
+
+    // window 1 has just closed, and grace would normally hold it back
+    clock = at(2) + 500
+    await metric.flush({ final: true })
+    expect(sink.shape).toEqual([
+      [at(0), 4],
+      [at(1), 4],
+    ])
   })
 })

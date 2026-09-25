@@ -26,15 +26,14 @@ import {
 } from '../runtime/live.js'
 import type { Shape } from '../schema/types.js'
 import { closedUpTo } from '../time/buckets.js'
-import type { AnyMetric, MaterializedBatch, Row } from './types.js'
+import type { AnyMetric, ClaimOptions, MaterializedBatch, Row } from './types.js'
 
 /**
- * How long past a boundary a late write still lands in the closed bucket, when
+ * How long a window waits after it ends before a flush may claim it, when
  * neither the metric nor the house says otherwise.
  *
  * Shared by every bucketed kind so the number is written once: a counter and a
- * gauge disagreeing about it would put the same late write in two different
- * buckets.
+ * gauge disagreeing about it would ship the same window at different times.
  */
 export const DEFAULT_GRACE_MS = 2_000
 
@@ -142,9 +141,11 @@ export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
       return driver().recover(name)
     },
 
-    async claimBatch(nowMs: number): Promise<Claim> {
-      // everything strictly below this has ended and outlived grace
-      return driver().claim(name, closedUpTo(resolutionMs, nowMs, graceMs()))
+    async claimBatch(nowMs: number, claimOptions: ClaimOptions = {}): Promise<Claim> {
+      // everything strictly below this has ended and outlived grace. A final
+      // flush waives the grace: see `FlushOptions.final`
+      const grace = claimOptions.final ? 0 : graceMs()
+      return driver().claim(name, closedUpTo(resolutionMs, nowMs, grace))
     },
 
     materializeClaim(claim: Claim): MaterializedBatch {

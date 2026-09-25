@@ -1,8 +1,8 @@
 # Driver contract
 
 A driver is where running totals and staged records live between a write and a
-flush. The interface is sixteen methods. Implementing it is how you put
-MetricHouse on storage it does not ship with.
+flush. The interface is fourteen methods and one `capabilities` property.
+Implementing it is how you put MetricHouse on storage it does not ship with.
 
 ```ts
 import type { Driver } from 'metrichouse/core'
@@ -24,7 +24,7 @@ export function myDriver(): Driver {
     async append(ops) {},
 
     async readLevels(metric) { return [] },
-    async dropLevels(metric, dimKeys) {},
+    async dropLevels(metric, dimKeys, writtenBefore) {},
 
     async readBuckets(query) { return [] },
     async readPending(query) { return [] },
@@ -108,6 +108,15 @@ Add `delta` to the cell at that metric, window and series. Create the cell if it
 does not exist. Deltas may be negative, and may be fractional because a counter
 can declare `float()`.
 
+Add in plain doubles, the way JavaScript's `+` does, so every driver holds the
+same bits. Redis's `HINCRBYFLOAT` rounds to seventeen decimal places, which turns
+`1e-310` into `0`; the Redis driver adds inside a Lua script instead. Refuse an
+increment whose total would not be a finite number, and change nothing when you
+do. Store `-0` as `0`.
+
+A write aimed below the claimed watermark lands at the watermark instead. See
+[claim](#claim).
+
 One round trip per call, not per operation. An empty array does nothing.
 
 ### observe
@@ -130,6 +139,9 @@ count = existing.count + 1
 Unlike `increment`, this is a read, modify and write. On shared storage it has to
 be atomic, or two writers lose observations. The Redis driver uses a Lua script
 for exactly this.
+
+Refuse an observation whose `sum` would not be a finite number, as `increment`
+does, and move it to the watermark the same way when it is aimed below it.
 
 ### setLevel
 
@@ -172,7 +184,22 @@ written at noon and again at three is still owed a row for every window in
 between, and a pointer that jumped to the later write would skip them.
 
 `carried` is the value the next carry starts from, and it is not always `value`
-for the same reason.
+for the same reason. The rule for a `set` or an `add`:
+
+| Where the write lands | `carried` becomes |
+| --- | --- |
+| a series the driver has not seen | the new value |
+| the window `heldThrough` names, or an earlier one | the new value, because that window now ends at it |
+| a window after `heldThrough` | unchanged, because the windows in between belong to the older number |
+
+Getting the middle row wrong is easy and shows up as a bug nobody notices for a
+while: `set(5)` then `set(3)` in one window carries `5` into every empty window
+after it.
+
+A `set` or an `add` aimed below the claimed watermark lands at the watermark,
+and the rule above uses the window it landed in. A `hold` aimed below it writes
+no cell, because a claim has already taken that window, and still moves
+`heldThrough`. An `add` whose result would not be a finite number is refused.
 
 ### readLevels
 
@@ -186,11 +213,21 @@ claims, because this is the state beside the buckets rather than in them.
 ### dropLevels
 
 ```ts
-dropLevels(metric: string, dimKeys: readonly string[]): Promise<void>
+dropLevels(
+  metric: string,
+  dimKeys: readonly string[],
+  writtenBefore?: number,
+): Promise<void>
 ```
 
 Forget those series entirely. What a `holdFor` expiry calls. Windows they have
 already filled are untouched; what goes is the reason to keep filling more.
+
+With `writtenBefore`, drop a series only if its `writtenAt` is still below it,
+checked at the moment of the drop and atomically with it on shared storage. The
+metric decides a series has expired from a `readLevels` taken a little earlier,
+and a `set` can land in between. Without this check, that write would be erased
+along with the series.
 
 ### append
 
@@ -250,9 +287,14 @@ Reading does not consume.
 countPending(metric: string): Promise<number>
 ```
 
-How many records are staged and unclaimed. A separate method because on real
-storage it is a different, much cheaper call, and counting by dragging a million
-rows over the wire is not something to make easy.
+How many records have not shipped: staged, plus claimed and not yet settled. A
+separate method because on real storage it is a different, much cheaper call,
+and counting by dragging a million rows over the wire is not something to make
+easy.
+
+In flight records count because they have not shipped. A sink that hangs holds
+its batch in a claim, and a backlog that read zero during the hang would hide
+it. `readPending` still returns only unclaimed records.
 
 ## Claiming
 
@@ -284,6 +326,16 @@ qualifies, return an empty claim rather than null.
 The driver knows nothing about time here. It is handed a watermark and claims
 everything below it. Deciding what "finished" means belongs to the metric, which
 is the only thing that knows its own resolution and grace.
+
+**Remember the highest watermark any claim of a metric has used**, even a claim
+that found nothing, and never lower it. From then on, every `increment`,
+`observe`, `set` and `add` aimed at a window below it lands in the watermark
+window instead. A window below the watermark has been claimed already. A write
+that reaches it late, from a slow request or a clock running behind, would
+otherwise start a second copy of a window that shipped, with the same row id and
+only the late part of the value, and a sink keeping one row per id would lose
+the rest. On shared storage the raise and the move have to be atomic, or a write
+can slip below the watermark between the two.
 
 ### claimRecords
 
@@ -326,12 +378,15 @@ The write failed. Return the claimed data to the live set, unchanged.
 
 Two rules that are easy to get wrong:
 
-- **Merge, do not overwrite.** A window that was written to while it was claimed
-  now holds new data. A release has to merge the two, not replace one with the
-  other. Counter cells add. Gauge folds merge the way the five aggregates merge,
-  with the newer observation winning `last`.
-- **Records go to the front.** Released records are older than anything appended
-  since, so they belong at the head of the queue, not the tail.
+- **Merge, do not overwrite.** With writes moved past the watermark, nothing
+  new should land in a claimed window. Data written by an older driver still
+  might have, so a release that finds a cell already there merges the two rather
+  than replacing one with the other. Counter cells add. Gauge folds merge the way
+  the five aggregates merge, with the newer observation winning `last`.
+- **Records go back where they came from.** Released records are older than
+  anything appended since, so they go ahead of it. They go behind any records an
+  earlier claim already put back, though, because those are older still. Keep
+  the order records were appended in so a release can find its place.
 
 ### Settling twice
 
@@ -408,7 +463,11 @@ A driver has to satisfy all of these.
 - Metrics are independent.
 - An empty batch does nothing.
 - A series key containing the separator or a backslash round trips intact.
-- A gauge fold keeps full floating point precision.
+- A gauge fold and a counter total keep full floating point precision.
+- A total, sum or level that would not be a finite number is refused, and
+  nothing changes.
+- `-0` is stored as `0`.
+- A write aimed below the highest claimed watermark lands at the watermark.
 - Writing a cell of one kind into a series that holds another throws, whichever
   two kinds they are.
 
@@ -422,7 +481,10 @@ A driver has to satisfy all of these.
 - `heldThrough` moves on a hold and never on a write; `writtenAt` moves on a
   write and never on a hold.
 - Held values survive the claim and the ack that ship their windows.
-- `dropLevels` forgets a series without touching the windows it already filled.
+- A `set` or `add` in the window `heldThrough` names replaces `carried`.
+- A `hold` below the claimed watermark writes no cell and still moves the pointer.
+- `dropLevels` forgets a series without touching the windows it already filled,
+  and keeps a series written at or after `writtenBefore`.
 
 **Reading**
 
@@ -445,8 +507,10 @@ A driver has to satisfy all of these.
 
 - Ack discards permanently and leaves unclaimed data alone.
 - Release restores the data unchanged, including record ids.
-- Release merges with anything written while the claim was held.
-- Released records return ahead of anything appended since.
+- A late write that moved forward stays apart from the released window.
+- Released records return ahead of anything appended since, and behind records
+  an older claim already put back.
+- `countPending` counts records in a claim until it is settled.
 - Settling the same claim twice throws.
 - Nothing is lost when a write fails and the flush retries.
 
@@ -456,7 +520,7 @@ A driver has to satisfy all of these.
 - A claim that was only just taken is left alone, so a flush still writing keeps
   what it is holding.
 - Recovery never touches the live set beyond merging into it.
-- A recovered window merges with anything written while it was stranded.
+- A recovered window comes back exactly as it was claimed.
 - Recovered records return ahead of anything appended since.
 - An empty claim is settled rather than left registered for ever.
 - Two sweeps running at once put the data back once.
@@ -498,6 +562,8 @@ export function tinyDriver(): Driver {
   // metric -> bucketTs -> dimKey -> cell
   const live = new Map<string, Map<number, Map<string, Cell>>>()
   const inFlight = new Map<string, Claim>()
+  // metric -> the highest watermark a claim has used
+  const claimedUpTo = new Map<string, number>()
   let seq = 0
 
   const bucketsFor = (metric: string) => {
@@ -511,12 +577,18 @@ export function tinyDriver(): Driver {
 
     async increment(ops) {
       for (const op of ops) {
-        const byBucket = bucketsFor(op.metric)
-        let series = byBucket.get(op.bucketTs)
-        if (!series) byBucket.set(op.bucketTs, (series = new Map()))
+        // A write aimed at a window a claim already took lands at the
+        // watermark instead, so a late write never reopens a shipped window.
+        const floor = claimedUpTo.get(op.metric) ?? Number.NEGATIVE_INFINITY
+        const bucketTs = Math.max(op.bucketTs, floor)
 
-        const existing = series.get(op.dimKey)
-        series.set(op.dimKey, ((existing as number) ?? 0) + op.delta)
+        const byBucket = bucketsFor(op.metric)
+        let series = byBucket.get(bucketTs)
+        if (!series) byBucket.set(bucketTs, (series = new Map()))
+
+        const total = ((series.get(op.dimKey) as number) ?? 0) + op.delta
+        if (!Number.isFinite(total)) throw new Error(`${op.metric}: total out of range`)
+        series.set(op.dimKey, total === 0 ? 0 : total)
       }
     },
 
@@ -550,6 +622,9 @@ export function tinyDriver(): Driver {
         byBucket.delete(bucketTs)
       }
 
+      // Raised even when nothing was claimed, and never lowered.
+      claimedUpTo.set(metric, Math.max(claimedUpTo.get(metric) ?? upToBucketTs, upToBucketTs))
+
       const claim: BucketClaim = {
         kind: 'buckets',
         id: `${metric}#${(seq += 1)}`,
@@ -581,8 +656,8 @@ export function tinyDriver(): Driver {
         if (!series) byBucket.set(bucket.bucketTs, (series = new Map()))
 
         for (const [dimKey, cell] of bucket.values) {
-          // Merge, never overwrite: this window may have been written to while
-          // the claim was held.
+          // Merge, never overwrite: data from an older driver may have landed
+          // in this window while the claim was held.
           const current = series.get(dimKey)
           series.set(dimKey, ((current as number) ?? 0) + (cell as number))
         }
@@ -594,7 +669,7 @@ export function tinyDriver(): Driver {
     async recover() { return NOTHING_RECOVERED },
 
     // The staged and level halves are left out for brevity. A real driver
-    // implements all sixteen methods.
+    // implements all fourteen methods.
     async observe() { throw new Error('not implemented') },
     async setLevel() { throw new Error('not implemented') },
     async readLevels() { return [] },

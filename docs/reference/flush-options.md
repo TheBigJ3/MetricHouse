@@ -6,6 +6,7 @@ the claim. These are the arguments it takes and the report it gives back.
 ```ts
 await httpRequests.flush()
 await httpRequests.flush({ force: true })
+await httpRequests.flush({ final: true })
 
 await house.flush()
 await house.flush({ force: true, only: ['http_requests'] })
@@ -15,9 +16,9 @@ await house.flush({ force: true, only: ['http_requests'] })
 
 | Callable | Options | Returns |
 | --- | --- | --- |
-| `metric.flush(options?)` | [`force`](#force) | [`MetricFlushReport`](#the-metric-report) |
-| `house.flush(options?)` | [`force`](#force), [`only`](#only) | [`FlushReport`](#the-house-report) |
-| `house.stop()` | none, it forces | [`FlushReport`](#the-house-report) |
+| `metric.flush(options?)` | [`force`](#force), [`final`](#final) | [`MetricFlushReport`](#the-metric-report) |
+| `house.flush(options?)` | [`force`](#force), [`final`](#final), [`only`](#only) | [`FlushReport`](#the-house-report) |
+| `house.stop()` | none, it passes `force` and `final` itself | [`FlushReport`](#the-house-report) |
 
 Every metric type takes the same options, whether it folds writes into windows
 or keeps each record whole.
@@ -53,6 +54,34 @@ has not closed, and a partial fold carrying the same row id is the corruption
 [`delivery: 'immediate'`](/guide/delivery) exists to handle. `house.stop()`
 forces a flush for the same reason and has the same limit.
 
+Nor does `force` skip [grace](/primitives/counter#grace). A window that ended a
+second ago is still held back, in case a write stamped inside it has not reached
+storage yet.
+
+### final
+
+```ts
+final?: boolean      // default false
+```
+
+The last flush this process will make. It does what `force` does, and it also
+ships windows that have ended but are still inside grace.
+
+```ts
+await house.drain()
+await house.flush({ final: true })   // everything but the open window
+```
+
+Grace waits for writes that are still on their way to storage. A process that
+is shutting down has drained its own writes already, so there is nothing left
+of its own to wait for. Another instance may still send a write for one of
+those windows, and that write is moved forward into a window that has not
+shipped rather than lost
+([Buckets and time](/guide/buckets-and-time#a-write-that-misses-its-window)).
+
+`house.stop()` passes `final` for you. Pass it yourself only in a shutdown path
+that does not go through `stop()`, and call `drain()` first.
+
 ### only
 
 ```ts
@@ -76,7 +105,8 @@ the concurrency.
 
 `metric.flush()` resolves with a report rather than rejecting, because a flush
 that fails has already released its claim. The data is safe, and you are being
-told what happened.
+told what happened. That holds for a driver that cannot be reached as well: the
+claim fails, nothing leaves storage, and the report carries the error.
 
 ```ts
 const report = await httpRequests.flush()
@@ -89,7 +119,8 @@ const report = await httpRequests.flush()
 | `skipped` | `boolean` | always | Whether anything was attempted |
 | `reason` | `'cadence'` or `'not-selected'` | when skipped | Why nothing was attempted |
 | `nextEligibleInMs` | `number` | when skipped on cadence | How long until this metric may ship again |
-| `error` | `unknown` | when the sink threw | What your `write` function threw. The rows are back in the live set |
+| `error` | `unknown` | when the flush shipped nothing it meant to | What your `write` function threw, or why the claim failed. The rows are back in the live set, or never left it |
+| `ackError` | `unknown` | when the rows were written and the claim could not be settled | The rows did ship. Another flusher had usually recovered the claim first, so the same rows, with the same ids, will arrive again |
 | `recovered` | `RecoveryReport` | when a dead flusher left a claim | What this flush put back before claiming |
 | `recoveryError` | `unknown` | when recovery itself failed | The flush below it still ran |
 
@@ -106,6 +137,11 @@ An empty flush leaves the cadence clock untouched. Nothing shipped, so nothing
 should count as a shipment, and data that closes a second later does not have
 to wait a full interval for the next one.
 
+`ackError` is the one failure that sits beside a success. The rows reached your
+`write` function and it returned, so they count as shipped and the cadence moves
+on. If it shows up often, `recoverAfter` on the
+[ioredis driver](/guide/drivers) is shorter than your sink takes to write.
+
 ## The house report
 
 ```ts
@@ -114,7 +150,7 @@ const report = await house.flush()
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `ok` | `boolean` | `false` when any metric reported an error |
+| `ok` | `boolean` | `false` when any metric reported an `error`. An `ackError` alone leaves it `true` |
 | `durationMs` | `number` | How long the whole fan out took |
 | `metrics` | `Record<string, MetricFlushReport>` | One report per metric, keyed by name |
 | `throwIfFailed()` | `() => void` | Throws naming every metric that failed |
@@ -140,9 +176,9 @@ cadence -> recover -> claim -> materialise -> write -> ack or release
 
 | Step | What happens |
 | --- | --- |
-| Cadence | An early call returns `skipped: true` unless `force` says otherwise |
-| Recover | A claim a previous flusher died holding is merged back, so this flush can ship it |
-| Claim | Finished data leaves the live set atomically, so a second flusher cannot take it |
+| Cadence | An early call returns `skipped: true` unless `force` or `final` says otherwise |
+| Recover | A claim a previous flusher died holding is put back, so this flush can ship it |
+| Claim | Finished data leaves the live set atomically, so a second flusher cannot take it. `final` counts a window inside grace as finished |
 | Materialise | The claim becomes the rows your `write` function receives |
 | Write | Your function runs. Throwing means the rows come back |
 | Settle | Success deletes the claimed data, failure returns it with `attempt` raised |

@@ -126,12 +126,12 @@ is what requires it; an app on `metrichouse/memory` never installs it.
 
 ## Status
 
-Early. Five primitives run, against two drivers measured by the same
-executable driver contract. The API is not yet stable — this is `0.x`, and
-minor versions may break.
+Early. Six primitives run: `counter`, `gauge`, `level`, `timer`, `event` and
+`log`, against two drivers measured by the same executable driver contract. The
+API is not yet stable. This is `0.x`, and minor versions may break.
 
-Not yet built: the `level` and `distinct` primitives, `house.ingest()` and
-backfill, the collector, and the CLI.
+Not yet built: the `distinct` primitive, `house.ingest()` and backfill, the
+collector, and the CLI.
 
 At-least-once holds across a failed *process* as well as a failed write, on
 `ioredis`: a claim is a durable move, and a flush merges back any claim held

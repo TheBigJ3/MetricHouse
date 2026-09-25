@@ -89,18 +89,42 @@ socket, which matters in tests and build steps.
 const driver = ioredis(() => new Redis(process.env.REDIS_URL!))
 ```
 
+A client made by that function belongs to the driver, and nothing else can
+reach it to close it. Call `driver.close()` when you are done, after
+`house.stop()`, or a script will never exit:
+
+```ts
+await house.stop()      // the final flush still needs the connection
+await driver.close()    // now the process can exit
+```
+
+`close()` does nothing to a client you passed in yourself. That one is yours to
+close with `client.quit()`.
+
 ### Options
 
 ```ts
 ioredis(client, {
   namespace: 'mh',         // key prefix
-  maxPipelineSize: 1000,   // commands per round trip
+  maxPipelineSize: 1000,   // commands or scripts per round trip
   recoverAfter: '5m',      // how long a claim may be held before it counts as abandoned
 })
 ```
 
 Give two houses that share one Redis different namespaces. Every key this driver
-creates starts with that prefix.
+creates starts with that prefix. Two houses given the same namespace share every
+metric of the same name, and nothing warns you, because the two can be in
+different processes that cannot see each other.
+
+A metric name may not contain a colon or whitespace, and that is what keeps two
+different namespaces apart. The key for an event named `checkout` under
+namespace `org:e` would otherwise be the same as the key for one named
+`e:checkout` under namespace `org`.
+
+`maxPipelineSize` bounds how many commands, or Lua scripts, go to Redis in one
+round trip. A batch larger than that is sent in several. Most writes are one
+script per window, so this mostly matters to a level carrying a series through a
+long gap, which can be ten thousand windows.
 
 `recoverAfter` is the one number behind crash recovery. A claim held by a flusher
 that is still writing looks exactly like a claim held by one that has died, and
@@ -122,6 +146,9 @@ driver.keyFor('http_requests', bucketTs)
 
 await driver.scanSeries('http_requests')
 // every distinct dimension combination currently live for this metric
+
+await driver.close()
+// closes the client this driver made from a factory
 ```
 
 `scanSeries` is how you watch for a dimension that is growing without bound. The
@@ -184,7 +211,7 @@ export const house = createHouse({ driver, schema })
 
 ## Writing your own
 
-The `Driver` interface is sixteen methods. It is exported, so a driver for
+The `Driver` interface is fourteen methods and a `capabilities` property. It is exported, so a driver for
 DynamoDB, Cloudflare Durable Objects, Postgres or anything else is an ordinary
 object.
 

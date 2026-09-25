@@ -44,6 +44,11 @@ async function probe(): Promise<Redis | undefined> {
 
 const client = await probe()
 
+/** The per-namespace counters a driver keeps between claims, by design. */
+function survives(ns: string, key: string): boolean {
+  return key === `${ns}:seq` || key.startsWith(`${ns}:wm:`) || key.startsWith(`${ns}:eseq:`)
+}
+
 const M = 'dog_poops'
 const G = 'dog_weight'
 const WILLOW = 'Willow|riverside'
@@ -133,8 +138,9 @@ if (!client) {
       await driver.ack(await driver.claim(M, 2000))
       await driver.ack(await driver.claimRecords(M))
 
-      // the sequence counter is the one key that legitimately survives
-      const left = (await live.keys(`${ns}:*`)).filter((k) => k !== `${ns}:seq`)
+      // three small counters legitimately survive: the claim sequence, the
+      // record sequence, and the watermark that sends late writes forward
+      const left = (await live.keys(`${ns}:*`)).filter((k) => !survives(ns, k))
       expect(left).toEqual([])
 
       await wipe(ns)
@@ -255,10 +261,10 @@ if (!client) {
       await wipe(ns)
     })
 
-    it('merges the stranded window with writes that landed while it was gone', async () => {
-      // the reason recovery puts data back rather than shipping it: both
-      // halves carry the same row id, so a sink upserting on that id would
-      // keep one and discard the other
+    it('puts the stranded window back exactly as it was claimed', async () => {
+      // a write aimed at the stranded window moved forward to the watermark,
+      // so the window comes back with the value the crashed flusher took, and
+      // shipping it again gives a sink the same row it may already have
       const ns = fresh()
       const crashed = ioredis(live, { namespace: ns })
       await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 5 }])
@@ -269,13 +275,16 @@ if (!client) {
       await survivor.recover(M)
 
       expect(await survivor.readBuckets({ metric: M })).toEqual([
-        { bucketTs: 1000, dimKey: WILLOW, value: 7 },
+        { bucketTs: 1000, dimKey: WILLOW, value: 5 },
+        { bucketTs: 2000, dimKey: WILLOW, value: 2 },
       ])
 
       await wipe(ns)
     })
 
-    it('folds a stranded gauge back together without inventing observations', async () => {
+    it('merges a stranded window with a cell written before late writes moved', async () => {
+      // data written by a version that let late writes into a claimed window
+      // is still merged, not overwritten
       const ns = fresh()
       const crashed = ioredis(live, { namespace: ns })
       await crashed.observe([
@@ -283,9 +292,10 @@ if (!client) {
         { metric: G, bucketTs: 1000, dimKey: WILLOW, value: 2 },
       ])
       await crashed.claim(G, 2000)
+      await live.hset(crashed.keyFor(G, 1000), WILLOW, '9|9|9|9|1')
+      await live.zadd(`${ns}:idx:${G}`, 1000, '1000')
 
       const survivor = sweeper(ns)
-      await survivor.observe([{ metric: G, bucketTs: 1000, dimKey: WILLOW, value: 9 }])
       await survivor.recover(G)
 
       const row = (await survivor.readBuckets({ metric: G }))[0]
@@ -402,7 +412,7 @@ if (!client) {
       await survivor.recover(M)
       await survivor.ack(await survivor.claim(M, 2000))
 
-      const left = (await live.keys(`${ns}:*`)).filter((k) => k !== `${ns}:seq`)
+      const left = (await live.keys(`${ns}:*`)).filter((k) => !survives(ns, k))
       expect(left).toEqual([])
 
       await wipe(ns)
@@ -505,6 +515,25 @@ if (!client) {
 
       await wipe(ns)
     })
+
+    it('closes a client it made from a factory', async () => {
+      const own = new Redis(URL, { lazyConnect: true })
+      const driver = ioredis(() => own, { namespace: fresh() })
+      await driver.countPending(M)
+
+      const ended = new Promise<void>((resolve) => own.once('end', () => resolve()))
+      await driver.close()
+      await ended
+      expect(own.status).toBe('end')
+    })
+
+    it('leaves a client it was handed alone', async () => {
+      const driver = ioredis(live, { namespace: fresh() })
+      await driver.countPending(M)
+
+      await driver.close()
+      expect(await live.ping()).toBe('PONG')
+    })
   })
 
   describe('ioredis · batching', () => {
@@ -524,6 +553,59 @@ if (!client) {
 
       expect(await driver.readBuckets({ metric: M })).toEqual([
         { bucketTs: 1000, dimKey: WILLOW, value: 50 },
+      ])
+
+      await wipe(ns)
+    })
+
+    it('splits scripts into round trips of maxPipelineSize', async () => {
+      // a level carry sends one script per window. Counting the scripts in
+      // each pipeline is the only way to see the split from outside
+      const ns = fresh()
+      const sizes: number[] = []
+      const counting = new Proxy(live, {
+        get(target, prop, receiver) {
+          if (prop !== 'pipeline') return Reflect.get(target, prop, receiver)
+          return () => {
+            const pipeline = target.pipeline()
+            const exec = pipeline.exec.bind(pipeline)
+            pipeline.exec = (async () => {
+              sizes.push(pipeline.length)
+              return exec()
+            }) as typeof pipeline.exec
+            return pipeline
+          }
+        },
+      })
+      const driver = ioredis(counting, { namespace: ns, maxPipelineSize: 10 })
+      await driver.setLevel([{ metric: M, bucketTs: 0, dimKey: WILLOW, value: 1, mode: 'set' }])
+      sizes.length = 0
+
+      await driver.setLevel(
+        Array.from({ length: 45 }, (_, i) => ({
+          metric: M,
+          bucketTs: (i + 1) * 1000,
+          dimKey: WILLOW,
+          value: 1,
+          mode: 'hold' as const,
+        })),
+      )
+
+      expect(sizes).toEqual([10, 10, 10, 10, 5])
+      expect((await driver.readLevels(M))[0]?.heldThrough).toBe(45_000)
+
+      await wipe(ns)
+    })
+
+    it('reads a record staged before records carried a sequence stamp', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.rpush(`${ns}:e:${M}`, JSON.stringify({ id: 'old', ts: 1000, fields: { a: 1 } }))
+      await driver.append([{ metric: M, id: 'new', ts: 2000, fields: { a: 2 } }])
+
+      expect(await driver.readPending({ metric: M })).toEqual([
+        { id: 'old', ts: 1000, fields: { a: 1 } },
+        { id: 'new', ts: 2000, fields: { a: 2 } },
       ])
 
       await wipe(ns)

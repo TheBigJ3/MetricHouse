@@ -84,6 +84,33 @@ export interface MemoryDriverOptions {
 const DEFAULT_MAX_SERIES = 100_000
 const DEFAULT_MAX_STAGED = 100_000
 
+/**
+ * `-0` stored as `0`.
+ *
+ * Redis receives every number as text, and `String(-0)` is `"0"`, so a shared
+ * driver can never hand back a negative zero. This one stores what Redis
+ * would, so the two agree to the bit.
+ */
+function plainZero(value: number): number {
+  return value === 0 ? 0 : value
+}
+
+/**
+ * Refuse a stored number that has left the range a double can hold.
+ *
+ * A counter at 1e308 that takes another 1e308 would otherwise read back as
+ * Infinity here and as something else entirely from Redis. Refusing the
+ * write is the one answer both drivers can give the same way.
+ */
+function assertFinite(value: number, metric: string, what: string): void {
+  if (!Number.isFinite(value)) {
+    throw new Error(
+      `memory driver: ${metric} ${what} would be ${value}, which is past the largest number ` +
+        'a metric can store, so the write was refused',
+    )
+  }
+}
+
 export function memory(options: MemoryDriverOptions = {}): Driver {
   const maxSeries = options.maxSeries ?? DEFAULT_MAX_SERIES
   const maxStaged = options.maxStaged ?? DEFAULT_MAX_STAGED
@@ -121,6 +148,33 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
 
   const inFlight = new Map<string, Claim>()
   let claimSeq = 0
+
+  /**
+   * metric -> the highest watermark any claim has used.
+   *
+   * Every window below it has been claimed at least once, so a write that
+   * arrives for one of them now is late. It is moved to this window, the
+   * oldest that has not shipped, rather than starting a second copy of a
+   * window that already went. See {@link Driver.claim}.
+   */
+  const claimedUpTo = new Map<string, number>()
+
+  /** Where a write aimed at `bucketTs` actually lands. */
+  function landing(metric: string, bucketTs: number): number {
+    const floor = claimedUpTo.get(metric)
+    return floor !== undefined && bucketTs < floor ? floor : bucketTs
+  }
+
+  /**
+   * metric -> the order each staged record was appended in.
+   *
+   * What `release` merges by, so records put back after a failed write return
+   * to the place they were taken from even when an older claim was released
+   * first. A WeakMap keyed by the record, because the record itself is the
+   * shape every driver stores and a counter on it would change that shape.
+   */
+  const appendOrder = new WeakMap<StagedRecord, number>()
+  let appendSeq = 0
 
   /** metric -> records held in a claim but not yet settled. */
   const stagedInFlight = new Map<string, number>()
@@ -224,11 +278,11 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
 
     async increment(ops: readonly IncrOp[]): Promise<void> {
       for (const op of ops) {
-        const bucket = cellSlot(op.metric, op.bucketTs, op.dimKey)
+        const bucket = cellSlot(op.metric, landing(op.metric, op.bucketTs), op.dimKey)
         const existing = bucket.get(op.dimKey)
 
         if (existing === undefined) {
-          bucket.set(op.dimKey, op.delta)
+          bucket.set(op.dimKey, plainZero(op.delta))
           continue
         }
         if (typeof existing !== 'number') {
@@ -238,23 +292,20 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           )
         }
 
-        bucket.set(op.dimKey, existing + op.delta)
+        const next = existing + op.delta
+        assertFinite(next, op.metric, 'total')
+        bucket.set(op.dimKey, plainZero(next))
       }
     },
 
     async observe(ops: readonly GaugeOp[]): Promise<void> {
       for (const op of ops) {
-        const bucket = cellSlot(op.metric, op.bucketTs, op.dimKey)
+        const bucket = cellSlot(op.metric, landing(op.metric, op.bucketTs), op.dimKey)
         const existing = bucket.get(op.dimKey)
+        const value = plainZero(op.value)
 
         if (existing === undefined) {
-          bucket.set(op.dimKey, {
-            last: op.value,
-            min: op.value,
-            max: op.value,
-            sum: op.value,
-            count: 1,
-          })
+          bucket.set(op.dimKey, { last: value, min: value, max: value, sum: value, count: 1 })
           continue
         }
         if (!isGaugeCell(existing)) {
@@ -265,11 +316,13 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         }
 
         // read-modify-write: min, max and last are not increments
+        const sum = existing.sum + value
+        assertFinite(sum, op.metric, 'sum')
         bucket.set(op.dimKey, {
-          last: op.value,
-          min: Math.min(existing.min, op.value),
-          max: Math.max(existing.max, op.value),
-          sum: existing.sum + op.value,
+          last: value,
+          min: plainZero(Math.min(existing.min, value)),
+          max: plainZero(Math.max(existing.max, value)),
+          sum: plainZero(sum),
           count: existing.count + 1,
         })
       }
@@ -285,10 +338,14 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           // must not be what brings one into existence
           if (!held) continue
 
-          const bucket = cellSlot(op.metric, op.bucketTs, op.dimKey)
-          // a written value always beats a carried one, so a window that
-          // already has a cell keeps it
-          if (!bucket.has(op.dimKey)) bucket.set(op.dimKey, { level: op.value })
+          // a window some claim has already taken is not filled again: that
+          // would ship it a second time. The pointer still moves past it
+          if (landing(op.metric, op.bucketTs) === op.bucketTs) {
+            const bucket = cellSlot(op.metric, op.bucketTs, op.dimKey)
+            // a written value always beats a carried one, so a window that
+            // already has a cell keeps it
+            if (!bucket.has(op.dimKey)) bucket.set(op.dimKey, { level: plainZero(op.value) })
+          }
 
           series.set(op.dimKey, {
             ...held,
@@ -305,12 +362,14 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           )
         }
 
-        const value = op.mode === 'add' ? (held?.value ?? 0) + op.value : op.value
+        const value = plainZero(op.mode === 'add' ? (held?.value ?? 0) + op.value : op.value)
+        assertFinite(value, op.metric, 'level')
+        const bucketTs = landing(op.metric, op.bucketTs)
 
         // the bucket first, because `cellSlot` is the other thing that can
         // refuse on the cap, and a held value written before it would name a
         // window that holds nothing
-        const bucket = cellSlot(op.metric, op.bucketTs, op.dimKey)
+        const bucket = cellSlot(op.metric, bucketTs, op.dimKey)
         const occupant = bucket.get(op.dimKey)
         if (occupant !== undefined && !isLevelCell(occupant)) {
           throw new Error(
@@ -323,13 +382,18 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         series.set(op.dimKey, {
           dimKey: op.dimKey,
           value,
-          // a first write is also the first thing there is to carry
-          carried: held?.carried ?? value,
-          writtenAt: Math.max(held?.writtenAt ?? op.bucketTs, op.bucketTs),
+          // `carried` is what the series was at in the window `heldThrough`
+          // names. A first write lands in that window, and so does a second
+          // write to the same one, so both replace it: the window ends at the
+          // newest value, not the first. A write to a later window leaves it
+          // alone, because the windows in between still belong to the older
+          // number
+          carried: held === undefined || bucketTs <= held.heldThrough ? value : held.carried,
+          writtenAt: Math.max(held?.writtenAt ?? bucketTs, bucketTs),
           // a write never moves the pointer. The windows between this write
           // and the last one are still owed a row, and only a `hold` may say
           // they have had one
-          heldThrough: held?.heldThrough ?? op.bucketTs,
+          heldThrough: held?.heldThrough ?? bucketTs,
         })
       }
     },
@@ -340,11 +404,20 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       return [...series.values()].sort((a, b) => (a.dimKey < b.dimKey ? -1 : 1))
     },
 
-    async dropLevels(metric: string, dimKeys: readonly string[]): Promise<void> {
+    async dropLevels(
+      metric: string,
+      dimKeys: readonly string[],
+      writtenBefore?: number,
+    ): Promise<void> {
       const series = levels.get(metric)
       if (!series) return
 
-      for (const dimKey of dimKeys) series.delete(dimKey)
+      for (const dimKey of dimKeys) {
+        const held = series.get(dimKey)
+        // a series written since the caller decided to drop it is kept
+        if (held && writtenBefore !== undefined && held.writtenAt >= writtenBefore) continue
+        series.delete(dimKey)
+      }
       if (series.size === 0) levels.delete(metric)
     },
 
@@ -367,7 +440,10 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       }
 
       for (const op of ops) {
-        stagedFor(op.metric).push({ id: op.id, ts: op.ts, fields: op.fields })
+        const record: StagedRecord = { id: op.id, ts: op.ts, fields: op.fields }
+        appendSeq += 1
+        appendOrder.set(record, appendSeq)
+        stagedFor(op.metric).push(record)
       }
     },
 
@@ -394,6 +470,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     async readPending(query: PendingQuery): Promise<StagedRecord[]> {
       const records = staged.get(query.metric)
       if (!records) return []
+      if (query.limit !== undefined && query.limit <= 0) return []
 
       const matched: StagedRecord[] = []
       for (const record of records) {
@@ -408,7 +485,9 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     },
 
     async countPending(metric: string): Promise<number> {
-      return staged.get(metric)?.length ?? 0
+      // claimed and not yet settled still counts: those records have not
+      // shipped, and a sink that hangs should not make a backlog read zero
+      return (staged.get(metric)?.length ?? 0) + (stagedInFlight.get(metric) ?? 0)
     },
 
     async claim(metric: string, upToBucketTs: number): Promise<BucketClaim> {
@@ -429,6 +508,10 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           claimed.push({ bucketTs, values: bucket })
         }
       }
+
+      // raised even by a claim that found nothing: the watermark is the promise
+      // that every window below it has been claimed once, whatever was in it
+      claimedUpTo.set(metric, Math.max(claimedUpTo.get(metric) ?? upToBucketTs, upToBucketTs))
 
       claimSeq += 1
       const claim: BucketClaim = {
@@ -489,9 +572,14 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
 
       if (isRecordClaim(claim)) {
         addStagedInFlight(claim.metric, -claim.records.length)
-        // to the front, not the back: these are older than anything appended
-        // while they were in flight, and `claimRecords` ships oldest first
-        stagedFor(claim.metric).unshift(...claim.records)
+        // back where they were taken from. They are older than anything
+        // appended while they were in flight, but a claim released before
+        // this one may already be back at the front, and it is older still
+        const records = stagedFor(claim.metric)
+        const merged = [...claim.records, ...records].sort(
+          (a, b) => (appendOrder.get(a) ?? 0) - (appendOrder.get(b) ?? 0),
+        )
+        records.splice(0, records.length, ...merged)
         return
       }
 

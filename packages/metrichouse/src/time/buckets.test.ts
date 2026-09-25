@@ -233,3 +233,18 @@ describe('assertResolution', () => {
     expect(expectRejected(() => assertResolution(7 * SEC, MIN)).message).toMatch(/divide|evenly/i)
   })
 })
+
+describe('clocks that are not whole milliseconds, or are near the epoch', () => {
+  it('floors a fractional timestamp into its bucket', () => {
+    expect(bucketStart(1_790_363_788_005.463, 1_000)).toBe(1_790_363_788_000)
+  })
+
+  it('refuses a timestamp that is not a finite, non-negative number', () => {
+    expect(() => bucketStart(Number.NaN, 1_000)).toThrow(/non-negative number/)
+    expect(() => bucketStart(-1, 1_000)).toThrow(/non-negative number/)
+  })
+
+  it('closes nothing while the clock is closer to the epoch than grace', () => {
+    expect(closedUpTo(1_000, 500, 2_000)).toBe(0)
+  })
+})

@@ -21,6 +21,8 @@ When your `write` function throws:
 1. Nothing is deleted.
 2. The claimed data goes back into the live set, unchanged.
 3. The next flush sends the same rows, with the same ids, and `attempt` goes up.
+   [Writing a sink](/guide/writing-a-sink#retries-and-failure) says exactly how
+   it is counted.
 
 ## Making a duplicate harmless
 
@@ -61,9 +63,10 @@ await sql`
 
 :::
 
-Use `DO UPDATE` rather than `DO NOTHING`. A resent row can carry a larger value
-than the first send if a late write landed in the meantime, and you want the
-newer number.
+Use `DO UPDATE` rather than `DO NOTHING`. A retry resends a row with the value
+it had the first time, so either handles that. Under
+[immediate delivery](/guide/delivery) a row is also sent again as its window
+fills, with a larger value each time, and `DO UPDATE` keeps the newest.
 
 ```ts
 import { naturalKey } from 'metrichouse/core'
@@ -105,8 +108,10 @@ your process when the response returns.
 
 ### The window that is still filling
 
-`house.stop()` cannot ship the open window, because it has not ended. At most one
-`resolution` of data is exposed to a shutdown.
+`house.stop()` ships every window that has ended, including those still inside
+grace, since the process has already drained its own writes. The one it cannot
+ship is the open window, because it has not ended. At most one `resolution` of
+data is exposed to a shutdown.
 
 Keep the resolution of anything important small, or turn on
 [immediate delivery](/guide/delivery) so those values reach your database as they
@@ -114,10 +119,13 @@ happen.
 
 ### Writes that arrive very late
 
-Grace holds a just finished window open a little longer. A write arriving after
-grace has passed lands in a window that has already shipped. That window ships
-again, with the same id and a larger value, so a table that keeps the newest row
-per id ends up correct and one that adds duplicates does not.
+Grace holds a just finished window back from the flush for a little longer. A
+write that arrives after its window has been claimed anyway is moved forward
+into the oldest window that has not shipped, and ships with that one. Nothing
+is lost and no window ships twice with different values, so a table that keeps
+one row per id stays correct. The write is counted a window late, which is the
+price of that. [Buckets and time](/guide/buckets-and-time#a-write-that-misses-its-window)
+has the details.
 
 ## Recovering a crashed flush
 
@@ -189,23 +197,27 @@ Set this above your sink's timeout. Set it lower and a slow write can have its
 window taken back and shipped by another instance, which sends those rows twice
 and then fails the original flush's acknowledgement. Neither of those loses
 data, because both sends carry the same row ids, but it is noise you do not
-need. Set it higher and a genuinely crashed window waits longer to ship.
+need. The failed acknowledgement comes back on that flush's report as
+`ackError`, next to the rows it did ship, and the rest of the house still
+flushes. Set it higher and a window from a crashed flusher waits longer to ship.
 
 Waiting is much the cheaper mistake, which is why the default is generous.
 
-### Why it merges rather than shipping
+### Why it puts the window back rather than shipping it
 
 A recovered window goes back into the live set. It is never sent straight to your
-database, and that is the part worth understanding.
+database, so it ships through the same flush, sink and acknowledgement as
+everything else.
 
-An aggregate row is identified by its metric, its window and its dimension
-values, so the abandoned half and anything written since it was stranded carry
-the same `id`. Sending them as two batches means your table keeps one and
-discards the other, and the total is then wrong. Merging them back into one live
-window is what makes the next flush send a single complete row.
+It comes back exactly as the crashed flusher claimed it. A write aimed at a
+window some flush has claimed is moved forward to a window that has not shipped
+([Buckets and time](/guide/buckets-and-time#a-write-that-misses-its-window)), so
+nothing can land in the stranded window while it waits. The next flush sends the
+same row, with the same id and the same value, that the crashed one may already
+have sent, and a table that treats `id` as unique keeps one copy.
 
-Records are different, since each one has an id of its own, but they are still
-put back at the head of the queue so they ship in the order they arrived.
+Records are put back at the head of the queue, behind any older records a failed
+flush already put back, so they ship in the order they arrived.
 
 ### What it does not cover
 

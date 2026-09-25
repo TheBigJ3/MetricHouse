@@ -116,6 +116,10 @@ function make<TValue, TOptional extends boolean>(
     default: (value: TValue) => {
       // validated here, at declare time, rather than at the first write
       assertValue(self as FieldType, value, `default for ${kind}()`)
+      // assertValue lets any payload through, because an event checks json
+      // while it converts it. A default is never converted until the first
+      // record, so it is checked here instead
+      if (kind === 'json') jsonText(value, `default for ${kind}()`)
       return make<TValue, true>(kind, true, { ...opts, hasDefault: true, defaultValue: value })
     },
   }
@@ -156,6 +160,23 @@ export function oneOf<const T extends readonly (string | number)[]>(
   if (values.length === 0) {
     throw new Error('oneOf: the set must declare at least one member')
   }
+
+  // a dim is stored as text, so two members that print the same would come
+  // back as whichever of them was declared first
+  const printed = new Set<string>()
+  for (const value of values) {
+    if (typeof value !== 'string' && !(typeof value === 'number' && Number.isFinite(value))) {
+      throw new Error(`oneOf: members must be strings or finite numbers, got ${describe(value)}`)
+    }
+    if (printed.has(String(value))) {
+      throw new Error(
+        `oneOf: ${JSON.stringify(value)} prints the same as another member, so the two could ` +
+          'not be told apart once stored',
+      )
+    }
+    printed.add(String(value))
+  }
+
   return make<T[number], false>('oneOf', false, { values: Object.freeze([...values]) })
 }
 
@@ -165,6 +186,40 @@ export function oneOf<const T extends readonly (string | number)[]>(
  */
 export function json<T = unknown>(): FieldType<T, false> {
   return make<T, false>('json', false, { dimLegal: false })
+}
+
+/**
+ * True for a `Date`, including one made in another realm.
+ *
+ * `instanceof Date` is false for a Date built inside `vm`, a worker or an
+ * iframe, because each realm has its own `Date` constructor. The internal
+ * class tag is the same everywhere, so this reads that instead.
+ */
+export function isDate(value: unknown): value is Date {
+  return Object.prototype.toString.call(value) === '[object Date]'
+}
+
+/**
+ * The JSON text for a `json()` value, or a thrown error naming the field.
+ *
+ * `JSON.stringify` is what every driver and every sink ends up running on the
+ * value, so it is also the test of whether the value is legal. It throws on a
+ * BigInt and on a cycle, and it returns `undefined` for a function, a symbol
+ * and `undefined` itself. Catching those at `record()` means the caller hears
+ * about them, where a failure at flush would take the whole batch down.
+ */
+export function jsonText(value: unknown, label: string): string {
+  let text: string | undefined
+  try {
+    text = JSON.stringify(value)
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    throw new Error(`${label}: json() needs a value JSON can hold, and this one failed: ${reason}`)
+  }
+  if (text === undefined) {
+    throw new Error(`${label}: json() needs a value JSON can hold, got ${describe(value)}`)
+  }
+  return text
 }
 
 /**
@@ -213,7 +268,7 @@ export function assertValue(type: FieldType, value: unknown, label: string): voi
       return
 
     case 'ts':
-      if (!(value instanceof Date) || Number.isNaN(value.getTime())) {
+      if (!isDate(value) || Number.isNaN(value.getTime())) {
         throw new Error(`${label}: expected a valid Date, got ${describe(value)}`)
       }
       return
@@ -230,7 +285,7 @@ export function assertValue(type: FieldType, value: unknown, label: string): voi
 /** A short, safe rendering of an arbitrary value for an error message. */
 function describe(value: unknown): string {
   if (value === null) return 'null'
-  if (value instanceof Date) return `Date(${value.toISOString()})`
+  if (isDate(value)) return `Date(${value.toISOString()})`
   if (typeof value === 'object') return Array.isArray(value) ? 'an array' : 'an object'
   if (typeof value === 'number' || typeof value === 'boolean') return String(value)
   if (typeof value === 'string') return JSON.stringify(value)

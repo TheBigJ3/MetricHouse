@@ -104,7 +104,7 @@ Every metric type has these members, whatever it measures.
 | `metric.dims` | `Shape` | The declared dimensions |
 | `metric.resolutionMs` | `number` | How wide one time window is, in milliseconds |
 | `metric.flushMs` | `number` | The shortest gap allowed between two shipments, in milliseconds |
-| `metric.graceMs` | `number` | How long a late write may still land in a closed window, in milliseconds |
+| `metric.graceMs` | `number` | How long a window waits after it ends before a flush may claim it, in milliseconds |
 | `metric.isBound` | `boolean` | Whether a house has registered it yet |
 | `metric.write` | `WriteFn` | The write function it was declared with. Each type narrows its rows, as it narrows `snapshot()` |
 | `metric.flush(options?)` | `Promise<MetricFlushReport>` | Ships everything finished to its write function, if its cadence allows. Needs no house |

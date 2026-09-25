@@ -21,14 +21,18 @@ import { formatDuration } from './duration.js'
  * fleet, and it is worth a test that two different "now"s inside one window
  * produce the same start.
  *
- * @throws if `resolutionMs` is not a positive integer
+ * @throws if `resolutionMs` is not a positive integer, or `tsMs` is negative or
+ * not a finite number
  */
 export function bucketStart(_tsMs: number, _resolutionMs: number): number {
   if (!Number.isSafeInteger(_resolutionMs) || _resolutionMs <= 0) {
     throw new Error(`bucketStart: resolutionMs must be a positive integer, got ${_resolutionMs}`)
   }
-  if (!Number.isSafeInteger(_tsMs) || _tsMs < 0) {
-    throw new Error(`bucketStart: tsMs must be a non-negative integer, got ${_tsMs}`)
+  // fractions are fine and are floored with everything else: a clock built
+  // from `performance.timeOrigin + performance.now()` reads 1790363788005.463,
+  // and that instant belongs to a bucket like any other
+  if (!Number.isFinite(_tsMs) || _tsMs < 0 || _tsMs > Number.MAX_SAFE_INTEGER) {
+    throw new Error(`bucketStart: tsMs must be a non-negative number of milliseconds, got ${_tsMs}`)
   }
 
   return Math.floor(_tsMs / _resolutionMs) * _resolutionMs
@@ -80,9 +84,11 @@ export function isOpen(_bucketTs: number, _resolutionMs: number, _nowMs: number)
 /**
  * Has this bucket ended *and* outlived its grace period?
  *
- * `grace` holds a just-closed bucket back from being claimed, because a
- * request in flight at the boundary can still land a write in it. A bucket
- * ending at `:07` accepts a `:07.001` write when grace is `2s`.
+ * `grace` holds a just-closed bucket back from being claimed, because a write
+ * stamped inside it can still be on its way to storage. A write stamped
+ * `:06.999` that reaches Redis at `:07.050` still lands in the `:06` bucket
+ * when grace is `2s`. A write *stamped* `:07.001` belongs to the `:07` bucket
+ * whatever grace is.
  *
  * True when `nowMs >= bucketTs + resolutionMs + graceMs`.
  */
@@ -113,7 +119,9 @@ export function isClosed(
  * @throws if `resolutionMs` is not a positive integer
  */
 export function closedUpTo(_resolutionMs: number, _nowMs: number, _graceMs: number): number {
-  return bucketStart(_nowMs - _graceMs, _resolutionMs)
+  // a clock closer to the epoch than grace has closed nothing yet, which is a
+  // watermark of zero rather than a negative instant
+  return bucketStart(Math.max(0, _nowMs - _graceMs), _resolutionMs)
 }
 
 /**

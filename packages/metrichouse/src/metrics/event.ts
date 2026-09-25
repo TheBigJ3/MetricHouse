@@ -22,11 +22,23 @@ import type {
 } from '../drivers/types.js'
 import { isRecordClaim, NOTHING_RECOVERED } from '../drivers/types.js'
 import { uuidv7 } from '../identity.js'
-import { metricFlush } from '../runtime/flush.js'
-import type { LiveFields, SnapshotOptions } from '../runtime/live.js'
+import { createAttempts, metricFlush } from '../runtime/flush.js'
+import {
+  assertLimit,
+  type LiveFields,
+  orderAndLimit,
+  type SnapshotOptions,
+} from '../runtime/live.js'
 import { shipClaim } from '../runtime/ship.js'
-import { applyDimDefaults, validateDims } from '../schema/dims.js'
-import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
+import { applyDimDefaults, encodeDimKey, validateDims } from '../schema/dims.js'
+import {
+  type FieldType,
+  type InferShape,
+  isDate,
+  jsonText,
+  type Shape,
+  type Simplify,
+} from '../schema/types.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
 import type {
   AnyMetric,
@@ -39,6 +51,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
+import { assertMetricName, assertSink } from './types.js'
 
 /**
  * Where records wait between `record()` and your `write()`.
@@ -82,6 +95,12 @@ export interface DeriveTarget {
  */
 export type DeriveFn<F> = (fields: F) => DeriveTarget | readonly DeriveTarget[]
 
+/** The names of the fields in `F` declared with `ts()`. */
+export type TsFieldOf<F extends Shape> = {
+  [K in keyof F]: F[K] extends FieldType<Date, boolean> ? K : never
+}[keyof F] &
+  string
+
 /** Columns MetricHouse owns on every event row. A field may not take these. */
 export const RESERVED_EVENT_COLUMNS = ['id', 'ts', '_ingested_at', '_sample_rate'] as const
 
@@ -122,7 +141,7 @@ export interface EventConfig<F extends Shape> {
    * `record()`, or name a declared `ts()` field to take it from the payload.
    * `record(fields, { at })` overrides both.
    */
-  readonly timestamp?: 'auto' | (keyof F & string)
+  readonly timestamp?: 'auto' | TsFieldOf<F>
   /**
    * Keep this fraction of events, `0` to `1`. A function is evaluated per
    * event, so an error can be kept at `1` while a success is sampled at
@@ -136,6 +155,15 @@ export interface EventConfig<F extends Shape> {
    * **Derive runs before sampling**, always: the counters stay exact and
    * unbiased while the event table holds a representative slice. That order is
    * the entire value of the feature and is not configurable.
+   *
+   * It runs after validation, though. A call that throws, because a field is
+   * wrong or `sample` returned something that is not a rate, increments
+   * nothing, and a `recordMany` with one bad record increments nothing for
+   * any of them.
+   *
+   * The increment lands in the counter's open window, the one `now` falls in,
+   * whatever `ts` the event carries. A counter has no way to be written in the
+   * past.
    */
   readonly derive?: Readonly<Record<string, DeriveFn<InferShape<F>>>>
   /**
@@ -176,11 +204,17 @@ export interface Event<F extends Shape, K extends MetricKind = 'event'> extends 
   /** Stage many in one round trip. */
   recordMany(fields: readonly InferShape<F>[], options?: { at?: Date | number }): void
 
-  /** How many records are staged and not yet shipped. */
+  /**
+   * How many records have not shipped yet: those waiting to be claimed, plus
+   * those a flush has claimed and is still writing.
+   */
   pending(): Promise<number>
 
-  /** The first `n` staged records as rows, without consuming them. */
-  peek(n?: number): Promise<Row[]>
+  /**
+   * The first `n` records waiting to be claimed, as rows, without consuming
+   * them. Records a flush is writing right now are not among them.
+   */
+  peek(n?: number): Promise<EventRow<F>[]>
 
   /**
    * Unshipped records as live rows.
@@ -195,6 +229,23 @@ export interface Event<F extends Shape, K extends MetricKind = 'event'> extends 
 
   drain(): Promise<void>
   rowShape(): RowShape
+}
+
+/** One record's worth of `record()`, decided and not yet applied. */
+interface Prepared<F extends Shape> {
+  /** The fields with defaults filled, as `derive` sees them. */
+  readonly values: InferShape<F>
+  /** What to stage, or `undefined` when sampling dropped it. */
+  readonly record: StagedRecord | undefined
+}
+
+/** A short rendering of a value for an error message. */
+function describeValue(value: unknown): string {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'an array'
+  if (typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'object') return 'an object'
+  return String(value)
 }
 
 const DEFAULT_MAX_SIZE = 500
@@ -232,9 +283,8 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   config: EventConfig<F>,
   kind: K,
 ): Event<F, K> {
-  if (typeof name !== 'string' || name.trim() === '') {
-    throw new Error('event: name must be a non-empty string')
-  }
+  assertMetricName(name, kind)
+  assertSink(config.write, name)
 
   const fields = config.fields ?? ({} as F)
 
@@ -298,6 +348,20 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   const localInFlight = new Map<string, RecordClaim>()
   let localSeq = 0
   let batchTimer: ReturnType<typeof setTimeout> | undefined
+
+  /**
+   * Local staging only: the order each record was staged in.
+   *
+   * Kept beside the buffer rather than on the record, so the record stays the
+   * shape every driver stores. A released claim is merged back by this, which
+   * keeps the buffer in arrival order when two claims fail one after the
+   * other.
+   */
+  const stagedOrder = new WeakMap<StagedRecord, number>()
+  let stagedCount = 0
+
+  /** One failure count for flush, batch and immediate sends alike. */
+  const attempts = createAttempts()
 
   /**
    * The event's own cadence, the house's, or the fallback.
@@ -364,10 +428,33 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     return filled
   }
 
+  /**
+   * The fields as they will be stored: a copy the caller cannot reach.
+   *
+   * A `json()` value becomes its JSON text here, at `record()`, for three
+   * reasons. A value JSON cannot hold, a BigInt or a cycle, throws at the
+   * caller instead of failing a whole batch at flush. The caller changing the
+   * object afterwards cannot change what ships. And every driver stores the
+   * same thing, so a payload that happens to look like one of Redis's own
+   * markers comes back exactly as it went in. A `ts()` value is copied for the
+   * second reason.
+   */
+  function stored(values: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) continue
+      const type = fields[key]
+      if (type?.kind === 'json') out[key] = jsonText(value, key)
+      else if (isDate(value)) out[key] = new Date(value.getTime())
+      else out[key] = value
+    }
+    return out
+  }
+
   function timestampFor(values: Record<string, unknown>, at: Date | number | undefined): number {
     // explicit `at` wins over the declared field, which wins over the clock
     if (at !== undefined) {
-      const ms = at instanceof Date ? at.getTime() : at
+      const ms = isDate(at) ? at.getTime() : at
       if (!Number.isFinite(ms)) {
         throw new Error(`${name}: at must be a Date or epoch milliseconds, got ${String(at)}`)
       }
@@ -377,16 +464,22 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       const declared = values[timestampField]
       // an optional ts field that was omitted falls back to the clock rather
       // than stamping the epoch
-      if (declared instanceof Date) return declared.getTime()
+      if (isDate(declared)) return declared.getTime()
     }
-    return (activeBinding().now ?? Date.now)()
+    // whole milliseconds, like every other timestamp a row carries
+    return Math.floor((activeBinding().now ?? Date.now)())
   }
 
   /**
    * Fan out to the counters this event feeds.
    *
-   * Runs before sampling and never blocks staging: a broken `derive` must not
-   * lose the evidence, so a throw is reported and the event is staged anyway.
+   * Never blocks staging: a broken `derive` must not lose the evidence, so a
+   * throw is reported and the event is staged anyway.
+   *
+   * Each target is all or nothing. Every increment a function returns is
+   * checked against the counter before any of them is applied, so a function
+   * returning three targets where the third names an unknown dim moves no
+   * counter at all, rather than two of them.
    */
   function runDerive(values: InferShape<F>): void {
     for (const [target, fn] of Object.entries(derive)) {
@@ -405,17 +498,57 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
           )
         }
 
-        const produced = fn(values)
-        const targets = Array.isArray(produced) ? produced : [produced as DeriveTarget]
+        const increments = plannedIncrements(target, metric, fn(values))
         const add = (metric as unknown as { add: (n: number, dims?: unknown) => void }).add
-
-        for (const one of targets) {
-          add.call(metric, one.value ?? 1, one.dims ?? {})
-        }
+        for (const one of increments) add.call(metric, one.value, one.dims)
       } catch (error) {
         reportDetached(error)
       }
     }
+  }
+
+  /**
+   * What one derive function asked for, checked in full before any of it runs.
+   *
+   * @throws naming the event and the target, so a report says which derive
+   * returned what
+   */
+  function plannedIncrements(
+    target: string,
+    metric: AnyMetric,
+    produced: unknown,
+  ): { value: number; dims: Record<string, unknown> }[] {
+    const label = `${name}: derive for ${JSON.stringify(target)}`
+    const list = Array.isArray(produced) ? produced : [produced]
+    const isFloat = (metric as unknown as { isFloat?: boolean }).isFloat === true
+
+    return list.map((one: unknown) => {
+      if (typeof one !== 'object' || one === null || Array.isArray(one)) {
+        throw new Error(
+          `${label} must return { value?, dims? } or an array of them, got ${describeValue(one)}`,
+        )
+      }
+      const { value = 1, dims: targetDims = {} } = one as DeriveTarget
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        throw new Error(`${label}: value must be a finite number, got ${describeValue(value)}`)
+      }
+      if (!isFloat && !Number.isSafeInteger(value)) {
+        throw new Error(
+          `${label}: ${value} is not a whole number, and ${target} counts in whole numbers`,
+        )
+      }
+      if (typeof targetDims !== 'object' || targetDims === null || Array.isArray(targetDims)) {
+        throw new Error(`${label}: dims must be an object, got ${describeValue(targetDims)}`)
+      }
+      // throws exactly as `add()` would, but before anything has been added
+      try {
+        encodeDimKey(metric.dims, targetDims as Record<string, unknown>)
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error)
+        throw new Error(`${label}: ${reason}`)
+      }
+      return { value, dims: targetDims as Record<string, unknown> }
+    })
   }
 
   /** The keep/drop decision, and the rate that goes on the row. */
@@ -428,48 +561,71 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     return rate
   }
 
-  /** Build the record for one event, or `undefined` when sampling dropped it. */
-  function stagedFrom(
-    values: InferShape<F>,
-    at: Date | number | undefined,
-  ): StagedRecord | undefined {
+  /**
+   * Everything `record()` decides before it changes anything.
+   *
+   * Validation, the timestamp, the sampling decision and the stored copy all
+   * happen here, and all of them can throw. Nothing here writes: `derive` and
+   * staging wait until every record in the call has made it through, so a
+   * call that throws leaves no trace anywhere.
+   */
+  function prepare(values: InferShape<F>, at: Date | number | undefined): Prepared<F> {
     const checkedValues = checked(values)
     const ts = timestampFor(checkedValues, at)
     // defaults applied: derive and sample see exactly what the row will carry,
     // not what the call site happened to omit
     const complete = checkedValues as InferShape<F>
 
-    // derive first, then sample — the counters stay exact whatever the event
-    // table keeps
-    runDerive(complete)
-
     const rate = sampleRate(complete)
-    // `< rate` is exact at both ends: 0 never keeps, 1 always does
-    if (rate < 1 && !(Math.random() < rate)) return undefined
+    const fieldsToStore = stored(checkedValues)
 
-    const ingestedAt = (activeBinding().now ?? Date.now)()
+    // `< rate` is exact at both ends: 0 never keeps, 1 always does
+    if (rate < 1 && !(Math.random() < rate)) return { values: complete, record: undefined }
+
+    const ingestedAt = Math.floor((activeBinding().now ?? Date.now)())
 
     return {
-      // minted here, not at flush: a released batch keeps its ids, so a retry
-      // is the same row rather than a new one
-      id: uuidv7(ingestedAt),
-      ts,
-      fields: {
-        ...checkedValues,
-        // stamped at record(), which is what makes a backfilled row
-        // distinguishable from a live one — and stable across a retry, which
-        // stamping at flush would not be
-        _ingested_at: ingestedAt,
-        ...(samples && { _sample_rate: rate }),
+      values: complete,
+      record: {
+        // minted here, not at flush: a released batch keeps its ids, so a retry
+        // is the same row rather than a new one
+        id: uuidv7(ingestedAt),
+        ts,
+        fields: {
+          ...fieldsToStore,
+          // stamped at record(), which is what makes a backfilled row
+          // distinguishable from a live one — and stable across a retry, which
+          // stamping at flush would not be
+          _ingested_at: ingestedAt,
+          ...(samples && { _sample_rate: rate }),
+        },
       },
     }
+  }
+
+  /**
+   * The half of `record()` that changes things: derive, then stage.
+   *
+   * Derive runs for every prepared record, sampled out or not, which is what
+   * keeps the counters exact.
+   */
+  function commit(prepared: readonly Prepared<F>[]): void {
+    const records: StagedRecord[] = []
+    for (const one of prepared) {
+      runDerive(one.values)
+      if (one.record) records.push(one.record)
+    }
+    stageAll(records)
   }
 
   function stageAll(records: StagedRecord[]): void {
     if (records.length === 0) return
 
     if (stage === 'local') {
-      const wasEmpty = buffer.length === 0
+      for (const record of records) {
+        stagedCount += 1
+        stagedOrder.set(record, stagedCount)
+      }
       buffer.push(...records)
 
       // immediate delivery is `maxSize: 1` without saying so — the batch
@@ -483,15 +639,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
         shipLocal('batch')
         return
       }
-      // the clock starts at the first record of a batch, so maxAge bounds how
-      // long the *oldest* record waits rather than the newest
-      if (wasEmpty && batchTimer === undefined) {
-        batchTimer = setTimeout(() => {
-          batchTimer = undefined
-          shipLocal('batch')
-        }, maxAgeMs)
-        batchTimer.unref?.()
-      }
+      armBatchTimer()
       return
     }
 
@@ -515,11 +663,26 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
    */
   async function shipStaged(): Promise<void> {
     const claim = await activeDriver().claimRecords(name, config.claimLimit)
-    const outcome = await shipClaim(self, claim, sink, {
-      attempt: 1,
-      source: 'immediate',
-    })
+    const outcome = await shipClaim(self, claim, sink, { attempts, source: 'immediate' })
     if (outcome.error !== undefined) throw outcome.error
+  }
+
+  /**
+   * Start the `maxAge` clock, unless it is already running.
+   *
+   * Called when records are staged and when a failed send puts records back.
+   * The clock starts at the first record of a batch, so `maxAge` bounds how
+   * long the oldest record waits rather than the newest. After a failure it
+   * starts again, so records that went back are retried `maxAge` later
+   * instead of waiting for the next record or the next `flush()`.
+   */
+  function armBatchTimer(): void {
+    if (batchTimer !== undefined || buffer.length === 0) return
+    batchTimer = setTimeout(() => {
+      batchTimer = undefined
+      shipLocal('batch')
+    }, maxAgeMs)
+    batchTimer.unref?.()
   }
 
   /** Take the local buffer and push it at the sink, off the caller's stack. */
@@ -534,7 +697,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
 
     track(
       (async (): Promise<void> => {
-        const outcome = await shipClaim(self, claim, sink, { attempt: 1, source })
+        const outcome = await shipClaim(self, claim, sink, { attempts, source })
         // a failed sink already released the records back into the buffer;
         // rethrow so the failure reaches onError rather than vanishing
         if (outcome.error !== undefined) throw outcome.error
@@ -566,7 +729,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   }
 
   function toMs(at: number | Date): number {
-    return at instanceof Date ? at.getTime() : at
+    return isDate(at) ? at.getTime() : at
   }
 
   /**
@@ -594,9 +757,10 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     for (const [key, type] of Object.entries(fields)) {
       const value = record.fields[key]
       if (value === undefined) continue
-      // a payload becomes a string column — the driver held it opaquely and
-      // your table almost certainly wants text
-      row[key] = type.kind === 'json' ? JSON.stringify(value) : value
+      // a payload is a string column, and `record()` already turned it into
+      // one. A record staged by an older version still holds the value
+      // itself, so that one is turned into text here
+      row[key] = type.kind === 'json' && typeof value !== 'string' ? JSON.stringify(value) : value
     }
 
     row._ingested_at = new Date(record.fields._ingested_at as number)
@@ -612,6 +776,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       sink: () => sink,
       now: () => (activeBinding().now ?? Date.now)(),
       self: () => self,
+      attempts,
     }),
 
     name,
@@ -644,42 +809,52 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       binding = next
     },
 
+    unbind(): void {
+      binding = undefined
+    },
+
     record(values: InferShape<F>, options?: { at?: Date | number }): void {
       activeBinding()
-      const record = stagedFrom(values, options?.at)
-      if (record) stageAll([record])
+      commit([prepare(values, options?.at)])
     },
 
     recordMany(many: readonly InferShape<F>[], options?: { at?: Date | number }): void {
       activeBinding()
-      const records: StagedRecord[] = []
-      for (const values of many) {
-        const record = stagedFrom(values, options?.at)
-        if (record) records.push(record)
-      }
-      stageAll(records)
+      // every record is prepared before any of them is committed, so one bad
+      // record in the list throws with nothing derived and nothing staged
+      commit(many.map((values) => prepare(values, options?.at)))
     },
 
     async pending(): Promise<number> {
-      if (stage === 'local') return buffer.length
+      if (stage === 'local') {
+        let inFlight = 0
+        for (const claim of localInFlight.values()) inFlight += claim.records.length
+        return buffer.length + inFlight
+      }
       return activeDriver().countPending(name)
     },
 
     async snapshot(options: SnapshotOptions = {}): Promise<EventLiveRow<F>[]> {
       const from = options.from === undefined ? undefined : toMs(options.from)
       const to = options.to === undefined ? undefined : toMs(options.to)
+      if (options.limit !== undefined) assertLimit(options.limit, name)
+
+      // with an order to sort by, every record has to be read before the top
+      // ones are known. Without one, the limit is only "the first n", which
+      // the driver can answer without reading the rest
+      const readLimit = options.orderBy === undefined ? options.limit : undefined
 
       const records =
         stage === 'local'
-          ? bounded(buffer, from, to, options.limit)
+          ? bounded(buffer, from, to, readLimit)
           : await activeDriver().readPending({
               metric: name,
               ...(from !== undefined && { from }),
               ...(to !== undefined && { to }),
-              ...(options.limit !== undefined && { limit: options.limit }),
+              ...(readLimit !== undefined && { limit: readLimit }),
             })
 
-      return records.map(
+      const rows = records.map(
         (record) =>
           ({
             ...materialize(record),
@@ -688,14 +863,22 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
             bucket_elapsed_ms: 0,
           }) as unknown as EventLiveRow<F>,
       )
+
+      return orderAndLimit(
+        rows as unknown as Record<string, unknown>[],
+        options,
+        name,
+      ) as unknown as EventLiveRow<F>[]
     },
 
-    async peek(n?: number): Promise<Row[]> {
+    async peek(n?: number): Promise<EventRow<F>[]> {
+      if (n !== undefined) assertLimit(n, name, 'peek(n)')
+      if (n === 0) return []
       const records =
         stage === 'local'
           ? buffer.slice(0, n ?? buffer.length)
           : await activeDriver().readPending({ metric: name, ...(n !== undefined && { limit: n }) })
-      return records.map(materialize)
+      return records.map(materialize) as unknown as EventRow<F>[]
     },
 
     async recoverBatch(): Promise<RecoveryReport> {
@@ -716,8 +899,18 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       assertRecords(claim)
 
       const rows = claim.records.map(materialize)
-      const first = claim.records[0]?.ts ?? 0
-      const last = claim.records.at(-1)?.ts ?? 0
+      // the earliest and latest timestamps, not the first and last records: a
+      // backfilled record carries an older `ts` than the ones staged before it
+      let first = Number.POSITIVE_INFINITY
+      let last = Number.NEGATIVE_INFINITY
+      for (const record of claim.records) {
+        if (record.ts < first) first = record.ts
+        if (record.ts > last) last = record.ts
+      }
+      if (claim.records.length === 0) {
+        first = 0
+        last = 0
+      }
 
       return {
         rows,
@@ -749,8 +942,14 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
         if (!localInFlight.delete(claim.id)) {
           throw new Error(`${name}: claim ${claim.id} is not in flight — already settled?`)
         }
-        // to the front: these are older than anything recorded since
-        buffer.unshift(...claim.records)
+        // back in the order they were staged. These are older than anything
+        // recorded since, but a claim that failed before this one may already
+        // be back at the front, and its records are older still
+        const merged = [...claim.records, ...buffer].sort(
+          (a, b) => (stagedOrder.get(a) ?? 0) - (stagedOrder.get(b) ?? 0),
+        )
+        buffer.splice(0, buffer.length, ...merged)
+        armBatchTimer()
         return
       }
       await activeDriver().release(claim)
