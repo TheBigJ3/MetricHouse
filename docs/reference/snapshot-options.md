@@ -59,8 +59,9 @@ await httpRequests.snapshot({ dims: { route: '/checkout' } })
 await httpRequests.snapshot({ dims: { route: '/checkout', status: '5xx' } })
 ```
 
-Values are compared for equality against the materialised row, so a `ts()` dim
-matches on the `Date` it decodes to.
+Values are compared for equality against the materialised row. A `ts()` dim
+matches any `Date` for the same instant, since the row holds a fresh `Date`
+rather than the one you passed.
 
 Naming a dim the metric does not declare throws. A typo would otherwise match
 nothing and render as an empty chart, which reads like an outage.

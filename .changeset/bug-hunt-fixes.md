@@ -123,3 +123,28 @@ lists each rule, and the shared test suite checks them.
   value backwards.
 - A claim's age is now measured with Redis's clock, so a host whose clock runs
   fast no longer takes back claims that are seconds old.
+- On Redis, a write that first had to load its script could be overtaken by a
+  later one, so `set(1)`, `set(2)`, `set(3)` could end at 2. Sends now go out
+  in the order they were made.
+- On Redis, releasing a claim whose records interleaved with records already
+  put back returned them out of order, and past 10,000 put back records a
+  release landed in the middle. Releases now merge by append order.
+- With `claimLimit`, `drain()`, `batch.maxAge` and `house.stop()` shipped one
+  batch and left the rest behind while reporting success. They now ship the
+  whole backlog in batches of `claimLimit`.
+- `snapshot({ dims })` never matched a `ts()` dim, because it compared `Date`
+  objects by identity.
+- `record(fields, { at })` accepted a time past the range a `Date` can hold and
+  shipped an Invalid Date. It now throws.
+- A `-0` event field came back as `-0` from memory and `0` from Redis. Both
+  store `0`, and a level set to `-0` no longer carries `-0`.
+- An invalid `Date` in a `ts()` field threw a bare RangeError instead of the
+  message naming the field.
+- A dim or field named `__proto__` was accepted and then missing from every row.
+  It now throws at declaration.
+- A log child's bound field was erased by `undefined` at the call site, and an
+  `Error` from another realm lost its stack.
+- `timer.observe()` now rounds to the microsecond, as `end()` does.
+- The serverless recipe that paired `memory()` with immediate delivery claimed
+  counters would be exact across isolates. They are not, and the docs now say
+  to count with events there.

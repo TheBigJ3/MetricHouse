@@ -407,9 +407,14 @@ Two rules that are easy to get wrong:
   than replacing one with the other. Counter cells add. Gauge folds merge the way
   the five aggregates merge, with the newer observation winning `last`.
 - **Records go back where they came from.** Released records are older than
-  anything appended since, so they go ahead of it. They go behind any records an
-  earlier claim already put back, though, because those are older still. Keep
-  the order records were appended in so a release can find its place.
+  anything appended since, so they go ahead of it. Records an earlier release
+  already put back can be older than some of them and newer than others, so the
+  two are merged by the order they were appended in. Keep that order somewhere
+  a release can read it.
+- **Keep one writer's writes in order.** Two `set` calls from one process must
+  reach storage in the order they were made. The Redis driver queues each send
+  behind the one before it, because a send that first has to load its script
+  would otherwise be overtaken.
 
 ### Settling twice
 
@@ -535,8 +540,8 @@ A driver has to satisfy all of these.
 - Ack discards permanently and leaves unclaimed data alone.
 - Release restores the data unchanged, including record ids.
 - A late write that moved forward stays apart from the released window.
-- Released records return ahead of anything appended since, and behind records
-  an older claim already put back.
+- Released records return ahead of anything appended since, merged by append
+  order with records an earlier release already put back.
 - `countPending` counts records in a claim until it is settled.
 - Settling the same claim twice throws.
 - Nothing is lost when a write fails and the flush retries.

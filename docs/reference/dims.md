@@ -396,6 +396,7 @@ half finished state behind.
 | `dim "x" declares json(), which cannot be encoded into a series key` | `json()` used as a dim. At declaration |
 | `default for int(): expected a safe integer, got "five"` | `.default()` given a value its own type rejects. At declaration |
 | `dim "duration_ms" is reserved` | A timer dim using the name a timing carries onto its record event. At declaration |
+| `a dim cannot be named "__proto__"` | JavaScript treats that key as an object's prototype, so no row could carry it. At declaration |
 | `missing required dim "status"` | A declared dim with no value and no default |
 | `unknown dim "pakr" — declared dims are [route, status]` | A key that is not declared |
 | `route: expected a string, got 42` | A value of the wrong type |

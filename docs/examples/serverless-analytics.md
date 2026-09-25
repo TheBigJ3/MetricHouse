@@ -245,9 +245,14 @@ export const house = createHouse({
 The trade is real:
 
 - One database call per tracked event, rather than one per minute.
-- Counters resend the same row id with a rising running total, so your table must
-  keep the newest row per id. `ReplacingMergeTree` in ClickHouse,
-  `ON CONFLICT (id) DO UPDATE` in Postgres.
+- **Events are exact, and counters, gauges and timers are not.** Each isolate
+  keeps its own running total for a window, and every isolate sends it under the
+  same row id, because the id comes from the metric, the window and the labels.
+  Your table keeps whichever total arrived last, which is one isolate's share. In
+  a test with many isolates the table held 32 where 1,595 had been counted.
+- So on this setup, record what you want to count as an event, and count it in
+  your database. `derive` does not help here: the counter it feeds has the same
+  problem. For exact counters across isolates you need a shared driver.
 - Live reads only see the isolate you happen to be in.
 
 Read [Delivery modes](/guide/delivery) before choosing this.

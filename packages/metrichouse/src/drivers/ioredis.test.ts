@@ -606,6 +606,33 @@ if (!client) {
       await wipe(ns)
     })
 
+    it('keeps the sets of one writer in order while a script is still loading', async () => {
+      // the first call has to load its script, and the calls behind it must
+      // not overtake it once the script is cached
+      const ns = fresh()
+      let loads = 0
+      const slowLoad = new Proxy(live, {
+        get(target, prop, receiver) {
+          if (prop !== 'script') return Reflect.get(target, prop, receiver)
+          return async (...args: unknown[]) => {
+            loads += 1
+            if (loads === 1) await new Promise((resolve) => setTimeout(resolve, 50))
+            return (target.script as (...a: unknown[]) => Promise<unknown>)(...args)
+          }
+        },
+      })
+      const driver = ioredis(slowLoad, { namespace: ns })
+      const set = (value: number) =>
+        driver.setLevel([{ metric: 'lvl', bucketTs: 1000, dimKey: WILLOW, value, mode: 'set' }])
+
+      const first = set(1)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      await Promise.all([first, set(2), set(3)])
+
+      expect((await driver.readLevels('lvl'))[0]?.value).toBe(3)
+      await wipe(ns)
+    })
+
     it('ages a claim by Redis time, whatever the recovering host believes', async () => {
       const ns = fresh()
       const claimer = ioredis(live, { namespace: ns })

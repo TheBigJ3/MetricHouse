@@ -415,7 +415,11 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           // window, from a flusher whose clock runs behind, arrives after the
           // pointer has passed it and must not drag `carried` back with it
           if (op.bucketTs >= held.heldThrough) {
-            series.set(op.dimKey, { ...held, carried: op.value, heldThrough: op.bucketTs })
+            series.set(op.dimKey, {
+              ...held,
+              carried: plainZero(op.value),
+              heldThrough: op.bucketTs,
+            })
           }
           continue
         }
@@ -481,7 +485,11 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         for (const [at, level] of plan.cells) {
           cellSlot(op.metric, at, op.dimKey).set(op.dimKey, { level: plainZero(level) })
         }
-        series.set(op.dimKey, { ...plan.series, value: plainZero(plan.series.value) })
+        series.set(op.dimKey, {
+          ...plan.series,
+          value: plainZero(plan.series.value),
+          carried: plainZero(plan.series.carried),
+        })
       }
     },
 

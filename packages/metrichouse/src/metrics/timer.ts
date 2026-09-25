@@ -366,12 +366,15 @@ export function timer<D extends Shape = Record<never, never>>(
    * event second, and detached: the gauge observation has already been made,
    * and a broken pairing must not turn a recorded timing into a thrown one.
    */
-  function recordTiming(ms: number, values: Record<string, unknown>): void {
-    if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) {
+  function recordTiming(given: number, values: Record<string, unknown>): void {
+    if (typeof given !== 'number' || !Number.isFinite(given) || given < 0) {
       throw new Error(
-        `${name}: a duration must be a finite, non-negative number, got ${String(ms)}`,
+        `${name}: a duration must be a finite, non-negative number, got ${String(given)}`,
       )
     }
+    // rounded here as well as in `end()`, so `observe()` keeps the same
+    // microsecond grain the docs promise for every timing
+    const ms = toMicros(given)
 
     inner.set(ms, ...([values] as DimsArgs<D>))
 

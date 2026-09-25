@@ -278,12 +278,15 @@ export type Log<F extends Shape, L extends readonly string[]> = Omit<
  * throws — this is the one call people make from inside a `catch`.
  */
 function splitMessage(message: string | Error): { message: string; error_stack?: string } {
-  if (message instanceof Error) {
+  // the class tag and not `instanceof`, so an error thrown inside `vm`, a
+  // worker or an iframe keeps its stack too
+  if (message instanceof Error || Object.prototype.toString.call(message) === '[object Error]') {
+    const error = message as Error
     return {
-      message: message.message,
+      message: error.message,
       // a rethrown or cross-realm error can arrive without one; the header
       // line is still worth more than an empty column
-      error_stack: message.stack ?? `${message.name}: ${message.message}`,
+      error_stack: error.stack ?? `${error.name}: ${error.message}`,
     }
   }
   if (typeof message === 'string') return { message }
@@ -390,8 +393,10 @@ export function log<
     if (index < minIndex) return
 
     // the call site wins over the child's bound fields: the nearer the
-    // context, the more specific it is
-    inner.record({ ...bound, ...values, level, ...splitMessage(message) })
+    // context, the more specific it is. A key it passes as `undefined` says
+    // nothing, so the bound value stays
+    const given = Object.entries(values ?? {}).filter(([, value]) => value !== undefined)
+    inner.record({ ...bound, ...Object.fromEntries(given), level, ...splitMessage(message) })
   }
 
   /** The level methods, for the log itself and for every child of it. */

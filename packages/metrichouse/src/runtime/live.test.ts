@@ -9,7 +9,7 @@ import { type Log, log } from '../metrics/log.js'
 import { timer } from '../metrics/timer.js'
 import type { AnyMetric, WriteFn } from '../metrics/types.js'
 import { encodeDimKey } from '../schema/dims.js'
-import { oneOf, str } from '../schema/types.js'
+import { oneOf, str, ts } from '../schema/types.js'
 import { createHouse } from './house.js'
 import { liveness, snapshotRange } from './live.js'
 
@@ -716,5 +716,22 @@ describe('orderBy over rows that do not all have the column', () => {
     const rows = await hits.snapshot({ complete: false, groupBy: [] })
     const value: number | undefined = rows[0]?.value
     expect(value).toBe(1)
+  })
+})
+
+describe('a ts() dim in a snapshot filter', () => {
+  it('matches by the instant, not by object identity', async () => {
+    const opens = counter('opens', {
+      dims: { day: ts() },
+      resolution: '10s',
+      flush: '1m',
+      write: discard,
+    })
+    createHouse({ driver, schema: [opens], now })
+    opens.add({ day: new Date(86_400_000) })
+    await opens.drain()
+
+    const rows = await opens.snapshot({ complete: false, dims: { day: new Date(86_400_000) } })
+    expect(rows).toHaveLength(1)
   })
 })

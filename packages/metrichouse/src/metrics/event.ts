@@ -30,7 +30,7 @@ import {
   type SnapshotOptions,
 } from '../runtime/live.js'
 import { shipClaim } from '../runtime/ship.js'
-import { applyDimDefaults, encodeDimKey, validateDims } from '../schema/dims.js'
+import { applyDimDefaults, assertShapeNames, encodeDimKey, validateDims } from '../schema/dims.js'
 import {
   type FieldType,
   type InferShape,
@@ -287,6 +287,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   assertSink(config.write, name)
 
   const fields = config.fields ?? ({} as F)
+  assertShapeNames(fields, name, 'field')
 
   for (const key of Object.keys(fields)) {
     if ((RESERVED_EVENT_COLUMNS as readonly string[]).includes(key)) {
@@ -446,6 +447,8 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       const type = fields[key]
       if (type?.kind === 'json') out[key] = jsonText(value, key)
       else if (isDate(value)) out[key] = new Date(value.getTime())
+      // -0 as 0, which is what JSON, and so the Redis driver, makes of it
+      else if (value === 0) out[key] = 0
       else out[key] = value
     }
     return out
@@ -455,7 +458,9 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     // explicit `at` wins over the declared field, which wins over the clock
     if (at !== undefined) {
       const ms = isDate(at) ? at.getTime() : at
-      if (!Number.isFinite(ms)) {
+      // the range a Date can hold, ±8.64e15, and not merely a finite number:
+      // anything past it ships as an Invalid Date
+      if (!Number.isFinite(ms) || Number.isNaN(new Date(ms).getTime())) {
         throw new Error(`${name}: at must be a Date or epoch milliseconds, got ${String(at)}`)
       }
       return Math.floor(ms)
@@ -680,19 +685,42 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     if (batchTimer !== undefined || buffer.length === 0) return
     batchTimer = setTimeout(() => {
       batchTimer = undefined
-      shipLocal('batch')
+      // everything, because every record waiting has now waited `maxAge`
+      shipLocal('batch', true)
     }, maxAgeMs)
     batchTimer.unref?.()
   }
 
   /** Take the local buffer and push it at the sink, off the caller's stack. */
-  function shipLocal(source: WriteContext['source']): void {
+  /**
+   * Ship from the local buffer, in batches of at most `claimLimit`.
+   *
+   * `everything` is for `maxAge` and `drain()`: every record already waiting
+   * goes, however many batches that takes. A full buffer on `maxSize` ships
+   * batches while the buffer is still full and leaves the rest to the age
+   * clock, which starts again for them. Immediate delivery always ships
+   * everything. Each record is sent once per call, so a sink that is down
+   * puts its records back and they wait for the next trigger rather than
+   * being retried in a loop.
+   */
+  function shipLocal(source: WriteContext['source'], everything = false): void {
     if (batchTimer !== undefined) {
       clearTimeout(batchTimer)
       batchTimer = undefined
     }
-    if (buffer.length === 0) return
+    // counted from what was waiting when this call began. A sink that fails
+    // at once puts its records straight back, and a loop that waited for an
+    // empty buffer would send them again for ever
+    let unsent = buffer.length
+    while (unsent > 0 && buffer.length > 0) {
+      unsent -= shipLocalBatch(source)
+      if (!everything && !isImmediate() && buffer.length < maxSize) break
+    }
+    armBatchTimer()
+  }
 
+  /** One claim from the local buffer, sent off the caller's stack. Returns its size. */
+  function shipLocalBatch(source: WriteContext['source']): number {
     const claim = takeLocalClaim()
 
     track(
@@ -703,6 +731,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
         if (outcome.error !== undefined) throw outcome.error
       })(),
     )
+    return claim.records.length
   }
 
   /** Move the local buffer into a claim. The local answer to `claimRecords`. */
@@ -960,10 +989,11 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       // there after drain() resolves is exactly the silent loss drain exists
       // to prevent
       //
-      // Ships **once**, deliberately. A failed sink releases those records
-      // back into the buffer, and re-shipping whatever is in the buffer would
-      // spin against a sink that is down until the process dies.
-      if (stage === 'local') shipLocal('batch')
+      // Ships each record **once**, deliberately, in as many batches as
+      // `claimLimit` needs. A failed sink releases its records back into the
+      // buffer, and re-shipping whatever is in the buffer would spin against a
+      // sink that is down until the process dies.
+      if (stage === 'local') shipLocal('batch', true)
 
       while (pendingWrites.size > 0) {
         await Promise.all([...pendingWrites])

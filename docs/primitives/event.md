@@ -299,7 +299,7 @@ reported to `onError` with the event and the target in the message.
 | --- | --- |
 | Targets are named, not passed | Resolved at the first `record()`, so schema files may be declared in any order |
 | Only a counter can be a target | Anything else throws when the first record resolves it |
-| Derive runs before sampling | Always, and this is not configurable. It is the whole value of the feature |
+| Derive counts every record | Sampled out or kept, every record that passes validation is derived. This is not configurable, and it is the whole value of the feature |
 | Derive runs after validation | A call that throws increments nothing. In `recordMany`, one bad record means nothing is derived for any of them |
 | An array records several increments | One fact can feed two counters, or one counter twice |
 | A function's targets apply together | Every target a function returns is checked first. If one is wrong, none of that function's increments are applied |
@@ -322,6 +322,12 @@ claimLimit: 10_000
 Set it when the backlog can outgrow what your database will accept in one
 statement. After a long outage an unbounded claim is one enormous insert, and
 the rest of the backlog ships on the following flush either way.
+
+The places that have to empty the backlog still do, in batches of this size:
+[`drain()`](#event-drain) and `batch.maxAge` ship every locally staged record,
+and a [final flush](/reference/flush-options#final), which `house.stop()` makes,
+keeps claiming until nothing is left. A full buffer on `batch.maxSize` ships
+batches while it is still full and leaves the rest to the age clock.
 
 A limit that is not a positive whole number throws at declaration.
 
@@ -353,7 +359,7 @@ Stages one record.
 | Parameter | Type | Required | Meaning |
 | --- | --- | --- | --- |
 | `fields` | the declared shape | yes | [The values for this record](/reference/fields#the-fields-argument) |
-| `options.at` | `Date` or epoch milliseconds | no | The `ts` for this record, overriding [`timestamp`](#timestamp) |
+| `options.at` | `Date` or epoch milliseconds | no | The `ts` for this record, overriding [`timestamp`](#timestamp). It has to be a time a `Date` can hold, within about 275,000 years of 1970 |
 
 ```ts
 checkoutAttempted.record({ userId: 'u_1', plan: 'pro', outcome: 'paid', amountCents: 4_999 })

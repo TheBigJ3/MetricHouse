@@ -174,3 +174,11 @@ describe('json() defaults', () => {
     expect(() => json().default(1n as never)).toThrow(/json\(\)/)
   })
 })
+
+describe('error messages', () => {
+  it('names the key when a ts() value is an invalid Date', () => {
+    expect(() => assertValue(ts(), new Date(Number.NaN), 'placedAt')).toThrow(
+      /placedAt: expected a valid Date, got an invalid Date/,
+    )
+  })
+})

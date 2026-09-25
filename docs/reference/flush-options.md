@@ -79,6 +79,11 @@ those windows, and that write is moved forward into a window that has not
 shipped rather than lost
 ([Buckets and time](/guide/buckets-and-time#a-write-that-misses-its-window)).
 
+A final flush also keeps claiming until the backlog is empty, for a metric with
+a [`claimLimit`](/primitives/event#claimlimit) that ships a backlog across
+several claims. It stops after a hundred claims, so a process that is stopping
+does not chase records another instance is still adding.
+
 `house.stop()` passes `final` for you. Pass it yourself only in a shutdown path
 that does not go through `stop()`, and call `drain()` first.
 

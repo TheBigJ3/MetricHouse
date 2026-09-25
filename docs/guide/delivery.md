@@ -155,7 +155,7 @@ write: async (rows, context) => {
 | --- | --- |
 | A server that stays running, any driver | `'staged'` |
 | Serverless or edge with a shared driver | `'staged'`, flushed from a cron |
-| Serverless or edge with `memory()` | `'immediate'` |
+| Serverless or edge with `memory()` | `'immediate'`, and events only: each isolate's counter total overwrites the others' |
 | Not sure, and you want the safe default | `'auto'` |
 | You want rows in your database within a second | `'immediate'` |
 

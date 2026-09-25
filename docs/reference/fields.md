@@ -218,6 +218,7 @@ reads `id, ts, level, message, error_stack`, then your fields, then
 | Message | Cause |
 | --- | --- |
 | `field "ts" is a reserved column` | A declared field taking a name MetricHouse owns. At declaration |
+| `a field cannot be named "__proto__"` | JavaScript treats that key as an object's prototype, so no row could carry it. At declaration |
 | `timestamp names "occurredAt", which is not a declared field` | `timestamp` pointing at nothing. At declaration |
 | `timestamp field "occurredAt" declares str() — it must be ts()` | `timestamp` pointing at the wrong type. At declaration |
 | `default for int(): expected a safe integer, got "five"` | `.default()` given a value its own type rejects. At declaration |

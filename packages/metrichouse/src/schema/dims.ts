@@ -66,7 +66,24 @@ export function dimOrder(dims: Shape): string[] {
   return Object.keys(dims)
 }
 
+/**
+ * Refuse a name no row can carry.
+ *
+ * `row.__proto__ = value` sets the row's prototype rather than adding a
+ * column, so a dim or field with that name would be accepted and then be
+ * missing from every row a sink receives.
+ */
+export function assertShapeNames(shape: Shape, metricName: string, noun = 'dim'): void {
+  if (Object.hasOwn(shape, '__proto__')) {
+    throw new Error(
+      `${metricName}: a ${noun} cannot be named "__proto__", because JavaScript treats that ` +
+        "key as an object's prototype and no row could carry it",
+    )
+  }
+}
+
 export function assertDimsLegal(dims: Shape, metricName: string): void {
+  assertShapeNames(dims, metricName)
   for (const [key, type] of Object.entries(dims)) {
     if (!type.dimLegal) {
       throw new Error(

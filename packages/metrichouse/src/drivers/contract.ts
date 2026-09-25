@@ -354,6 +354,12 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect((await driver.readLevels(L))[0]).toMatchObject({ value: 9, carried: 5 })
       })
 
+      it('stores a level of negative zero as zero, carried included', async () => {
+        await put(1000, WILLOW, -0)
+        const [one] = await driver.readLevels(L)
+        expect(Object.is(one?.value, 0) && Object.is(one?.carried, 0)).toBe(true)
+      })
+
       it('ignores a hold for a window older than the pointer', async () => {
         // a flusher whose clock runs behind carries late, after a newer one
         await put(1000, WILLOW, 5)
@@ -1015,6 +1021,34 @@ export function describeDriverContract(name: string, options: DriverContractOpti
           'r3',
           'later',
         ])
+      })
+
+      it('merges a release with interleaved records an earlier release put back', async () => {
+        await driver.append([rec('r1', 1), rec('r2', 2), rec('r3', 3)])
+        const a = await driver.claimRecords(M, 1)
+        const b = await driver.claimRecords(M, 1)
+        await driver.release(a)
+        const c = await driver.claimRecords(M, 2)
+        await driver.release(b)
+        await driver.release(c)
+
+        expect((await driver.readPending({ metric: M })).map((r) => r.id)).toEqual([
+          'r1',
+          'r2',
+          'r3',
+        ])
+      })
+
+      it('puts a release behind a large earlier release in order', async () => {
+        const n = 10_002
+        await driver.append(Array.from({ length: n }, (_, i) => rec(`r${i + 1}`, i + 1)))
+        const a = await driver.claimRecords(M, n - 1)
+        const b = await driver.claimRecords(M, 1)
+        await driver.release(a)
+        await driver.release(b)
+
+        const ids = (await driver.readPending({ metric: M })).map((r) => r.id)
+        expect(ids.slice(-3)).toEqual(['r10000', 'r10001', 'r10002'])
       })
 
       it('reads nothing for a limit of zero', async () => {

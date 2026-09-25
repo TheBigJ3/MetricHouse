@@ -573,3 +573,22 @@ describe('end() with a dim it leaves undefined', () => {
     expect(rows[0]).toMatchObject({ route: '/a', status: 200 })
   })
 })
+
+describe('observe() precision', () => {
+  it('rounds away digits below a microsecond, as end() does', async () => {
+    const rows: Row[] = []
+    const t = timer('op', {
+      resolution: '1s',
+      flush: '1m',
+      write: (batch) => {
+        rows.push(...batch)
+      },
+    })
+    let at = 1_788_616_987_000
+    createHouse({ driver: memory(), schema: [t], now: () => at })
+    t.observe(1.23456789)
+    at += 5_000
+    await t.flush()
+    expect(rows[0]?.sum).toBe(1.235)
+  })
+})

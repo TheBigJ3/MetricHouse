@@ -132,6 +132,9 @@ export function cadenceSlack(flushMs: number): number {
   return Math.min(50, flushMs / 10)
 }
 
+/** How many claims one final flush may make before it stops. */
+const FINAL_CLAIM_CAP = 100
+
 /** A fresh count, for a metric that has not failed yet. */
 export function createAttempts(): Attempts {
   return { current: 1 }
@@ -234,32 +237,38 @@ export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush
       // 3 and 4. claim, then ship. A driver that cannot be reached fails the
       //    claim, and that comes back in the report like a sink failure does:
       //    a caller flushing a whole house should hear about it and still see
-      //    every other metric flushed
-      let outcome: ShipOutcome
-      try {
-        // what is claimable is the metric's judgement, not this file's
-        const claim = await metric.claimBatch(now, { final })
-        outcome = await shipClaim(metric, claim, options.sink(), { attempts, source: 'flush' })
-      } catch (error) {
-        return { buckets: 0, rows: 0, skipped: false, error, ...repair }
-      }
-
-      if (outcome.error !== undefined) {
-        return {
-          buckets: outcome.buckets,
-          rows: outcome.rows,
-          skipped: false,
-          error: outcome.error,
-          ...repair,
+      //    every other metric flushed.
+      //
+      //    One claim per flush, except for a final one. A metric with a
+      //    `claimLimit` ships its backlog across several flushes, and a
+      //    process that is stopping has no later flush to wait for, so a final
+      //    flush claims again until the backlog is gone. The cap stops it
+      //    chasing records another process is still appending.
+      let buckets = 0
+      let rows = 0
+      let ackError: unknown
+      for (let claims = 0; claims < FINAL_CLAIM_CAP; claims++) {
+        let outcome: ShipOutcome
+        try {
+          // what is claimable is the metric's judgement, not this file's
+          const claim = await metric.claimBatch(now, { final })
+          outcome = await shipClaim(metric, claim, options.sink(), { attempts, source: 'flush' })
+        } catch (error) {
+          return { buckets, rows, skipped: false, error, ...repair }
         }
+
+        buckets += outcome.buckets
+        rows += outcome.rows
+        if (outcome.error !== undefined) {
+          return { buckets, rows, skipped: false, error: outcome.error, ...repair }
+        }
+        if (outcome.ackError !== undefined) ackError ??= outcome.ackError
+        if (!final || outcome.rows === 0) break
       }
 
-      const settled = {
-        ...repair,
-        ...(outcome.ackError !== undefined && { ackError: outcome.ackError }),
-      }
+      const settled = { ...repair, ...(ackError !== undefined && { ackError }) }
 
-      if (outcome.rows === 0) {
+      if (rows === 0) {
         // deliberately does NOT advance lastFlushMs. The cadence bounds how
         // often this metric *ships*, and nothing shipped. Advancing here would
         // let an empty flush eat the cadence, so data that closed a second
@@ -271,7 +280,7 @@ export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush
 
       state.lastFlushMs = now
 
-      return { buckets: outcome.buckets, rows: outcome.rows, skipped: false, ...settled }
+      return { buckets, rows, skipped: false, ...settled }
     },
   }
 }

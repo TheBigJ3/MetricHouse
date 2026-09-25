@@ -1002,3 +1002,106 @@ describe('local staging after a failure', () => {
     expect(seen.flat()).toEqual(['1', '2', '3', '4'])
   })
 })
+
+describe('claimLimit at drain, stop and maxAge', () => {
+  it('ships every local record on drain, in batches of claimLimit', async () => {
+    const sent: number[] = []
+    const views = event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      claimLimit: 3,
+      write: (rows) => {
+        sent.push(rows.length)
+      },
+    })
+    createHouse({ driver: memory(), schema: [views] })
+    views.recordMany(Array.from({ length: 7 }, (_, i) => ({ path: `/${i}` })))
+    await views.drain()
+    expect(sent).toEqual([3, 3, 1])
+  })
+
+  it('ships a whole driver-staged backlog on stop()', async () => {
+    const shipped: Row[] = []
+    const views = event('views', {
+      fields: { path: str() },
+      claimLimit: 2,
+      write: (rows) => {
+        shipped.push(...rows)
+      },
+    })
+    const house = createHouse({ driver: memory(), schema: [views] })
+    views.recordMany(Array.from({ length: 7 }, (_, i) => ({ path: `/${i}` })))
+
+    const report = await house.stop()
+    expect(shipped).toHaveLength(7)
+    expect(report.metrics.views?.rows).toBe(7)
+  })
+
+  it('does not loop on a sink that fails at once', async () => {
+    const views = event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      claimLimit: 2,
+      write: () => {
+        throw new Error('down')
+      },
+    })
+    createHouse({ driver: memory(), schema: [views], onError: () => {} })
+    views.recordMany(Array.from({ length: 5 }, (_, i) => ({ path: `/${i}` })))
+    await views.drain()
+    expect(await views.pending()).toBe(5)
+  })
+
+  it('starts the age clock for what a full batch left behind', async () => {
+    vi.useFakeTimers()
+    try {
+      const sent: number[] = []
+      const views = event('views', {
+        fields: { path: str() },
+        stage: 'local',
+        claimLimit: 2,
+        batch: { maxSize: 2, maxAge: '100ms' },
+        write: (rows) => {
+          sent.push(rows.length)
+        },
+      })
+      createHouse({ driver: memory(), schema: [views] })
+      views.recordMany([{ path: '/a' }, { path: '/b' }, { path: '/c' }])
+      await vi.advanceTimersByTimeAsync(150)
+      expect(sent).toEqual([2, 1])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('values record() now refuses or cleans up', () => {
+  it('refuses an at past the range a Date can hold', () => {
+    const e = event('e', { fields: {}, write: discard })
+    createHouse({ driver: memory(), schema: [e] })
+    expect(() => e.record({}, { at: 8.64e15 + 1 })).toThrow(/at must be/)
+  })
+
+  it('stores a negative zero field as zero', async () => {
+    const rows: Row[] = []
+    const e = event('e', {
+      fields: { delta: int() },
+      write: (batch) => {
+        rows.push(...batch)
+      },
+    })
+    const house = createHouse({ driver: memory(), schema: [e] })
+    e.record({ delta: -0 })
+    await house.flush({ force: true })
+    expect(Object.is(rows[0]?.delta, 0)).toBe(true)
+  })
+
+  it('refuses a field named __proto__', () => {
+    expect(() =>
+      event('e', {
+        fields: { ['__proto__']: str() } as unknown as Record<string, never>,
+        write: discard,
+      }),
+    ).toThrow(/__proto__/)
+  })
+})

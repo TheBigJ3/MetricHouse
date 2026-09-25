@@ -450,3 +450,34 @@ describe('level names that would hide a method', () => {
     }
   })
 })
+
+describe('child fields and errors from elsewhere', () => {
+  it('keeps a bound value when the call passes undefined for it', async () => {
+    const rows: Row[] = []
+    const app = log('app', {
+      fields: { requestId: str() },
+      write: (batch) => {
+        rows.push(...batch)
+      },
+    })
+    const house = createHouse({ driver: memory(), schema: [app] })
+    app.child({ requestId: 'r1' }).info('hi', { requestId: undefined } as never)
+    await house.flush({ force: true })
+    expect(rows[0]?.requestId).toBe('r1')
+  })
+
+  it('keeps the stack of an error made in another realm', async () => {
+    const { runInNewContext } = await import('node:vm')
+    const rows: Row[] = []
+    const app = log('app', {
+      write: (batch) => {
+        rows.push(...batch)
+      },
+    })
+    const house = createHouse({ driver: memory(), schema: [app] })
+    app.error(runInNewContext('new Error("far away")') as Error)
+    await house.flush({ force: true })
+    expect(rows[0]?.message).toBe('far away')
+    expect(String(rows[0]?.error_stack)).toMatch(/far away/)
+  })
+})

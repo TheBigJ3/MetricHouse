@@ -260,9 +260,10 @@ try {
 }
 ```
 
-An error that arrives without a stack, which happens with a rethrown or cross
-realm error, still gets a header line, because that is worth more than an empty
-column.
+An error made in another realm, inside `vm`, a worker or an iframe, counts as an
+`Error` too, and keeps its stack. An error that arrives without a stack, which
+happens with some rethrown errors, still gets a header line, because that is
+worth more than an empty column.
 
 ::: tip A logger never takes down a request
 Every other call in MetricHouse throws on a bad value. A log message does not.
@@ -316,7 +317,8 @@ const userLog = requestLog.child({ userId: 'u_42' })
 
 A bound field becomes omittable rather than absent in the child's type, so
 `child({ service })` satisfies a required field and a call site may still
-override it.
+override it. Passing it as `undefined` at the call site does not count as an
+override: the bound value stays.
 
 ```ts
 requestLog.info('retrying', { requestId: 'req_9f22' })   // the call site wins

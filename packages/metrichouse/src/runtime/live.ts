@@ -250,8 +250,8 @@ export function applySnapshot(
   // 1. partial dim match
   const matched = options.dims
     ? rows.filter((one) =>
-        Object.entries(options.dims as Record<string, unknown>).every(
-          ([key, value]) => one.row[key] === value,
+        Object.entries(options.dims as Record<string, unknown>).every(([key, value]) =>
+          sameValue(one.row[key], value),
         ),
       )
     : [...rows]
@@ -388,6 +388,17 @@ export function orderAndLimit<R extends Record<string, unknown>>(
   }
 
   return limit === undefined ? rows : rows.slice(0, limit)
+}
+
+/**
+ * Does a row's dim equal the value a filter asked for?
+ *
+ * A `ts()` dim comes back as a fresh `Date`, so `===` against the caller's
+ * `Date` is never true. Dates compare by the instant they name.
+ */
+function sameValue(actual: unknown, wanted: unknown): boolean {
+  if (isDate(actual) && isDate(wanted)) return actual.getTime() === wanted.getTime()
+  return actual === wanted
 }
 
 /** Numbers and dates by value, everything else by its string form. */

@@ -285,7 +285,11 @@ export function assertValue(type: FieldType, value: unknown, label: string): voi
 /** A short, safe rendering of an arbitrary value for an error message. */
 function describe(value: unknown): string {
   if (value === null) return 'null'
-  if (isDate(value)) return `Date(${value.toISOString()})`
+  // an invalid Date has no ISO form, and asking for one throws a RangeError
+  // that would replace the message this function exists to build
+  if (isDate(value)) {
+    return Number.isNaN(value.getTime()) ? 'an invalid Date' : `Date(${value.toISOString()})`
+  }
   if (typeof value === 'object') return Array.isArray(value) ? 'an array' : 'an object'
   if (typeof value === 'number' || typeof value === 'boolean') return String(value)
   if (typeof value === 'string') return JSON.stringify(value)

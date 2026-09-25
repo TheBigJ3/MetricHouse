@@ -729,11 +729,10 @@ return last
  * ships oldest first, so returning them to the back would ship out of order.
  *
  * Not quite the very front, though. A claim that failed before this one may
- * already be back there, and its records are older still, so these go in
- * behind them. Each record starts with the sequence number
- * {@link APPEND_RECORDS} gave it, fixed width, so comparing the stored strings
- * byte by byte compares arrival order. The scan is capped: past ten thousand
- * older records, the rest is left where it is rather than read.
+ * already be back there, and its records can be older than some of these and
+ * newer than others, so the two runs are merged. Each record starts with the
+ * sequence number {@link APPEND_RECORDS} gave it, fixed width, so comparing the
+ * stored strings byte by byte compares arrival order.
  *
  * `LPUSH a b c` leaves `c b a`, so each chunk goes in reversed, and the chunks
  * themselves run back to front — which is what lands the whole run in its
@@ -768,30 +767,43 @@ end
 local function mh_restore_records(inflight, records)
   local held = redis.call('LRANGE', inflight, 0, -1)
   if #held == 0 then return 0 end
+  table.sort(held, mh_before)
 
-  local first = held[1]
-  local ahead = 0
-  while ahead < 10000 do
-    local page = redis.call('LRANGE', records, ahead, ahead + 99)
+  -- every record at the front older than the newest of these: records an
+  -- earlier release already put back. They can interleave with these, so
+  -- the two runs are merged rather than one placed before the other
+  local newest = held[#held]
+  local older = {}
+  local scanned = 0
+  while true do
+    local page = redis.call('LRANGE', records, scanned, scanned + 99)
     local stopped = false
     for k = 1, #page do
-      if mh_before(page[k], first) then
-        ahead = ahead + 1
+      if mh_before(page[k], newest) then
+        older[#older + 1] = page[k]
       else
         stopped = true
         break
       end
     end
+    scanned = scanned + #page
     if stopped or #page < 100 then break end
   end
 
-  local older = {}
-  if ahead > 0 then
-    older = redis.call('LRANGE', records, 0, ahead - 1)
-    redis.call('LTRIM', records, ahead, -1)
+  if #older > 0 then redis.call('LTRIM', records, #older, -1) end
+  local merged = {}
+  local a = 1
+  local b = 1
+  while a <= #older or b <= #held do
+    if b > #held or (a <= #older and mh_before(older[a], held[b])) then
+      merged[#merged + 1] = older[a]
+      a = a + 1
+    else
+      merged[#merged + 1] = held[b]
+      b = b + 1
+    end
   end
-  mh_push_front(records, held)
-  mh_push_front(records, older)
+  mh_push_front(records, merged)
   return #held
 end
 `
@@ -1106,6 +1118,22 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
   const unanswered = new Set<number>()
 
   /**
+   * The last send issued, so the next one waits for it to be issued too.
+   *
+   * A send may first have to load its script, and a later send whose script
+   * is already cached would otherwise reach Redis ahead of it. Two `set()`
+   * calls on one level would then land in the wrong order. Only the issuing
+   * is queued, never the reply, so pipelining is unaffected.
+   */
+  let issuing: Promise<unknown> = Promise.resolve()
+
+  function inOrder<T>(issue: () => Promise<{ reply: Promise<T> }>): Promise<T> {
+    const issued = issuing.then(issue)
+    issuing = issued.catch(() => undefined)
+    return issued.then((sent) => sent.reply)
+  }
+
+  /**
    * Run scripts pipelined, reloading them if Redis has forgotten.
    *
    * Split into round trips of at most `maxPipelineSize` scripts, as commands
@@ -1129,25 +1157,26 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       const seqs = chunk.map((call) => (call.once ? ++writeSeq : 0))
       for (const seq of seqs) if (seq > 0) unanswered.add(seq)
 
-      const send = async (
+      const send = (
         indexes: readonly number[],
-      ): Promise<[error: Error | null, result: unknown][] | null> => {
-        const resolved = await Promise.all(
-          indexes.map((i) => shaFor(client, (chunk[i] as ScriptCall).script)),
-        )
-        // the floor is taken after the await, as late as possible, so it
-        // accounts for every write still waiting at the moment this one goes
-        const floor = Math.min(...unanswered)
-        const pipeline = client.pipeline()
-        indexes.forEach((i, n) => {
-          const call = chunk[i] as ScriptCall
-          const seq = seqs[i] as number
-          const keys = seq > 0 ? [...call.keys, writerKey] : call.keys
-          const args = seq > 0 ? [...call.args, floor, seq] : call.args
-          pipeline.evalsha(resolved[n] as string, keys.length, ...keys, ...args)
+      ): Promise<[error: Error | null, result: unknown][] | null> =>
+        inOrder(async () => {
+          const resolved = await Promise.all(
+            indexes.map((i) => shaFor(client, (chunk[i] as ScriptCall).script)),
+          )
+          // the floor is taken after the await, as late as possible, so it
+          // accounts for every write still waiting at the moment this one goes
+          const floor = Math.min(...unanswered)
+          const pipeline = client.pipeline()
+          indexes.forEach((i, n) => {
+            const call = chunk[i] as ScriptCall
+            const seq = seqs[i] as number
+            const keys = seq > 0 ? [...call.keys, writerKey] : call.keys
+            const args = seq > 0 ? [...call.args, floor, seq] : call.args
+            pipeline.evalsha(resolved[n] as string, keys.length, ...keys, ...args)
+          })
+          return { reply: pipeline.exec() }
         })
-        return pipeline.exec()
-      }
 
       try {
         const every = chunk.map((_, i) => i)
@@ -1184,7 +1213,9 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     for (let start = 0; start < commands.length; start += maxPipeline) {
       const pipeline = client.pipeline()
       for (const queue of commands.slice(start, start + maxPipeline)) queue(pipeline)
-      out.push(...unwrap(await pipeline.exec(), what))
+      // queued behind any write still loading its script, so a read issued
+      // after a write sees it
+      out.push(...unwrap(await inOrder(async () => ({ reply: pipeline.exec() })), what))
     }
     return out
   }
