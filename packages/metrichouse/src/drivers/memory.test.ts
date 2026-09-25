@@ -136,3 +136,38 @@ describe('memory · maxSeries', () => {
     ])
   })
 })
+
+describe('memory · large batches', () => {
+  it('puts back a released claim of 150,000 records', async () => {
+    const big = memory({ maxStaged: Number.POSITIVE_INFINITY })
+    await big.append(
+      Array.from({ length: 150_000 }, (_, i) => ({ metric: M, id: `r${i}`, ts: i, fields: {} })),
+    )
+    const claim = await big.claimRecords(M)
+    await big.release(claim)
+
+    expect(await big.countPending(M)).toBe(150_000)
+    const first = await big.readPending({ metric: M, limit: 2 })
+    expect(first.map((r) => r.id)).toEqual(['r0', 'r1'])
+  })
+
+  it('reads one series without walking every series in the window', async () => {
+    const wide = memory({ maxSeries: Number.POSITIVE_INFINITY })
+    await wide.increment(
+      Array.from({ length: 100_000 }, (_, i) => ({
+        metric: M,
+        bucketTs: 1000,
+        dimKey: `s${i}`,
+        delta: 1,
+      })),
+    )
+
+    const started = performance.now()
+    for (let i = 0; i < 1_000; i++) await wide.readBuckets({ metric: M, dimKey: 's5' })
+    // a scan of 100,000 series a thousand times takes seconds; a lookup, a few ms
+    expect(performance.now() - started).toBeLessThan(500)
+    expect(await wide.readBuckets({ metric: M, dimKey: 's5' })).toEqual([
+      { bucketTs: 1000, dimKey: 's5', value: 1 },
+    ])
+  })
+})

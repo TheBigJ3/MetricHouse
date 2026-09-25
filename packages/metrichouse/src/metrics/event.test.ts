@@ -1105,3 +1105,40 @@ describe('values record() now refuses or cleans up', () => {
     ).toThrow(/__proto__/)
   })
 })
+
+describe('large local batches', () => {
+  it('stages and derives a recordMany of 150,000 records', async () => {
+    const sold = counter('sold', { resolution: '1h', flush: '1h', write: discard })
+    const views = event('views', {
+      fields: { n: int() },
+      stage: 'local',
+      batch: { maxSize: 1_000_000 },
+      derive: { sold: () => ({}) },
+      write: discard,
+    })
+    const house = createHouse({ driver: memory(), schema: [sold, views] })
+    views.recordMany(Array.from({ length: 150_000 }, (_, n) => ({ n })))
+    await sold.drain()
+
+    expect(await views.pending()).toBe(150_000)
+    expect(await sold.current()).toBe(150_000)
+    await house.stop().catch(() => undefined)
+  })
+
+  it('keeps 150,000 local records when the sink fails', async () => {
+    const views = event('views', {
+      fields: { n: int() },
+      stage: 'local',
+      batch: { maxSize: 1_000_000 },
+      write: () => {
+        throw new Error('down')
+      },
+    })
+    createHouse({ driver: memory(), schema: [views], onError: () => {} })
+    views.recordMany(Array.from({ length: 150_000 }, (_, n) => ({ n })))
+
+    const report = await views.flush({ force: true })
+    expect(report.error).toBeInstanceOf(Error)
+    expect(await views.pending()).toBe(150_000)
+  })
+})

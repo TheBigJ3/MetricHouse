@@ -652,6 +652,75 @@ if (!client) {
       await wipe(ns)
     })
 
+    it('takes a burst of 150,000 writes without waiting on each other', {
+      timeout: 120_000,
+    }, async () => {
+      // every write is issued before any reply comes back, as in a batch
+      // import. The floor of waiting writes used to be a scan of all of them
+      // on every send, quadratic, and past 125,000 it overflowed the stack
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      const writes: Promise<void>[] = []
+      for (let i = 0; i < 150_000; i++) {
+        writes.push(driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }]))
+      }
+      await Promise.all(writes)
+
+      expect((await driver.readBuckets({ metric: M }))[0]?.value).toBe(150_000)
+      await wipe(ns)
+    })
+
+    it('appends 150,000 records in one call', { timeout: 60_000 }, async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await driver.append(
+        Array.from({ length: 150_000 }, (_, i) => ({ metric: M, id: `r${i}`, ts: i, fields: {} })),
+      )
+      expect(await driver.countPending(M)).toBe(150_000)
+      await wipe(ns)
+    })
+
+    it('carries many series through a gap in one script per window', async () => {
+      const ns = fresh()
+      let scripts = 0
+      const counting = new Proxy(live, {
+        get(target, prop, receiver) {
+          if (prop !== 'pipeline') return Reflect.get(target, prop, receiver)
+          return () => {
+            const pipeline = target.pipeline()
+            const evalsha = pipeline.evalsha.bind(pipeline)
+            pipeline.evalsha = ((...args: Parameters<typeof evalsha>) => {
+              scripts += 1
+              return evalsha(...args)
+            }) as typeof pipeline.evalsha
+            return pipeline
+          }
+        },
+      })
+      const driver = ioredis(counting, { namespace: ns })
+      for (let s = 0; s < 50; s++) {
+        await driver.setLevel([{ metric: M, bucketTs: 0, dimKey: `s${s}`, value: s, mode: 'set' }])
+      }
+      scripts = 0
+
+      // what a level flush sends after sorting by window: 50 series, 5 windows
+      const holds = []
+      for (let w = 1; w <= 5; w++) {
+        for (let s = 0; s < 50; s++) {
+          holds.push({
+            metric: M,
+            bucketTs: w * 1000,
+            dimKey: `s${s}`,
+            value: s,
+            mode: 'hold' as const,
+          })
+        }
+      }
+      await driver.setLevel(holds)
+      expect(scripts).toBe(5)
+      await wipe(ns)
+    })
+
     it('splits scripts into round trips of maxPipelineSize', async () => {
       // a level carry sends one script per window. Counting the scripts in
       // each pipeline is the only way to see the split from outside

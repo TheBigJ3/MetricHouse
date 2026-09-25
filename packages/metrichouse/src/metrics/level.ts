@@ -554,6 +554,12 @@ export function level<D extends Shape = Record<never, never>>(
       }
     }
 
+    // window by window rather than series by series. A driver batches
+    // neighbouring ops for one window into one call, so a thousand series
+    // carried through ten windows is ten calls instead of ten thousand. Each
+    // series still reaches its windows in order, because the sort is stable
+    ops.sort((a, b) => a.bucketTs - b.bucketTs)
+
     // the carry first, so a series being dropped still ships the windows it
     // owed up to the moment it expired
     if (ops.length > 0) await driver.setLevel(ops)

@@ -148,3 +148,22 @@ lists each rule, and the shared test suite checks them.
 - The serverless recipe that paired `memory()` with immediate delivery claimed
   counters would be exact across isolates. They are not, and the docs now say
   to count with events there.
+
+**Found by a load test**
+
+- On Redis, each write scanned every write still waiting for a reply, so a
+  burst slowed quadratically (40,000 writes took 27 seconds to drain), and
+  past about 125,000 waiting writes the scan overflowed the stack and the
+  writes were dropped. Finding the lowest waiting write now costs next to
+  nothing, and a burst of 150,000 drains in about two seconds.
+- A release of more than about 125,000 records, on the memory driver or from a
+  local event buffer, overflowed the stack after the claim was settled and lost
+  every record in it. A `recordMany` that large overflowed after derive had
+  already run. None of these pass their records as function arguments any more.
+- On Redis, one script call carries at most 1,000 items, so a large append,
+  increment or level batch no longer overflows the stack either.
+- The memory driver read one series by walking every series in the window, so
+  `current(dims)` and every immediate send slowed as series grew. It is now a
+  single lookup.
+- A level carry now sends one script per window for all its series, instead of
+  one per series per window.

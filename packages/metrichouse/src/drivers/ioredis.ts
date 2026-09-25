@@ -147,6 +147,25 @@ export interface IoredisDriver extends Driver {
 }
 
 const DEFAULT_NAMESPACE = 'mh'
+
+/**
+ * The most items one script call carries: field and value pairs, records, or
+ * dim keys.
+ *
+ * Every item is an argument to `evalsha`, and JavaScript passes arguments on
+ * the stack, which overflows somewhere past a hundred thousand of them. A
+ * bigger batch is split into several calls, pipelined together.
+ */
+const MAX_PAIRS_PER_SCRIPT = 1000
+
+/** `items` in slices of at most `size`. */
+function chunks<T>(items: readonly T[], size: number): T[][] {
+  const out: T[][] = []
+  for (let start = 0; start < items.length; start += size) {
+    out.push(items.slice(start, start + size))
+  }
+  return out
+}
 const DEFAULT_MAX_PIPELINE = 1000
 /** Five minutes. Far longer than any sane sink, which is the point. */
 const DEFAULT_RECOVER_AFTER = 300_000
@@ -1116,6 +1135,18 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
   const writerKey = `${ns}:w:${uuidv7(Date.now())}`
   let writeSeq = 0
   const unanswered = new Set<number>()
+  /**
+   * The lowest sequence number that may still be waiting, found by walking
+   * forward from where the last search stopped. Numbers are handed out in
+   * order and never reused, so the walk only ever moves forward, and finding
+   * the floor costs next to nothing however many writes are in flight. A scan
+   * of the whole set on every send was quadratic in a burst.
+   */
+  let lowestWaiting = 1
+  function floorOfUnanswered(): number {
+    while (lowestWaiting <= writeSeq && !unanswered.has(lowestWaiting)) lowestWaiting += 1
+    return lowestWaiting
+  }
 
   /**
    * The last send issued, so the next one waits for it to be issued too.
@@ -1166,7 +1197,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           )
           // the floor is taken after the await, as late as possible, so it
           // accounts for every write still waiting at the moment this one goes
-          const floor = Math.min(...unanswered)
+          const floor = floorOfUnanswered()
           const pipeline = client.pipeline()
           indexes.forEach((i, n) => {
             const call = chunk[i] as ScriptCall
@@ -1238,16 +1269,19 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       string,
       { metric: string; bucketTs: number; args: (string | number)[] }
     >()
+    const full: { metric: string; bucketTs: number; args: (string | number)[] }[] = []
     for (const op of ops) {
       const groupKey = key.bucket(op.metric, op.bucketTs)
       let group = groups.get(groupKey)
-      if (!group) {
+      if (!group || group.args.length >= MAX_PAIRS_PER_SCRIPT * 2) {
+        if (group) full.push(group)
         group = { metric: op.metric, bucketTs: op.bucketTs, args: [] }
         groups.set(groupKey, group)
       }
-      group.args.push(...pair(op))
+      const [field, value] = pair(op)
+      group.args.push(field, value)
     }
-    return [...groups.values()]
+    return [...full, ...groups.values()]
   }
 
   /** The flat `HGETALL` of an in-flight key, back into buckets and series. */
@@ -1362,7 +1396,8 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           !group ||
           group.mode !== op.mode ||
           group.metric !== op.metric ||
-          group.bucketTs !== op.bucketTs
+          group.bucketTs !== op.bucketTs ||
+          group.args.length >= MAX_PAIRS_PER_SCRIPT * 2
         ) {
           group = { metric: op.metric, bucketTs: op.bucketTs, mode: op.mode, args: [] }
           groups.push(group)
@@ -1418,13 +1453,11 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     ): Promise<void> {
       if (dimKeys.length === 0) return
       await runScripts(
-        [
-          {
-            script: DROP_LEVELS,
-            keys: [key.levels(metric)],
-            args: [writtenBefore === undefined ? '' : writtenBefore, ...dimKeys],
-          },
-        ],
+        chunks(dimKeys, MAX_PAIRS_PER_SCRIPT).map((some) => ({
+          script: DROP_LEVELS,
+          keys: [key.levels(metric)],
+          args: [writtenBefore === undefined ? '' : writtenBefore, ...some],
+        })),
         'dropLevels',
       )
     },
@@ -1439,13 +1472,18 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         else byMetric.set(op.metric, [encodeRecord(op)])
       }
 
+      // in slices, each its own script call: the records become arguments,
+      // and a quarter of a million arguments overflows the stack of the call
+      // that passes them. Each slice is applied once on its own
       await runScripts(
-        [...byMetric].map(([metric, encoded]) => ({
-          script: APPEND_RECORDS,
-          once: true,
-          keys: [key.records(metric), key.recordSeq(metric)],
-          args: encoded,
-        })),
+        [...byMetric].flatMap(([metric, encoded]) =>
+          chunks(encoded, MAX_PAIRS_PER_SCRIPT).map((some) => ({
+            script: APPEND_RECORDS,
+            once: true,
+            keys: [key.records(metric), key.recordSeq(metric)],
+            args: some,
+          })),
+        ),
         'append',
       )
     },

@@ -149,6 +149,17 @@ const DEFAULT_MAX_SERIES = 100_000
 const DEFAULT_MAX_STAGED = 100_000
 
 /**
+ * Make `target` hold exactly `items`, in place.
+ *
+ * A loop rather than `splice(0, n, ...items)` or `push(...items)`, which pass
+ * every item as a function argument and overflow the stack for a large one.
+ */
+function replaceContents<T>(target: T[], items: readonly T[]): void {
+  target.length = 0
+  for (const item of items) target.push(item)
+}
+
+/**
  * `-0` stored as `0`.
  *
  * Redis receives every number as text, and `String(-0)` is `"0"`, so a shared
@@ -551,10 +562,15 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         if (query.from !== undefined && bucketTs < query.from) continue
         if (query.to !== undefined && bucketTs >= query.to) continue
 
-        for (const [dimKey, value] of bucket) {
-          if (query.dimKey !== undefined && dimKey !== query.dimKey) continue
-          rows.push({ bucketTs, dimKey, value })
+        // one series is a lookup, not a scan: `current(dims)` and every
+        // immediate send ask for exactly one, and walking every series in the
+        // window made them slower the more series it held
+        if (query.dimKey !== undefined) {
+          const value = bucket.get(query.dimKey)
+          if (value !== undefined) rows.push({ bucketTs, dimKey: query.dimKey, value })
+          continue
         }
+        for (const [dimKey, value] of bucket) rows.push({ bucketTs, dimKey, value })
       }
 
       // deterministic order, so callers and tests never depend on Map insertion
@@ -674,7 +690,10 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         const merged = [...claim.records, ...records].sort(
           (a, b) => (appendOrder.get(a) ?? 0) - (appendOrder.get(b) ?? 0),
         )
-        records.splice(0, records.length, ...merged)
+        // copied back one by one: `splice(0, n, ...merged)` passes every
+        // record as an argument and overflows the stack past about 125,000
+        // of them, after the claim has already been settled
+        replaceContents(records, merged)
         return
       }
 

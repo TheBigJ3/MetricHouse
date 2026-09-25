@@ -631,7 +631,9 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
         stagedCount += 1
         stagedOrder.set(record, stagedCount)
       }
-      buffer.push(...records)
+      // one at a time: `push(...records)` overflows the stack for a large
+      // `recordMany`, and by then derive has already run
+      for (const record of records) buffer.push(record)
 
       // immediate delivery is `maxSize: 1` without saying so — the batch
       // settings still describe the shape of a send, they just stop being what
@@ -977,7 +979,8 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
         const merged = [...claim.records, ...buffer].sort(
           (a, b) => (stagedOrder.get(a) ?? 0) - (stagedOrder.get(b) ?? 0),
         )
-        buffer.splice(0, buffer.length, ...merged)
+        buffer.length = 0
+        for (const record of merged) buffer.push(record)
         armBatchTimer()
         return
       }
