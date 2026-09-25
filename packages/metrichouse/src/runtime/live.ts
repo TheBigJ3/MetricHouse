@@ -111,7 +111,9 @@ export type LiveIdentity<O extends SnapshotOptions> = O extends { rollup: 'sum' 
 export type LiveDims<D extends Shape, O extends SnapshotOptions> = O extends {
   groupBy: readonly (infer K)[]
 }
-  ? K extends keyof InferShape<D>
+  ? // bracketed so `groupBy: []`, where K is never, keeps no dims rather than
+    // distributing over nothing and making the whole row `never`
+    [K] extends [keyof InferShape<D>]
     ? Pick<InferShape<D>, K>
     : InferShape<D>
   : InferShape<D>
@@ -362,8 +364,10 @@ export function orderAndLimit<R extends Record<string, unknown>>(
   if (limit !== undefined) assertLimit(limit, metric)
 
   if (orderBy !== undefined) {
+    // any row will do, not only the first: a merged gauge row can leave
+    // `last` off while its neighbours keep it
     const sample = rows[0]
-    if (sample !== undefined && !(orderBy in sample)) {
+    if (sample !== undefined && !rows.some((row) => row[orderBy] !== undefined)) {
       throw new Error(
         `${metric}: orderBy names ${JSON.stringify(orderBy)}, which is not a column on these ` +
           `rows — they have [${Object.keys(sample).join(', ')}]`,
@@ -371,7 +375,16 @@ export function orderAndLimit<R extends Record<string, unknown>>(
     }
 
     const sign = (options.direction ?? 'desc') === 'desc' ? -1 : 1
-    rows.sort((a, b) => sign * compare(a[orderBy], b[orderBy]))
+    rows.sort((a, b) => {
+      // a row without the column goes last whichever way the sort runs, so
+      // a top ten is ten rows that have the value being ranked
+      const left = a[orderBy]
+      const right = b[orderBy]
+      if (left === undefined || right === undefined) {
+        return left === undefined ? (right === undefined ? 0 : 1) : -1
+      }
+      return sign * compare(left, right)
+    })
   }
 
   return limit === undefined ? rows : rows.slice(0, limit)

@@ -286,6 +286,9 @@ That is the difference from [`gauge.current()`](/primitives/gauge#gauge-current)
 
 `undefined` rather than `0` for a series nothing has written to. A zero claims
 the queue exists and is empty, which is a different thing from not knowing yet.
+A series past its [`holdFor`](#holdfor) also reads `undefined`, from the first
+window after its last one, even before a flush has removed it from storage.
+[`totals()`](#level-totals) leaves it out the same way.
 
 ## level.totals()
 
@@ -317,7 +320,9 @@ Every unflushed window, as rows. That includes the windows the next flush will
 carry a held value into, not only the ones something wrote to, so a queue that
 sat at 42 for five minutes reads as five rows of 42, with the same ids those rows
 will ship under. With `complete: false`, the open window is included too, at the
-value the series is at right now.
+value the series is at right now. Nothing past the open window is returned, even
+when `to` reaches into the future, because a window that has not started has no
+value yet.
 
 ```ts
 await queueDepth.snapshot()

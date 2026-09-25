@@ -131,6 +131,12 @@ early empty call would block the next real one for a full interval, which is
 worst on metrics with coarse resolutions.
 :::
 
+A call that arrives within fifty milliseconds of the cadence, or a tenth of it
+for a cadence shorter than half a second, counts as on time. The scheduler's
+timers and the house clock are two different clocks, and a tick can fire a
+millisecond before the clock says the interval is over. Turning that tick away
+would make the metric wait a second full interval.
+
 The cadence is measured from the last flush that shipped rows. Before the first
 one there is nothing to measure from, so the first flush always goes ahead,
 whatever the clock reads. If the clock steps backwards, say an NTP correction of

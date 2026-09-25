@@ -18,7 +18,13 @@
  * wrong.
  */
 
-import { type Cell, type Claim, type Driver, isEmptyClaim } from '../drivers/types.js'
+import {
+  type BucketRow,
+  type Cell,
+  type Claim,
+  type Driver,
+  isEmptyClaim,
+} from '../drivers/types.js'
 import type {
   AnyMetric,
   MaterializedBatch,
@@ -113,6 +119,8 @@ export interface OpenSeriesShip {
   readonly materialize: (bucketTs: number, dimKey: string, cell: Cell) => Row
   readonly totalOf: (rows: readonly Row[]) => number
   readonly sink: WriteFn
+  /** The metric's failure count, shared with its flushes. */
+  readonly attempts: Attempts
 }
 
 /**
@@ -140,30 +148,48 @@ export interface OpenSeriesShip {
  * with writes, not with the cardinality of the metric.
  */
 export async function shipOpenSeries(ship: OpenSeriesShip): Promise<void> {
-  const bucketTo = ship.bucketTs + ship.resolutionMs
-
-  const live = await ship.driver.readBuckets({
+  let live = await ship.driver.readBuckets({
     metric: ship.metric,
     dimKey: ship.dimKey,
     from: ship.bucketTs,
-    to: bucketTo,
+    to: ship.bucketTs + ship.resolutionMs,
   })
 
-  // a concurrent flush claimed the bucket between the write and this read —
-  // that flush owns the data now, and it ships the same id with the same fold
-  if (live.length === 0) return
+  // nothing where the write was aimed: a flush claimed that window before the
+  // write arrived, so the driver moved the write forward to the oldest window
+  // that has not shipped. That is the earliest one still live from here on
+  if (live.length === 0) {
+    const later = await ship.driver.readBuckets({
+      metric: ship.metric,
+      dimKey: ship.dimKey,
+      from: ship.bucketTs,
+    })
+    const landed = later[0]
+    // nothing at all: a flush claimed the landing window too, and it ships
+    // the same id with the same fold
+    if (landed === undefined) return
+    live = [landed]
+  }
 
+  const bucketTs = (live[0] as BucketRow).bucketTs
   const rows = live.map((row) => ship.materialize(row.bucketTs, row.dimKey, row.value))
 
-  await ship.sink(rows, {
-    metric: ship.metric,
-    kind: ship.kind,
-    bucketFrom: ship.bucketTs,
-    bucketTo,
-    total: ship.totalOf(rows),
-    // nothing was claimed, so nothing can be retried — a resend is whatever
-    // the next write produces, and it is a first attempt at that value
-    attempt: 1,
-    source: 'immediate',
-  })
+  try {
+    await ship.sink(rows, {
+      metric: ship.metric,
+      kind: ship.kind,
+      bucketFrom: bucketTs,
+      bucketTo: bucketTs + ship.resolutionMs,
+      total: ship.totalOf(rows),
+      // nothing was claimed, so a failure has nothing to release: the next
+      // write sends the window again. It is still a failure in a row, and the
+      // count is the one this metric's flushes use
+      attempt: ship.attempts.current,
+      source: 'immediate',
+    })
+  } catch (error) {
+    ship.attempts.current += 1
+    throw error
+  }
+  ship.attempts.current = 1
 }

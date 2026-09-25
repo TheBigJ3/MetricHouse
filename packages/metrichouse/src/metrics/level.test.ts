@@ -706,3 +706,27 @@ describe('regressions', () => {
     ])
   })
 })
+
+describe('round two', () => {
+  it('stops a snapshot at the open window when to reaches into the future', async () => {
+    const metric = bound()
+    metric.set(42, EMAIL)
+    await metric.drain()
+
+    clock = at(2) + 5_000
+    const rows = await metric.snapshot({ complete: false, to: clock + 60_000 })
+    expect(rows.map((row) => row.bucket_ts.getTime())).toEqual([at(0), at(1), at(2)])
+  })
+
+  it('forgets a series past holdFor in current() and totals() before any flush', async () => {
+    const metric = bound({ holdFor: '20s' })
+    metric.set(80, EMAIL)
+    await metric.drain()
+
+    clock = at(2) + 5_000
+    expect(await metric.current(EMAIL)).toBe(80)
+    clock = at(3) + 5_000
+    expect(await metric.current(EMAIL)).toBeUndefined()
+    expect(await metric.totals()).toBeUndefined()
+  })
+})

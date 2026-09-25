@@ -177,7 +177,7 @@ ioredis(clientOrFactory, { namespace, maxPipelineSize, recoverAfter })
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `namespace` | string | `'mh'` | Key prefix. Two houses sharing one Redis need different ones |
+| `namespace` | string | `'mh'` | Key prefix, with no colon or whitespace. Two houses sharing one Redis need different ones |
 | `maxPipelineSize` | number | `1000` | Commands or Lua scripts per round trip |
 | `recoverAfter` | duration | `'5m'` | How long a claim may be held before a flush treats it as abandoned |
 

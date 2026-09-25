@@ -914,3 +914,34 @@ function _metricWriteTypes(metric: Counter<{ route: ReturnType<typeof str> }>): 
 }
 
 void [_sinkRowTypes, _sharedSinkStillFits, _wrongSinkIsRefused, _metricWriteTypes]
+
+describe('a scheduled tick that fires a moment early', () => {
+  it('counts as on time instead of waiting a whole interval', async () => {
+    const write = vi.fn()
+    const metric = counter('m', { resolution: '1s', flush: '1m', write })
+    let at = 1_788_616_987_000
+    createHouse({ driver: memory(), schema: [metric], now: () => at })
+    metric.add()
+    await metric.drain()
+    at += 5_000
+    await metric.flush()
+
+    metric.add()
+    await metric.drain()
+    at += 60_000 - 1
+    expect(await metric.flush()).toMatchObject({ skipped: false, rows: 1 })
+  })
+
+  it('still skips a call that is clearly early', async () => {
+    const metric = counter('m', { resolution: '1s', flush: '1m', write: vi.fn() })
+    let at = 1_788_616_987_000
+    createHouse({ driver: memory(), schema: [metric], now: () => at })
+    metric.add()
+    await metric.drain()
+    at += 5_000
+    await metric.flush()
+
+    at += 30_000
+    expect(await metric.flush()).toMatchObject({ skipped: true, reason: 'cadence' })
+  })
+})

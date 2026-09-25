@@ -685,3 +685,36 @@ describe('merging series inside one window', () => {
     expect(one?.last).toBe(30)
   })
 })
+
+describe('orderBy over rows that do not all have the column', () => {
+  it('ranks the rows that have it and puts the rest last, in both directions', async () => {
+    const temp = gauge('temp', { dims: DIMS, resolution: '10s', flush: '1m', write: discard })
+    createHouse({ driver, schema: [temp], now })
+    // solid: two series in one window, so its merged row has no `last`
+    temp.set(30, RIVERSIDE)
+    temp.set(10, { park: 'north', kind: 'solid' })
+    temp.set(20, CENTRAL)
+    await temp.drain()
+
+    for (const direction of ['asc', 'desc'] as const) {
+      const rows = await temp.snapshot({
+        complete: false,
+        groupBy: ['kind'],
+        orderBy: 'last',
+        direction,
+      })
+      expect(rows.map((row) => row.kind)).toEqual(['liquid', 'solid'])
+    }
+  })
+
+  it('types a groupBy of no dims as a row with no dims, not as never', async () => {
+    const hits = counter('hits', { dims: DIMS, resolution: '10s', flush: '1m', write: discard })
+    createHouse({ driver, schema: [hits], now })
+    hits.add(RIVERSIDE)
+    await hits.drain()
+
+    const rows = await hits.snapshot({ complete: false, groupBy: [] })
+    const value: number | undefined = rows[0]?.value
+    expect(value).toBe(1)
+  })
+})

@@ -106,6 +106,12 @@ claimed and deleted, otherwise they pile up in the driver forever.
 The final flush sends the same id with the complete value, so it supersedes every
 partial send. The two paths agree rather than fight.
 
+A write that arrived after its window was claimed is
+[moved forward](/guide/buckets-and-time#a-write-that-misses-its-window) to the
+oldest window that has not shipped, and the immediate send follows it there: the
+row it sends is the landing window's. A failed send counts toward `attempt`
+exactly as a failed flush does.
+
 With several processes writing to one Redis, each of them sends the running
 total it read, and two sends can arrive at your table in either order. A table
 that keeps the newest arrival can briefly hold an older total. Rows carry no

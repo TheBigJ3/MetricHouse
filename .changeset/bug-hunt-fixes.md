@@ -89,3 +89,24 @@ the highest watermark and move later writes below it forward. `countPending`
 counts records in flight. `increment` and `observe` refuse totals that are not
 finite. The [driver contract](https://github.com/TheBigJ3/MetricHouse/blob/main/docs/reference/driver-contract.md)
 lists each rule, and the shared test suite checks them.
+
+**Found by a second round of testing**
+
+- `level.snapshot()` with a `to` in the future returned windows that had not
+  started. It now stops at the open window.
+- Level `current()` and `totals()` kept reporting a series past its `holdFor`
+  until a flush removed it. They now leave it out from its first expired window.
+- About one scheduler tick in twenty was turned away as a millisecond early,
+  which made that metric wait a second interval. A call within fifty
+  milliseconds of the cadence now counts as on time.
+- `gauge.totals()` and `timer.totals()` overflowed the stack past about 124,000
+  series, and `current()` and `totals()` broke when passed around on their own.
+- `orderBy` on a column only some rows have, such as `last` after a `groupBy`,
+  could throw or rank the missing rows first. They now go last.
+- `groupBy: []` typed its rows as `never`.
+- Immediate delivery sent nothing for a write that had been moved forward. It
+  now sends the window the write landed in, and a failed immediate send from a
+  counter, gauge, level or timer counts toward `attempt`.
+- A Redis namespace may no longer contain a colon or whitespace. Namespace
+  `org:idx` shared its `org:idx:seq` key with the index of a metric named `seq`
+  in namespace `org`.

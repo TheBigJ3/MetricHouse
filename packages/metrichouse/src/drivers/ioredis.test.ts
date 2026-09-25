@@ -72,7 +72,7 @@ if (!client) {
    * lets two drivers in the *same* test deliberately share one.
    */
   let namespace = ''
-  const fresh = () => `mhtest:${randomUUID()}`
+  const fresh = () => `mhtest_${randomUUID()}`
 
   async function wipe(ns: string): Promise<void> {
     const keys = await live.keys(`${ns}:*`)
@@ -514,6 +514,12 @@ if (!client) {
       expect(calls).toBe(1)
 
       await wipe(ns)
+    })
+
+    it('refuses a namespace with a colon or whitespace in it', () => {
+      expect(() => ioredis(live, { namespace: 'org:idx' })).toThrow(/no colon or whitespace/)
+      expect(() => ioredis(live, { namespace: 'org idx' })).toThrow(/no colon or whitespace/)
+      expect(() => ioredis(live, { namespace: '' })).toThrow(/no colon or whitespace/)
     })
 
     it('closes a client it made from a factory', async () => {

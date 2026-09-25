@@ -546,3 +546,52 @@ describe('declaration checks every kind shares', () => {
     ).toThrow(/write must be a function/)
   })
 })
+
+describe('immediate delivery', () => {
+  it('sends a write that was moved forward, from the window it landed in', async () => {
+    const sent: number[][] = []
+    const hits = counter('hits', {
+      resolution: '1s',
+      flush: '1m',
+      write: (rows) => {
+        sent.push(rows.map((row) => (row.bucket_ts as Date).getTime()))
+      },
+    })
+    const driver = memory()
+    const at = 1_788_616_980_000
+    hits.bind({ driver, now: () => at, delivery: 'immediate' })
+
+    // another process has already claimed up to five seconds ahead
+    await driver.ack(await driver.claim('hits', at + 5_000))
+    hits.add()
+    await hits.drain()
+
+    expect(sent).toEqual([[at + 5_000]])
+  })
+
+  it('counts failed immediate sends in attempt, as flushes do', async () => {
+    const attempts: number[] = []
+    let fail = true
+    const hits = counter('hits', {
+      resolution: '1s',
+      flush: '1m',
+      write: (_rows, context) => {
+        attempts.push(context.attempt)
+        if (fail) throw new Error('down')
+      },
+    })
+    const at = 1_788_616_980_000
+    hits.bind({ driver: memory(), now: () => at, delivery: 'immediate', onError: () => {} })
+
+    hits.add()
+    await hits.drain()
+    hits.add()
+    await hits.drain()
+    fail = false
+    hits.add()
+    await hits.drain()
+    hits.add()
+    await hits.drain()
+    expect(attempts).toEqual([1, 2, 3, 1])
+  })
+})

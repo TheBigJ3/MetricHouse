@@ -124,6 +124,14 @@ export interface Attempts {
   current: number
 }
 
+/**
+ * How early a flush may arrive and still count as on time: fifty
+ * milliseconds, or a tenth of the cadence when that is shorter.
+ */
+export function cadenceSlack(flushMs: number): number {
+  return Math.min(50, flushMs / 10)
+}
+
 /** A fresh count, for a metric that has not failed yet. */
 export function createAttempts(): Attempts {
   return { current: 1 }
@@ -181,10 +189,15 @@ export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush
       //    negative elapsed time. That is not "too soon", it is "no longer
       //    comparable", and holding the metric back until the clock caught up
       //    would stall it for as long as the step was.
+      //
+      //    A call a hair early counts as on time. The scheduler's interval
+      //    runs on a different clock from `now()`, and a tick can fire a
+      //    millisecond before `now()` agrees a full interval has passed.
+      //    Refusing it would push that metric back a whole interval.
       const flushMs = options.flushMs()
       if (!flushOptions.force && !final && state.lastFlushMs !== undefined) {
         const elapsed = now - state.lastFlushMs
-        if (elapsed >= 0 && elapsed < flushMs) {
+        if (elapsed >= 0 && elapsed < flushMs - cadenceSlack(flushMs)) {
           return {
             buckets: 0,
             rows: 0,

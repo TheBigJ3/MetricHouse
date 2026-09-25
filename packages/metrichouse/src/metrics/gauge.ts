@@ -15,7 +15,7 @@
 
 import { type Cell, type Driver, type GaugeCell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
-import { metricFlush } from '../runtime/flush.js'
+import { createAttempts, metricFlush } from '../runtime/flush.js'
 import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
 import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
@@ -200,6 +200,8 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
 
   let binding: MetricBinding | undefined
   const pending = new Set<Promise<void>>()
+  /** One failure count for flushes and immediate sends alike. */
+  const attempts = createAttempts()
 
   function asFold(cell: Cell): GaugeCell {
     if (!isGaugeCell(cell)) {
@@ -259,6 +261,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       materialize,
       totalOf,
       sink,
+      attempts,
     })
   }
 
@@ -383,6 +386,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       sink: () => sink,
       now: nowMs,
       self: () => self,
+      attempts,
     }),
 
     name,
@@ -445,18 +449,22 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       return rows.map((row) => asFold(row.value))
     },
 
+    // through `self` rather than `this`, so `setInterval(temp.totals)` works
+    // on a method passed around on its own
     async current(...args: DimsArgs<D>): Promise<GaugeCell | undefined> {
-      const folds = await this.openFolds(args[0] ?? ({} as InferShape<D>))
+      const folds = await self.openFolds(args[0] ?? ({} as InferShape<D>))
       return folds[0]
     },
 
     async totals(): Promise<GaugeTotals | undefined> {
-      const folds = await this.openFolds()
+      const folds = await self.openFolds()
       if (folds.length === 0) return undefined
 
       return {
-        min: Math.min(...folds.map((fold) => fold.min)),
-        max: Math.max(...folds.map((fold) => fold.max)),
+        // a loop and not Math.min(...folds): one argument per series
+        // overflows the stack somewhere past a hundred thousand of them
+        min: folds.reduce((low, fold) => Math.min(low, fold.min), Infinity),
+        max: folds.reduce((high, fold) => Math.max(high, fold.max), -Infinity),
         sum: folds.reduce((total, fold) => total + fold.sum, 0),
         count: folds.reduce((total, fold) => total + fold.count, 0),
       }

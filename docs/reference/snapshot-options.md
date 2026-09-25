@@ -171,6 +171,7 @@ is no honest answer, and `totals()` leaves `last` out for the same reason. A
 group whose newest window holds a single series keeps it.
 
 Naming a dim the metric does not declare throws, exactly as `dims` does.
+`groupBy: []` keeps no dims at all and merges every series, one row per window.
 
 ### orderBy
 
@@ -183,7 +184,10 @@ await httpRequests.snapshot({ orderBy: 'value', limit: 10 })
 ```
 
 The column has to exist on the rows the other options produced, so a rollup
-that dropped `bucket_ts` cannot then sort on it.
+that dropped `bucket_ts` cannot then sort on it. A column some rows have and
+others do not, such as a gauge's `last` after a `groupBy`, is fine: the rows
+without it go last whichever `direction` you ask for, so a top ten is ten rows
+that have the value being ranked.
 
 ```
 http_requests: orderBy names "bucket_ts", which is not a column on these rows

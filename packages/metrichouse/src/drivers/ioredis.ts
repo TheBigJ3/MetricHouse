@@ -96,7 +96,7 @@ export interface IoredisDriverOptions {
    *
    * Two houses sharing one Redis need different namespaces, and so do two
    * test runs — the suite gives each driver a random one for exactly that
-   * reason.
+   * reason. No colon and no whitespace, or the constructor throws.
    */
   readonly namespace?: string
 
@@ -903,6 +903,16 @@ function typedError(error: unknown, metric: string): Error {
 
 export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {}): IoredisDriver {
   const ns = options.namespace ?? DEFAULT_NAMESPACE
+  // no colon, for the same reason a metric name has none: every key is
+  // namespace, a type, then a metric, split on colons. A namespace `org:idx`
+  // would make its `org:idx:seq` counter the same key as the index of a
+  // metric named `seq` in namespace `org`
+  if (typeof ns !== 'string' || !/^[^\s:]+$/.test(ns)) {
+    throw new Error(
+      `ioredis driver: namespace ${JSON.stringify(ns)} must be non-empty with no colon or ` +
+        'whitespace, because the driver builds every key by joining it to the rest with colons',
+    )
+  }
   const maxPipeline = Math.max(1, options.maxPipelineSize ?? DEFAULT_MAX_PIPELINE)
   const recoverAfterMs = parseDuration(options.recoverAfter ?? DEFAULT_RECOVER_AFTER)
 

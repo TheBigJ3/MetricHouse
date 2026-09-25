@@ -291,3 +291,21 @@ describe('mixing kinds is refused at the driver', () => {
     ).rejects.toThrow(/counter cells/)
   })
 })
+
+describe('totals at high cardinality', () => {
+  it('merges two hundred thousand series without overflowing the stack', async () => {
+    const wide = gauge('wide', {
+      dims: { id: str() },
+      resolution: '1m',
+      flush: '1m',
+      write: () => {},
+    })
+    const clock = 1_788_616_980_000
+    wide.bind({ driver: memory({ maxSeries: Number.POSITIVE_INFINITY }), now: () => clock })
+    for (let i = 0; i < 200_000; i++) wide.set(i, { id: String(i) })
+    await wide.drain()
+
+    const totals = wide.totals
+    expect(await totals()).toMatchObject({ min: 0, max: 199_999, count: 200_000 })
+  })
+})

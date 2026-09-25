@@ -116,10 +116,12 @@ creates starts with that prefix. Two houses given the same namespace share every
 metric of the same name, and nothing warns you, because the two can be in
 different processes that cannot see each other.
 
-A metric name may not contain a colon or whitespace, and that is what keeps two
-different namespaces apart. The key for an event named `checkout` under
-namespace `org:e` would otherwise be the same as the key for one named
-`e:checkout` under namespace `org`.
+Neither a namespace nor a metric name may contain a colon or whitespace, and
+that is what keeps two namespaces apart. Every key is the namespace, a short
+type, then the metric, joined with colons. With a colon allowed in either, the
+key for an event named `checkout` under namespace `org:e` would be the same as
+the key for one named `e:checkout` under namespace `org`. A namespace with a
+colon throws when the driver is created.
 
 `maxPipelineSize` bounds how many commands, or Lua scripts, go to Redis in one
 round trip. A batch larger than that is sent in several. Most writes are one

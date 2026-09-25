@@ -183,8 +183,13 @@ await house.snapshot({ only: ['http_requests'], rollup: 'sum' })
 ```
 
 Metrics are read in parallel. Options that only make sense for a folded metric
-are ignored by events and logs rather than rejected, so one set of options works
-across a mixed schema.
+are ignored by events and logs rather than rejected, so `complete`, `rollup`,
+`from`, `to` and `limit` work across a mixed schema. `dims`, `groupBy` and
+`orderBy` name columns, and every metric that reads them has to have those
+columns: `orderBy: 'value'` on a house that also holds a gauge throws, because a
+gauge row has `min` and `max` rather than `value`. One metric that throws
+rejects the whole call, so narrow it with `only` when the options fit some
+metrics and not others.
 
 ```ts
 const now = await house.current()

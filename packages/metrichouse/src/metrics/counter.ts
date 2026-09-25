@@ -11,7 +11,7 @@
 
 import { type Cell, type Driver, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
-import { metricFlush } from '../runtime/flush.js'
+import { createAttempts, metricFlush } from '../runtime/flush.js'
 import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
 import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
@@ -209,6 +209,8 @@ export function counter<D extends Shape = Record<never, never>>(
    * retain every promise it ever created.
    */
   const pending = new Set<Promise<void>>()
+  /** One failure count for flushes and immediate sends alike. */
+  const attempts = createAttempts()
 
   /** The driver stores whatever a metric wrote; a counter only writes numbers. */
   function asCount(cell: Cell): number {
@@ -303,6 +305,7 @@ export function counter<D extends Shape = Record<never, never>>(
       materialize,
       totalOf,
       sink,
+      attempts,
     })
   }
 
@@ -352,6 +355,7 @@ export function counter<D extends Shape = Record<never, never>>(
       sink: () => sink,
       now: nowMs,
       self: () => self,
+      attempts,
     }),
 
     name,

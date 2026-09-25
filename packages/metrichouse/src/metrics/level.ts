@@ -21,7 +21,7 @@
 import type { Cell, Claim, Driver, LevelOp, LevelSeries } from '../drivers/types.js'
 import { isLevelCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
-import { metricFlush } from '../runtime/flush.js'
+import { createAttempts, metricFlush } from '../runtime/flush.js'
 import {
   applySnapshot,
   type LiveRow,
@@ -223,6 +223,8 @@ export function level<D extends Shape = Record<never, never>>(
 
   let binding: MetricBinding | undefined
   const pending = new Set<Promise<void>>()
+  /** One failure count for flushes and immediate sends alike. */
+  const attempts = createAttempts()
 
   /** The driver stores whatever a metric wrote; a level only writes level cells. */
   function asLevel(cell: Cell): number {
@@ -299,6 +301,7 @@ export function level<D extends Shape = Record<never, never>>(
       materialize,
       totalOf,
       sink,
+      attempts,
     })
   }
 
@@ -393,6 +396,21 @@ export function level<D extends Shape = Record<never, never>>(
   function holdUntil(one: LevelSeries): number | undefined {
     if (holdForMs === undefined) return undefined
     return bucketStart(one.writtenAt + holdForMs, resolutionMs) + resolutionMs
+  }
+
+  /**
+   * Every series still reporting in the open window.
+   *
+   * A series past its `holdFor` is only removed from storage by the next
+   * flush, so a read between the two filters it out itself. That keeps
+   * `current()` and `totals()` in step with `snapshot()`, which already stops
+   * a series at its last window.
+   */
+  async function heldNow(): Promise<LevelSeries[]> {
+    const series = await activeDriver().readLevels(name)
+    if (holdForMs === undefined) return series
+    const open = bucketStart(nowMs(), resolutionMs)
+    return series.filter((one) => open < (holdUntil(one) ?? Number.POSITIVE_INFINITY))
   }
 
   /**
@@ -559,8 +577,10 @@ export function level<D extends Shape = Record<never, never>>(
     const now = nowMs()
     const range = snapshotRange(options, resolutionMs, now)
     // the newest window that can hold anything: the open one, unless the
-    // range or `complete` stops short of it
-    const upper = range.to ?? bucketStart(now, resolutionMs) + resolutionMs
+    // range or `complete` stops short of it. A `to` in the future does not
+    // reach further, because a window that has not started has no value yet
+    const openEnd = bucketStart(now, resolutionMs) + resolutionMs
+    const upper = Math.min(range.to ?? openEnd, openEnd)
 
     const [series, stored] = await Promise.all([
       driver.readLevels(name),
@@ -619,6 +639,7 @@ export function level<D extends Shape = Record<never, never>>(
       sink: () => sink,
       now: nowMs,
       self: () => self,
+      attempts,
     }),
 
     name,
@@ -682,12 +703,12 @@ export function level<D extends Shape = Record<never, never>>(
 
     async current(...args: DimsArgs<D>): Promise<number | undefined> {
       const dimKey = keyFor(args[0])
-      const series = await activeDriver().readLevels(name)
+      const series = await heldNow()
       return series.find((one) => one.dimKey === dimKey)?.value
     },
 
     async totals(): Promise<number | undefined> {
-      const series = await activeDriver().readLevels(name)
+      const series = await heldNow()
       if (series.length === 0) return undefined
       return series.reduce((sum, one) => sum + one.value, 0)
     },
