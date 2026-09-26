@@ -280,6 +280,11 @@ export function applySnapshot(
   matched.sort((a, b) => a.bucketTs - b.bucketTs)
 
   const rollup = options.rollup ?? 'none'
+  // a value from JavaScript or from config gets past the type, and anything
+  // but 'none' would otherwise be taken as 'sum'
+  if (rollup !== 'none' && rollup !== 'sum') {
+    throw new Error(`${metric}: rollup must be 'none' or 'sum', got ${JSON.stringify(rollup)}`)
+  }
   const collapsing = rollup !== 'none' || options.groupBy !== undefined
 
   const live: LiveRow[] = collapsing
@@ -335,7 +340,9 @@ function collapse(
       // an absent optional dim stays absent, as it is on an ungrouped row,
       // rather than turning into a key that holds `undefined`
       ...Object.fromEntries(
-        kept.filter((dim) => first.row[dim] !== undefined).map((dim) => [dim, first.row[dim]]),
+        kept
+          .filter((dim) => Object.hasOwn(first.row, dim) && first.row[dim] !== undefined)
+          .map((dim) => [dim, first.row[dim]]),
       ),
       ...mergeValues(group.map((one) => one.row)),
       // partial if any constituent bucket is, and elapsed across all of them —

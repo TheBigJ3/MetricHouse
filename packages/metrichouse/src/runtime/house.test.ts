@@ -3,6 +3,7 @@ import { memory } from '../drivers/memory.js'
 import type { Driver } from '../drivers/types.js'
 import { rowId } from '../identity.js'
 import { counter } from '../metrics/counter.js'
+import { event } from '../metrics/event.js'
 import type { Row, WriteFn } from '../metrics/types.js'
 import { oneOf, str } from '../schema/types.js'
 import { createHouse } from './house.js'
@@ -343,5 +344,89 @@ describe('flush keeps going when one metric fails', () => {
     expect(report.ok).toBe(false)
     expect(String(report.metrics.first?.error)).toMatch(/connection refused/)
     expect(report.metrics.second?.error).toBeUndefined()
+  })
+})
+
+/**
+ * Stand in for `Promise.reject` while `run` runs, so a failure raised on
+ * purpose as an unhandled rejection is caught here instead of failing the run.
+ */
+async function raisedDuring(run: () => Promise<unknown>): Promise<string[]> {
+  const raised: string[] = []
+  const reject = vi.spyOn(Promise, 'reject').mockImplementation((reason?: unknown) => {
+    raised.push((reason as Error).message)
+    return Promise.resolve() as never
+  })
+  try {
+    await run()
+  } finally {
+    reject.mockRestore()
+  }
+  return raised
+}
+
+describe('house.drain()', () => {
+  it('waits for every metric when another metric has a failed write in flight', async () => {
+    const inner = memory()
+    const slow: Driver = {
+      ...inner,
+      increment: async (ops) => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        return inner.increment(ops)
+      },
+    }
+    const pageViewed = event('page_viewed', {
+      fields: { path: str() },
+      stage: 'local',
+      batch: { maxSize: 1 },
+      write: async () => {
+        throw new Error('clickhouse is down')
+      },
+    })
+    const requests = makeCounter('requests')
+    // no onError, so the failed write is raised as an unhandled rejection
+    const house = createHouse({ driver: slow, schema: [pageViewed, requests], now })
+
+    const raised = await raisedDuring(async () => {
+      requests.add(WILLOW)
+      pageViewed.record({ path: '/' })
+      await house.drain()
+    })
+
+    expect(raised).toEqual(['clickhouse is down'])
+    expect(await inner.readBuckets({ metric: 'requests' })).toEqual([
+      { bucketTs: 1_788_616_987_000, dimKey: 'Willow|riverside|solid', value: 1 },
+    ])
+  })
+})
+
+describe('house.stop()', () => {
+  it('makes the final flush when another metric has a failed write in flight', async () => {
+    const shipped: Row[] = []
+    const pageViewed = event('page_viewed', {
+      fields: { path: str() },
+      stage: 'local',
+      batch: { maxSize: 1 },
+      write: async () => {
+        throw new Error('clickhouse is down')
+      },
+    })
+    const requests = makeCounter('requests', {
+      write: (rows: Row[]) => {
+        shipped.push(...rows)
+      },
+    })
+    const house = createHouse({ driver, schema: [pageViewed, requests], now })
+    requests.add(WILLOW)
+    await house.drain()
+    clock += 1_000
+
+    const raised = await raisedDuring(async () => {
+      pageViewed.record({ path: '/' })
+      expect((await house.stop()).metrics.requests?.rows).toBe(1)
+    })
+
+    expect(raised).toEqual(['clickhouse is down', 'clickhouse is down'])
+    expect(shipped.map((row) => row.value)).toEqual([1])
   })
 })

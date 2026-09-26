@@ -220,6 +220,7 @@ reads `id, ts, level, message, error_stack`, then your fields, then
 | `field "ts" is a reserved column` | A declared field taking a name MetricHouse owns. At declaration |
 | `a field cannot be named "__proto__"` | JavaScript treats that key as an object's prototype, so no row could carry it. At declaration |
 | `a field cannot be named "7"` | A name that reads as a whole number, which JavaScript moves ahead of every other key, so the column order you declared would be lost. At declaration |
+| `a field cannot be named "bucket_open"` | A name every snapshot row already uses, and the same for `bucket_elapsed_ms`. At declaration |
 | `timestamp names "occurredAt", which is not a declared field` | `timestamp` pointing at nothing, or at a name such as `toString` that every object inherits. At declaration |
 | `timestamp field "occurredAt" declares str(), and it must be ts()` | `timestamp` pointing at the wrong type. At declaration |
 | `default for int(): expected a safe integer, got "five"` | `.default()` given a value its own type rejects. At declaration |

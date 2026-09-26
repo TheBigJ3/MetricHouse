@@ -117,8 +117,10 @@ dims: { value: str() }
 A gauge that leaves an aggregate out of `aggregate` can use its name for a dim,
 because no column of that name is written.
 
-Two more names are refused on every type. `__proto__` sets an object's prototype
-rather than adding a key, so no row could carry it. A name that reads as a whole
+More names are refused on every type. `bucket_open` and `bucket_elapsed_ms` are
+columns every row [`snapshot()`](/reference/snapshot-options#complete) returns,
+and a dim of either name would be overwritten there. `__proto__` sets an
+object's prototype rather than adding a key, so no row could carry it. A name that reads as a whole
 number, such as `'2024'`, is listed by JavaScript before every other key
 whatever order you wrote it in, so the [declared order](#declaration-order) would
 be lost. `'y2024'` or `'01'` keep their place and are accepted.
@@ -429,6 +431,7 @@ half finished state behind.
 | `dim "id" is a reserved column` | A dim named after a column the metric writes itself. At declaration |
 | `a dim cannot be named "__proto__"` | JavaScript treats that key as an object's prototype, so no row could carry it. At declaration |
 | `a dim cannot be named "2024"` | A name that reads as a whole number, which JavaScript moves ahead of every other key. At declaration |
+| `a dim cannot be named "bucket_open"` | A name every snapshot row already uses, and the same for `bucket_elapsed_ms`. At declaration |
 | `missing required dim "status"` | A declared dim with no value and no default |
 | `unknown dim "pakr". The declared dims are [route, status]` | A key that is not declared |
 | `route: expected a string, got 42` | A value of the wrong type |

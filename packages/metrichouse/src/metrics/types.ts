@@ -135,6 +135,14 @@ export interface MetricBinding {
    */
   readonly onError?: (error: unknown, context: { metric: string }) => void
   /**
+   * True once the house has stopped, until it is started again.
+   *
+   * A locally staged event arms a timer to retry a failed send. After
+   * `house.stop()` has returned, nothing should call a sink any more, so the
+   * event arms none.
+   */
+  readonly stopped?: () => boolean
+  /**
    * Look up a sibling metric by name.
    *
    * `event({ derive })` names the counters an event also writes, and names are
@@ -352,8 +360,18 @@ export function assertSink(write: unknown, name: string): void {
  * bigint or a boolean there, and without this check `add(5n)` would count 1.
  */
 export function assertDeltaOrDims(name: string, first: unknown): void {
-  if (first === undefined || first === null) return
-  if (typeof first === 'number' || typeof first === 'object') return
+  if (first === undefined || first === null || typeof first === 'number') return
+  if (typeof first === 'object') {
+    // a dims object is a plain one. A Date, an array or a boxed Number is an
+    // object too, and TypeScript accepts each where a metric with no dims
+    // takes its argument, but none of them is a set of labels
+    const proto = Object.getPrototypeOf(first)
+    if (proto === Object.prototype || proto === null) return
+    const kind = Array.isArray(first) ? 'an array' : `a ${proto?.constructor?.name ?? 'object'}`
+    throw new Error(
+      `${name}: the first argument must be a number or a plain dims object, got ${kind}`,
+    )
+  }
   throw new Error(
     `${name}: the first argument must be a number or a dims object, got ${typeof first}` +
       (typeof first === 'bigint' ? '. Convert a bigint with Number() first' : ''),
@@ -393,6 +411,32 @@ export function dimColumns(dims: Shape): RowColumn[] {
     const type = dims[column] as FieldType
     return { name: column, kind: type.kind, optional: type.isOptional && !type.hasDefault }
   })
+}
+
+/**
+ * Hand a failure that cannot be thrown at a caller to `onError`, or raise it
+ * as an unhandled rejection when there is no handler.
+ *
+ * Never throws, so the promise it runs in never rejects. `drain()` waits on
+ * those promises, and one that rejected would end the wait before the other
+ * writes had landed and make `house.stop()` skip its final flush. A handler
+ * that throws is raised the same way, rather than replacing the wait.
+ */
+export function reportError(
+  onError: MetricBinding['onError'],
+  error: unknown,
+  context: { metric: string },
+): void {
+  let raised = error
+  if (onError) {
+    try {
+      onError(error, context)
+      return
+    } catch (thrown) {
+      raised = thrown
+    }
+  }
+  void Promise.reject(raised)
 }
 
 /** What a flush tells a metric about the claim it is asking for. */

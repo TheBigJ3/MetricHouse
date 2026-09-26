@@ -21,7 +21,7 @@
  * file is not involved.
  */
 
-import type { AnyMetric } from '../metrics/types.js'
+import { type AnyMetric, reportError } from '../metrics/types.js'
 
 export interface SchedulerOptions {
   /** Read late: `register()` can add a metric after the scheduler is running. */
@@ -69,20 +69,23 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
   let running = false
 
   async function run(metric: AnyMetric): Promise<void> {
+    // with no handler a scheduled failure is an unhandled rejection, as a
+    // failed write is. A handler that throws is raised the same way rather
+    // than making this reject, so `stop()` still reaches its drain and its
+    // final flush
+    const report = (error: unknown) => reportError(options.onError, error, { metric: metric.name })
     try {
-      const report = await metric.flush()
-      if (report.error !== undefined) options.onError?.(report.error, { metric: metric.name })
+      const flushed = await metric.flush()
+      if (flushed.error !== undefined) report(flushed.error)
+      if (flushed.releaseError !== undefined) report(flushed.releaseError)
       // a failed recovery pass does not stop the flush below it, so it is not
       // `error`. A scheduled flush has no caller to read the report, and
       // this is the only place it can be heard
-      if (report.recoveryError !== undefined) {
-        options.onError?.(report.recoveryError, { metric: metric.name })
-      }
+      if (flushed.recoveryError !== undefined) report(flushed.recoveryError)
     } catch (error) {
-      // flush reports its own failures, so this is one it could not: an
-      // unbound metric, or a release that failed. Same destination: there is
-      // no caller to hand it to.
-      options.onError?.(error, { metric: metric.name })
+      // flush reports its own failures, so this is one it could not, such as
+      // an unbound metric. Same destination: there is no caller to hand it to
+      report(error)
     } finally {
       inFlight.delete(metric.name)
     }

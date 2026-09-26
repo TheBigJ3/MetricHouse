@@ -263,6 +263,28 @@ describe('errors', () => {
     expect((await shipped(appLog))[0]?.message).toBe('[object Object]')
   })
 
+  it('writes a caught value whose class tag cannot be read rather than throwing', async () => {
+    const appLog = bound()
+    const { proxy, revoke } = Proxy.revocable({}, {})
+    revoke()
+    const noTag = {
+      get [Symbol.toStringTag]() {
+        throw new Error('no tag')
+      },
+      toString() {
+        throw new Error('no text')
+      },
+    }
+    appLog.error(proxy as Error, { service: 'api' })
+    appLog.error(noTag as unknown as Error, { service: 'api' })
+    await appLog.drain()
+
+    expect((await shipped(appLog)).map((row) => row.message)).toEqual([
+      '[a value that cannot be printed]',
+      '[a value that cannot be printed]',
+    ])
+  })
+
   it('writes an Error whose message and stack are not strings rather than throwing', async () => {
     const appLog = bound()
     const odd = Object.assign(new RangeError('x'), {

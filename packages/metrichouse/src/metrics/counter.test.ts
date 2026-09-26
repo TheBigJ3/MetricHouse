@@ -176,6 +176,26 @@ describe('dimensionless counters', () => {
     await metric.drain()
     expect(await metric.current()).toBe(0)
   })
+
+  it('refuses an object that is not a plain dims object', async () => {
+    // each is an object, and TypeScript accepts all three on a metric with no dims
+    const metric = online()
+    metric.bind({ driver, now })
+    const refusal = (value: unknown) =>
+      expectRejected(() => metric.add(value as Record<never, never>)).message
+    expect(refusal(new Date())).toBe(
+      'online_users: the first argument must be a number or a plain dims object, got a Date',
+    )
+    expect(refusal([])).toBe(
+      'online_users: the first argument must be a number or a plain dims object, got an array',
+    )
+    expect(refusal(new Number(5))).toBe(
+      'online_users: the first argument must be a number or a plain dims object, got a Number',
+    )
+    metric.add(Object.create(null))
+    await metric.drain()
+    expect(await metric.current()).toBe(1)
+  })
 })
 
 describe('inert until bound', () => {
@@ -445,6 +465,29 @@ describe('current', () => {
 })
 
 describe('current() with no dims is the metric total', () => {
+  it('refuses a total across series a double cannot hold exactly', async () => {
+    const metric = bound()
+    metric.add(Number.MAX_SAFE_INTEGER, WILLOW)
+    metric.add(2, { ...WILLOW, park: 'central' })
+    await metric.drain()
+
+    await expect(metric.current()).rejects.toThrow(
+      'dog_poops: the total across series would be 9007199254740992, which is past ' +
+        '9007199254740991, the largest whole number a double holds exactly',
+    )
+    await expect(metric.snapshot({ complete: false, groupBy: [] })).rejects.toThrow(
+      /^dog_poops: a merged value would be 9007199254740992/,
+    )
+  })
+
+  it('adds series past the safe range when the counter declares float', async () => {
+    const metric = make({ value: float() })
+    metric.bind({ driver, now })
+    metric.add(Number.MAX_SAFE_INTEGER, WILLOW)
+    metric.add(2, { ...WILLOW, park: 'central' })
+    await metric.drain()
+    expect(await metric.current()).toBe(2 ** 53)
+  })
   it('sums every series — the counter tracks one thing', async () => {
     const metric = bound()
     metric.add(WILLOW)
@@ -643,6 +686,19 @@ describe('declaration checks every kind shares', () => {
         'on every row',
     )
   })
+
+  it.each(['bucket_open', 'bucket_elapsed_ms'])(
+    'refuses a dim named %s, a live read column',
+    (dim) => {
+      const write: WriteFn = () => {}
+      expect(() =>
+        counter('doors', { dims: { [dim]: str() }, resolution: '1s', flush: '1m', write }),
+      ).toThrow(
+        `doors: a dim cannot be named "${dim}", because every row snapshot() returns carries a ` +
+          'column of that name',
+      )
+    },
+  )
 
   it('refuses a flush cadence a timer cannot wait for', () => {
     const write: WriteFn = () => {}

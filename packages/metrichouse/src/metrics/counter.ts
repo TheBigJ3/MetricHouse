@@ -34,6 +34,7 @@ import {
   assertSink,
   assertWhole,
   dimColumns,
+  reportError,
 } from './types.js'
 
 /** The columns a counter writes on every row itself, which no dim may take. */
@@ -268,13 +269,9 @@ export function counter<D extends Shape = Record<never, never>>(
 
   function track(write: Promise<void>, onError: MetricBinding['onError']): void {
     const settled = write
-      .catch((error: unknown) => {
-        // `.add()` already returned, so this cannot be thrown at the caller.
-        // With no handler it surfaces as an unhandled rejection, which is
-        // noisy — and better than a write disappearing in silence.
-        if (!onError) throw error
-        onError(error, { metric: name })
-      })
+      // reported and never rethrown, so `drain()` waits for every write
+      // rather than stopping at the first that failed
+      .catch((error: unknown) => reportError(onError, error, { metric: name }))
       .finally(() => {
         pending.delete(settled)
       })
@@ -333,9 +330,27 @@ export function counter<D extends Shape = Record<never, never>>(
     return rows.reduce((sum, row) => sum + (row.value as number), 0)
   }
 
+  /**
+   * A sum a live read hands back, refused for an integer counter when a
+   * double cannot hold it exactly.
+   *
+   * Each series is kept below `Number.MAX_SAFE_INTEGER` by the driver, but
+   * several of them added together can pass it, and the answer would be a
+   * different whole number with nothing to say so.
+   */
+  function exactSum(total: number, what: string): number {
+    if (!isFloat && !Number.isSafeInteger(total)) {
+      throw new Error(
+        `${name}: ${what} would be ${total}, which is past ${Number.MAX_SAFE_INTEGER}, the ` +
+          'largest whole number a double holds exactly',
+      )
+    }
+    return total
+  }
+
   /** Counters merge by adding, across buckets and across series alike. */
   function mergeValues(rows: readonly Row[]): Record<string, unknown> {
-    return { value: totalOf(rows) }
+    return { value: exactSum(totalOf(rows), 'a merged value') }
   }
 
   // named, so the flush mixin can reach the finished metric — it is spread
@@ -446,8 +461,11 @@ export function counter<D extends Shape = Record<never, never>>(
         ...(values !== undefined && { dimKey: keyFor(values) }),
       })
 
-      // an unseen series is zero, not absent — a dashboard should render 0
-      return rows.reduce((sum, row) => sum + asCount(row.value), 0)
+      // an unseen series is zero, not absent, so a dashboard renders 0
+      return exactSum(
+        rows.reduce((sum, row) => sum + asCount(row.value), 0),
+        'the total across series',
+      )
     },
 
     async drain(): Promise<void> {

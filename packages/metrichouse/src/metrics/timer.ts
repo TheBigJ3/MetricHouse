@@ -55,7 +55,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink } from './types.js'
+import { assertMetricName, assertSink, reportError } from './types.js'
 
 /**
  * What a timer ships unless told otherwise: the gauge's five, minus `last`.
@@ -303,12 +303,7 @@ export function timer<D extends Shape = Record<never, never>>(
 
   /** See `event()`'s function of the same name: a detached failure must not vanish. */
   function reportDetached(error: unknown): void {
-    const onError = binding?.onError
-    if (onError) {
-      onError(error, { metric: name })
-      return
-    }
-    void Promise.reject(error)
+    reportError(binding?.onError, error, { metric: name })
   }
 
   /**
@@ -483,8 +478,19 @@ export function timer<D extends Shape = Record<never, never>>(
         throw error
       }
 
+      // a Promise is returned as it is, and timed through a second
+      // subscription, which a Promise allows. Any other thenable, a query
+      // builder for one, may run its work each time `then` is called, so it
+      // is subscribed to exactly once and a Promise of its result is returned
+      if (result instanceof Promise) {
+        result.then(
+          () => handle.end(),
+          () => handle.end(),
+        )
+        return result
+      }
       if (isThenable(result)) {
-        return result.then(
+        return Promise.resolve(result).then(
           (value) => {
             handle.end()
             return value

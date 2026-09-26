@@ -259,6 +259,7 @@ jobsProcessed.add(5)
 | `not bound to a house` | The counter was never registered |
 | `delta must be a finite number` | `NaN` or `Infinity` |
 | `the first argument must be a number or a dims object, got bigint` | A bigint, boolean or string where a delta goes. TypeScript allows it on a counter with no dims |
+| `the first argument must be a number or a plain dims object, got a Date` | A `Date`, an array or a boxed `Number` where a delta goes, which TypeScript also allows there |
 | `declares an integer counter, so 1.5 is not a legal delta` | A fraction without `value: float()` |
 | `9007199254740992 is past 9007199254740991` | A whole delta too large for a double to hold exactly, on an integer counter |
 | `missing required dim "status"` | A declared dim with no value and no default |
@@ -297,6 +298,12 @@ await httpRequests.current()                                        // 1337
 **Returns** a number. With dim values, that one series. Without them, every
 series added together, which is the metric's own total. A series nothing has
 written to returns `0`, so a dashboard renders a zero rather than a gap.
+
+On an integer counter, a total across series past `9007199254740991` rejects
+rather than returning a nearby whole number, and so does a `snapshot()` that
+merges series or windows past it. Each series stays below it on its own, but
+several added together can pass it. `context.total` in a sink is a plain sum
+of doubles, and past that range it is rounded.
 
 This reads the open window only. For the finished windows that have not shipped
 yet, use [`snapshot()`](#counter-snapshot).

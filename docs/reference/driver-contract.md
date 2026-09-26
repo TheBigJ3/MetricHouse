@@ -128,6 +128,12 @@ Apply the operations in the order they were given. Two aimed at different
 windows can land in the same one, as the next paragraph explains, and a sum of
 doubles depends on the order it was added in.
 
+A refusal is only promised to leave its own window unchanged. The memory driver
+checks a whole call before storing any of it, and the Redis driver checks each
+window's operations as one step, so a call spanning two windows can keep the
+first when the second is refused. Every metric writes one operation per call,
+so this only shows through the driver itself.
+
 A write aimed below the claimed watermark lands at the watermark instead. See
 [claim](#claim).
 
@@ -168,7 +174,11 @@ setLevel(ops: readonly LevelOp[]): Promise<void>
 ```
 
 Two things move per operation, and they move together or not at all: the
-series' held value, and the cell in the window the operation names.
+series' held value, and the cell in the window the operation names. A call that
+refuses one operation changes nothing that call wrote in that window, although
+an operation later in the call reads what the earlier ones did. The Redis driver
+works a whole window's operations out before it writes any of them, and the
+memory driver undoes the call's writes when one is refused.
 
 | `mode` | Held value becomes | Cell at `bucketTs` becomes |
 | --- | --- | --- |
@@ -186,7 +196,10 @@ When a `hold` finds its window already written, `carried` becomes the value in
 that cell rather than the one the hold named. The flush worked out its value
 before a late `set` landed in the window, and carrying that older number would
 repeat a level the series had already left in every empty window after it. The
-same rule makes a `hold` safe to apply twice.
+same rule makes a `hold` safe to apply twice. A `hold` for the window
+`heldThrough` already names, arriving once a claim has taken that window, leaves
+`carried` alone: the cell that would say what the window ended at is gone, and
+`carried` already holds it.
 
 `integer` is set by a level that holds whole numbers. Refuse a `set` or an `add`
 that would leave a cell or the held value past `9007199254740991`, as
@@ -330,6 +343,11 @@ timestamp and are half open. `limit` caps what comes back, and on storage that
 supports it this should be a bounded read rather than fetching everything and
 slicing.
 
+A read taken in pages must not skip a record, or return one twice, when
+another process claims or releases records between two pages. The Redis driver
+starts each page after the last record it read rather than at an index, and
+finds that record again when the list has moved.
+
 Reading does not consume.
 
 ### countPending
@@ -434,8 +452,12 @@ release(claim: Claim): Promise<void>
 
 The write failed. Return the claimed data to the live set, unchanged.
 
-Two rules that are easy to get wrong:
+Four rules that are easy to get wrong:
 
+- **Keep the claim until the data is back.** A release that fails partway,
+  for instance on a cell of another kind, must leave the rest of the claim
+  where a retried release or a recovery pass still finds it. The Redis driver
+  removes the claim from its registry only once every cell has been restored.
 - **Merge, do not overwrite.** With writes moved past the watermark, nothing
   new should land in a claimed window. Data written by an older driver still
   might have, so a release that finds a cell already there merges the two rather
@@ -562,6 +584,9 @@ A driver has to satisfy all of these.
 - Held values survive the claim and the ack that ship their windows.
 - A `set` or `add` in the window `heldThrough` names replaces `carried`.
 - A `hold` into a window that already has a cell carries that cell's value.
+- A `hold` for the pointer's window, after a claim has taken it, leaves
+  `carried` alone.
+- A refused operation changes nothing its call wrote in that window.
 - A `hold` below the claimed watermark writes no cell and still moves the pointer.
 - `dropLevels` forgets a series without touching the windows it already filled,
   and keeps a series written at or after `writtenBefore`.
@@ -575,6 +600,8 @@ A driver has to satisfy all of these.
 - Claimed data is invisible.
 - Reading never consumes.
 - A read sees a write issued before it, awaited or not.
+- An error names the metric of the operation that was refused.
+- An invalid `Date` in `fields` comes back as an invalid `Date`.
 - A field shaped like the driver's own date marker comes back untouched.
 
 **Claiming**

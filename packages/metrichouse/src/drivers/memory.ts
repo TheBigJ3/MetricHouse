@@ -360,6 +360,51 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
   }
 
   /**
+   * Store a level cell, and record how to take it back out.
+   *
+   * `setLevel` changes nothing when it refuses an op, and an op late in a
+   * batch reads what the ops before it wrote, so it cannot all be checked
+   * first. It writes as it goes instead, and a refusal undoes the writes.
+   */
+  function putLevelCell(
+    metric: string,
+    at: number,
+    dimKey: string,
+    level: number,
+    undo: (() => void)[],
+  ): void {
+    const byBucket = bucketsFor(metric)
+    const hadBucket = byBucket.has(at)
+    const previous = byBucket.get(at)?.get(dimKey)
+    cellSlot(metric, at, dimKey).set(dimKey, { level: plainZero(level) })
+    undo.push(() => {
+      const bucket = byBucket.get(at)
+      if (!bucket) return
+      if (previous !== undefined) {
+        bucket.set(dimKey, previous)
+        return
+      }
+      bucket.delete(dimKey)
+      removeHolder(metric, dimKey)
+      if (!hadBucket && bucket.size === 0) byBucket.delete(at)
+    })
+  }
+
+  /** Store a level series, and record how to put the old one back. */
+  function putLevelSeries(
+    series: Map<string, LevelSeries>,
+    next: LevelSeries,
+    undo: (() => void)[],
+  ): void {
+    const previous = series.get(next.dimKey)
+    series.set(next.dimKey, next)
+    undo.push(() => {
+      if (previous === undefined) series.delete(next.dimKey)
+      else series.set(next.dimKey, previous)
+    })
+  }
+
+  /**
    * Refuse a batch that would take a metric past `maxSeries`, before any of
    * it is stored.
    *
@@ -418,6 +463,117 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     return [...planned.values()]
   }
 
+  /** One level op, its writes recorded in `undo`. See {@link Driver.setLevel}. */
+  function applyLevel(op: LevelOp, undo: (() => void)[]): void {
+    const series = levelsFor(op.metric)
+    const held = series.get(op.dimKey)
+
+    if (op.mode === 'hold') {
+      // a series storage has never seen has nothing to carry, and a hold
+      // must not be what brings one into existence
+      if (!held) return
+
+      // the value the window ends at: the one carried into it, or the one a
+      // write already put there
+      let carried = plainZero(op.value)
+
+      // a window some claim has already taken is not filled again: that
+      // would ship it a second time. The pointer still moves past it
+      const claimed = landing(op.metric, op.bucketTs) !== op.bucketTs
+      if (!claimed) {
+        const written = bucketsFor(op.metric).get(op.bucketTs)?.get(op.dimKey)
+        // a written value always beats a carried one, so a window that
+        // already has a cell keeps it, and so does `carried`. The hold's
+        // value was read before that write landed
+        if (written === undefined) putLevelCell(op.metric, op.bucketTs, op.dimKey, carried, undo)
+        else if (isLevelCell(written)) carried = written.level
+      }
+
+      // `carried` belongs to the pointer's window. A hold for an older
+      // window, from a flusher whose clock runs behind, arrives after the
+      // pointer has passed it and must not drag `carried` back with it. Nor
+      // may a hold for the pointer's own window that arrives again once a
+      // claim has taken it: the cell that would say what it ended at is gone,
+      // and `carried` already holds that value
+      if (op.bucketTs > held.heldThrough || (op.bucketTs === held.heldThrough && !claimed)) {
+        putLevelSeries(series, { ...held, carried, heldThrough: op.bucketTs }, undo)
+      }
+      return
+    }
+
+    if (!held && series.size >= maxSeries) {
+      throw new Error(
+        `memory driver: ${op.metric} exceeded maxSeries (${maxSeries}), which a dim with ` +
+          'unbounded values will do. Put that value on an event instead',
+      )
+    }
+
+    const bucketTs = landing(op.metric, op.bucketTs)
+    const byBucket = bucketsFor(op.metric)
+    const cellAt = (at: number): number | undefined => {
+      const cell = byBucket.get(at)?.get(op.dimKey)
+      if (cell === undefined) return undefined
+      if (!isLevelCell(cell)) {
+        throw new Error(
+          `memory driver: ${op.metric} holds ${isGaugeCell(cell) ? 'gauge' : 'counter'} ` +
+            'cells, and set is a level op',
+        )
+      }
+      return cell.level
+    }
+
+    // windows after this one that already hold a value for the series. Two
+    // processes writing across a boundary can land the later window first,
+    // and the rule below keeps both windows right whichever arrives second
+    const later = [...byBucket.keys()]
+      .filter((at) => at > bucketTs && cellAt(at) !== undefined)
+      .sort((a, b) => a - b)
+
+    const plan = planLevelWrite(
+      op,
+      bucketTs,
+      held,
+      cellAt(bucketTs),
+      later,
+      () => {
+        // the value in effect just before this window: the newest cell
+        // between the pointer and here, or what the pointer carried
+        let before: number | undefined
+        let newest = Number.NEGATIVE_INFINITY
+        for (const at of byBucket.keys()) {
+          const level = at < bucketTs && at > (held?.heldThrough ?? -1) ? cellAt(at) : undefined
+          if (level !== undefined && at > newest) {
+            newest = at
+            before = level
+          }
+        }
+        return before ?? held?.carried ?? 0
+      },
+      (at) => cellAt(at) as number,
+    )
+
+    for (const [, level] of plan.cells) assertFinite(level, op.metric, 'level')
+    assertFinite(plan.series.value, op.metric, 'level')
+    if (op.integer) {
+      for (const [, level] of plan.cells) assertSafe(level, op.metric, 'level')
+      assertSafe(plan.series.value, op.metric, 'level')
+    }
+
+    // the bucket first, because `cellSlot` is the other thing that can
+    // refuse on the cap, and a held value written before it would name a
+    // window that holds nothing
+    for (const [at, level] of plan.cells) putLevelCell(op.metric, at, op.dimKey, level, undo)
+    putLevelSeries(
+      series,
+      {
+        ...plan.series,
+        value: plainZero(plan.series.value),
+        carried: plainZero(plan.series.carried),
+      },
+      undo,
+    )
+  }
+
   return {
     capabilities: {
       durable: false,
@@ -474,110 +630,14 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     },
 
     async setLevel(ops: readonly LevelOp[]): Promise<void> {
-      for (const op of ops) {
-        const series = levelsFor(op.metric)
-        const held = series.get(op.dimKey)
-
-        if (op.mode === 'hold') {
-          // a series storage has never seen has nothing to carry, and a hold
-          // must not be what brings one into existence
-          if (!held) continue
-
-          // the value the window ends at: the one carried into it, or the one
-          // a write already put there
-          let carried = plainZero(op.value)
-
-          // a window some claim has already taken is not filled again: that
-          // would ship it a second time. The pointer still moves past it
-          if (landing(op.metric, op.bucketTs) === op.bucketTs) {
-            const bucket = cellSlot(op.metric, op.bucketTs, op.dimKey)
-            const written = bucket.get(op.dimKey)
-            // a written value always beats a carried one, so a window that
-            // already has a cell keeps it, and so does `carried`. The hold's
-            // value was read before that write landed
-            if (written === undefined) bucket.set(op.dimKey, { level: carried })
-            else if (isLevelCell(written)) carried = written.level
-          }
-
-          // `carried` belongs to the pointer's window. A hold for an older
-          // window, from a flusher whose clock runs behind, arrives after the
-          // pointer has passed it and must not drag `carried` back with it
-          if (op.bucketTs >= held.heldThrough) {
-            series.set(op.dimKey, { ...held, carried, heldThrough: op.bucketTs })
-          }
-          continue
-        }
-
-        if (!held && series.size >= maxSeries) {
-          throw new Error(
-            `memory driver: ${op.metric} exceeded maxSeries (${maxSeries}), which a dim with ` +
-              'unbounded values will do. Put that value on an event instead',
-          )
-        }
-
-        const bucketTs = landing(op.metric, op.bucketTs)
-        const byBucket = bucketsFor(op.metric)
-        const cellAt = (at: number): number | undefined => {
-          const cell = byBucket.get(at)?.get(op.dimKey)
-          if (cell === undefined) return undefined
-          if (!isLevelCell(cell)) {
-            throw new Error(
-              `memory driver: ${op.metric} holds ${isGaugeCell(cell) ? 'gauge' : 'counter'} ` +
-                'cells, and set is a level op',
-            )
-          }
-          return cell.level
-        }
-
-        // windows after this one that already hold a value for the series.
-        // Two processes writing across a boundary can land the later window
-        // first, and the rule below keeps both windows right whichever
-        // arrives second
-        const later = [...byBucket.keys()]
-          .filter((at) => at > bucketTs && cellAt(at) !== undefined)
-          .sort((a, b) => a - b)
-
-        const plan = planLevelWrite(
-          op,
-          bucketTs,
-          held,
-          cellAt(bucketTs),
-          later,
-          () => {
-            // the value in effect just before this window: the newest cell
-            // between the pointer and here, or what the pointer carried
-            let before: number | undefined
-            let newest = Number.NEGATIVE_INFINITY
-            for (const at of byBucket.keys()) {
-              const level = at < bucketTs && at > (held?.heldThrough ?? -1) ? cellAt(at) : undefined
-              if (level !== undefined && at > newest) {
-                newest = at
-                before = level
-              }
-            }
-            return before ?? held?.carried ?? 0
-          },
-          (at) => cellAt(at) as number,
-        )
-
-        for (const [, level] of plan.cells) assertFinite(level, op.metric, 'level')
-        assertFinite(plan.series.value, op.metric, 'level')
-        if (op.integer) {
-          for (const [, level] of plan.cells) assertSafe(level, op.metric, 'level')
-          assertSafe(plan.series.value, op.metric, 'level')
-        }
-
-        // the bucket first, because `cellSlot` is the other thing that can
-        // refuse on the cap, and a held value written before it would name a
-        // window that holds nothing
-        for (const [at, level] of plan.cells) {
-          cellSlot(op.metric, at, op.dimKey).set(op.dimKey, { level: plainZero(level) })
-        }
-        series.set(op.dimKey, {
-          ...plan.series,
-          value: plainZero(plan.series.value),
-          carried: plainZero(plan.series.carried),
-        })
+      // a refused op takes the whole call back with it, so a batch is
+      // applied entirely or not at all
+      const undo: (() => void)[] = []
+      try {
+        for (const op of ops) applyLevel(op, undo)
+      } catch (error) {
+        for (const step of undo.reverse()) step()
+        throw error
       }
     },
 

@@ -663,6 +663,30 @@ void [
 ]
 
 describe('merging series inside one window', () => {
+  it('refuses a rollup it does not know', async () => {
+    const hits = counter('hits', { dims: DIMS, resolution: '10s', flush: '1m', write: discard })
+    createHouse({ driver, schema: [hits], now })
+    await expect(hits.snapshot({ rollup: 'avg' as unknown as 'sum' })).rejects.toThrow(
+      `hits: rollup must be 'none' or 'sum', got "avg"`,
+    )
+  })
+
+  it('leaves an absent dim named after an inherited property off a grouped row', async () => {
+    const hits = counter('hits', {
+      dims: { route: str(), constructor: str().optional() },
+      resolution: '10s',
+      flush: '1m',
+      write: discard,
+    })
+    createHouse({ driver, schema: [hits], now })
+    // cast: TypeScript reads the inherited `constructor` off the literal too
+    hits.add({ route: '/a' } as never)
+    await hits.drain()
+
+    const [grouped] = await hits.snapshot({ complete: false, groupBy: ['route', 'constructor'] })
+    expect(Object.hasOwn(grouped ?? {}, 'constructor')).toBe(false)
+  })
+
   it('leaves an absent optional dim off a grouped row, as it is off an ungrouped one', async () => {
     const signups = counter('signups', {
       dims: { plan: str(), campaign: str().optional() },
