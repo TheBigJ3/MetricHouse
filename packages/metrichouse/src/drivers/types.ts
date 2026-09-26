@@ -314,6 +314,17 @@ export const NOTHING_RECOVERED: RecoveryReport = Object.freeze({
 })
 
 /**
+ * What {@link Driver.takeTurn} answers.
+ *
+ * Granted, it carries the turn it replaced, so a flush that ships nothing can
+ * put that one back with {@link Driver.returnTurn}. Refused, it carries when
+ * the turn in the way was taken, so the flush can say how long to wait.
+ */
+export type ShipTurn =
+  | { readonly granted: true; readonly previous: number | undefined }
+  | { readonly granted: false; readonly lastTakenAt: number }
+
+/**
  * What a driver can honestly promise. The house reads this to decide whether
  * at-least-once is available, and warns once at boot when it is not.
  */
@@ -501,4 +512,40 @@ export interface Driver {
    * left to recover and {@link NOTHING_RECOVERED} is the honest answer.
    */
   recover(metric: string): Promise<RecoveryReport>
+
+  /**
+   * Take this metric's turn to ship, on behalf of every process sharing the
+   * driver, and record `now` as the time it was taken.
+   *
+   * A metric's `flush` setting bounds how often it ships. Each process keeps
+   * that clock for itself, and with only that, N processes sharing a driver
+   * ship up to N times an interval between them: the claim stops two of them
+   * shipping the same rows, but not each of them shipping a few. The turn is
+   * the one clock they share.
+   *
+   * Granted when no turn has been taken, or when the last one is `gapMs` or
+   * more away from `now` in either direction. A turn taken slightly in the
+   * future is another host whose clock runs ahead, and it holds this one back
+   * like any other. One more than `gapMs` ahead is a clock that has stepped
+   * backwards, and holding back until it caught up would stall the metric
+   * for as long as the step was. A `gapMs` of `0` is always granted, and
+   * still records the turn.
+   *
+   * Check and record are one atomic step, so of two processes asking at the
+   * same moment one is granted and the other refused.
+   *
+   * Optional, and a driver that has it has {@link returnTurn} too. Without
+   * them each process keeps the cadence for itself.
+   */
+  takeTurn?(metric: string, now: number, gapMs: number): Promise<ShipTurn>
+
+  /**
+   * Give back a turn that shipped nothing, putting `previous` in its place,
+   * or clearing it when `previous` is `undefined`.
+   *
+   * Only while the recorded turn is still the one taken at `at`. A later turn
+   * belongs to a flush that is still running, and putting an older one over
+   * it would let a third process ship beside it.
+   */
+  returnTurn?(metric: string, at: number, previous: number | undefined): Promise<void>
 }

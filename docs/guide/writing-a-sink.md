@@ -479,3 +479,36 @@ Points worth keeping:
 - **Make it idempotent.** Retries are normal, not exceptional.
 - **Do not rewrite the data.** Rename columns and change types if you must, but
   the ids and the values should reach your table unchanged.
+
+### ClickHouse
+
+ClickHouse writes every insert to disk as a new part and merges parts in the
+background. Many small inserts outrun the merging, and the server starts
+refusing writes with `Too many parts`. Two settings keep inserts few and large.
+
+The first is a `flush` interval long enough that each insert carries a good
+number of rows. On `ioredis()` it holds across every server, as
+[Several processes on one driver](/guide/flushing#several-processes-on-one-driver)
+explains, so adding servers does not add inserts.
+
+The second is asynchronous inserts, which let ClickHouse gather small inserts
+from many clients into one part:
+
+```ts
+await clickhouse.insert({
+  table,
+  values: rows,
+  format: 'JSONEachRow',
+  clickhouse_settings: {
+    async_insert: 1,
+    // answer only once the gathered rows are written, so a returned insert
+    // is on disk before MetricHouse deletes its copy
+    wait_for_async_insert: 1,
+  },
+})
+```
+
+Keep `wait_for_async_insert` at `1`, which is its default. At `0`, ClickHouse
+answers as soon as the rows are in its memory buffer. Your sink returns,
+MetricHouse deletes the claim, and a ClickHouse crash before the buffer is
+written loses rows that nothing will send again.

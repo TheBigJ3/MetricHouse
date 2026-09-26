@@ -57,7 +57,10 @@ process.on('SIGINT', shutdown)
 ```
 
 Move to `ioredis()` when you run more than one instance and want live reads to
-describe the whole fleet rather than one process.
+describe the whole fleet rather than one process. Every instance runs the same
+`house.start()`. They take turns through Redis, so each metric ships once per
+interval for the fleet, however many instances there are. See
+[Several processes on one driver](/guide/flushing#several-processes-on-one-driver).
 
 ## Vercel
 

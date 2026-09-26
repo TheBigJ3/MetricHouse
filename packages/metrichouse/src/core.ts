@@ -25,6 +25,7 @@ export type {
   PendingQuery,
   RecordClaim,
   RecoveryReport,
+  ShipTurn,
   StagedRecord,
 } from './drivers/types.js'
 // the driver contract, for anyone implementing a backend

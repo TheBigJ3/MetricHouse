@@ -11,7 +11,9 @@ Nothing flushes on its own. Something has to ask.
 </figure>
 
 1. **Check the cadence.** If this metric shipped recently, stop and report that
-   it was skipped.
+   it was skipped. On a shared driver such as `ioredis()`, a shipment from any
+   process counts, as [Several processes on one driver](#several-processes-on-one-driver)
+   explains.
 2. **Recover.** Put back anything a previous flusher claimed and then died
    holding, so this flush can ship it. Almost always there is nothing to do, and
    on `memory()` there is never anything to do.
@@ -115,7 +117,9 @@ setInterval(() => house.flush(), 10_000)
 ```
 
 With `flush: '5m'` that is 30 calls that report `skipped: true` and one that
-ships. Each skipped call is a clock comparison and nothing else.
+ships. A call this process can rule out from its own last shipment is a clock
+comparison and nothing else. On a shared driver, a call it cannot rule out
+asks the driver, which is one round trip.
 
 Ignore the cadence when you need to:
 
@@ -144,6 +148,60 @@ one there is nothing to measure from, so the first flush always goes ahead,
 whatever the clock reads. If the clock steps backwards, say an NTP correction of
 an hour, the next flush goes ahead too, instead of waiting for the clock to catch
 back up.
+
+### Several processes on one driver
+
+With a driver every process can see, such as `ioredis()`, the cadence holds for
+the whole fleet. Every server runs the same code, and each metric still ships
+at most once per `flush` interval between all of them.
+
+```ts
+// on every server
+house.start()
+```
+
+Before a flush claims anything, it takes the metric's turn from the driver. The
+driver records when the turn was taken and refuses the next one until a full
+interval has passed, whichever process asks. A refused flush reports
+`skipped: true` with `reason: 'cadence'`, and `nextEligibleInMs` counts from the
+turn the other process took.
+
+```ts
+// flush: '1m', and server A shipped 20 seconds ago
+const report = await httpRequests.flush()      // on server B
+// { buckets: 0, rows: 0, skipped: true, reason: 'cadence', nextEligibleInMs: 40_000 }
+```
+
+A flush that writes nothing gives its turn back, so another process can ship
+straight away. That covers a flush that found nothing closed and one whose
+`write` function threw.
+
+Each process keeping its own clock would let ten servers on `flush: '1m'` make
+up to ten small inserts a minute between them. The claim stops two of them
+shipping the same rows, and nothing else would stop each of them shipping a
+few. A columnar database such as ClickHouse writes each insert to disk as a
+separate part, and too many small ones is the load it handles worst.
+
+What follows from how the turn works:
+
+- **Whichever server asks first ships.** Once the interval is over, the next
+  flush from any server takes the turn and ships everything closed. One large
+  insert per interval is what the database wants, so the work is left on one
+  server rather than split into smaller inserts.
+- **The turn uses each server's own clock.** Servers whose clocks differ by a
+  few milliseconds see the interval move by that much. A turn stamped by a clock
+  running ahead, by less than one interval, holds the others back like any
+  other. One more than an interval away is taken as a clock that stepped, and
+  the flush goes ahead.
+- **`force` and `final` ship regardless**, and still record their turn, so the
+  other servers count the interval from that shipment.
+- **A locally staged event takes no turn.** Its records sit in one process's
+  memory, and only that process can ship them.
+- **`memory()` takes no turn either.** It serves one process, and the clock
+  that process keeps is enough.
+
+A flush that cannot reach the driver to take its turn reports the failure as
+its `error`, and claims nothing.
 
 ## Only finished windows ship
 

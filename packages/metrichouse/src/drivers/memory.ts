@@ -29,6 +29,7 @@ import {
   type PendingQuery,
   type RecordClaim,
   type RecoveryReport,
+  type ShipTurn,
   type StagedRecord,
 } from './types.js'
 
@@ -269,6 +270,9 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
    * window that already went. See {@link Driver.claim}.
    */
   const claimedUpTo = new Map<string, number>()
+
+  /** metric -> when its last turn to ship was taken. See {@link Driver.takeTurn}. */
+  const turns = new Map<string, number>()
 
   /** Where a write aimed at `bucketTs` actually lands. */
   function landing(metric: string, bucketTs: number): number {
@@ -920,6 +924,21 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       // That is the whole of what `durable: false` costs, said once more here
       // so it cannot be mistaken for an oversight.
       return NOTHING_RECOVERED
+    },
+
+    async takeTurn(metric: string, now: number, gapMs: number): Promise<ShipTurn> {
+      const last = turns.get(metric)
+      if (last !== undefined && Math.abs(now - last) < gapMs) {
+        return { granted: false, lastTakenAt: last }
+      }
+      turns.set(metric, now)
+      return { granted: true, previous: last }
+    },
+
+    async returnTurn(metric: string, at: number, previous: number | undefined): Promise<void> {
+      if (turns.get(metric) !== at) return
+      if (previous === undefined) turns.delete(metric)
+      else turns.set(metric, previous)
     },
   }
 }

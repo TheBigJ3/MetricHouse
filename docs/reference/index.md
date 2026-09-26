@@ -280,7 +280,7 @@ All of these are exported as types from `metrichouse/core`.
 **Drivers**
 `Driver`, `DriverCapabilities`, `Cell`, `GaugeCell`, `LevelCell`, `LevelSeries`, `BucketRow`, `BucketQuery`, `BucketRange`,
 `PendingQuery`, `StagedRecord`, `Claim`, `BucketClaim`, `RecordClaim`,
-`ClaimedBucket`, `IncrOp`, `GaugeOp`, `LevelOp`, `AppendOp`, `RecoveryReport`, `Hasher`
+`ClaimedBucket`, `IncrOp`, `GaugeOp`, `LevelOp`, `AppendOp`, `RecoveryReport`, `ShipTurn`, `Hasher`
 
 **Extension points**
 `BatchLifecycle`, `BucketedOptions`, `BucketedReader`, `BucketedReaderOptions`,

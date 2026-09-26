@@ -5,7 +5,7 @@
  * is the whole unit:
  *
  * ```
- * cadence -> claimBatch(now) -> shipClaim -> ack | release
+ * cadence -> turn -> claimBatch(now) -> shipClaim -> ack | release
  * ```
  *
  * {@link runFlush} is a loop over that and nothing else. The house is a
@@ -19,7 +19,7 @@
  * five {@link AnyMetric} batch methods plus this mixin, and no edit here.
  */
 
-import type { RecoveryReport } from '../drivers/types.js'
+import type { Driver, RecoveryReport, ShipTurn } from '../drivers/types.js'
 import { type AnyMetric, SETTLE, type WriteFn } from '../metrics/types.js'
 import { type ShipOutcome, shipClaim } from './ship.js'
 
@@ -125,10 +125,14 @@ export interface FlushReport {
  */
 interface FlushState {
   /**
-   * When this metric last actually shipped rows. Unset until the first one,
-   * so a fresh metric ships as soon as anything is closed rather than sitting
-   * on data for a full interval, whatever the clock reads. An empty flush
-   * does not move it.
+   * When this process last actually shipped rows of this metric. Unset until
+   * the first one, so a fresh metric ships as soon as anything is closed
+   * rather than sitting on data for a full interval, whatever the clock
+   * reads. An empty flush does not move it.
+   *
+   * With a shared driver this is only the half of the cadence this process
+   * can see for itself, checked first because it costs nothing. The turn the
+   * driver keeps is the half every process sees.
    */
   lastFlushMs: number | undefined
 }
@@ -186,6 +190,17 @@ export interface MetricFlushOptions {
    * that only ships through `flush()` can leave it out.
    */
   readonly attempts?: Attempts
+  /**
+   * The driver that keeps this metric's turn to ship, so every process
+   * sharing it holds to one cadence between them. See {@link Driver.takeTurn}.
+   * Asked only when its capabilities say it is shared: a driver no other
+   * process can see has nobody to take turns with.
+   *
+   * Left out, or answering `undefined`, the cadence is this process's alone.
+   * That is right for a locally staged event, whose records only this process
+   * holds: a turn another process took would stop it shipping its own.
+   */
+  readonly sharedDriver?: () => Driver | undefined
 }
 
 /**
@@ -256,9 +271,11 @@ export function metricFlush(
     //    millisecond before `now()` agrees a full interval has passed.
     //    Refusing it would push that metric back a whole interval.
     const flushMs = options.flushMs()
-    if (!flushOptions.force && !final && state.lastFlushMs !== undefined) {
+    const ignoreCadence = flushOptions.force === true || final
+    const gapMs = flushMs - cadenceSlack(flushMs)
+    if (!ignoreCadence && state.lastFlushMs !== undefined) {
       const elapsed = now - state.lastFlushMs
-      if (elapsed >= 0 && elapsed < flushMs - cadenceSlack(flushMs)) {
+      if (elapsed >= 0 && elapsed < gapMs) {
         return {
           buckets: 0,
           rows: 0,
@@ -269,6 +286,58 @@ export function metricFlush(
       }
     }
 
+    //    Then the turn every process sharing the driver keeps, since this
+    //    process may not be the one that shipped last. `force` and `final`
+    //    still take it, with no gap, so the processes that keep to the
+    //    cadence count from what they shipped.
+    const driver = options.sharedDriver?.()
+    let turn: { readonly driver: Driver; readonly previous: number | undefined } | undefined
+    if (driver?.capabilities.shared === true && driver.takeTurn !== undefined) {
+      let taken: ShipTurn
+      try {
+        taken = await driver.takeTurn(options.name, now, ignoreCadence ? 0 : gapMs)
+      } catch (error) {
+        return { buckets: 0, rows: 0, skipped: false, error }
+      }
+      if (!taken.granted) {
+        return {
+          buckets: 0,
+          rows: 0,
+          skipped: true,
+          reason: 'cadence',
+          nextEligibleInMs: taken.lastTakenAt + flushMs - now,
+        }
+      }
+      turn = { driver, previous: taken.previous }
+    }
+
+    const { report, wrote } = await ship(metric, now, final)
+
+    // a turn that wrote nothing, because nothing was closed or because the
+    // sink failed, was not a shipment, for the same reason those leave
+    // `lastFlushMs` alone. Given back on a best effort basis: failing to
+    // means the fleet waits one interval before the next try, and the
+    // flush's own failure, if it had one, is already in the report
+    if (turn !== undefined && !wrote) {
+      try {
+        await turn.driver.returnTurn?.(options.name, now, turn.previous)
+      } catch {
+        // see above
+      }
+    }
+    return report
+  }
+
+  /**
+   * Steps 2 to 5, for a flush the cadence has let through. `wrote` says
+   * whether any claim reached the sink and was written, which `rows` cannot:
+   * it also counts the rows of a write that failed.
+   */
+  async function ship(
+    metric: AnyMetric,
+    now: number,
+    final: boolean,
+  ): Promise<{ report: MetricFlushReport; wrote: boolean }> {
     // 2. recover. A batch claimed by a flusher that then died is already
     //    out of the live set, so `claimBatch` cannot reach it however long
     //    it waits. Putting it back first is what lets this flush ship it.
@@ -304,6 +373,7 @@ export function metricFlush(
     //    chasing records another process is still appending.
     let buckets = 0
     let rows = 0
+    let wrote = false
     let ackError: unknown
     for (let claims = 0; claims < FINAL_CLAIM_CAP; claims++) {
       let outcome: ShipOutcome
@@ -312,13 +382,13 @@ export function metricFlush(
         const claim = await metric.claimBatch(now, { final })
         outcome = await shipClaim(metric, claim, options.sink(), { attempts, source: 'flush' })
       } catch (error) {
-        return { buckets, rows, skipped: false, error, ...repair }
+        return { report: { buckets, rows, skipped: false, error, ...repair }, wrote }
       }
 
       buckets += outcome.buckets
       rows += outcome.rows
       if (outcome.error !== undefined) {
-        return {
+        const report = {
           buckets,
           rows,
           skipped: false,
@@ -326,7 +396,9 @@ export function metricFlush(
           ...(outcome.releaseError !== undefined && { releaseError: outcome.releaseError }),
           ...repair,
         }
+        return { report, wrote }
       }
+      if (outcome.rows > 0) wrote = true
       if (outcome.ackError !== undefined) ackError ??= outcome.ackError
       if (!final || outcome.rows === 0) break
     }
@@ -340,12 +412,12 @@ export function metricFlush(
       // later would then wait a full interval. The coarser the resolution,
       // the worse it gets, because early flushes always find the only bucket
       // still open.
-      return { buckets: 0, rows: 0, skipped: false, ...settled }
+      return { report: { buckets: 0, rows: 0, skipped: false, ...settled }, wrote }
     }
 
     state.lastFlushMs = now
 
-    return { buckets, rows, skipped: false, ...settled }
+    return { report: { buckets, rows, skipped: false, ...settled }, wrote }
   }
 }
 

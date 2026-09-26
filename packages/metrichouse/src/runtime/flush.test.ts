@@ -895,6 +895,171 @@ describe('metric.flush()', () => {
   })
 })
 
+describe('cadence across processes sharing a driver', () => {
+  /** A memory driver that says it is shared, as every process on one Redis sees theirs. */
+  const sharedMemory = (): Driver => {
+    const inner = memory()
+    return { ...inner, capabilities: { ...inner.capabilities, shared: true } }
+  }
+
+  /** One process: its own metric and house, on the driver every process shares. */
+  const processOn = (shared: Driver, write: WriteFn = vi.fn()) => {
+    const metric = make('m', { write })
+    const house = createHouse({ driver: shared, schema: [metric], now })
+    return { metric, house }
+  }
+
+  const written = async (proc: ReturnType<typeof processOn>) => {
+    proc.metric.add(A)
+    await proc.house.drain()
+    settle()
+  }
+
+  it('ships once per cadence between every process', async () => {
+    const shared = sharedMemory()
+    const first = vi.fn()
+    const second = vi.fn()
+    const one = processOn(shared, first)
+    const two = processOn(shared, second)
+
+    await written(one)
+    await one.metric.flush()
+    await written(two)
+    expect(await two.metric.flush()).toMatchObject({ skipped: true, reason: 'cadence' })
+    expect(second).not.toHaveBeenCalled()
+
+    clock += 300_000
+    expect(await two.metric.flush()).toMatchObject({ skipped: false, rows: 1 })
+    expect(first).toHaveBeenCalledTimes(1)
+    expect(second).toHaveBeenCalledTimes(1)
+  })
+
+  it('says how long until the turn another process took lets it ship', async () => {
+    const shared = sharedMemory()
+    const one = processOn(shared)
+    const two = processOn(shared)
+    await written(one)
+    const shippedAt = clock
+    await one.metric.flush()
+
+    clock = shippedAt + 1000
+    expect(await two.metric.flush()).toEqual({
+      buckets: 0,
+      rows: 0,
+      skipped: true,
+      reason: 'cadence',
+      nextEligibleInMs: 299_000,
+    })
+  })
+
+  it('gives the turn back when nothing was closed, so another process can ship at once', async () => {
+    const shared = sharedMemory()
+    const second = vi.fn()
+    const one = processOn(shared)
+    const two = processOn(shared, second)
+
+    expect(await one.metric.flush()).toMatchObject({ skipped: false, rows: 0 })
+    await written(two)
+    expect(await two.metric.flush()).toMatchObject({ skipped: false, rows: 1 })
+  })
+
+  it('gives the turn back when the write failed, so another process ships the rows', async () => {
+    const shared = sharedMemory()
+    const second = vi.fn()
+    const one = processOn(shared, () => {
+      throw new Error('clickhouse is down')
+    })
+    const two = processOn(shared, second)
+
+    await written(one)
+    expect((await one.metric.flush()).error).toEqual(new Error('clickhouse is down'))
+    await two.metric.flush()
+    expect(second.mock.calls[0]?.[0]).toMatchObject([{ dogName: 'Willow', value: 1 }])
+  })
+
+  it("ships under force inside another process's turn, and the others count from it", async () => {
+    const shared = sharedMemory()
+    const one = processOn(shared)
+    const two = processOn(shared)
+    await written(one)
+    const shippedAt = clock
+    await one.metric.flush()
+
+    clock = shippedAt + 1000
+    await written(two)
+    expect(await two.metric.flush({ force: true })).toMatchObject({ skipped: false, rows: 1 })
+
+    clock = shippedAt + 300_000
+    expect(await one.metric.flush()).toMatchObject({ skipped: true, reason: 'cadence' })
+  })
+
+  it("ships each process's locally staged events, since only that process holds them", async () => {
+    const shared = sharedMemory()
+    const first = vi.fn()
+    const second = vi.fn()
+    const local = (write: WriteFn) =>
+      event('clicks', { fields: { a: str() }, stage: 'local', flush: '5m', write })
+    const one = local(first)
+    const two = local(second)
+    createHouse({ driver: shared, schema: [one], now })
+    createHouse({ driver: shared, schema: [two], now })
+
+    one.record({ a: 'x' })
+    two.record({ a: 'y' })
+    await one.flush()
+    await two.flush()
+    expect(first.mock.calls[0]?.[0]).toMatchObject([{ a: 'x' }])
+    expect(second.mock.calls[0]?.[0]).toMatchObject([{ a: 'y' }])
+  })
+
+  it('keeps no turn on a driver that is not shared', async () => {
+    const second = vi.fn()
+    const one = processOn(driver)
+    const two = processOn(driver, second)
+
+    await written(one)
+    await one.metric.flush()
+    await written(two)
+    expect(await two.metric.flush()).toMatchObject({ skipped: false, rows: 1 })
+  })
+
+  it('reports a turn that cannot be taken as a failed flush, and claims nothing', async () => {
+    const shared = sharedMemory()
+    const refusing: Driver = {
+      ...shared,
+      takeTurn: () => Promise.reject(new Error('redis is down')),
+    }
+    const write = vi.fn()
+    const one = processOn(refusing, write)
+    await written(one)
+
+    expect(await one.metric.flush()).toEqual({
+      buckets: 0,
+      rows: 0,
+      skipped: false,
+      error: new Error('redis is down'),
+    })
+    expect(write).not.toHaveBeenCalled()
+    expect(await shared.readBuckets({ metric: 'm' })).toHaveLength(1)
+  })
+
+  it('keeps the flush report when the turn cannot be given back', async () => {
+    const shared = sharedMemory()
+    const stuck: Driver = {
+      ...shared,
+      returnTurn: () => Promise.reject(new Error('redis is down')),
+    }
+    const one = processOn(stuck, () => {
+      throw new Error('clickhouse is down')
+    })
+    await written(one)
+
+    const report = await one.metric.flush()
+    expect(report.error).toEqual(new Error('clickhouse is down'))
+    expect(report.rows).toBe(1)
+  })
+})
+
 // ---------------------------------------------------------------------------
 // types
 // ---------------------------------------------------------------------------

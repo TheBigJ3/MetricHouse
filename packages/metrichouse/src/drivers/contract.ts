@@ -1187,6 +1187,89 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       })
     })
 
+    describe('takeTurn', () => {
+      // optional, so a driver that keeps no turns passes without checking
+      const take = (now: number, gapMs = 1000, metric = M) => driver.takeTurn?.(metric, now, gapMs)
+
+      it('grants the first turn, with none before it', async () => {
+        if (!driver.takeTurn) return
+        expect(await take(5000)).toEqual({ granted: true, previous: undefined })
+      })
+
+      it('refuses a turn inside the gap, and says when the last one was taken', async () => {
+        if (!driver.takeTurn) return
+        await take(5000)
+        expect(await take(5999)).toEqual({ granted: false, lastTakenAt: 5000 })
+      })
+
+      it('grants a turn exactly the gap after the last, and hands back the one it replaced', async () => {
+        if (!driver.takeTurn) return
+        await take(5000)
+        expect(await take(6000)).toEqual({ granted: true, previous: 5000 })
+        expect(await take(6999)).toEqual({ granted: false, lastTakenAt: 6000 })
+      })
+
+      it('refuses a turn taken by a clock running less than the gap ahead', async () => {
+        if (!driver.takeTurn) return
+        await take(5000)
+        expect(await take(4001)).toEqual({ granted: false, lastTakenAt: 5000 })
+      })
+
+      it('grants a turn from a clock that stepped back the gap or more', async () => {
+        if (!driver.takeTurn) return
+        await take(5000)
+        expect(await take(4000)).toEqual({ granted: true, previous: 5000 })
+      })
+
+      it('always grants a gap of zero, and still records the turn', async () => {
+        if (!driver.takeTurn) return
+        await take(5000)
+        expect(await take(5000, 0)).toEqual({ granted: true, previous: 5000 })
+        expect(await take(5500)).toEqual({ granted: false, lastTakenAt: 5000 })
+      })
+
+      it('keeps a turn per metric', async () => {
+        if (!driver.takeTurn) return
+        await take(5000)
+        expect(await take(5000, 1000, G)).toEqual({ granted: true, previous: undefined })
+      })
+
+      it('grants one of two turns asked for at the same moment', async () => {
+        if (!driver.takeTurn) return
+        const answers = await Promise.all([take(5000), take(5000)])
+        expect(answers.filter((a) => a?.granted)).toHaveLength(1)
+      })
+    })
+
+    describe('returnTurn', () => {
+      const take = (now: number) => driver.takeTurn?.(M, now, 1000)
+      const giveBack = (at: number, previous: number | undefined) =>
+        driver.returnTurn?.(M, at, previous)
+
+      it('puts the previous turn back', async () => {
+        if (!driver.takeTurn) return
+        await take(5000)
+        await take(6000)
+        await giveBack(6000, 5000)
+        expect(await take(5500)).toEqual({ granted: false, lastTakenAt: 5000 })
+      })
+
+      it('clears the turn when there was none before it', async () => {
+        if (!driver.takeTurn) return
+        await take(5000)
+        await giveBack(5000, undefined)
+        expect(await take(5001)).toEqual({ granted: true, previous: undefined })
+      })
+
+      it('leaves a later turn alone', async () => {
+        if (!driver.takeTurn) return
+        await take(5000)
+        await take(6000)
+        await giveBack(5000, undefined)
+        expect(await take(6500)).toEqual({ granted: false, lastTakenAt: 6000 })
+      })
+    })
+
     describe('append', () => {
       it('stages records verbatim, in append order', async () => {
         await driver.append([rec('a', 1000, { dog: 'Willow' }), rec('b', 2000, { dog: 'Rex' })])

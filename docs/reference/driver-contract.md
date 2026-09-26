@@ -3,8 +3,10 @@
 A driver is where running totals and staged records live between a write and a
 flush. The interface is fourteen methods and one `capabilities` property, plus
 two [optional reads](#optional-reads) a driver may add to answer two questions
-with less data on the wire. Implementing it is how you put MetricHouse on
-storage it does not ship with.
+with less data on the wire, and two optional methods for
+[taking turns](#taking-turns), which keep every process sharing the driver to
+one flush cadence. Implementing it is how you put MetricHouse on storage it
+does not ship with.
 
 ```ts
 import type { Driver } from 'metrichouse/core'
@@ -58,7 +60,8 @@ interface DriverCapabilities {
 ```
 
 Declare these honestly. The house reads them at startup, warns when `durable` is
-false, and uses them to resolve `delivery: 'auto'`.
+false, and uses them to resolve `delivery: 'auto'`. A flush takes
+[turns](#taking-turns) only on a driver whose `shared` is true.
 
 ## What a driver stores
 
@@ -615,6 +618,63 @@ async recover() {
 }
 ```
 
+## Taking turns
+
+Two methods a driver may leave out, and has both of or neither. They keep one
+cadence for every process that shares the driver.
+
+```ts
+takeTurn?(metric: string, now: number, gapMs: number): Promise<ShipTurn>
+returnTurn?(metric: string, at: number, previous: number | undefined): Promise<void>
+
+type ShipTurn =
+  | { granted: true; previous: number | undefined }   // the turn this one replaced
+  | { granted: false; lastTakenAt: number }            // the turn in the way
+```
+
+A metric's `flush` setting is the fastest it may ship. Each process tracks its
+own last shipment, and on its own that lets N processes ship up to N times an
+interval between them. Before a flush claims, it calls `takeTurn`, and the
+driver answers for every process at once.
+
+### takeTurn
+
+Grant the turn and record `now` as the time it was taken, or refuse it.
+
+- Grant it when no turn has been taken for the metric.
+- Grant it when the last turn is `gapMs` or more away from `now`, before or
+  after it. A turn a little after `now` comes from a host whose clock runs
+  ahead, and it holds this one back like any other. One a whole gap after `now`
+  means this clock stepped backwards, and waiting for it to catch up would stall
+  the metric.
+- Refuse it otherwise, and answer when the last turn was taken.
+- A `gapMs` of `0` is always granted, and still recorded. That is how `force`
+  and `final` take one.
+
+Check and record in one atomic step. Two processes asking at the same moment
+must get one grant and one refusal. The Redis driver does both in one script,
+against a key per metric, `mh:turn:<metric>`, holding the time in milliseconds.
+
+The time is the caller's `now`, so an injected test clock applies to turns as it
+does to windows.
+
+### returnTurn
+
+Put `previous` back as the recorded turn, or clear the turn when `previous` is
+`undefined`. Do it only while the recorded turn is still the one taken at `at`.
+A later turn belongs to a flush that is still running, and writing an older
+time over it would let a third process ship beside that one.
+
+A flush calls it when it wrote nothing: the claim was empty, or the `write`
+function threw. A failure here is ignored. The next turn is then granted one
+interval later than it could have been, and nothing else changes.
+
+### Without them
+
+A driver that leaves both out, or says `shared: false`, gets a cadence kept in
+each process, which is all `memory()` needs. A flush on such a driver never
+calls them.
+
 ## The rules in full
 
 A driver has to satisfy all of these.
@@ -707,6 +767,21 @@ A driver has to satisfy all of these.
 - Two sweeps running at once put the data back once.
 - A sweep that reaches storage twice reports what the first arrival put back.
 
+**Taking turns**
+
+- The first turn for a metric is granted, with no previous turn.
+- A turn less than the gap after the last one is refused, and names it.
+- A turn exactly the gap after the last one is granted, and names the one it
+  replaced.
+- A turn less than the gap before the last one is refused.
+- A turn the gap or more before the last one is granted.
+- A gap of zero is always granted, and recorded.
+- Each metric keeps its own turn.
+- Of two turns asked for at once, one is granted.
+- Giving a turn back restores the previous one, or clears it when there was
+  none, and leaves a later turn alone.
+- A turn that reaches storage twice answers the way the first arrival did.
+
 ## Testing your driver
 
 The repository holds an executable version of the list above as a shared test
@@ -732,9 +807,9 @@ Anything a driver is *allowed* to differ on, such as a series cap, a key layout 
 whether a claim survives a restart, belongs in that driver's own test file rather
 than in the shared suite.
 
-The tests for the [optional reads](#optional-reads) pass without checking
-anything when a driver leaves the method out, and hold it to the rules above
-when it has one.
+The tests for the [optional reads](#optional-reads) and for
+[taking turns](#taking-turns) pass without checking anything when a driver
+leaves the methods out, and hold it to the rules above when it has them.
 
 ## A worked minimal driver
 

@@ -47,6 +47,7 @@ import {
   type PendingQuery,
   type RecordClaim,
   type RecoveryReport,
+  type ShipTurn,
   type StagedRecord,
 } from './types.js'
 
@@ -1049,6 +1050,63 @@ return { claims, buckets, records, oldest }
 `
 
 /**
+ * Take a metric's turn to ship, if the last one is far enough away.
+ *
+ * The rule {@link Driver.takeTurn} states, checked and recorded in one step.
+ * The time is the caller's, not Redis's: a turn is compared with the clock
+ * the flush reads, the one a test can inject, and hosts whose clocks disagree
+ * by a few milliseconds move the gap by that much and no more.
+ *
+ * Applied once, with its answer recorded. A turn resent after a reconnect
+ * would otherwise find the one it had just taken in its way and be refused,
+ * and the flush would skip while holding a turn nobody gives back.
+ *
+ * KEYS: turn. ARGV: now, gapMs. Returns `1` or `0` for granted, and the turn
+ * recorded before this one, or an empty string when there was none.
+ */
+const TAKE_TURN = `${LUA_ONCE}
+local replayed = mh_seen()
+if replayed then
+  local granted, last = string.match(replayed, '^(%d),(.*)$')
+  return { tonumber(granted), last }
+end
+
+local now = tonumber(ARGV[1])
+local gap = tonumber(ARGV[2])
+local last = redis.call('GET', KEYS[1])
+local granted = 1
+if last then
+  local elapsed = now - tonumber(last)
+  if elapsed < gap and -elapsed < gap then granted = 0 end
+end
+if granted == 1 then redis.call('SET', KEYS[1], ARGV[1]) end
+
+last = last or ''
+mh_mark(granted .. ',' .. last)
+return { granted, last }
+`
+
+/**
+ * Give back a turn that shipped nothing, while it is still the one recorded.
+ *
+ * KEYS: turn. ARGV: the turn being given back, the one to restore or an empty
+ * string to clear it.
+ */
+const RETURN_TURN = `${LUA_ONCE}
+if mh_seen() then return 1 end
+
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  if ARGV[2] == '' then
+    redis.call('DEL', KEYS[1])
+  else
+    redis.call('SET', KEYS[1], ARGV[2])
+  end
+end
+mh_mark()
+return 1
+`
+
+/**
  * One page of the staged list, starting after the last record the caller has
  * already read.
  *
@@ -1415,6 +1473,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     inflight: (claimId: string) => `${ns}:inflight:${claimId}`,
     claims: (metric: string) => `${ns}:claims:${metric}`,
     watermark: (metric: string) => `${ns}:wm:${metric}`,
+    turn: (metric: string) => `${ns}:turn:${metric}`,
     seq: `${ns}:seq`,
   }
 
@@ -2188,6 +2247,29 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       if (claims === 0) return NOTHING_RECOVERED
 
       return { claims, buckets, records, ...(oldest > 0 && { oldestClaimedAt: oldest }) }
+    },
+
+    async takeTurn(metric: string, now: number, gapMs: number): Promise<ShipTurn> {
+      const reply = await runScript(
+        { script: TAKE_TURN, once: true, keys: [key.turn(metric)], args: [now, gapMs] },
+        'takeTurn',
+      )
+      const [granted, last] = reply as [number, string]
+      const previous = last === '' ? undefined : Number(last)
+      if (granted === 1) return { granted: true, previous }
+      return { granted: false, lastTakenAt: previous as number }
+    },
+
+    async returnTurn(metric: string, at: number, previous: number | undefined): Promise<void> {
+      await runScript(
+        {
+          script: RETURN_TURN,
+          once: true,
+          keys: [key.turn(metric)],
+          args: [at, previous ?? ''],
+        },
+        'returnTurn',
+      )
     },
   }
 }

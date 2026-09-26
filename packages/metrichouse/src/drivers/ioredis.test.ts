@@ -876,6 +876,15 @@ if (!client) {
       await wipe(ns)
     })
 
+    it('grants a turn whose reply was lost and resent', async () => {
+      const ns = fresh()
+      const resent = ioredis(lostReply(), { namespace: ns })
+
+      expect(await resent.takeTurn?.(M, 5000, 1000)).toEqual({ granted: true, previous: undefined })
+      expect(await live.get(`${ns}:turn:${M}`)).toBe('5000')
+      await wipe(ns)
+    })
+
     it('claims at most limit records when the claim was resent', async () => {
       const ns = fresh()
       const plain = ioredis(live, { namespace: ns })

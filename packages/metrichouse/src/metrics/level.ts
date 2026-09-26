@@ -656,6 +656,7 @@ export function level<D extends Shape = Record<never, never>>(
       now: slot.now,
       self: () => self,
       attempts: slot.attempts,
+      sharedDriver: slot.driver,
     }),
 
     name,
