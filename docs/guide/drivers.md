@@ -270,6 +270,14 @@ export function myDriver(): Driver {
 The bodies are placeholders, so this compiles and does nothing useful yet.
 Fill in each one from the contract.
 
+Two more methods are optional. `readLevel` reads one series of a level, and
+`sumBuckets` adds up an integer counter's window where the data lives. Leave
+them out and every answer stays the same: `level.current(dims)` and
+`counter.current()` read through the fourteen methods instead, which fetches
+every series. Add them when your storage is across a network and a metric has
+many series. The [optional reads](/reference/driver-contract#optional-reads)
+section says what each one has to return.
+
 The full method by method contract, including the rules a driver has to obey, is
 in the [driver contract reference](/reference/driver-contract).
 

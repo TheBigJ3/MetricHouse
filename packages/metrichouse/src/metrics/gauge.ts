@@ -17,7 +17,7 @@ import { type Cell, type GaugeCell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
 import { metricFlush } from '../runtime/flush.js'
 import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
-import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
+import { assertDimsLegal, dimKeyDecoder, dimKeyEncoder } from '../schema/dims.js'
 import type { InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketStart } from '../time/buckets.js'
 import type { DurationInput } from '../time/duration.js'
@@ -221,8 +221,13 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     return cell
   }
 
+  // built once, here: every write encodes a key and every row a flush or a
+  // snapshot builds decodes one, against a declaration that never changes
+  const encodeKey = dimKeyEncoder(dims)
+  const decodeKey = dimKeyDecoder(dims)
+
   function keyFor(values: InferShape<D> | undefined): string {
-    return encodeDimKey(dims, (values ?? {}) as Record<string, unknown>)
+    return encodeKey((values ?? {}) as Record<string, unknown>)
   }
 
   /**
@@ -240,7 +245,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     const row: Row = {
       id: rowId(name, bucketTs, dimKey),
       bucket_ts: new Date(bucketTs),
-      ...decodeDimKey(dims, dimKey),
+      ...decodeKey(dimKey),
     }
     // only the declared aggregates become columns
     for (const column of aggregate) row[column] = fold[column]
@@ -332,6 +337,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       now: slot.now,
       materialize,
       mergeValues,
+      assertCell: asFold,
     }),
 
     ...metricFlush({

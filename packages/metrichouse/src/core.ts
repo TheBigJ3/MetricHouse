@@ -9,6 +9,7 @@ export type {
   AppendOp,
   BucketClaim,
   BucketQuery,
+  BucketRange,
   BucketRow,
   Cell,
   Claim,

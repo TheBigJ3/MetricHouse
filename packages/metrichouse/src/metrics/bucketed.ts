@@ -10,6 +10,7 @@
  */
 
 import {
+  type BucketRow,
   type Cell,
   type Claim,
   type Driver,
@@ -19,13 +20,16 @@ import {
 import { type Attempts, createAttempts } from '../runtime/flush.js'
 import {
   applySnapshot,
+  type BucketedRow,
   type LiveRow,
   type MergeValues,
   type SnapshotOptions,
+  sameValue,
   snapshotRange,
   type TypedSnapshot,
 } from '../runtime/live.js'
 import { shipOpenSeries } from '../runtime/ship.js'
+import { dimKeyDecoder } from '../schema/dims.js'
 import type { Shape } from '../schema/types.js'
 import { assertResolution, closedUpTo } from '../time/buckets.js'
 import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
@@ -252,6 +256,18 @@ export interface BucketedReaderOptions {
 }
 
 /**
+ * What the built in kinds pass on top of {@link BucketedReaderOptions}.
+ *
+ * `assertCell` throws what `materialize` throws for a cell of the wrong kind.
+ * With it, a snapshot filtered by `dims` checks the cells of rows the filter
+ * drops rather than building them, and still fails on the same cell with the
+ * same error. Without it every row is built, as before.
+ */
+interface BucketedReaderInternals extends BucketedReaderOptions {
+  readonly assertCell?: (cell: Cell) => void
+}
+
+/**
  * Live read for a bucketed kind.
  *
  * The sibling of {@link bucketedLifecycle}: that one is the write path's shared
@@ -264,9 +280,45 @@ export interface BucketedReaderOptions {
  * that straddles a boundary report two different answers about the same window.
  */
 export function bucketedReader<D extends Shape, V>(
-  options: BucketedReaderOptions,
+  options: BucketedReaderInternals,
 ): BucketedReader<D, V> {
-  const { name, resolutionMs, dims, driver, now, materialize, mergeValues } = options
+  const { name, resolutionMs, dims, driver, now, materialize, mergeValues, assertCell } = options
+  const decodeKey = dimKeyDecoder(dims)
+
+  /**
+   * Build the rows a `dims` filter keeps, and only those.
+   *
+   * Building a row hashes its id, which costs several times what reading its
+   * dims back from the key does, and a filter over a metric with many series
+   * keeps few of them. A kept row still goes through `applySnapshot`, which
+   * checks the filter's names and matches it again, so the answer and every
+   * error are what building every row gave. Rows are visited in order, and a
+   * row whose key cannot be read is built anyway, so the first bad row throws
+   * exactly what it threw before.
+   */
+  function built(live: readonly BucketRow[], filter: object | undefined): BucketedRow[] {
+    const wanted = filter !== undefined && filter !== null ? Object.entries(filter) : undefined
+    const out: BucketedRow[] = []
+    for (const one of live) {
+      if (wanted !== undefined && assertCell !== undefined) {
+        let values: Record<string, unknown> | undefined
+        try {
+          values = decodeKey(one.dimKey)
+        } catch {
+          // left to `materialize` below, which throws what it always threw
+        }
+        if (
+          values !== undefined &&
+          !wanted.every(([key, value]) => sameValue(values[key], value))
+        ) {
+          assertCell(one.value)
+          continue
+        }
+      }
+      out.push({ bucketTs: one.bucketTs, row: materialize(one.bucketTs, one.dimKey, one.value) })
+    }
+    return out
+  }
 
   // the one cast: `applySnapshot` works in erased rows because filtering and
   // merging are the same work whatever the columns are called, and the kind
@@ -279,14 +331,13 @@ export function bucketedReader<D extends Shape, V>(
 
       const live = await driver().readBuckets({ metric: name, ...range })
 
-      return applySnapshot(
-        live.map((row) => ({
-          bucketTs: row.bucketTs,
-          row: materialize(row.bucketTs, row.dimKey, row.value),
-        })),
-        snapshotOptions,
-        { metric: name, dims, resolutionMs, nowMs, mergeValues },
-      )
+      return applySnapshot(built(live, snapshotOptions.dims), snapshotOptions, {
+        metric: name,
+        dims,
+        resolutionMs,
+        nowMs,
+        mergeValues,
+      })
     },
   }
 

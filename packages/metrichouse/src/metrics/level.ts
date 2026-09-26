@@ -29,7 +29,7 @@ import {
   type SnapshotOptions,
   snapshotRange,
 } from '../runtime/live.js'
-import { assertDimsLegal, decodeDimKey, encodeDimKey, isShorterDimKey } from '../schema/dims.js'
+import { assertDimsLegal, dimKeyDecoder, dimKeyEncoder, isShorterDimKey } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketRange, bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
@@ -244,8 +244,13 @@ export function level<D extends Shape = Record<never, never>>(
     return cell.level
   }
 
+  // built once, here: every write encodes a key and every row a flush or a
+  // snapshot builds decodes one, against a declaration that never changes
+  const encodeKey = dimKeyEncoder(dims)
+  const decodeKey = dimKeyDecoder(dims)
+
   function keyFor(values: InferShape<D> | undefined): string {
-    return encodeDimKey(dims, (values ?? {}) as Record<string, unknown>)
+    return encodeKey((values ?? {}) as Record<string, unknown>)
   }
 
   /** The one write path. `set`, `inc` and `dec` all land here. */
@@ -277,7 +282,7 @@ export function level<D extends Shape = Record<never, never>>(
     return {
       id: rowId(name, bucketTs, dimKey),
       bucket_ts: new Date(bucketTs),
-      ...decodeDimKey(dims, dimKey),
+      ...decodeKey(dimKey),
       value: asLevel(cell),
     }
   }
@@ -387,10 +392,30 @@ export function level<D extends Shape = Record<never, never>>(
    * a series at its last window.
    */
   async function heldNow(): Promise<LevelSeries[]> {
-    const series = (await slot.driver().readLevels(name)).filter(carries)
-    if (holdForMs === undefined) return series
+    return reporting(await slot.driver().readLevels(name))
+  }
+
+  /** The series in `series` that {@link heldNow} would keep, read against the clock now. */
+  function reporting(series: readonly LevelSeries[]): LevelSeries[] {
+    const carried = series.filter(carries)
+    if (holdForMs === undefined) return carried
     const open = bucketStart(slot.now(), resolutionMs)
-    return series.filter((one) => open < (holdUntil(one) ?? Number.POSITIVE_INFINITY))
+    return carried.filter((one) => open < (holdUntil(one) ?? Number.POSITIVE_INFINITY))
+  }
+
+  /**
+   * The one series under `dimKey` still reporting in the open window.
+   *
+   * A driver that can read one series is asked for just that one, rather than
+   * for every series the level holds. The same filters apply either way.
+   */
+  async function heldNowAt(dimKey: string): Promise<LevelSeries | undefined> {
+    const driver = slot.driver()
+    if (driver.readLevel === undefined) {
+      return (await heldNow()).find((one) => one.dimKey === dimKey)
+    }
+    const one = await driver.readLevel(name, dimKey)
+    return one === undefined ? undefined : reporting([one])[0]
   }
 
   /**
@@ -686,9 +711,7 @@ export function level<D extends Shape = Record<never, never>>(
     },
 
     async current(...args: DimsArgs<D>): Promise<number | undefined> {
-      const dimKey = keyFor(args[0])
-      const series = await heldNow()
-      return series.find((one) => one.dimKey === dimKey)?.value
+      return (await heldNowAt(keyFor(args[0])))?.value
     },
 
     async totals(): Promise<number | undefined> {

@@ -867,6 +867,61 @@ describe('round two', () => {
   })
 })
 
+describe('current(dims) and the optional readLevel', () => {
+  it('asks the driver for the one series rather than every series', async () => {
+    const base = memory()
+    driver = {
+      ...base,
+      readLevels: async () => {
+        throw new Error('read every series')
+      },
+    }
+    const metric = bound()
+    metric.set(80, EMAIL)
+    metric.set(5, EXPORT)
+    await metric.drain()
+    expect(await metric.current(EMAIL)).toBe(80)
+    expect(await metric.current({ queue: 'nowhere' })).toBeUndefined()
+  })
+
+  it('answers the same through a driver without readLevel', async () => {
+    /** What current(dims) reports for each queue at each moment of one story. */
+    const story = async (plain: boolean) => {
+      clock = BASE
+      const { readLevel: _, ...required } = memory()
+      driver = plain ? required : memory()
+      const sink = collector()
+      const metric = bound({ write: sink.write, holdFor: '30s' })
+      const seen: (number | undefined)[] = []
+      const look = async () => {
+        seen.push(await metric.current(EMAIL), await metric.current(EXPORT))
+      }
+
+      metric.set(80, EMAIL)
+      metric.inc(4, EXPORT)
+      await metric.drain()
+      await look()
+      // carried through windows nobody wrote to, and across a flush
+      clock = at(2) + 3_000
+      await look()
+      await metric.flush()
+      await look()
+      metric.dec(EXPORT)
+      await metric.drain()
+      await look()
+      // past holdFor for EMAIL, which nothing has written since the start
+      clock = at(4) + 3_000
+      await look()
+      await metric.flush()
+      await look()
+      return seen
+    }
+    const withRead = await story(false)
+    expect(withRead).toEqual(await story(true))
+    expect(withRead).toEqual([80, 4, 80, 4, 80, 4, 80, 3, undefined, 3, undefined, 3])
+  })
+})
+
 /**
  * A Redis client for the tests a level runs on both drivers, or `undefined`
  * when no server answers. Those tests then run on `memory()` alone.

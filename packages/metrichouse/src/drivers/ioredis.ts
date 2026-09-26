@@ -32,6 +32,7 @@ import {
   type AppendOp,
   type BucketClaim,
   type BucketQuery,
+  type BucketRange,
   type BucketRow,
   type Cell,
   type Claim,
@@ -1120,6 +1121,64 @@ return n
 `
 
 /**
+ * One series' cells across a range of windows, in one round trip.
+ *
+ * Reads only, so a resend after a reconnect answers the same way and nothing
+ * needs recording. `pcall` rather than `call`, and the error handed back as
+ * it came, so a bad bound or a key of the wrong type fails with the words
+ * Redis uses for the plain command.
+ *
+ * KEYS: bucket index. ARGV: bucket key prefix, lower bound, upper bound, dim
+ * key. Returns bucketTs and raw cell pairs, oldest window first.
+ */
+const READ_SERIES = `
+local buckets = redis.pcall('ZRANGEBYSCORE', KEYS[1], ARGV[2], ARGV[3])
+if buckets.err then return buckets end
+local out = {}
+for i = 1, #buckets do
+  local raw = redis.pcall('HGET', ARGV[1] .. buckets[i], ARGV[4])
+  if type(raw) == 'table' and raw.err then return raw end
+  if raw then
+    out[#out + 1] = buckets[i]
+    out[#out + 1] = raw
+  end
+end
+return out
+`
+
+/**
+ * Every counter cell across a range of windows, added up where they live.
+ *
+ * Answers only when the answer is exact whatever order the cells are added
+ * in, so it is the number adding them one by one in JavaScript gives. That
+ * holds when every cell is a whole number, the positive cells add up to less
+ * than 2^53 and the negative ones to more than -2^53: every partial sum then
+ * lies between the two, where a double holds every whole number. A cell of any
+ * other shape, or a sum past either limit, returns nil, and the caller reads
+ * the cells instead.
+ *
+ * KEYS: bucket index. ARGV: bucket key prefix, lower bound, upper bound.
+ */
+const SUM_COUNTS = `
+local buckets = redis.pcall('ZRANGEBYSCORE', KEYS[1], ARGV[2], ARGV[3])
+if buckets.err then return buckets end
+local pos = 0
+local neg = 0
+for i = 1, #buckets do
+  local cells = redis.pcall('HVALS', ARGV[1] .. buckets[i])
+  if cells.err then return false end
+  for j = 1, #cells do
+    local raw = cells[j]
+    if not string.match(raw, '^%-?%d+$') then return false end
+    local x = tonumber(raw)
+    if x >= 0 then pos = pos + x else neg = neg + x end
+    if pos > 9007199254740991 or neg < -9007199254740991 then return false end
+  end
+end
+return string.format('%.17g', pos + neg)
+`
+
+/**
  * Marks an encoded `Date` inside a record's fields.
  *
  * `fields` is opaque to the driver, but it is not opaque to `JSON`: a `ts()`
@@ -1144,7 +1203,49 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && !isDate(value)
 }
 
-function encodeRecord(op: AppendOp): string {
+/**
+ * True when the replacer in {@link encodeRecord} would hand every value back
+ * untouched, so plain `JSON.stringify` writes the same bytes.
+ *
+ * That holds for a string or a number id and ts, and for fields in an ordinary
+ * object whose keys do not start with the reserved prefix and whose values are
+ * all strings, numbers, booleans, null or undefined. The replacer returns a
+ * primitive as it came, NaN, the infinities and `-0` included, and so does a
+ * string that happens to read like the date tag. Anything else, a Date, a
+ * nested object, an array, a boxed number, takes the replacer. An event
+ * stores its json fields as text, so its records are nearly always flat.
+ */
+function isFlatRecord(op: AppendOp): boolean {
+  if (typeof op.id !== 'string' || typeof op.ts !== 'number') return false
+  const fields: unknown = op.fields
+  if (fields === null || typeof fields !== 'object') return false
+  const proto = Object.getPrototypeOf(fields)
+  if (proto !== Object.prototype && proto !== null) return false
+  for (const key of Object.keys(fields)) {
+    if (key.startsWith(RESERVED_PREFIX)) return false
+    const value = (fields as Record<string, unknown>)[key]
+    const type = typeof value
+    if (type !== 'string' && type !== 'number' && type !== 'boolean' && value != null) {
+      return false
+    }
+  }
+  return true
+}
+
+/**
+ * A record as the text Redis stores. Exported for the tests, which hold it to
+ * the bytes {@link encodeRecordTagged} writes. The package entry does not
+ * export it.
+ */
+export function encodeRecord(op: AppendOp): string {
+  // the replacer is called once per value, which makes a stringify with one
+  // more than twice as slow, and a flat record has nothing for it to do
+  if (isFlatRecord(op)) return JSON.stringify({ id: op.id, ts: op.ts, fields: op.fields })
+  return encodeRecordTagged(op)
+}
+
+/** The full encoding, which tags a Date and escapes a reserved key. */
+export function encodeRecordTagged(op: AppendOp): string {
   return JSON.stringify({ id: op.id, ts: op.ts, fields: op.fields }, function (key, value) {
     // `value` has already been through Date.prototype.toJSON by the time a
     // replacer sees it. The original is only reachable through `this`
@@ -1164,11 +1265,31 @@ function encodeRecord(op: AppendOp): string {
   })
 }
 
-function decodeRecord(stored: string): StagedRecord {
+/** The JSON of a stored record, after the sequence stamp if it has one. */
+function recordJson(stored: string): string {
   // the sequence stamp from APPEND_RECORDS, if there is one. A record staged
   // before stamps existed starts with the JSON itself
-  const json = stored.startsWith('{') ? stored : stored.slice(stored.indexOf('|') + 1)
-  return JSON.parse(json, (_key, value) => {
+  return stored.startsWith('{') ? stored : stored.slice(stored.indexOf('|') + 1)
+}
+
+/**
+ * A stored record, back as the record. Exported for the tests, which hold it
+ * to what {@link decodeRecordTagged} returns. The package entry does not
+ * export it.
+ */
+export function decodeRecord(stored: string): StagedRecord {
+  const json = recordJson(stored)
+  // the reviver only changes an object with a key that starts with the
+  // reserved prefix, and JSON.stringify never escapes an underscore, so text
+  // without that prefix in quotes has nothing for it to do. Skipping it makes
+  // a parse about five times faster
+  if (!json.includes(`"${RESERVED_PREFIX}`)) return JSON.parse(json) as StagedRecord
+  return decodeRecordTagged(stored)
+}
+
+/** The full decoding, which restores a tagged Date and a reserved key. */
+export function decodeRecordTagged(stored: string): StagedRecord {
+  return JSON.parse(recordJson(stored), (_key, value) => {
     if (!isPlainObject(value)) return value
     const keys = Object.keys(value)
     const ms = value[DATE_TAG]
@@ -1196,6 +1317,22 @@ function numberFrom(raw: string | undefined): number {
   if (raw === 'inf') return Number.POSITIVE_INFINITY
   if (raw === '-inf') return Number.NEGATIVE_INFINITY
   return Number(raw)
+}
+
+/**
+ * A level series from its packed field, `value|carried|writtenAt|heldThrough`,
+ * or `undefined` for a field of any other shape, which is left unread.
+ */
+function levelSeriesFrom(dimKey: string, packed: string): LevelSeries | undefined {
+  const parts = packed.split('|')
+  if (parts.length !== 4) return undefined
+  return {
+    dimKey,
+    value: numberFrom(parts[0]),
+    carried: numberFrom(parts[1]),
+    writtenAt: Number(parts[2]),
+    heldThrough: Number(parts[3]),
+  }
 }
 
 /** A packed gauge fold, a level's held value, or a counter's scalar. */
@@ -1327,6 +1464,25 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
   }
 
   /**
+   * The SHA of each script, handed back without waiting when every one is
+   * cached already, which is every send after the first. Waiting on a
+   * promise per script cost a turn of the microtask queue and a handful of
+   * allocations on every single write.
+   */
+  function shasFor(
+    client: IoredisClient,
+    scripts: readonly string[],
+  ): string[] | Promise<string[]> {
+    const known: string[] = []
+    for (const script of scripts) {
+      const sha = shas.get(script)
+      if (sha === undefined) return Promise.all(scripts.map((one) => shaFor(client, one)))
+      known.push(sha)
+    }
+    return known
+  }
+
+  /**
    * Which call in a {@link runScripts} batch an error came from, so a write
    * spanning several metrics names the one that was refused rather than the
    * first one in the batch.
@@ -1443,9 +1599,11 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         indexes: readonly number[],
       ): Promise<[error: Error | null, result: unknown][] | null> =>
         inOrder(async () => {
-          const resolved = await Promise.all(
-            indexes.map((i) => shaFor(client, (chunk[i] as ScriptCall).script)),
+          const found = shasFor(
+            client,
+            indexes.map((i) => (chunk[i] as ScriptCall).script),
           )
+          const resolved = Array.isArray(found) ? found : await found
           // the floor is taken after the await, as late as possible, so it
           // accounts for every write still waiting at the moment this one goes
           const floor = floorOfUnanswered()
@@ -1730,18 +1888,34 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
       const series: LevelSeries[] = []
       for (const [dimKey, packed] of Object.entries(flat)) {
-        const parts = packed.split('|')
-        if (parts.length !== 4) continue
-        series.push({
-          dimKey,
-          value: numberFrom(parts[0]),
-          carried: numberFrom(parts[1]),
-          writtenAt: Number(parts[2]),
-          heldThrough: Number(parts[3]),
-        })
+        const one = levelSeriesFrom(dimKey, packed)
+        if (one !== undefined) series.push(one)
       }
 
       return series.sort((a, b) => (a.dimKey < b.dimKey ? -1 : 1))
+    },
+
+    async readLevel(metric: string, dimKey: string): Promise<LevelSeries | undefined> {
+      const client = await connect()
+      // one field of the level hash, where `readLevels` fetches all of them
+      const packed = await afterSends(() => client.hget(key.levels(metric), dimKey))
+      return packed === null ? undefined : levelSeriesFrom(dimKey, packed)
+    },
+
+    async sumBuckets(query: BucketRange): Promise<number | undefined> {
+      const reply = await runScript(
+        {
+          script: SUM_COUNTS,
+          keys: [key.idx(query.metric)],
+          args: [
+            key.bucketPrefix(query.metric),
+            query.from ?? '-inf',
+            query.to === undefined ? '+inf' : `(${query.to}`,
+          ],
+        },
+        'sumBuckets',
+      )
+      return typeof reply === 'string' ? Number(reply) : undefined
     },
 
     async dropLevels(
@@ -1787,51 +1961,58 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     },
 
     async readBuckets(query: BucketQuery): Promise<BucketRow[]> {
-      const client = await connect()
-
-      const buckets = await afterSends(() =>
-        client.zrangebyscore(
-          key.idx(query.metric),
-          query.from ?? '-inf',
-          // half-open: `(` is Redis for an exclusive bound
-          query.to === undefined ? '+inf' : `(${query.to}`,
-        ),
-      )
-      if (buckets.length === 0) return []
-
-      const rows: BucketRow[] = []
+      const lower = query.from ?? '-inf'
+      // half-open: `(` is Redis for an exclusive bound
+      const upper = query.to === undefined ? '+inf' : `(${query.to}`
 
       if (query.dimKey !== undefined) {
         // one field, not the whole hash, since a metric with a million series
-        // should not come over the wire to answer a question about one of them
+        // should not come over the wire to answer a question about one of
+        // them. One script finds the windows and reads the field in each, so
+        // `current(dims)` and every immediate send cost one round trip
         const dimKey = query.dimKey
-        const values = await runCommands(
-          buckets.map(
-            (bucketTs) => (pipeline: IoredisPipeline) =>
-              pipeline.hget(key.bucket(query.metric, bucketTs), dimKey),
-          ),
+        const reply = await runScript(
+          {
+            script: READ_SERIES,
+            keys: [key.idx(query.metric)],
+            args: [key.bucketPrefix(query.metric), lower, upper, dimKey],
+          },
           'readBuckets',
         )
-        buckets.forEach((bucketTs, index) => {
-          const raw = values[index]
-          if (typeof raw !== 'string') return
-          rows.push({ bucketTs: Number(bucketTs), dimKey, value: decodeCell(raw) })
-        })
-      } else {
-        const hashes = await runCommands(
-          buckets.map(
-            (bucketTs) => (pipeline: IoredisPipeline) =>
-              pipeline.hgetall(key.bucket(query.metric, bucketTs)),
-          ),
-          'readBuckets',
-        )
-        buckets.forEach((bucketTs, index) => {
-          const hash = (hashes[index] ?? {}) as Record<string, string>
-          for (const [dimKey, raw] of Object.entries(hash)) {
-            rows.push({ bucketTs: Number(bucketTs), dimKey, value: decodeCell(raw) })
-          }
-        })
+        const flat = (reply ?? []) as string[]
+        const rows: BucketRow[] = []
+        for (let i = 0; i < flat.length; i += 2) {
+          rows.push({
+            bucketTs: Number(flat[i]),
+            dimKey,
+            value: decodeCell(flat[i + 1] as string),
+          })
+        }
+        // the index is a sorted set and the windows arrive oldest first, but
+        // the order is stated here too rather than left to the script
+        return rows.sort((a, b) => a.bucketTs - b.bucketTs)
       }
+
+      const client = await connect()
+      const buckets = await afterSends(() =>
+        client.zrangebyscore(key.idx(query.metric), lower, upper),
+      )
+      if (buckets.length === 0) return []
+
+      const hashes = await runCommands(
+        buckets.map(
+          (bucketTs) => (pipeline: IoredisPipeline) =>
+            pipeline.hgetall(key.bucket(query.metric, bucketTs)),
+        ),
+        'readBuckets',
+      )
+      const rows: BucketRow[] = []
+      buckets.forEach((bucketTs, index) => {
+        const hash = (hashes[index] ?? {}) as Record<string, string>
+        for (const [dimKey, raw] of Object.entries(hash)) {
+          rows.push({ bucketTs: Number(bucketTs), dimKey, value: decodeCell(raw) })
+        }
+      })
 
       // deterministic, so callers and tests never depend on hash field order
       rows.sort((a, b) => a.bucketTs - b.bucketTs || (a.dimKey < b.dimKey ? -1 : 1))

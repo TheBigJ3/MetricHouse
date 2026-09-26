@@ -30,8 +30,23 @@ function fmix32(value: number): number {
   return h >>> 0
 }
 
+/** Every byte as two lowercase hex characters. */
+const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'))
+
+/**
+ * An unsigned 32 bit value as 8 hex characters, a byte at a time.
+ *
+ * The same text `value.toString(16).padStart(8, '0')` gives, at about a
+ * quarter of the cost. Every row id calls this four times, and on a large
+ * flush it was the most expensive single step.
+ */
 function toHex(value: number): string {
-  return value.toString(16).padStart(8, '0')
+  return (
+    (HEX[value >>> 24] as string) +
+    (HEX[(value >>> 16) & 0xff] as string) +
+    (HEX[(value >>> 8) & 0xff] as string) +
+    (HEX[value & 0xff] as string)
+  )
 }
 
 /**
@@ -118,6 +133,12 @@ export function naturalKey(dims: Shape): string[] {
   return ['bucket_ts', ...dimOrder(dims)]
 }
 
+/** Random bytes drawn from the platform ahead of need: 256 ids' worth. */
+const POOL_SIZE = 4096
+const pool = new Uint8Array(POOL_SIZE)
+/** The next unused byte. Starts past the end, so the first id fills the pool. */
+let poolOffset = POOL_SIZE
+
 /**
  * Random bytes, from the platform.
  *
@@ -128,17 +149,24 @@ export function naturalKey(dims: Shape): string[] {
  * way.
  */
 function randomBytes(length: number): Uint8Array {
-  const bytes = new Uint8Array(length)
   const source = globalThis.crypto
   if (source?.getRandomValues) {
-    source.getRandomValues(bytes)
+    // asking the platform once per id cost more than the rest of minting it,
+    // so the bytes are drawn a pool at a time. Each byte is handed out once:
+    // the offset only moves forward, and a refill replaces the whole pool
+    // before the offset goes back to its start
+    if (poolOffset + length > POOL_SIZE) {
+      source.getRandomValues(pool)
+      poolOffset = 0
+    }
+    const bytes = pool.slice(poolOffset, poolOffset + length)
+    poolOffset += length
     return bytes
   }
+  const bytes = new Uint8Array(length)
   for (let i = 0; i < length; i++) bytes[i] = Math.floor(Math.random() * 256)
   return bytes
 }
-
-const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'))
 
 /** Last millisecond an id was minted in, and how many were minted in it. */
 let lastMs = -1

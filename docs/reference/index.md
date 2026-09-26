@@ -278,7 +278,7 @@ All of these are exported as types from `metrichouse/core`.
 `RequiredKeys`, `MarkOptional`, `Simplify`
 
 **Drivers**
-`Driver`, `DriverCapabilities`, `Cell`, `GaugeCell`, `LevelCell`, `LevelSeries`, `BucketRow`, `BucketQuery`,
+`Driver`, `DriverCapabilities`, `Cell`, `GaugeCell`, `LevelCell`, `LevelSeries`, `BucketRow`, `BucketQuery`, `BucketRange`,
 `PendingQuery`, `StagedRecord`, `Claim`, `BucketClaim`, `RecordClaim`,
 `ClaimedBucket`, `IncrOp`, `GaugeOp`, `LevelOp`, `AppendOp`, `RecoveryReport`, `Hasher`
 

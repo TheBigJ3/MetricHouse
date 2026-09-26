@@ -308,6 +308,13 @@ of doubles, and past that range it is rounded.
 This reads the open window only. For the finished windows that have not shipped
 yet, use [`snapshot()`](#counter-snapshot).
 
+On `ioredis()`, the total of an integer counter is added up inside Redis, so a
+window with a hundred thousand series sends back one number. The driver does
+this only when no order of adding could change the answer, and otherwise sends
+every series for the counter to add, so the result is the same either way. A
+float counter always adds the series itself. See
+[sumBuckets](/reference/driver-contract#sumbuckets).
+
 ## counter.snapshot()
 
 ```ts

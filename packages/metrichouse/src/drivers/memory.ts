@@ -12,6 +12,7 @@ import {
   type AppendOp,
   type BucketClaim,
   type BucketQuery,
+  type BucketRange,
   type BucketRow,
   type Cell,
   type Claim,
@@ -372,6 +373,28 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     return getOrCreate(live, metric, () => new Map())
   }
 
+  /**
+   * metric -> the newest window a live bucket has ever been created for.
+   *
+   * Only ever raised, so it is at or past every live bucket, and a level
+   * write landing at or past it knows no later window exists without looking
+   * at each one. Every place that puts a bucket into {@link live} goes through
+   * {@link addBucket} to keep that true.
+   */
+  const newestBucket = new Map<string, number>()
+
+  /** Put a bucket into a metric's live set, and remember how new it is. */
+  function addBucket(
+    metric: string,
+    byBucket: Map<number, Map<string, Cell>>,
+    bucketTs: number,
+    bucket: Map<string, Cell>,
+  ): void {
+    byBucket.set(bucketTs, bucket)
+    const newest = newestBucket.get(metric)
+    if (newest === undefined || bucketTs > newest) newestBucket.set(metric, bucketTs)
+  }
+
   /** Get or create the bucket a write lands in, capping series on a new key. */
   function cellSlot(metric: string, bucketTs: number, dimKey: string): Map<string, Cell> {
     const byBucket = bucketsFor(metric)
@@ -383,7 +406,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     if (existing) return existing
 
     const bucket = new Map<string, Cell>()
-    byBucket.set(bucketTs, bucket)
+    addBucket(metric, byBucket, bucketTs, bucket)
     return bucket
   }
 
@@ -542,10 +565,16 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
 
     // windows after this one that already hold a value for the series. Two
     // processes writing across a boundary can land the later window first,
-    // and the rule below keeps both windows right whichever arrives second
-    const later = [...byBucket.keys()]
-      .filter((at) => at > bucketTs && cellAt(at) !== undefined)
-      .sort((a, b) => a - b)
+    // and the rule below keeps both windows right whichever arrives second.
+    // A write at or past the newest bucket, which is nearly every write,
+    // has none, and skips a scan that grows with every unflushed window
+    const newest = newestBucket.get(op.metric)
+    const later =
+      newest === undefined || bucketTs >= newest
+        ? []
+        : [...byBucket.keys()]
+            .filter((at) => at > bucketTs && cellAt(at) !== undefined)
+            .sort((a, b) => a - b)
 
     const plan = planLevelWrite(
       op,
@@ -659,6 +688,10 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       return [...series.values()].sort((a, b) => (a.dimKey < b.dimKey ? -1 : 1))
     },
 
+    async readLevel(metric: string, dimKey: string): Promise<LevelSeries | undefined> {
+      return levels.get(metric)?.get(dimKey)
+    },
+
     async dropLevels(
       metric: string,
       dimKeys: readonly string[],
@@ -725,6 +758,26 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       // deterministic order, so callers and tests never depend on Map insertion
       rows.sort((a, b) => a.bucketTs - b.bucketTs || (a.dimKey < b.dimKey ? -1 : 1))
       return rows
+    },
+
+    async sumBuckets(query: BucketRange): Promise<number | undefined> {
+      // the same rule the Redis driver keeps, so the two answer alike: only a
+      // sum no order of adding could change
+      let positive = 0
+      let negative = 0
+      for (const [bucketTs, bucket] of live.get(query.metric) ?? []) {
+        if (query.from !== undefined && bucketTs < query.from) continue
+        if (query.to !== undefined && bucketTs >= query.to) continue
+        for (const cell of bucket.values()) {
+          if (typeof cell !== 'number' || !Number.isInteger(cell)) return undefined
+          if (cell >= 0) positive += cell
+          else negative += cell
+          if (positive > Number.MAX_SAFE_INTEGER || negative < -Number.MAX_SAFE_INTEGER) {
+            return undefined
+          }
+        }
+      }
+      return positive + negative
     },
 
     async readPending(query: PendingQuery): Promise<StagedRecord[]> {
@@ -840,7 +893,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         const existing = byBucket.get(claimedBucket.bucketTs)
 
         if (!existing) {
-          byBucket.set(claimedBucket.bucketTs, new Map(claimedBucket.values))
+          addBucket(claim.metric, byBucket, claimedBucket.bucketTs, new Map(claimedBucket.values))
           continue
         }
 

@@ -508,11 +508,18 @@ export function pendingWrites(name: string): PendingWrites {
 
   return {
     track(work: Promise<void>, onError: () => MetricBinding['onError']): void {
-      const settled = work
-        .catch((error: unknown) => reportError(onError(), error, { metric: name }))
-        .finally(() => {
+      // one `then` with both handlers rather than a `catch` and a `finally`:
+      // every write passes through here, and that chain made three promises
+      // for each one where this makes one
+      const settled: Promise<void> = work.then(
+        () => {
           pending.delete(settled)
-        })
+        },
+        (error: unknown) => {
+          pending.delete(settled)
+          reportError(onError(), error, { metric: name })
+        },
+      )
       pending.add(settled)
     },
 
