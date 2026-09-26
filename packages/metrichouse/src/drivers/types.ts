@@ -39,6 +39,12 @@ export interface IncrOp {
   readonly bucketTs: number
   readonly dimKey: string
   readonly delta: number
+  /**
+   * The metric counts whole numbers. A total past `Number.MAX_SAFE_INTEGER`
+   * is refused, because a double past it cannot hold every whole number and
+   * the total would silently stop being exact.
+   */
+  readonly integer?: boolean
 }
 
 /** One gauge observation, already bucketed and keyed. */
@@ -71,6 +77,8 @@ export interface LevelOp {
   readonly dimKey: string
   readonly value: number
   readonly mode: 'set' | 'add' | 'hold'
+  /** The level holds whole numbers, as {@link IncrOp.integer} says of a counter. */
+  readonly integer?: boolean
 }
 
 /**

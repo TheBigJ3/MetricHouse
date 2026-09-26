@@ -91,6 +91,9 @@ const jobsProcessed = counter('jobs_processed', { resolution: '1m', flush: '1m',
 jobsProcessed.add()
 ```
 
+A dim cannot be named `id`, `bucket_ts` or `value`, the columns a counter
+writes on every row itself.
+
 [dims](/reference/dims) covers the declaration, the argument at each call site,
 the series key underneath and what cardinality costs.
 
@@ -130,7 +133,13 @@ resolution: '7s',  flush: '1m'    // Error: 7s does not divide 1m evenly
 ```
 
 Omit it to take `defaults.flush` from the house. A counter with neither throws
-when the house registers it, naming both places the setting could come from.
+when the house registers it, naming both places the setting could come from, and
+stays unregistered, so the same counter can be registered once the mistake is
+fixed.
+
+`flush` becomes the delay of a timer, so it has to be longer than zero and at
+most `2147483647` milliseconds, just under 25 days. See
+[Durations](/reference/durations#settings-a-timer-waits-for).
 
 ### grace
 
@@ -168,9 +177,16 @@ wrong.
 
 ```ts
 requests.add(1.5)
-// Error: declares an integer counter, so 1.5 is not a legal delta —
-// declare `value: float()` if fractions are intended
+// Error: declares an integer counter, so 1.5 is not a legal delta. Declare
+// `value: float()` if fractions are intended
 ```
+
+An integer counter also stops at `9007199254740991`, `Number.MAX_SAFE_INTEGER`.
+Past it a double cannot hold every whole number, so a total there would stop
+being exact without any error. A delta past it throws at `add()`, and an
+`add()` whose total would pass it is refused by the driver and reported to
+`onError`, leaving the total where it was. A `float()` counter has no such
+limit.
 
 ```ts
 import { float } from 'metrichouse/core'
@@ -242,7 +258,9 @@ jobsProcessed.add(5)
 | --- | --- |
 | `not bound to a house` | The counter was never registered |
 | `delta must be a finite number` | `NaN` or `Infinity` |
+| `the first argument must be a number or a dims object, got bigint` | A bigint, boolean or string where a delta goes. TypeScript allows it on a counter with no dims |
 | `declares an integer counter, so 1.5 is not a legal delta` | A fraction without `value: float()` |
+| `9007199254740992 is past 9007199254740991` | A whole delta too large for a double to hold exactly, on an integer counter |
 | `missing required dim "status"` | A declared dim with no value and no default |
 | `unknown dim "pakr"` | A key that is not declared |
 
@@ -367,7 +385,9 @@ httpRequests.rowShape()
 ```
 
 This is the honest answer to "what columns does my table need", and it is how
-a generic sink builds a statement without being told the schema twice.
+a generic sink builds a statement without being told the schema twice. A column
+is `optional: true` only for a dim marked `.optional()`. A dim with a
+`.default()` is never null, so its column is not.
 
 ## Properties
 

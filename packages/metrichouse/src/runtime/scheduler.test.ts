@@ -156,6 +156,29 @@ describe('house.start()', () => {
       metric: 'm',
     })
   })
+
+  it('routes a failed recovery pass on a scheduled flush to onError', async () => {
+    const errors: [string, { metric: string }][] = []
+    const failing: Driver = {
+      ...driver,
+      recover: () => Promise.reject(new Error('recovery failed')),
+    }
+    const metric = make('m', vi.fn())
+    const house = createHouse({
+      driver: failing,
+      schema: [metric],
+      now,
+      onError: (error, context) => errors.push([(error as Error).message, context]),
+    })
+    metric.add(A)
+    await house.drain()
+    settle()
+    house.start()
+
+    await tick(60_000)
+    expect(errors).toEqual([['recovery failed', { metric: 'm' }]])
+    await house.stop()
+  })
 })
 
 describe('house.stop()', () => {

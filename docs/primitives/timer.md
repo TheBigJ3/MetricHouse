@@ -77,7 +77,9 @@ dims: { route: str(), status: oneOf(['ok', 'error']) }
 ```
 
 A dim may not be called `duration_ms`. That name is reserved for the field a
-timing carries onto a [`record`](#record) event, whether or not you use one.
+timing carries onto a [`record`](#record) event, whether or not you use one. The
+names a [gauge dim](/primitives/gauge#dims) cannot take are refused here too:
+`id`, `bucket_ts`, and each aggregate the timer ships.
 
 ```ts
 import { DURATION_FIELD } from 'metrichouse/core'
@@ -431,7 +433,9 @@ timing ends. A timing is recorded where it completed.
 
 Sub microsecond digits are rounded away, because they are scheduler jitter
 rather than signal, and they would turn every `sum` column into a number with
-eleven decimal places.
+eleven decimal places. A duration above about `1.8e305` milliseconds is kept as
+it is. It has no fraction left to round, and scaling it to microseconds would
+overflow.
 
 ::: warning Cloudflare Workers
 On Workers, `performance.now()` only advances across input and output. A timer

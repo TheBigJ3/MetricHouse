@@ -68,12 +68,19 @@ export interface HouseDefaults {
 
 /**
  * Resolve the mode a metric is bound with. A metric never sees `'auto'`.
+ *
+ * @throws for a value that is none of the three. It often comes from an
+ * environment variable, where TypeScript cannot check it, and a typo would
+ * otherwise behave as `'staged'` while the house reported the typo.
  */
 export function resolveDelivery(
   config: DeliveryConfig | undefined,
   capabilities: DriverCapabilities,
 ): DeliveryMode {
-  if (config === undefined) return 'staged'
-  if (config !== 'auto') return config
-  return capabilities.durable ? 'staged' : 'immediate'
+  if (config === undefined || config === 'staged') return 'staged'
+  if (config === 'immediate') return 'immediate'
+  if (config === 'auto') return capabilities.durable ? 'staged' : 'immediate'
+  throw new Error(
+    `createHouse: delivery must be 'staged', 'immediate' or 'auto', got ${JSON.stringify(config)}`,
+  )
 }

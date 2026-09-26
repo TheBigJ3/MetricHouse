@@ -135,6 +135,34 @@ describe('memory · maxSeries', () => {
       { bucketTs: 1000, dimKey: 'a', value: 1 },
     ])
   })
+
+  it('leaves no empty window behind when a write to a new window is refused', async () => {
+    // an empty window would still be claimed, and ship as a batch of no rows
+    const capped = memory({ maxSeries: 1 })
+    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
+    await expect(
+      capped.increment([{ metric: M, bucketTs: 2000, dimKey: 'b', delta: 1 }]),
+    ).rejects.toThrow(/maxSeries/)
+
+    const claim = await capped.claim(M, 3000)
+    expect(claim.buckets.map((b) => [b.bucketTs, [...b.values.keys()]])).toEqual([[1000, ['a']]])
+  })
+
+  it('refuses a batch that would pass the cap without keeping any of it', async () => {
+    const capped = memory({ maxSeries: 2 })
+    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
+    await expect(
+      capped.increment([
+        { metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 },
+        { metric: M, bucketTs: 1000, dimKey: 'b', delta: 1 },
+        { metric: M, bucketTs: 1000, dimKey: 'c', delta: 1 },
+      ]),
+    ).rejects.toThrow(/maxSeries/)
+
+    expect(await capped.readBuckets({ metric: M })).toEqual([
+      { bucketTs: 1000, dimKey: 'a', value: 1 },
+    ])
+  })
 })
 
 describe('memory · large batches', () => {

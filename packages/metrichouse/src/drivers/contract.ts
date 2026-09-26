@@ -174,6 +174,37 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect((await driver.readBuckets({ metric: M }))[0]?.value).toBe(Number.MAX_VALUE)
       })
 
+      it('refuses a first increment that is not a finite number', async () => {
+        await expect(incr(1000, WILLOW, Number.POSITIVE_INFINITY)).rejects.toThrow(/largest number/)
+        await expect(incr(1000, WILLOW, Number.NaN)).rejects.toThrow(/largest number/)
+        expect(await driver.readBuckets({ metric: M })).toEqual([])
+      })
+
+      it('changes nothing when one increment in a batch is refused', async () => {
+        await expect(
+          driver.increment([
+            { metric: M, bucketTs: 1000, dimKey: REX, delta: 1 },
+            { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: Number.MAX_VALUE },
+            { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: Number.MAX_VALUE },
+          ]),
+        ).rejects.toThrow(/largest number/)
+        expect(await driver.readBuckets({ metric: M })).toEqual([])
+      })
+
+      it('refuses an integer total past the largest safe integer', async () => {
+        const whole = (delta: number) =>
+          driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta, integer: true }])
+        await whole(Number.MAX_SAFE_INTEGER)
+        await expect(whole(1)).rejects.toThrow(/largest whole number/)
+        expect((await driver.readBuckets({ metric: M }))[0]?.value).toBe(Number.MAX_SAFE_INTEGER)
+      })
+
+      it('lets a total without the integer flag pass the largest safe integer', async () => {
+        await incr(1000, WILLOW, Number.MAX_SAFE_INTEGER)
+        await incr(1000, WILLOW, 2)
+        expect((await driver.readBuckets({ metric: M }))[0]?.value).toBe(2 ** 53 + 1)
+      })
+
       it('stores a negative zero as zero', async () => {
         await incr(1000, WILLOW, -0)
         expect(Object.is((await driver.readBuckets({ metric: M }))[0]?.value, 0)).toBe(true)
@@ -274,6 +305,11 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await obs(1000, WILLOW, Number.MAX_VALUE)
         await expect(obs(1000, WILLOW, Number.MAX_VALUE)).rejects.toThrow(/largest number/)
         expect((await gaugeAt(1000, WILLOW)).count).toBe(1)
+      })
+
+      it('refuses a first observation that is not a finite number', async () => {
+        await expect(obs(1000, WILLOW, Number.POSITIVE_INFINITY)).rejects.toThrow(/largest number/)
+        expect(await driver.readBuckets({ metric: G })).toEqual([])
       })
 
       it('does nothing on an empty batch', async () => {
@@ -383,6 +419,16 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(await levelAt(1000, WILLOW)).toBe(Number.MAX_VALUE)
       })
 
+      it('refuses an integer level past the largest safe integer', async () => {
+        const whole = (value: number, mode: 'set' | 'add') =>
+          driver.setLevel([
+            { metric: L, bucketTs: 1000, dimKey: WILLOW, value, mode, integer: true },
+          ])
+        await whole(Number.MAX_SAFE_INTEGER, 'set')
+        await expect(whole(1, 'add')).rejects.toThrow(/largest whole number/)
+        expect(await levelAt(1000, WILLOW)).toBe(Number.MAX_SAFE_INTEGER)
+      })
+
       it('moves a series by a delta, treating an untouched one as zero', async () => {
         await move(1000, WILLOW, 3)
         await move(1000, WILLOW, 4)
@@ -416,6 +462,30 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await hold(2000, WILLOW, 42)
 
         expect(await levelAt(2000, WILLOW)).toBe(7)
+      })
+
+      it('carries the written value when a hold finds its window already written', async () => {
+        // the flush read the series at 42, then a late set of 7 landed in
+        // the window before the flush's hold for it arrived. The windows
+        // after this one must repeat 7, the value the window ended at
+        await put(1000, WILLOW, 42)
+        await put(2000, WILLOW, 7)
+        await hold(2000, WILLOW, 42)
+
+        expect(await driver.readLevels(L)).toEqual([
+          { dimKey: WILLOW, value: 7, carried: 7, writtenAt: 2000, heldThrough: 2000 },
+        ])
+      })
+
+      it('carries the window when a hold arrives a second time after a set', async () => {
+        // a hold resent after a reconnect, with a set in between
+        await put(1000, WILLOW, 42)
+        await hold(2000, WILLOW, 42)
+        await put(2000, WILLOW, 7)
+        await hold(2000, WILLOW, 42)
+
+        expect(await levelAt(2000, WILLOW)).toBe(7)
+        expect((await driver.readLevels(L))[0]).toMatchObject({ value: 7, carried: 7 })
       })
 
       it('holds nothing for a series it has never seen', async () => {
@@ -492,6 +562,17 @@ export function describeDriverContract(name: string, options: DriverContractOpti
     describe('readLevels', () => {
       it('is empty for a metric nothing has written', async () => {
         expect(await driver.readLevels(L)).toEqual([])
+      })
+
+      it('sees a write issued before it and not yet awaited', async () => {
+        await put(1000, REX, 1)
+        const write = put(1000, WILLOW, 2)
+        const levels = await driver.readLevels(L)
+        await write
+        expect(levels.map((one) => [one.dimKey, one.value])).toEqual([
+          [REX, 1],
+          [WILLOW, 2],
+        ])
       })
 
       it('outlives the claim that shipped the buckets', async () => {
@@ -575,6 +656,18 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(await gaugeAt(2000, WILLOW)).toEqual({ last: 9, min: 9, max: 9, sum: 9, count: 1 })
       })
 
+      it('folds a batch in order when its observations move to one window', async () => {
+        // aimed at two windows, both below the watermark, so all three land
+        // at 5000 and the last one written has to win `last`
+        await driver.ack(await driver.claim(G, 5000))
+        await driver.observe([
+          { metric: G, bucketTs: 2000, dimKey: WILLOW, value: 1 },
+          { metric: G, bucketTs: 1000, dimKey: WILLOW, value: 2 },
+          { metric: G, bucketTs: 2000, dimKey: WILLOW, value: 3 },
+        ])
+        expect(await gaugeAt(5000, WILLOW)).toEqual({ last: 3, min: 1, max: 3, sum: 6, count: 3 })
+      })
+
       it('moves a level write forward, and carries it from there', async () => {
         await put(1000, WILLOW, 5)
         await driver.ack(await driver.claim(L, 2000))
@@ -647,6 +740,13 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await incr(1000, REX)
         const rows = await driver.readBuckets({ metric: M, from: 1000, to: 2000 })
         expect(rows.map((r) => r.dimKey)).toEqual([REX, WILLOW])
+      })
+
+      it('sees a write issued before it and not yet awaited', async () => {
+        const write = incr(4000, WILLOW, 5)
+        const rows = await driver.readBuckets({ metric: M, from: 4000 })
+        await write
+        expect(rows).toEqual([{ bucketTs: 4000, dimKey: WILLOW, value: 5 }])
       })
     })
 
@@ -909,6 +1009,18 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(back?.fields.note).toBe('not a date')
       })
 
+      it('hands back a field shaped like its own date marker untouched', async () => {
+        // a driver that tags dates inside JSON must not read a caller's own
+        // object of the same shape as one
+        const fields = {
+          payload: { __mh_date: 5 },
+          nested: [{ __mh_x: 'y', plain: 1 }],
+          at: new Date(7),
+        }
+        await driver.append([rec('a', 1000, fields)])
+        expect((await driver.readPending({ metric: M }))[0]?.fields).toEqual(fields)
+      })
+
       it('keeps metrics separate', async () => {
         await driver.append([rec('a', 1000), { metric: 'other', id: 'b', ts: 1000, fields: {} }])
         expect(await driver.countPending(M)).toBe(1)
@@ -952,6 +1064,14 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await seed()
         await driver.readPending({ metric: M })
         expect(await driver.countPending(M)).toBe(3)
+      })
+
+      it('sees an append issued before it and not yet awaited', async () => {
+        await seed()
+        const write = driver.append([rec('d', 4000)])
+        const pending = await driver.readPending({ metric: M })
+        await write
+        expect(pending.map((one) => one.id)).toEqual(['a', 'b', 'c', 'd'])
       })
     })
 

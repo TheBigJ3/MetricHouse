@@ -123,8 +123,8 @@ RESERVED_LOG_COLUMNS     // ['id', 'ts', 'level', 'message', 'error_stack',
 
 ```ts
 event('checkout', { fields: { ts: str() }, write })
-// Error: field "ts" is a reserved column — MetricHouse owns
-// [id, ts, _ingested_at, _sample_rate] on every event row
+// Error: checkout: field "ts" is a reserved column. MetricHouse writes
+// [id, ts, _ingested_at, _sample_rate] on every row
 ```
 
 A log reserves more names than an event because the three columns a log adds
@@ -219,11 +219,12 @@ reads `id, ts, level, message, error_stack`, then your fields, then
 | --- | --- |
 | `field "ts" is a reserved column` | A declared field taking a name MetricHouse owns. At declaration |
 | `a field cannot be named "__proto__"` | JavaScript treats that key as an object's prototype, so no row could carry it. At declaration |
-| `timestamp names "occurredAt", which is not a declared field` | `timestamp` pointing at nothing. At declaration |
-| `timestamp field "occurredAt" declares str() — it must be ts()` | `timestamp` pointing at the wrong type. At declaration |
+| `a field cannot be named "7"` | A name that reads as a whole number, which JavaScript moves ahead of every other key, so the column order you declared would be lost. At declaration |
+| `timestamp names "occurredAt", which is not a declared field` | `timestamp` pointing at nothing, or at a name such as `toString` that every object inherits. At declaration |
+| `timestamp field "occurredAt" declares str(), and it must be ts()` | `timestamp` pointing at the wrong type. At declaration |
 | `default for int(): expected a safe integer, got "five"` | `.default()` given a value its own type rejects. At declaration |
 | `missing required field "plan"` | A declared field with no value and no default |
-| `unknown field "pln" — declared fields are [userId, plan]` | A key that is not declared |
+| `unknown field "pln". The declared fields are [userId, plan]` | A key that is not declared |
 | `amountCents: expected a safe integer, got 49.99` | A value of the wrong type |
 | `at must be a Date or epoch milliseconds` | `record(fields, { at })` given something else |
 

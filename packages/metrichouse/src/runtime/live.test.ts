@@ -68,6 +68,15 @@ describe('snapshotRange', () => {
       from: 3_000,
     })
   })
+
+  it('refuses an invalid Date rather than dropping the bound', () => {
+    expect(() => snapshotRange({ to: new Date('garbage') }, 1_000, 10_400, 'm')).toThrow(
+      'm: to must be a valid Date or a finite number of milliseconds, got an invalid Date',
+    )
+    expect(() => snapshotRange({ from: Number.NaN }, 1_000, 10_400, 'm')).toThrow(
+      'm: from must be a valid Date or a finite number of milliseconds, got NaN',
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -654,6 +663,28 @@ void [
 ]
 
 describe('merging series inside one window', () => {
+  it('leaves an absent optional dim off a grouped row, as it is off an ungrouped one', async () => {
+    const signups = counter('signups', {
+      dims: { plan: str(), campaign: str().optional() },
+      resolution: '10s',
+      flush: '1m',
+      write: discard,
+    })
+    createHouse({ driver, schema: [signups], now })
+    signups.add({ plan: 'pro' })
+    await signups.drain()
+
+    const [grouped] = await signups.snapshot({ complete: false, groupBy: ['plan', 'campaign'] })
+    expect(Object.keys(grouped ?? {})).toEqual([
+      'id',
+      'bucket_ts',
+      'plan',
+      'value',
+      'bucket_open',
+      'bucket_elapsed_ms',
+    ])
+  })
+
   it('counts a window once in bucket_elapsed_ms, however many series it holds', async () => {
     const hits = counter('hits', { dims: DIMS, resolution: '10s', flush: '1m', write: discard })
     createHouse({ driver, schema: [hits], now })

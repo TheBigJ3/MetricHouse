@@ -143,7 +143,9 @@ Local staging only, and ignored entirely when `stage: 'driver'`.
 
 The age clock starts at the first record of a batch, so `maxAge` bounds how
 long the oldest record waits rather than the newest. A `maxSize` that is not a
-positive whole number throws at declaration.
+positive whole number throws at declaration, and so does a `maxAge` of zero or
+one longer than a timer can wait, just under 25 days. See
+[Durations](/reference/durations#settings-a-timer-waits-for).
 
 When a send fails, its records go back into the buffer ahead of anything newer,
 and the age clock starts again. They are retried `maxAge` later, whether or not
@@ -158,8 +160,9 @@ flush?: DurationInput      // default: the house default, then '30s'
 ```
 
 The fastest this event may ship when something calls `flush()`. An event has no
-resolution for a cadence to divide, so any duration is legal and a default is
-always available.
+resolution for a cadence to divide, so a default is always available. Any
+duration a timer can wait for is legal: more than zero and at most
+`2147483647` milliseconds, just under 25 days.
 
 This is separate from [`batch`](#batch), which ships a locally staged buffer
 without anyone calling `flush()`.
@@ -199,7 +202,8 @@ deviceReading.record({
 
 `TsFieldOf<F>` is the names of the fields declared `ts()`, so naming any other
 field is a type error. Naming a field that is not declared, or one that is not
-`ts()`, also throws at declaration, for code that gets past the types. An optional `ts()` field that a call site leaves out falls back to
+`ts()`, also throws at declaration, for code that gets past the types. A name
+every object inherits, such as `toString`, counts as not declared. An optional `ts()` field that a call site leaves out falls back to
 the clock rather than stamping the epoch.
 
 Whatever this says, [`record(fields, { at })`](#event-record) overrides it for
@@ -246,9 +250,11 @@ FROM api_call
 GROUP BY route;
 ```
 
-The function sees the complete record, with defaults already filled in, and it
-runs after [`derive`](#derive). Counters fed by this event therefore stay exact
-whatever fraction of the event table you keep.
+The function sees the complete record, with defaults already filled in. It runs
+before [`derive`](#derive), and derive counts every record whether sampling kept
+it or not, so counters fed by this event stay exact whatever fraction of the
+event table you keep. A `sample` function that throws therefore increments
+nothing.
 
 ### derive
 

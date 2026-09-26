@@ -17,7 +17,7 @@ import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
 import { assertResolution, bucketStart } from '../time/buckets.js'
-import { type DurationInput, parseDuration } from '../time/duration.js'
+import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
 import { bucketedLifecycle, bucketedReader, DEFAULT_GRACE_MS } from './bucketed.js'
 import type {
   AnyMetric,
@@ -28,7 +28,16 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink } from './types.js'
+import {
+  assertDeltaOrDims,
+  assertMetricName,
+  assertSink,
+  assertWhole,
+  dimColumns,
+} from './types.js'
+
+/** The columns a counter writes on every row itself, which no dim may take. */
+const COUNTER_COLUMNS = ['id', 'bucket_ts', 'value'] as const
 
 export type { DimsArgs, RowColumn, RowShape } from './types.js'
 
@@ -180,12 +189,13 @@ export function counter<D extends Shape = Record<never, never>>(
   assertSink(config.write, name)
 
   const dims = (config.dims ?? {}) as D
-  assertDimsLegal(dims, name)
+  assertDimsLegal(dims, name, COUNTER_COLUMNS)
 
   // parsed once, here — the write path does integer math and never sees a
   // duration string
   const resolutionMs = parseDuration(config.resolution)
-  const ownFlushMs = config.flush === undefined ? undefined : parseDuration(config.flush)
+  const ownFlushMs =
+    config.flush === undefined ? undefined : parseInterval(config.flush, `${name}: flush`)
   const ownGraceMs = config.grace === undefined ? undefined : parseDuration(config.grace)
   // still eager when the metric declares its own cadence, which is the case
   // that used to be the only one: a bad pair is a programming error and should
@@ -225,13 +235,14 @@ export function counter<D extends Shape = Record<never, never>>(
 
   /**
    * The metric's own cadence, or the house's. Resolved on every read rather
-   * than at bind, so nothing has to care which came first.
+   * than at bind, so nothing has to care which came first. `from` is the
+   * binding to read the house's from, which `bind` passes before it keeps one.
    */
-  function effectiveFlushMs(): number {
-    const ms = ownFlushMs ?? binding?.defaults?.flushMs
+  function effectiveFlushMs(from: MetricBinding | undefined = binding): number {
+    const ms = ownFlushMs ?? from?.defaults?.flushMs
     if (ms === undefined) {
       throw new Error(
-        `${name}: no flush cadence — declare flush on the counter, or defaults.flush on the house`,
+        `${name}: no flush cadence. Declare flush on the counter, or defaults.flush on the house`,
       )
     }
     return ms
@@ -244,7 +255,7 @@ export function counter<D extends Shape = Record<never, never>>(
   function activeBinding(): MetricBinding {
     if (!binding) {
       throw new Error(
-        `${name}: not bound to a house — pass it to createHouse({ schema }) before writing`,
+        `${name}: not bound to a house. Pass it to createHouse({ schema }) before writing`,
       )
     }
     return binding
@@ -383,13 +394,15 @@ export function counter<D extends Shape = Record<never, never>>(
 
     bind(next: MetricBinding): void {
       if (binding) {
-        throw new Error(`${name}: already bound to a house — a metric belongs to exactly one`)
+        throw new Error(`${name}: already bound to a house, and a metric belongs to exactly one`)
       }
-      binding = next
       // the half of validation that could not run at declare time: a cadence
       // taken from the house is only knowable now, and createHouse is still
-      // early enough to be a boot failure rather than a flush-time surprise
-      if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs())
+      // early enough to be a boot failure rather than a flush-time surprise.
+      // Checked before the binding is kept, so a refusal leaves the metric
+      // free to be registered again once the mistake is fixed
+      if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs(next))
+      binding = next
     },
 
     unbind(): void {
@@ -401,25 +414,23 @@ export function counter<D extends Shape = Record<never, never>>(
 
       // `.add()`, `.add(dims)`, `.add(delta)` and `.add(delta, dims)` all
       // collapse into one implementation
+      assertDeltaOrDims(name, first)
       const delta = typeof first === 'number' ? first : 1
       const values = (typeof first === 'number' ? second : first) as InferShape<D> | undefined
 
       if (!Number.isFinite(delta)) {
         throw new Error(`${name}: delta must be a finite number, got ${delta}`)
       }
-      if (!isFloat && !Number.isSafeInteger(delta)) {
-        throw new Error(
-          `${name}: declares an integer counter, so ${delta} is not a legal delta — ` +
-            'declare `value: float()` if fractions are intended',
-        )
-      }
+      if (!isFloat) assertWhole(name, 'counter', delta, 'delta')
 
       // validated before the clock is read, so a rejected write never
       // half-commits and never depends on when it was rejected
       const dimKey = keyFor(values)
       const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
 
-      const write = active.driver.increment([{ metric: name, bucketTs, dimKey, delta }])
+      const write = active.driver.increment([
+        { metric: name, bucketTs, dimKey, delta, ...(!isFloat && { integer: true }) },
+      ])
       track(deliver(write, bucketTs, dimKey), active.onError)
     },
 
@@ -455,10 +466,7 @@ export function counter<D extends Shape = Record<never, never>>(
         columns: [
           { name: 'id', kind: 'str', optional: false },
           { name: 'bucket_ts', kind: 'ts', optional: false },
-          ...Object.keys(dims).map((column) => {
-            const type = dims[column] as FieldType
-            return { name: column, kind: type.kind, optional: type.isOptional }
-          }),
+          ...dimColumns(dims),
           { name: 'value', kind: isFloat ? 'float' : 'int', optional: false },
         ],
       }

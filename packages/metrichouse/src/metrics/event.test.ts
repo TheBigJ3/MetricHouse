@@ -92,6 +92,34 @@ describe('declaration', () => {
     ).toMatch(/not a declared field/)
   })
 
+  it('refuses a timestamp naming a property every object inherits', () => {
+    expect(
+      expectRejected(() =>
+        event('e', { write: discard, fields: { a: str() }, timestamp: 'toString' as never }),
+      ).message,
+    ).toBe('e: timestamp names "toString", which is not a declared field')
+  })
+
+  it('refuses a field named like a whole number, which would lose its place', () => {
+    expect(
+      expectRejected(() => event('e', { write: discard, fields: { a: str(), 7: str() } })).message,
+    ).toMatch(/^e: a field cannot be named "7"/)
+  })
+
+  it('refuses a flush cadence of zero', () => {
+    expect(
+      expectRejected(() => event('e', { write: discard, fields: {}, flush: '0s' })).message,
+    ).toBe('e: flush must be longer than zero, got "0s"')
+  })
+
+  it('refuses a batch age a timer cannot wait for', () => {
+    expect(
+      expectRejected(() =>
+        event('e', { write: discard, fields: {}, stage: 'local', batch: { maxAge: '25d' } }),
+      ).message,
+    ).toMatch(/^e: batch.maxAge is 25d, longer than 2147483647ms/)
+  })
+
   it('refuses a timestamp field that is not ts()', () => {
     expect(
       expectRejected(() =>
@@ -274,6 +302,11 @@ describe('materialized rows', () => {
       { name: 'weather', kind: 'str', optional: true },
       { name: '_ingested_at', kind: 'ts', optional: false },
     ])
+  })
+
+  it('describes a field with a default as a column every row carries', () => {
+    const walks = event('walks', { fields: { env: str().default('prod') }, write: discard })
+    expect(walks.rowShape().columns[2]).toEqual({ name: 'env', kind: 'str', optional: false })
   })
 
   it('adds _sample_rate to the shape only when sampling is declared', () => {
@@ -481,6 +514,25 @@ describe('derive', () => {
     expect(onError.mock.calls[0]?.[0]).toMatchObject({
       message: expect.stringMatching(/is a event, and derive can only increment a counter/),
     })
+  })
+
+  it('says a whole derived value past the safe range is too large, not a fraction', async () => {
+    const onError = vi.fn()
+    const steps = counter('steps', { resolution: '1s', flush: '5m', write: vi.fn() })
+    const walked = event('walked', {
+      fields: { n: int() },
+      derive: { steps: () => ({ value: 2 ** 53 }) },
+      write: vi.fn(),
+    })
+    const own = createHouse({ driver, schema: [steps, walked], now, onError })
+
+    walked.record({ n: 1 })
+    await own.drain()
+
+    expect(onError.mock.calls.map(([error]) => (error as Error).message)).toEqual([
+      'walked: derive for "steps": 9007199254740992 is past 9007199254740991, the largest ' +
+        'whole number a double holds exactly, and steps counts in whole numbers',
+    ])
   })
 
   it('resolves lazily, so a target may be registered after the event', async () => {

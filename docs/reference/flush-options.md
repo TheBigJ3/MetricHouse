@@ -124,7 +124,7 @@ const report = await httpRequests.flush()
 | `skipped` | `boolean` | always | Whether anything was attempted |
 | `reason` | `'cadence'` or `'not-selected'` | when skipped | Why nothing was attempted |
 | `nextEligibleInMs` | `number` | when skipped on cadence | How long until this metric may ship again |
-| `error` | `unknown` | when the flush shipped nothing it meant to | What your `write` function threw, or why the claim failed. The rows are back in the live set, or never left it |
+| `error` | `unknown` | when the flush shipped nothing it meant to | What your `write` function threw, or why the claim failed. The rows are back in the live set, or never left it. A `write` that rejects with no reason, as `Promise.reject()` does, reports `Error: <metric>: the sink rejected without a reason` |
 | `ackError` | `unknown` | when the rows were written and the claim could not be settled | The rows did ship. Another flusher had usually recovered the claim first, so the same rows, with the same ids, will arrive again |
 | `recovered` | `RecoveryReport` | when a dead flusher left a claim | What this flush put back before claiming |
 | `recoveryError` | `unknown` | when recovery itself failed | The flush below it still ran |

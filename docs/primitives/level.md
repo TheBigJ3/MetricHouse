@@ -74,8 +74,9 @@ dims: { queue: oneOf(['email', 'export', 'webhooks']) }
 ```
 
 Dims cost more here than on any other type, because every series reports
-forever. A dim whose values come and go wants [`holdFor`](#holdfor).
-[dims](/reference/dims) covers the argument itself.
+forever. A dim whose values come and go wants [`holdFor`](#holdfor). A dim
+cannot be named `id`, `bucket_ts` or `value`, the columns a level writes on
+every row itself. [dims](/reference/dims) covers the argument itself.
 
 ### resolution
 
@@ -172,6 +173,12 @@ const inFlight = level('requests_in_flight', {
 })
 ```
 
+A level declared `value: int()` stops at `9007199254740991`,
+`Number.MAX_SAFE_INTEGER`, as an [integer counter](/primitives/counter#value)
+does. A write whose value is past it throws at the call, and an `inc()` that
+would move the series past it is refused by the driver and reported to
+`onError`.
+
 ### write
 
 ```ts
@@ -216,8 +223,10 @@ fold together, and that difference is what separates the two types.
 **Returns** nothing, and returns before storage has acknowledged anything.
 
 **Throws immediately** on an unbound level, a value that is not finite, a
-fraction on a level declared `value: int()`, or dims that are missing, unknown
-or ill typed.
+fraction or a whole number past `9007199254740991` on a level declared
+`value: int()`, or dims that are missing, unknown or ill typed. `inc()` and
+`dec()` also throw for a first argument that is neither a number nor a dims
+object, such as a bigint, which TypeScript accepts on a level with no dims.
 
 A value too large for a JavaScript number cannot reach storage either. An
 `inc()` that would move a series past about `1.8e308` is refused by the driver,

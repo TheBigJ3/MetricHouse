@@ -213,9 +213,15 @@ interface RecordTarget {
 /**
  * Sub-microsecond digits are scheduler jitter, not signal, and they turn every
  * `sum` column into `36.12345678901`.
+ *
+ * A duration so large that scaling it overflows is returned as it is. It has
+ * no fraction left to round, and scaling it would turn a finite number into
+ * Infinity, which the gauge then refuses.
  */
 function toMicros(ms: number): number {
-  return Math.round(ms * 1000) / 1000
+  const scaled = ms * 1000
+  if (!Number.isFinite(scaled)) return ms
+  return Math.round(scaled) / 1000
 }
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
@@ -241,10 +247,10 @@ export function timer<D extends Shape = Record<never, never>>(
 
   const dims = (config.dims ?? {}) as D
 
-  if (DURATION_FIELD in dims) {
+  if (Object.hasOwn(dims, DURATION_FIELD)) {
     throw new Error(
-      `${name}: dim ${JSON.stringify(DURATION_FIELD)} is reserved — it is the field a timing ` +
-        'carries onto a record event',
+      `${name}: dim ${JSON.stringify(DURATION_FIELD)} is reserved, because it is the field a ` +
+        'timing carries onto a record event',
     )
   }
   if (config.record !== undefined) {
@@ -252,7 +258,7 @@ export function timer<D extends Shape = Record<never, never>>(
       throw new Error(`${name}: record must name an event`)
     }
     if (config.record === name) {
-      throw new Error(`${name}: record names the timer itself — it must name an event`)
+      throw new Error(`${name}: record names the timer itself, and it must name an event`)
     }
   }
 
@@ -277,7 +283,7 @@ export function timer<D extends Shape = Record<never, never>>(
   function assertBound(): void {
     if (!inner.isBound) {
       throw new Error(
-        `${name}: not bound to a house — pass it to createHouse({ schema }) before timing`,
+        `${name}: not bound to a house. Pass it to createHouse({ schema }) before timing`,
       )
     }
   }
@@ -288,7 +294,7 @@ export function timer<D extends Shape = Record<never, never>>(
       const type = Object.hasOwn(dims, key) ? dims[key] : undefined
       if (!type) {
         throw new Error(
-          `unknown dim ${JSON.stringify(key)} — declared dims are [${Object.keys(dims).join(', ')}]`,
+          `unknown dim ${JSON.stringify(key)}. The declared dims are [${Object.keys(dims).join(', ')}]`,
         )
       }
       if (value !== undefined) assertValue(type, value, key)
@@ -319,7 +325,7 @@ export function timer<D extends Shape = Record<never, never>>(
     if (!metric) {
       throw new Error(
         `${name}: record names ${JSON.stringify(target)}, which no metric in this house ` +
-          'declares — register it alongside the timer',
+          'declares. Register it alongside the timer',
       )
     }
     if (metric.kind !== 'event') {
@@ -333,25 +339,28 @@ export function timer<D extends Shape = Record<never, never>>(
     if (fields[DURATION_FIELD]?.kind !== 'float') {
       throw new Error(
         `${name}: record target ${JSON.stringify(target)} must declare ` +
-          `${DURATION_FIELD}: float() — a duration is fractional milliseconds`,
+          `${DURATION_FIELD}: float(), because a duration is fractional milliseconds`,
       )
     }
 
-    const missing = Object.keys(dims).filter((key) => !(key in fields))
+    // own keys only: `constructor` is `in` every object, declared or not
+    const missing = Object.keys(dims).filter((key) => !Object.hasOwn(fields, key))
     if (missing.length > 0) {
       throw new Error(
         `${name}: record target ${JSON.stringify(target)} does not declare ` +
-          `[${missing.join(', ')}] — spread the timer's dims into its fields`,
+          `[${missing.join(', ')}], so spread the timer's dims into its fields`,
       )
     }
 
     const unfillable = Object.entries(fields)
-      .filter(([key, type]) => key !== DURATION_FIELD && !(key in dims) && !type.isOptional)
+      .filter(
+        ([key, type]) => key !== DURATION_FIELD && !Object.hasOwn(dims, key) && !type.isOptional,
+      )
       .map(([key]) => key)
     if (unfillable.length > 0) {
       throw new Error(
         `${name}: record target ${JSON.stringify(target)} requires [${unfillable.join(', ')}], ` +
-          'which a timing cannot supply — make them optional or give them defaults',
+          'which a timing cannot supply. Make them optional or give them defaults',
       )
     }
 

@@ -43,7 +43,7 @@ that into something that writes.
 
 ```ts
 httpRequests.add({ route: '/checkout', method: 'GET', status: '2xx' })
-// Error: not bound to a house — pass it to createHouse({ schema }) before writing
+// Error: not bound to a house. Pass it to createHouse({ schema }) before writing
 ```
 
 That is why a schema file is safe to import anywhere, including at module scope

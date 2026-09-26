@@ -105,6 +105,10 @@ const RESERVED_LEVEL_NAMES: readonly string[] = [
   'materializeClaim',
   'ackBatch',
   'releaseBatch',
+  // not a method of the logger, but a method by this name makes it a
+  // thenable: `await` on anything that resolves to the logger would call it,
+  // write a line, and never settle
+  'then',
 ]
 
 /**
@@ -269,28 +273,56 @@ export type Log<F extends Shape, L extends readonly string[]> = Omit<
     rowShape(): RowShape
   }
 
+/** A property of a caught value, or `undefined` when reading it throws. */
+function readSafely(value: object, key: string): unknown {
+  try {
+    return (value as Record<string, unknown>)[key]
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The string form of anything a caller might pass.
+ *
+ * `String()` throws for an object with no prototype, and for one whose
+ * `toString` throws. The class tag, `[object Object]`, is what is left.
+ */
+function textOf(value: unknown): string {
+  if (typeof value === 'string') return value
+  try {
+    return String(value)
+  } catch {
+    return Object.prototype.toString.call(value)
+  }
+}
+
 /**
  * Split a message into the two columns it can fill.
  *
  * Coerces rather than throws, deliberately and against the grain of the rest
  * of this package: a logger that takes down a request because someone passed
  * a number is worse than a row reading `"42"`. Everything else here still
- * throws — this is the one call people make from inside a `catch`.
+ * throws. This is the one call people make from inside a `catch`, where the
+ * value caught can be anything at all.
  */
-function splitMessage(message: string | Error): { message: string; error_stack?: string } {
+function splitMessage(message: unknown): { message: string; error_stack?: string } {
   // the class tag and not `instanceof`, so an error thrown inside `vm`, a
   // worker or an iframe keeps its stack too
   if (message instanceof Error || Object.prototype.toString.call(message) === '[object Error]') {
-    const error = message as Error
+    const error = message as object
+    const text = textOf(readSafely(error, 'message'))
+    const stack = readSafely(error, 'stack')
     return {
-      message: error.message,
-      // a rethrown or cross-realm error can arrive without one; the header
-      // line is still worth more than an empty column
-      error_stack: error.stack ?? `${error.name}: ${error.message}`,
+      message: text,
+      // a rethrown or cross-realm error can arrive without one, or with
+      // something that is not a string. The header line is still worth more
+      // than an empty column
+      error_stack:
+        typeof stack === 'string' ? stack : `${textOf(readSafely(error, 'name'))}: ${text}`,
     }
   }
-  if (typeof message === 'string') return { message }
-  return { message: String(message) }
+  return { message: textOf(message) }
 }
 
 /**
@@ -324,7 +356,7 @@ export function log<
     if (shadows(level)) {
       throw new Error(
         `${name}: level ${JSON.stringify(level)} would shadow an existing property on the ` +
-          'logger — pick another',
+          'logger. Pick another',
       )
     }
     seen.add(level)
@@ -333,8 +365,8 @@ export function log<
   for (const key of Object.keys(fields)) {
     if ((RESERVED_LOG_COLUMNS as readonly string[]).includes(key)) {
       throw new Error(
-        `${name}: field ${JSON.stringify(key)} is a reserved column — ` +
-          `MetricHouse owns [${RESERVED_LOG_COLUMNS.join(', ')}] on every log row`,
+        `${name}: field ${JSON.stringify(key)} is a reserved column. MetricHouse writes ` +
+          `[${RESERVED_LOG_COLUMNS.join(', ')}] on every log row`,
       )
     }
   }

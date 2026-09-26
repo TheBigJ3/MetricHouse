@@ -60,6 +60,30 @@ describe('assertDimsLegal', () => {
     expect(err.message).toMatch(/payload/)
     expect(err.message).toMatch(/dog_poops/)
   })
+
+  it('rejects a name JavaScript would move ahead of the others', () => {
+    // `{ region, 2024 }` lists 2024 first, so the declared order is gone
+    // before any code can read it
+    expect(expectRejected(() => assertDimsLegal({ region: str(), 2024: str() }, 'm')).message).toBe(
+      'm: a dim cannot be named "2024", because JavaScript lists a key that reads as a whole ' +
+        'number before every other key, and the order you declared would be lost. Give it a ' +
+        'name such as "dim_2024"',
+    )
+  })
+
+  it('accepts a name that reads like a number but keeps its place', () => {
+    // a leading zero, or a value past the largest array index, is an
+    // ordinary key and stays where it was written
+    const kept = { region: str(), '01': str(), '4294967295': str() }
+    expect(() => assertDimsLegal(kept, 'm')).not.toThrow()
+    expect(dimOrder(kept)).toEqual(['region', '01', '4294967295'])
+  })
+
+  it('rejects a name among the columns the metric writes itself', () => {
+    expect(
+      expectRejected(() => assertDimsLegal({ value: str() }, 'm', ['id', 'value'])).message,
+    ).toBe('m: dim "value" is a reserved column. MetricHouse writes [id, value] on every row')
+  })
 })
 
 describe('escaping', () => {

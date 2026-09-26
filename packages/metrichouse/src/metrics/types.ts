@@ -10,7 +10,8 @@ import type { Claim, Driver, RecoveryReport } from '../drivers/types.js'
 import type { DeliveryMode, HouseDefaults } from '../runtime/delivery.js'
 import type { FlushOptions, MetricFlushReport } from '../runtime/flush.js'
 import type { LiveRow, SnapshotOptions } from '../runtime/live.js'
-import type { InferShape, Shape, TypeKind } from '../schema/types.js'
+import { hasLoneSurrogate } from '../schema/dims.js'
+import type { FieldType, InferShape, Shape, TypeKind } from '../schema/types.js'
 
 /**
  * Every primitive, in declaration order. A single list rather than a bare
@@ -298,6 +299,12 @@ export interface AnyMetric {
  * refused for the same reason it is refused in a table name: it is almost
  * always a typo, and it makes every key awkward to type into a shell.
  *
+ * Half of a surrogate pair is refused because Redis stores a key as UTF-8,
+ * which cannot hold one: two names that differ only there would share every
+ * key. `__proto__` is refused because a flush report and a house snapshot are
+ * keyed by metric name, and that key sets an object's prototype rather than
+ * adding an entry.
+ *
  * @throws naming the kind, so the message says which declaration is wrong
  */
 export function assertMetricName(name: unknown, kind: MetricKind): asserts name is string {
@@ -308,6 +315,18 @@ export function assertMetricName(name: unknown, kind: MetricKind): asserts name 
     throw new Error(
       `${kind}: name ${JSON.stringify(name)} may not contain a colon or whitespace, because ` +
         'a driver builds storage keys from it and both would make those keys ambiguous',
+    )
+  }
+  if (hasLoneSurrogate(name)) {
+    throw new Error(
+      `${kind}: name ${JSON.stringify(name)} holds half of a surrogate pair, which a driver ` +
+        'storing UTF-8 cannot keep apart from another name',
+    )
+  }
+  if (name === '__proto__') {
+    throw new Error(
+      `${kind}: a metric cannot be named "__proto__", because reports are keyed by metric ` +
+        "name and JavaScript treats that key as an object's prototype",
     )
   }
 }
@@ -323,6 +342,57 @@ export function assertSink(write: unknown, name: string): void {
   if (typeof write !== 'function') {
     throw new Error(`${name}: write must be a function that stores the rows, got ${typeof write}`)
   }
+}
+
+/**
+ * Refuse a first argument that is neither a delta nor a dims object.
+ *
+ * `add(delta)` and `add(dims)` share the first position, so anything that is
+ * not a number is read as dims. On a metric with no dims TypeScript accepts a
+ * bigint or a boolean there, and without this check `add(5n)` would count 1.
+ */
+export function assertDeltaOrDims(name: string, first: unknown): void {
+  if (first === undefined || first === null) return
+  if (typeof first === 'number' || typeof first === 'object') return
+  throw new Error(
+    `${name}: the first argument must be a number or a dims object, got ${typeof first}` +
+      (typeof first === 'bigint' ? '. Convert a bigint with Number() first' : ''),
+  )
+}
+
+/**
+ * Refuse a number an integer metric cannot take.
+ *
+ * Two different mistakes, told apart: a fraction, and a whole number past
+ * `Number.MAX_SAFE_INTEGER`, which a double cannot hold exactly. `noun` says
+ * what the number is to the caller, a delta or a value.
+ */
+export function assertWhole(name: string, kind: MetricKind, value: number, noun: string): void {
+  if (Number.isSafeInteger(value)) return
+  if (Number.isInteger(value)) {
+    throw new Error(
+      `${name}: ${value} is past ${Number.MAX_SAFE_INTEGER}, the largest whole number a ` +
+        `double holds exactly, so an integer ${kind} cannot take it`,
+    )
+  }
+  throw new Error(
+    `${name}: declares an integer ${kind}, so ${value} is not a legal ${noun}. ` +
+      'Declare `value: float()` if fractions are intended',
+  )
+}
+
+/**
+ * The row columns a set of dims becomes, in declared order.
+ *
+ * A dim with a default is never null, because the default fills every row
+ * that leaves it out, so only a dim marked `.optional()` is an optional
+ * column.
+ */
+export function dimColumns(dims: Shape): RowColumn[] {
+  return Object.keys(dims).map((column) => {
+    const type = dims[column] as FieldType
+    return { name: column, kind: type.kind, optional: type.isOptional && !type.hasDefault }
+  })
 }
 
 /** What a flush tells a metric about the claim it is asking for. */

@@ -132,8 +132,11 @@ A Redis restart, or a dropped connection, is safe for your totals. ioredis sends
 a command again after it reconnects if the first send got no reply, and the first
 send may already have run. Every write carries this driver's id and a sequence
 number, and Redis records which ones it has applied, so the second arrival does
-nothing. The record is one small key per driver, `mh:w:<id>`, trimmed as replies
-arrive and expired a day after the driver's last write.
+nothing. Acking, releasing and recovering a claim, and claiming records, are
+recorded the same way, along with the reply the first arrival gave, so a resent
+ack does not fail a flush that succeeded and a resent recovery still reports the
+claims it put back. The record is one small key per driver, `mh:w:<id>`, trimmed
+as replies arrive and expired a day after the driver's last write.
 
 `recoverAfter` is the one number behind crash recovery. A claim held by a flusher
 that is still writing looks exactly like a claim held by one that has died, and

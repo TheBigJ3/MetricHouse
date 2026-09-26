@@ -54,6 +54,12 @@ const house = createHouse({
 Defaults are filled in, never overridden. A metric that declares `flush: '5m'`
 because it carries payment data keeps it whatever the house says.
 
+Both `delivery` and `defaults.flush` are checked when the house is created. A
+`delivery` that is not one of the three modes throws, which matters when it is
+read from an environment variable that TypeScript cannot check. A
+`defaults.flush` of zero, or one longer than a timer can wait, throws too. See
+[Durations](/reference/durations#settings-a-timer-waits-for).
+
 ## Registering metrics
 
 You can pass an imported module, and the house picks out the metrics.
@@ -80,8 +86,9 @@ with the house that already holds it does nothing.
 
 Registration is all or nothing. If one metric in a schema cannot be registered,
 for example because it has no flush cadence and the house gives none either,
-`createHouse` throws and none of the metrics in that call stay bound. Fix the
-mistake and call `createHouse` again with the same metrics.
+`createHouse` throws and none of the metrics in that call stay bound, the one
+that failed included. Fix the mistake and call `createHouse` again with the same
+metrics.
 
 ## Looking at what is registered
 

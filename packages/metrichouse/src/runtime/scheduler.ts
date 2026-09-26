@@ -72,6 +72,12 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     try {
       const report = await metric.flush()
       if (report.error !== undefined) options.onError?.(report.error, { metric: metric.name })
+      // a failed recovery pass does not stop the flush below it, so it is not
+      // `error`. A scheduled flush has no caller to read the report, and
+      // this is the only place it can be heard
+      if (report.recoveryError !== undefined) {
+        options.onError?.(report.recoveryError, { metric: metric.name })
+      }
     } catch (error) {
       // flush reports its own failures, so this is one it could not: an
       // unbound metric, or a release that failed. Same destination: there is

@@ -122,7 +122,9 @@ import { DEFAULT_LOG_LEVELS } from 'metrichouse/core'
 Three things throw at declaration: an empty set, a level declared twice, and a
 level that would shadow a method on the logger. `levels: ['debug', 'drain']` is
 the third one, and catching it here is better than having `logger.drain()`
-quietly write a log line.
+quietly write a log line. A level named `then` is refused for the same reason:
+a `then` method makes the logger look like a promise, and `await` on anything
+that resolves to it would write a line and never finish.
 
 ### minLevel
 
@@ -263,13 +265,16 @@ try {
 An error made in another realm, inside `vm`, a worker or an iframe, counts as an
 `Error` too, and keeps its stack. An error that arrives without a stack, which
 happens with some rethrown errors, still gets a header line, because that is
-worth more than an empty column.
+worth more than an empty column. So does one whose `stack` is not a string. A
+`message` that is not a string is turned into one.
 
 ::: tip A logger never takes down a request
 Every other call in MetricHouse throws on a bad value. A log message does not.
-Something that is neither a string nor an `Error` is turned into a string. This
-call is made from inside `catch` blocks, and a logger that throws there
-replaces the error you were handling.
+Something that is neither a string nor an `Error` is turned into a string. A
+value `String()` cannot convert, such as an object made with
+`Object.create(null)`, is written as `[object Object]`. This call is made from
+inside `catch` blocks, where the value caught can be anything at all, and a
+logger that throws there replaces the error you were handling.
 :::
 
 ## log.at()

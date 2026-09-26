@@ -20,12 +20,6 @@ export const DIM_SEPARATOR = '|'
 export const DIM_ABSENT = '\\0'
 
 /**
- * Canonical declaration order — the object's own key order.
- *
- * The key depends on this, so **reordering dims is a breaking schema change**:
- * existing rows encoded under the old order will not match new ones.
- */
-/**
  * Split a key on unescaped separators.
  *
  * A plain `key.split('|')` is wrong: an escaped `\|` inside a value would
@@ -62,33 +56,82 @@ function splitKey(key: string): string[] {
 /** The escape character. A literal one in a value is always doubled. */
 const ESCAPE = '\\'
 
+/**
+ * Canonical declaration order, which is the object's own key order.
+ *
+ * The key depends on this, so **reordering dims is a breaking schema change**:
+ * existing rows encoded under the old order will not match new ones.
+ */
 export function dimOrder(dims: Shape): string[] {
   return Object.keys(dims)
 }
 
 /**
- * Refuse a name no row can carry.
+ * True for a key JavaScript lists before every other key.
+ *
+ * An object keeps its keys in the order they were written, except for a key
+ * that reads as an array index, a whole number below 2^32 - 1 written without
+ * a leading zero. Those come first, smallest first, whatever order they were
+ * written in. The declared order is then lost before any code can see it.
+ */
+function isArrayIndex(key: string): boolean {
+  return /^(0|[1-9]\d*)$/.test(key) && Number(key) < 2 ** 32 - 1
+}
+
+/**
+ * Refuse a name no row can carry, or one whose place in the row cannot be
+ * kept.
  *
  * `row.__proto__ = value` sets the row's prototype rather than adding a
  * column, so a dim or field with that name would be accepted and then be
- * missing from every row a sink receives.
+ * missing from every row a sink receives. A name in `columns` is one the
+ * metric writes on every row itself, and a dim or field of that name would
+ * overwrite it or be overwritten.
  */
-export function assertShapeNames(shape: Shape, metricName: string, noun = 'dim'): void {
+export function assertShapeNames(
+  shape: Shape,
+  metricName: string,
+  noun = 'dim',
+  columns: readonly string[] = [],
+): void {
   if (Object.hasOwn(shape, '__proto__')) {
     throw new Error(
       `${metricName}: a ${noun} cannot be named "__proto__", because JavaScript treats that ` +
         "key as an object's prototype and no row could carry it",
     )
   }
+  for (const key of Object.keys(shape)) {
+    if (columns.includes(key)) {
+      throw new Error(
+        `${metricName}: ${noun} ${JSON.stringify(key)} is a reserved column. MetricHouse ` +
+          `writes [${columns.join(', ')}] on every row`,
+      )
+    }
+    if (isArrayIndex(key)) {
+      throw new Error(
+        `${metricName}: a ${noun} cannot be named ${JSON.stringify(key)}, because JavaScript ` +
+          'lists a key that reads as a whole number before every other key, and the order ' +
+          `you declared would be lost. Give it a name such as "${noun}_${key}"`,
+      )
+    }
+  }
 }
 
-export function assertDimsLegal(dims: Shape, metricName: string): void {
-  assertShapeNames(dims, metricName)
+/**
+ * Refuse a dim no series key can hold, or one that shares a name with a
+ * column in `columns`, the ones the metric writes on every row itself.
+ */
+export function assertDimsLegal(
+  dims: Shape,
+  metricName: string,
+  columns: readonly string[] = [],
+): void {
+  assertShapeNames(dims, metricName, 'dim', columns)
   for (const [key, type] of Object.entries(dims)) {
     if (!type.dimLegal) {
       throw new Error(
         `${metricName}: dim ${JSON.stringify(key)} declares ${type.kind}(), which cannot be ` +
-          'encoded into a series key — put it on an event instead',
+          'encoded into a series key. Put it on an event instead',
       )
     }
   }
@@ -126,12 +169,17 @@ export function unescapeDimValue(value: string): string {
  */
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
 
+/** True when `text` holds half of a surrogate pair, which UTF-8 cannot store. */
+export function hasLoneSurrogate(text: string): boolean {
+  return LONE_SURROGATE.test(text)
+}
+
 export function encodeDimValue(type: FieldType, value: unknown): string {
   if (type.kind === 'ts') return String((value as Date).getTime())
   if (type.kind === 'bool') return value ? 'true' : 'false'
 
   const text = String(value)
-  if (LONE_SURROGATE.test(text)) {
+  if (hasLoneSurrogate(text)) {
     throw new Error(
       `dim value ${JSON.stringify(text)} holds half of a surrogate pair, which cannot be ` +
         'stored as UTF-8. It usually means a string was cut in the middle of an emoji',
@@ -232,7 +280,7 @@ export function validateDims(dims: Shape, values: Record<string, unknown>, noun 
   for (const key of Object.keys(values)) {
     if (!Object.hasOwn(dims, key)) {
       throw new Error(
-        `unknown ${noun} ${JSON.stringify(key)} — declared ${noun}s are ` +
+        `unknown ${noun} ${JSON.stringify(key)}. The declared ${noun}s are ` +
           `[${dimOrder(dims).join(', ')}]`,
       )
     }

@@ -212,6 +212,10 @@ such as `0` or `''`, survives.
 | The row carries a value | No | Yes |
 | Your column can be null | Yes | No |
 
+`rowShape()` follows the last row: a column with a default reports
+`optional: false`, although `.default()` also sets `isOptional` on the
+declaration, because the caller may leave the key out.
+
 Use `.default()` for a dimension, so every row has a value and grouping behaves
 consistently. Use `.optional()` for an event field that genuinely does not apply
 to every record.
@@ -266,7 +270,7 @@ route: expected a string, got 42
 amountCents: expected a safe integer, got 49.99
 status: "200" is not one of ["2xx", "3xx", "4xx", "5xx"]
 missing required dim "status"
-unknown dim "pakr" — declared dims are [route, status]
+unknown dim "pakr". The declared dims are [route, status]
 occurredAt: expected a valid Date, got "2026-09-17"
 ```
 

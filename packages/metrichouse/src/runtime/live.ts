@@ -160,8 +160,24 @@ export interface BucketedRow {
  */
 export type MergeValues = (rows: readonly Row[]) => Record<string, unknown>
 
-function asMs(at: number | Date): number {
-  return isDate(at) ? at.getTime() : at
+/**
+ * A snapshot's `from` or `to`, as epoch milliseconds.
+ *
+ * An invalid `Date` reads as NaN, and a NaN bound is no bound at all: a `to`
+ * of `new Date('garbage')` would quietly include the open window, and a
+ * `from` would match nothing. Refused instead, like a typo in `dims`.
+ *
+ * @throws for an invalid `Date` or a number that is not finite
+ */
+export function boundMs(at: number | Date, which: 'from' | 'to', metric: string): number {
+  const ms = isDate(at) ? at.getTime() : at
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) {
+    throw new Error(
+      `${metric}: ${which} must be a valid Date or a finite number of milliseconds, got ` +
+        (isDate(at) ? 'an invalid Date' : String(at)),
+    )
+  }
+  return ms
 }
 
 /**
@@ -181,7 +197,7 @@ function assertDimsKnown(
       const declared = Object.keys(dims)
       throw new Error(
         `${metric}: ${label} names ${JSON.stringify(key)}, which is not a declared dim` +
-          (declared.length > 0 ? ` — this metric has [${declared.join(', ')}]` : ' — it has none'),
+          (declared.length > 0 ? `. This metric has [${declared.join(', ')}]` : '. It has none'),
       )
     }
   }
@@ -198,15 +214,17 @@ export function snapshotRange(
   options: SnapshotOptions,
   resolutionMs: number,
   nowMs: number,
+  metric = 'snapshot',
 ): { from?: number; to?: number } {
   const openStart = Math.floor(nowMs / resolutionMs) * resolutionMs
-  const asked = options.to === undefined ? undefined : asMs(options.to)
+  const asked = options.to === undefined ? undefined : boundMs(options.to, 'to', metric)
+  const from = options.from === undefined ? undefined : boundMs(options.from, 'from', metric)
   const complete = options.complete ?? true
 
   const to = complete ? Math.min(asked ?? Number.POSITIVE_INFINITY, openStart) : asked
 
   return {
-    ...(options.from !== undefined && { from: asMs(options.from) }),
+    ...(from !== undefined && { from }),
     ...(to !== undefined && Number.isFinite(to) && { to }),
   }
 }
@@ -314,7 +332,11 @@ function collapse(
       // keeps the identity a sink would give it
       ...(keepsBuckets && keepsEverySeries && group.length === 1 ? { id: first.row.id } : {}),
       ...(keepsBuckets ? { bucket_ts: first.row.bucket_ts } : {}),
-      ...Object.fromEntries(kept.map((dim) => [dim, first.row[dim]])),
+      // an absent optional dim stays absent, as it is on an ungrouped row,
+      // rather than turning into a key that holds `undefined`
+      ...Object.fromEntries(
+        kept.filter((dim) => first.row[dim] !== undefined).map((dim) => [dim, first.row[dim]]),
+      ),
       ...mergeValues(group.map((one) => one.row)),
       // partial if any constituent bucket is, and elapsed across all of them —
       // "of the window this covers, this much has happened"
@@ -370,7 +392,7 @@ export function orderAndLimit<R extends Record<string, unknown>>(
     if (sample !== undefined && !rows.some((row) => row[orderBy] !== undefined)) {
       throw new Error(
         `${metric}: orderBy names ${JSON.stringify(orderBy)}, which is not a column on these ` +
-          `rows — they have [${Object.keys(sample).join(', ')}]`,
+          `rows. They have [${Object.keys(sample).join(', ')}]`,
       )
     }
 

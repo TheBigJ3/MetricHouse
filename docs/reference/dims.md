@@ -90,8 +90,38 @@ a series. Put it on an [event field](/reference/fields) instead.
 ```ts
 dims: { metadata: json() }
 // Error: dim "metadata" declares json(), which cannot be encoded into a series
-// key — put it on an event instead
+// key. Put it on an event instead
 ```
+
+### Names a dim cannot take
+
+A dim becomes a column of every row, beside the columns the metric writes
+itself, so it cannot share a name with one of them.
+
+| Metric type | Columns a dim cannot be named |
+| --- | --- |
+| counter, level | `id`, `bucket_ts`, `value` |
+| gauge, timer | `id`, `bucket_ts`, and each aggregate the metric ships |
+| timer | `duration_ms` as well, the field a timing carries onto its record event |
+
+A dim sharing a name with a column would overwrite it or be overwritten by it. A
+dim named `id` would replace the row id, and every window of the series would
+ship with the same id.
+
+```ts
+dims: { value: str() }
+// Error: http_requests: dim "value" is a reserved column. MetricHouse writes
+// [id, bucket_ts, value] on every row
+```
+
+A gauge that leaves an aggregate out of `aggregate` can use its name for a dim,
+because no column of that name is written.
+
+Two more names are refused on every type. `__proto__` sets an object's prototype
+rather than adding a key, so no row could carry it. A name that reads as a whole
+number, such as `'2024'`, is listed by JavaScript before every other key
+whatever order you wrote it in, so the [declared order](#declaration-order) would
+be lost. `'y2024'` or `'01'` keep their place and are accepted.
 
 ### Optional dims
 
@@ -216,7 +246,7 @@ missing throws at `end()`, where it is the last chance to supply one.
 
 ```ts
 httpLatency.start({ rout: '/checkout' })
-// Error: unknown dim "rout" — declared dims are [route, status]
+// Error: unknown dim "rout". The declared dims are [route, status]
 
 httpLatency.start({}).end({})
 // Error: missing required dim "route"
@@ -396,13 +426,16 @@ half finished state behind.
 | `dim "x" declares json(), which cannot be encoded into a series key` | `json()` used as a dim. At declaration |
 | `default for int(): expected a safe integer, got "five"` | `.default()` given a value its own type rejects. At declaration |
 | `dim "duration_ms" is reserved` | A timer dim using the name a timing carries onto its record event. At declaration |
+| `dim "id" is a reserved column` | A dim named after a column the metric writes itself. At declaration |
 | `a dim cannot be named "__proto__"` | JavaScript treats that key as an object's prototype, so no row could carry it. At declaration |
+| `a dim cannot be named "2024"` | A name that reads as a whole number, which JavaScript moves ahead of every other key. At declaration |
 | `missing required dim "status"` | A declared dim with no value and no default |
-| `unknown dim "pakr" — declared dims are [route, status]` | A key that is not declared |
+| `unknown dim "pakr". The declared dims are [route, status]` | A key that is not declared |
 | `route: expected a string, got 42` | A value of the wrong type |
 | `status: "200" is not one of ["2xx", "3xx", "4xx", "5xx"]` | A value outside a `oneOf` set |
 | `occurredAt: expected a valid Date, got "2026-09-17"` | A `ts()` dim given something that is not a `Date` |
 | `http_requests: dims names "pakr", which is not a declared dim` | A snapshot filter or `groupBy` naming an undeclared dim |
+| `dim value "a\ud800" holds half of a surrogate pair` | A string cut in the middle of an emoji, which storage kept as UTF-8 could not tell apart from another |
 | `memory driver: http_requests exceeded maxSeries (100000)` | A dim with unbounded values, on `memory()` |
 
 ## Related
