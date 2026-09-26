@@ -21,7 +21,7 @@ import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
 import type { InferShape, Shape, Simplify } from '../schema/types.js'
 import { assertResolution, bucketStart } from '../time/buckets.js'
-import { type DurationInput, parseDuration } from '../time/duration.js'
+import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
 import { bucketedLifecycle, bucketedReader, DEFAULT_GRACE_MS } from './bucketed.js'
 import type {
   AnyMetric,
@@ -34,7 +34,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink } from './types.js'
+import { assertMetricName, assertSink, dimColumns } from './types.js'
 
 /** The five stored aggregates, in column order. */
 export const GAUGE_AGGREGATES = ['last', 'min', 'max', 'sum', 'count'] as const
@@ -178,10 +178,10 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
   assertSink(config.write, name)
 
   const dims = (config.dims ?? {}) as D
-  assertDimsLegal(dims, name)
 
   const resolutionMs = parseDuration(config.resolution)
-  const ownFlushMs = config.flush === undefined ? undefined : parseDuration(config.flush)
+  const ownFlushMs =
+    config.flush === undefined ? undefined : parseInterval(config.flush, `${name}: flush`)
   const ownGraceMs = config.grace === undefined ? undefined : parseDuration(config.grace)
   if (ownFlushMs !== undefined) assertResolution(resolutionMs, ownFlushMs)
 
@@ -194,6 +194,15 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       throw new Error(`${name}: unknown aggregate ${JSON.stringify(column)}`)
     }
   }
+  if (new Set(aggregate).size !== aggregate.length) {
+    throw new Error(
+      `${name}: aggregate names ${JSON.stringify(aggregate)}, and each one may appear once, ` +
+        'because each becomes one column of the row',
+    )
+  }
+  // after the aggregates, because the ones declared are columns of every row
+  // and a dim may take none of them
+  assertDimsLegal(dims, name, ['id', 'bucket_ts', ...aggregate])
 
   // erased for the engine, which carries rows of every kind. See the counter
   const sink = config.write as WriteFn
@@ -211,11 +220,11 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
   }
 
   /** The metric's own cadence, or the house's. See the counter for the rule. */
-  function effectiveFlushMs(): number {
-    const ms = ownFlushMs ?? binding?.defaults?.flushMs
+  function effectiveFlushMs(from: MetricBinding | undefined = binding): number {
+    const ms = ownFlushMs ?? from?.defaults?.flushMs
     if (ms === undefined) {
       throw new Error(
-        `${name}: no flush cadence — declare flush on the gauge, or defaults.flush on the house`,
+        `${name}: no flush cadence. Declare flush on the ${kind}, or defaults.flush on the house`,
       )
     }
     return ms
@@ -228,7 +237,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
   function activeBinding(): MetricBinding {
     if (!binding) {
       throw new Error(
-        `${name}: not bound to a house — pass it to createHouse({ schema }) before writing`,
+        `${name}: not bound to a house. Pass it to createHouse({ schema }) before writing`,
       )
     }
     return binding
@@ -285,6 +294,16 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     return (activeBinding().now ?? Date.now)()
   }
 
+  /**
+   * The fold's `sum` for each row this metric built, whether or not `sum` is
+   * one of its columns.
+   *
+   * A sink is told every observed value added up as the batch total, and a
+   * gauge that ships only `min` and `max` still observed values. Weak, so a
+   * row a sink has let go of takes its entry with it.
+   */
+  const sums = new WeakMap<Row, number>()
+
   function materialize(bucketTs: number, dimKey: string, cell: Cell): Row {
     const fold = asFold(cell)
     const row: Row = {
@@ -294,12 +313,16 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     }
     // only the declared aggregates become columns
     for (const column of aggregate) row[column] = fold[column]
+    sums.set(row, fold.sum)
     return row
   }
 
   function totalOf(rows: readonly Row[]): number {
-    // every observed value added up — `sum` is exactly that, per series
-    return rows.reduce((total, row) => total + (typeof row.sum === 'number' ? row.sum : 0), 0)
+    // every observed value added up, which is `sum` per series
+    return rows.reduce((total, row) => {
+      const sum = sums.get(row) ?? row.sum
+      return total + (typeof sum === 'number' ? sum : 0)
+    }, 0)
   }
 
   /**
@@ -412,10 +435,11 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
 
     bind(next: MetricBinding): void {
       if (binding) {
-        throw new Error(`${name}: already bound to a house — a metric belongs to exactly one`)
+        throw new Error(`${name}: already bound to a house, and a metric belongs to exactly one`)
       }
+      // checked before the binding is kept, as the counter does
+      if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs(next))
       binding = next
-      if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs())
     },
 
     unbind(): void {
@@ -483,14 +507,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       const columns: RowColumn[] = [
         { name: 'id', kind: 'str', optional: false },
         { name: 'bucket_ts', kind: 'ts', optional: false },
-        ...Object.keys(dims).map((column) => {
-          const type = dims[column]
-          return {
-            name: column,
-            kind: type?.kind ?? 'str',
-            optional: type?.isOptional ?? false,
-          }
-        }),
+        ...dimColumns(dims),
         // count is a whole number of observations; the rest are values
         ...aggregate.map((column) => ({
           name: column,

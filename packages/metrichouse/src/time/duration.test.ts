@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatDuration, parseDuration, UNIT_MS } from './duration.js'
+import { formatDuration, MAX_TIMER_MS, parseDuration, parseInterval, UNIT_MS } from './duration.js'
 
 /**
  * Asserts `fn` throws a *real* validation error — not the `not implemented`
@@ -86,6 +86,29 @@ describe('parseDuration', () => {
 
   it('names the offending input in the error', () => {
     expect(expectRejected(() => parseDuration('5y')).message).toMatch(/5y/)
+  })
+})
+
+describe('parseInterval', () => {
+  it('parses what parseDuration parses', () => {
+    expect(parseInterval('5m', 'm: flush')).toBe(300_000)
+  })
+
+  it('refuses zero, which would fire a timer in a tight loop', () => {
+    expect(() => parseInterval('0s', 'm: flush')).toThrow(
+      'm: flush must be longer than zero, got "0s"',
+    )
+  })
+
+  it('accepts the longest delay a timer can wait', () => {
+    expect(parseInterval(MAX_TIMER_MS, 'm: flush')).toBe(2_147_483_647)
+  })
+
+  it('refuses one millisecond past it', () => {
+    expect(() => parseInterval(MAX_TIMER_MS + 1, 'm: flush')).toThrow(
+      'm: flush is 2147483648ms, longer than 2147483647ms (just under 25 days), which is the ' +
+        'longest a JavaScript timer can wait. A longer one fires every millisecond',
+    )
   })
 })
 

@@ -95,13 +95,18 @@ report a window nobody wrote to, so the number has to outlive the flush that
 shipped the last one. Everything else a driver holds is claimed and then
 deleted.
 
+Metric names and series keys reach a driver as well formed Unicode. A metric
+refuses a name, and a dim value, that holds half of a UTF-16 surrogate pair, so
+storage that keeps text as UTF-8, as Redis does, never has to tell two such
+keys apart.
+
 ## Writing
 
 ### increment
 
 ```ts
 increment(ops: readonly IncrOp[]): Promise<void>
-// IncrOp: { metric, bucketTs, dimKey, delta }
+// IncrOp: { metric, bucketTs, dimKey, delta, integer? }
 ```
 
 Add `delta` to the cell at that metric, window and series. Create the cell if it
@@ -111,8 +116,17 @@ can declare `float()`.
 Add in plain doubles, the way JavaScript's `+` does, so every driver holds the
 same bits. Redis's `HINCRBYFLOAT` rounds to seventeen decimal places, which turns
 `1e-310` into `0`; the Redis driver adds inside a Lua script instead. Refuse an
-increment whose total would not be a finite number, and change nothing when you
-do. Store `-0` as `0`.
+increment whose total would not be a finite number, the first one into an empty
+cell included, and change nothing in that window when you do. Store `-0` as `0`.
+
+`integer` is set by a counter that counts whole numbers. Refuse an increment
+whose total would pass `9007199254740991`, `Number.MAX_SAFE_INTEGER`, as well:
+past it a double cannot hold every whole number, and the total would stop being
+exact without anyone noticing.
+
+Apply the operations in the order they were given. Two aimed at different
+windows can land in the same one, as the next paragraph explains, and a sum of
+doubles depends on the order it was added in.
 
 A write aimed below the claimed watermark lands at the watermark instead. See
 [claim](#claim).
@@ -141,7 +155,9 @@ be atomic, or two writers lose observations. The Redis driver uses a Lua script
 for exactly this.
 
 Refuse an observation whose `sum` would not be a finite number, as `increment`
-does, and move it to the watermark the same way when it is aimed below it.
+does, the first one into an empty cell included. Move it to the watermark the
+same way when it is aimed below it, and fold a batch in the order it was given,
+because `last` is whichever observation came last.
 
 ### setLevel
 
@@ -165,6 +181,16 @@ own value rather than reading the held one, because the window it fills is in
 the past and the series may have moved since. It leaves an existing cell alone,
 so a written value always beats a carried one. A `hold` for a series the driver
 has never seen does nothing at all, and must not bring one into existence.
+
+When a `hold` finds its window already written, `carried` becomes the value in
+that cell rather than the one the hold named. The flush worked out its value
+before a late `set` landed in the window, and carrying that older number would
+repeat a level the series had already left in every empty window after it. The
+same rule makes a `hold` safe to apply twice.
+
+`integer` is set by a level that holds whole numbers. Refuse a `set` or an `add`
+that would leave a cell or the held value past `9007199254740991`, as
+[`increment`](#increment) does.
 
 Each series also carries two timestamps, both handed to the driver rather than
 read from a clock it owns:
@@ -262,7 +288,10 @@ it has never heard of.
 
 A `Date` inside `fields` has to survive the round trip. Plain `JSON.stringify`
 turns a `Date` into a string, which would hand the metric text for a column that
-wants a date.
+wants a date. However a driver marks a date inside stored text, an object of the
+caller's own that has the same shape must come back as it went in. The Redis
+driver writes a date as `{ "__mh_date": <ms> }`, and stores any key of the
+caller's that starts with `__mh_` with that prefix written twice.
 
 ## Reading
 
@@ -278,6 +307,12 @@ Unflushed, unclaimed windows only. `from` and `to` are half open, `[from, to)`.
 
 Results are ordered by window, then by series key. Sorted output is part of the
 contract, because merging a rollup and answering `last` both depend on it.
+
+A read sees every write the same driver was handed before it, even one whose
+promise has not resolved yet. The Redis driver sends each read behind the
+writes queued ahead of it, the same queue that
+[keeps one writer's writes in order](#release). `readLevels` and `readPending`
+follow the same rule.
 
 There is no `complete` flag. Excluding the window still filling is just
 `to = bucketStart(now, resolution)`, and keeping resolution out of storage is what
@@ -422,6 +457,15 @@ A claim can be settled exactly once. Acking a released claim, or releasing an
 acked one, has to throw. Silently accepting it means a bug in the layer above
 turns into missing data.
 
+A settle that reaches shared storage twice is not settling twice. A client that
+resends an `ack` after a reconnect cannot know whether the first one ran, and
+the second arrival would find the claim gone and throw, turning a successful
+flush into an error. Recognise the second arrival and answer the way the first
+one did. The same goes for `release`, for `recover`, which would otherwise
+report that it found nothing, and for `claimRecords`, which would otherwise take
+a second `limit` of records into the same claim. The Redis driver records each
+of these beside its writes and replays the recorded reply.
+
 ## Recovering
 
 ### recover
@@ -495,9 +539,12 @@ A driver has to satisfy all of these.
   a command after a reconnect cannot know whether the first send ran, so
   `increment`, `observe`, a level `set` or `add`, and `append` each carry
   something that lets storage recognise the second arrival.
+- A batch is applied in the order it was given, even when its operations move
+  forward to one window.
 - A gauge fold and a counter total keep full floating point precision.
 - A total, sum or level that would not be a finite number is refused, and
-  nothing changes.
+  nothing in that window changes. That includes the first write into a cell.
+- With `integer` set, a total or level past `9007199254740991` is refused too.
 - `-0` is stored as `0`.
 - A write aimed below the highest claimed watermark lands at the watermark.
 - Writing a cell of one kind into a series that holds another throws, whichever
@@ -514,6 +561,7 @@ A driver has to satisfy all of these.
   write and never on a hold.
 - Held values survive the claim and the ack that ship their windows.
 - A `set` or `add` in the window `heldThrough` names replaces `carried`.
+- A `hold` into a window that already has a cell carries that cell's value.
 - A `hold` below the claimed watermark writes no cell and still moves the pointer.
 - `dropLevels` forgets a series without touching the windows it already filled,
   and keeps a series written at or after `writtenBefore`.
@@ -526,6 +574,8 @@ A driver has to satisfy all of these.
 - Results are ordered by window, then series key, regardless of insertion order.
 - Claimed data is invisible.
 - Reading never consumes.
+- A read sees a write issued before it, awaited or not.
+- A field shaped like the driver's own date marker comes back untouched.
 
 **Claiming**
 
@@ -543,7 +593,8 @@ A driver has to satisfy all of these.
 - Released records return ahead of anything appended since, merged by append
   order with records an earlier release already put back.
 - `countPending` counts records in a claim until it is settled.
-- Settling the same claim twice throws.
+- Settling the same claim twice throws, and one settle that reaches storage
+  twice does not.
 - Nothing is lost when a write fails and the flush retries.
 
 **Recovering**
@@ -556,6 +607,7 @@ A driver has to satisfy all of these.
 - Recovered records return ahead of anything appended since.
 - An empty claim is settled rather than left registered for ever.
 - Two sweeps running at once put the data back once.
+- A sweep that reaches storage twice reports what the first arrival put back.
 
 ## Testing your driver
 

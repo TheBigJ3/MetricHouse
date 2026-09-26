@@ -84,7 +84,7 @@ export function bucketedReader<D extends Shape, V>(
   const reader = {
     async snapshot(snapshotOptions: SnapshotOptions = {}): Promise<LiveRow[]> {
       const nowMs = now()
-      const range = snapshotRange(snapshotOptions, resolutionMs, nowMs)
+      const range = snapshotRange(snapshotOptions, resolutionMs, nowMs, name)
 
       const live = await driver().readBuckets({ metric: name, ...range })
 

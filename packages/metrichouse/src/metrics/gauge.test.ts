@@ -87,6 +87,43 @@ describe('declaration', () => {
     expect(metric.dims).toEqual({})
   })
 
+  it('refuses an aggregate named twice', () => {
+    expect(expectRejected(() => make({ aggregate: ['sum', 'max', 'sum'] })).message).toBe(
+      'bowl_level: aggregate names ["sum","max","sum"], and each one may appear once, ' +
+        'because each becomes one column of the row',
+    )
+  })
+
+  it('refuses a dim named after a column it writes', () => {
+    expect(
+      expectRejected(() =>
+        gauge('by_min', { dims: { min: str() }, resolution: '10s', flush: '1m', write: discard }),
+      ).message,
+    ).toBe(
+      'by_min: dim "min" is a reserved column. MetricHouse writes ' +
+        '[id, bucket_ts, last, min, max, sum, count] on every row',
+    )
+  })
+
+  it('lets a dim take the name of an aggregate it does not ship', () => {
+    const metric = gauge('by_min', {
+      dims: { min: str() },
+      aggregate: ['max'],
+      resolution: '10s',
+      flush: '1m',
+      write: discard,
+    })
+    expect(metric.rowShape().columns.map((c) => c.name)).toEqual(['id', 'bucket_ts', 'min', 'max'])
+  })
+
+  it('stays unbound when a binding is refused', () => {
+    const metric = gauge('odd', { resolution: '7s', write: discard })
+    expect(() => metric.bind({ driver, now, defaults: { flushMs: 60_000 } })).toThrow(
+      /does not divide/,
+    )
+    expect(metric.isBound).toBe(false)
+  })
+
   it('is inert until bound', () => {
     expect(expectRejected(() => make().set(1, B1)).message).toMatch(/bound/)
   })
@@ -247,6 +284,22 @@ describe('materialize', () => {
       /counter cell/,
     )
   })
+
+  it('totals every observed value when sum is not a column', async () => {
+    const totals: number[] = []
+    const metric = bound({
+      aggregate: ['min', 'max'],
+      write: (_rows: unknown, context: { total: number }) => {
+        totals.push(context.total)
+      },
+    })
+    metric.set(5, B1)
+    metric.set(7, B1)
+    await metric.drain()
+    clock += 60_000
+    await metric.flush({ force: true })
+    expect(totals).toEqual([12])
+  })
 })
 
 describe('rowShape', () => {
@@ -270,6 +323,17 @@ describe('rowShape', () => {
         .rowShape()
         .columns.map((c) => c.name),
     ).toEqual(['id', 'bucket_ts', 'bowlId', 'room', 'last'])
+  })
+
+  it('marks a dim with a default as a column every row carries', () => {
+    const metric = gauge('g', {
+      dims: { room: str().default('kitchen') },
+      aggregate: ['last'],
+      resolution: '10s',
+      flush: '1m',
+      write: discard,
+    })
+    expect(metric.rowShape().columns[2]).toEqual({ name: 'room', kind: 'str', optional: false })
   })
 })
 
@@ -295,14 +359,14 @@ describe('mixing kinds is refused at the driver', () => {
 describe('totals at high cardinality', () => {
   it('merges two hundred thousand series without overflowing the stack', async () => {
     const wide = gauge('wide', {
-      dims: { id: str() },
+      dims: { host: str() },
       resolution: '1m',
       flush: '1m',
       write: () => {},
     })
     const clock = 1_788_616_980_000
     wide.bind({ driver: memory({ maxSeries: Number.POSITIVE_INFINITY }), now: () => clock })
-    for (let i = 0; i < 200_000; i++) wide.set(i, { id: String(i) })
+    for (let i = 0; i < 200_000; i++) wide.set(i, { host: String(i) })
     await wide.drain()
 
     const totals = wide.totals

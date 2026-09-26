@@ -379,6 +379,53 @@ describe('failure and retry', () => {
     expect((await house.flush()).ok).toBe(false)
     expect(await driver.readBuckets({ metric: 'm' })).toHaveLength(1)
   })
+
+  it('reports a sink that rejects with no reason as a failure', async () => {
+    const metric = make('m', { write: () => Promise.reject() })
+    const house = createHouse({ driver, schema: [metric], now })
+    metric.add(A)
+    await house.drain()
+    settle()
+
+    const report = await house.flush()
+    expect(report.ok).toBe(false)
+    expect(report.metrics.m?.error).toEqual(new Error('m: the sink rejected without a reason'))
+    expect(await driver.readBuckets({ metric: 'm' })).toHaveLength(1)
+  })
+
+  it('does not spend the cadence on a sink that rejected with no reason', async () => {
+    let calls = 0
+    const metric = make('m', {
+      write: () => {
+        calls += 1
+        if (calls === 1) return Promise.reject()
+      },
+    })
+    const house = createHouse({ driver, schema: [metric], now })
+    metric.add(A)
+    await house.drain()
+    settle()
+
+    await house.flush()
+    expect(await metric.flush()).toMatchObject({ skipped: false, rows: 1 })
+  })
+
+  it('calls a sink that rejects with no reason once in a final flush', async () => {
+    let calls = 0
+    const metric = make('m', {
+      write: () => {
+        calls += 1
+        return Promise.reject()
+      },
+    })
+    const house = createHouse({ driver, schema: [metric], now })
+    metric.add(A)
+    await house.drain()
+    settle()
+
+    expect((await house.stop()).ok).toBe(false)
+    expect(calls).toBe(1)
+  })
 })
 
 describe('recovery', () => {

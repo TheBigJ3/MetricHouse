@@ -248,19 +248,27 @@ These all throw when the module is first imported, not at the first write.
 | --- | --- |
 | Empty metric name | `counter: name must be a non-empty string` |
 | A colon or whitespace in a metric name | `name "e:checkout" may not contain a colon or whitespace` |
+| Half of a surrogate pair in a metric name | `name "a\ud800" holds half of a surrogate pair` |
+| A metric named `__proto__` | `a metric cannot be named "__proto__"` |
 | No `write` function | `sold: write must be a function that stores the rows, got undefined` |
 | A `oneOf` whose members print the same | `oneOf: "2" prints the same as another member` |
 | A `json()` default JSON cannot hold | `default for json(): json() needs a value JSON can hold` |
 | `json()` as a dimension | `dim "x" declares json(), which cannot be encoded into a series key` |
 | Resolution does not divide flush | `resolution 7s does not divide flush 1m evenly` |
+| A zero `flush`, `defaults.flush` or `batch.maxAge` | `flush must be longer than zero, got "0s"` |
+| A `flush`, `defaults.flush` or `batch.maxAge` past 2147483647ms | `flush is 30d, longer than 2147483647ms (just under 25 days)` |
 | Invalid duration | `parseDuration: "1.5m"` |
 | Bad default value | `default for int(): expected a safe integer, got "five"` |
 | Unknown gauge aggregate | `unknown aggregate "avg"` |
+| A gauge aggregate named twice | `aggregate names ["sum","sum"], and each one may appear once` |
+| A dim named after a column the metric writes | `dim "id" is a reserved column` |
+| A dim or field named like a whole number | `a dim cannot be named "2024"` |
 | Reserved event field name | `field "ts" is a reserved column` |
 | Duplicate level | `level "info" is declared twice` |
 | `minLevel` not in `levels` | `minLevel "trace" is not one of the declared levels` |
-| A level shadowing a method | `level "flush" would shadow an existing property on the logger` |
+| A level shadowing a method, or named `then` | `level "flush" would shadow an existing property on the logger` |
 | A timer dimension named `duration_ms` | `dim "duration_ms" is reserved` |
 | Two metrics with the same name | `createHouse: two metrics are both named "x"` |
 | A metric registered with a second house | `already bound to a house` |
-| No cadence anywhere | `no flush cadence — declare flush on the counter, or defaults.flush on the house` |
+| No cadence anywhere | `no flush cadence. Declare flush on the counter, or defaults.flush on the house` |
+| An unknown `delivery` | `createHouse: delivery must be 'staged', 'immediate' or 'auto', got "immedate"` |

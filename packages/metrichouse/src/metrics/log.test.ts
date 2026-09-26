@@ -254,6 +254,29 @@ describe('errors', () => {
 
     expect((await shipped(appLog))[0]?.message).toBe('42')
   })
+
+  it('writes a caught value with no string form rather than throwing', async () => {
+    const appLog = bound()
+    appLog.error(Object.create(null) as Error, { service: 'api' })
+    await appLog.drain()
+
+    expect((await shipped(appLog))[0]?.message).toBe('[object Object]')
+  })
+
+  it('writes an Error whose message and stack are not strings rather than throwing', async () => {
+    const appLog = bound()
+    const odd = Object.assign(new RangeError('x'), {
+      message: 42 as unknown as string,
+      stack: 7 as unknown as string,
+    })
+    appLog.error(odd, { service: 'api' })
+    await appLog.drain()
+
+    expect((await shipped(appLog))[0]).toMatchObject({
+      message: '42',
+      error_stack: 'RangeError: 42',
+    })
+  })
 })
 
 describe('child', () => {
@@ -448,6 +471,13 @@ describe('level names that would hide a method', () => {
     for (const name of reserved) {
       expect(() => log('app', { write, levels: ['info', name] }), name).toThrow(/shadow/)
     }
+  })
+
+  it('refuses a level named then, which would make the logger awaitable', () => {
+    const write: WriteFn = () => {}
+    expect(() => log('app', { write, levels: ['info', 'then'] })).toThrow(
+      'app: level "then" would shadow an existing property on the logger. Pick another',
+    )
   })
 })
 

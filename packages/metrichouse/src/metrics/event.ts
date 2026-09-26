@@ -25,6 +25,7 @@ import { uuidv7 } from '../identity.js'
 import { createAttempts, metricFlush } from '../runtime/flush.js'
 import {
   assertLimit,
+  boundMs,
   type LiveFields,
   orderAndLimit,
   type SnapshotOptions,
@@ -39,7 +40,7 @@ import {
   type Shape,
   type Simplify,
 } from '../schema/types.js'
-import { type DurationInput, parseDuration } from '../time/duration.js'
+import { type DurationInput, parseInterval } from '../time/duration.js'
 import type {
   AnyMetric,
   MaterializedBatch,
@@ -287,21 +288,13 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   assertSink(config.write, name)
 
   const fields = config.fields ?? ({} as F)
-  assertShapeNames(fields, name, 'field')
-
-  for (const key of Object.keys(fields)) {
-    if ((RESERVED_EVENT_COLUMNS as readonly string[]).includes(key)) {
-      throw new Error(
-        `${name}: field ${JSON.stringify(key)} is a reserved column — ` +
-          `MetricHouse owns [${RESERVED_EVENT_COLUMNS.join(', ')}] on every event row`,
-      )
-    }
-  }
+  assertShapeNames(fields, name, 'field', RESERVED_EVENT_COLUMNS)
 
   const stage: EventStage = config.stage ?? 'driver'
-  const ownFlushMs = config.flush === undefined ? undefined : parseDuration(config.flush)
+  const ownFlushMs =
+    config.flush === undefined ? undefined : parseInterval(config.flush, `${name}: flush`)
   const maxSize = config.batch?.maxSize ?? DEFAULT_MAX_SIZE
-  const maxAgeMs = parseDuration(config.batch?.maxAge ?? '10s')
+  const maxAgeMs = parseInterval(config.batch?.maxAge ?? '10s', `${name}: batch.maxAge`)
 
   if (!Number.isSafeInteger(maxSize) || maxSize <= 0) {
     throw new Error(`${name}: batch.maxSize must be a positive integer, got ${maxSize}`)
@@ -315,7 +308,8 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   const timestampField =
     config.timestamp && config.timestamp !== 'auto' ? config.timestamp : undefined
   if (timestampField !== undefined) {
-    const declared = fields[timestampField]
+    // own keys only: `toString` is on every object, declared or not
+    const declared = Object.hasOwn(fields, timestampField) ? fields[timestampField] : undefined
     if (!declared) {
       throw new Error(
         `${name}: timestamp names ${JSON.stringify(timestampField)}, which is not a declared field`,
@@ -323,8 +317,8 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     }
     if (declared.kind !== 'ts') {
       throw new Error(
-        `${name}: timestamp field ${JSON.stringify(timestampField)} declares ${declared.kind}() — ` +
-          'it must be ts()',
+        `${name}: timestamp field ${JSON.stringify(timestampField)} declares ` +
+          `${declared.kind}(), and it must be ts()`,
       )
     }
   }
@@ -382,7 +376,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   function activeBinding(): MetricBinding {
     if (!binding) {
       throw new Error(
-        `${name}: not bound to a house — pass it to createHouse({ schema }) before writing`,
+        `${name}: not bound to a house. Pass it to createHouse({ schema }) before writing`,
       )
     }
     return binding
@@ -493,7 +487,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
         if (!metric) {
           throw new Error(
             `${name}: derive names ${JSON.stringify(target)}, which no metric in this house ` +
-              'declares — register it alongside the event',
+              'declares. Register it alongside the event',
           )
         }
         if (metric.kind !== 'counter') {
@@ -539,7 +533,10 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       }
       if (!isFloat && !Number.isSafeInteger(value)) {
         throw new Error(
-          `${label}: ${value} is not a whole number, and ${target} counts in whole numbers`,
+          Number.isInteger(value)
+            ? `${label}: ${value} is past ${Number.MAX_SAFE_INTEGER}, the largest whole number ` +
+                `a double holds exactly, and ${target} counts in whole numbers`
+            : `${label}: ${value} is not a whole number, and ${target} counts in whole numbers`,
         )
       }
       if (typeof targetDims !== 'object' || targetDims === null || Array.isArray(targetDims)) {
@@ -759,10 +756,6 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     }
   }
 
-  function toMs(at: number | Date): number {
-    return isDate(at) ? at.getTime() : at
-  }
-
   /**
    * The local-buffer answer to `readPending`'s query.
    *
@@ -835,7 +828,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
 
     bind(next: MetricBinding): void {
       if (binding) {
-        throw new Error(`${name}: already bound to a house — a metric belongs to exactly one`)
+        throw new Error(`${name}: already bound to a house, and a metric belongs to exactly one`)
       }
       binding = next
     },
@@ -866,8 +859,8 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     },
 
     async snapshot(options: SnapshotOptions = {}): Promise<EventLiveRow<F>[]> {
-      const from = options.from === undefined ? undefined : toMs(options.from)
-      const to = options.to === undefined ? undefined : toMs(options.to)
+      const from = options.from === undefined ? undefined : boundMs(options.from, 'from', name)
+      const to = options.to === undefined ? undefined : boundMs(options.to, 'to', name)
       if (options.limit !== undefined) assertLimit(options.limit, name)
 
       // with an order to sort by, every record has to be read before the top
@@ -960,7 +953,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       assertRecords(claim)
       if (stage === 'local') {
         if (!localInFlight.delete(claim.id)) {
-          throw new Error(`${name}: claim ${claim.id} is not in flight — already settled?`)
+          throw new Error(`${name}: claim ${claim.id} is not in flight. Was it already settled?`)
         }
         return
       }
@@ -971,7 +964,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       assertRecords(claim)
       if (stage === 'local') {
         if (!localInFlight.delete(claim.id)) {
-          throw new Error(`${name}: claim ${claim.id} is not in flight — already settled?`)
+          throw new Error(`${name}: claim ${claim.id} is not in flight. Was it already settled?`)
         }
         // back in the order they were staged. These are older than anything
         // recorded since, but a claim that failed before this one may already
@@ -1010,10 +1003,12 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
         ...Object.keys(fields).map((column) => {
           const type = fields[column] as FieldType
           // json arrives stringified, so the column it wants is text
+          // and a field with a default is never null, since the default
+          // fills every record that leaves it out
           return {
             name: column,
             kind: type.kind === 'json' ? ('str' as const) : type.kind,
-            optional: type.isOptional,
+            optional: type.isOptional && !type.hasDefault,
           }
         }),
         { name: '_ingested_at', kind: 'ts', optional: false },

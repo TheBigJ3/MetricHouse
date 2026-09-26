@@ -69,6 +69,40 @@ export function parseDuration(_input: DurationInput): number {
 }
 
 /**
+ * The longest delay a JavaScript timer can wait: 2^31 - 1 milliseconds, just
+ * under 25 days.
+ *
+ * `setTimeout` and `setInterval` treat a longer delay as one millisecond, so a
+ * flush cadence past it would fire every millisecond instead of rarely.
+ */
+export const MAX_TIMER_MS = 2 ** 31 - 1
+
+/**
+ * Parse a duration a timer waits for: a flush cadence, or how long an event
+ * batch may wait before it ships.
+ *
+ * Stricter than {@link parseDuration}, because a timer given zero fires in a
+ * tight loop, and one given more than {@link MAX_TIMER_MS} fires every
+ * millisecond. `what` names the setting, so the error says which one is wrong.
+ *
+ * @throws for zero, for anything past {@link MAX_TIMER_MS}, and for anything
+ * {@link parseDuration} rejects
+ */
+export function parseInterval(input: DurationInput, what: string): number {
+  const ms = parseDuration(input)
+  if (ms === 0) {
+    throw new Error(`${what} must be longer than zero, got ${JSON.stringify(input)}`)
+  }
+  if (ms > MAX_TIMER_MS) {
+    throw new Error(
+      `${what} is ${formatDuration(ms)}, longer than ${MAX_TIMER_MS}ms (just under 25 days), ` +
+        'which is the longest a JavaScript timer can wait. A longer one fires every millisecond',
+    )
+  }
+  return ms
+}
+
+/**
  * Render milliseconds back to the most compact exact duration string.
  *
  * Picks the largest unit that divides evenly, so `90_000` is `'90s'` (not

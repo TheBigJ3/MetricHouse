@@ -150,7 +150,7 @@ export function assertResolution(_resolutionMs: number, _flushMs: number): void 
   if (_flushMs % _resolutionMs !== 0) {
     throw new Error(
       `assertResolution: resolution ${formatDuration(_resolutionMs)} does not divide flush ` +
-        `${formatDuration(_flushMs)} evenly - a shipment would split a bucket`,
+        `${formatDuration(_flushMs)} evenly, and a shipment would split a bucket`,
     )
   }
 }

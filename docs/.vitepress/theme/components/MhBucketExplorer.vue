@@ -218,7 +218,7 @@ const snippet = computed(() => {
       <strong>This is rejected at declaration time.</strong>
       <code>
         assertResolution: resolution {{ resolutionLabel }} does not divide flush
-        {{ flushLabel }} evenly - a shipment would split a bucket
+        {{ flushLabel }} evenly, and a shipment would split a bucket
       </code>
       <button v-if="nearestValid !== -1" type="button" class="mh-play__fix" @click="snap">
         Snap flush to {{ FLUSHES[nearestValid]?.label }}

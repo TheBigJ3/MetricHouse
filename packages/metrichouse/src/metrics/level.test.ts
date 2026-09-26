@@ -115,6 +115,34 @@ describe('declaration', () => {
     expect(expectRejected(() => metric.bind({ driver, now })).message).toMatch(/already bound/)
   })
 
+  it('stays unbound when a binding is refused', () => {
+    const metric = level('odd', { resolution: '7s', write: discard })
+    expect(() => metric.bind({ driver, now, defaults: { flushMs: 60_000 } })).toThrow(
+      /does not divide/,
+    )
+    expect(metric.isBound).toBe(false)
+  })
+
+  it.each(['id', 'bucket_ts', 'value'])('refuses a dim named %s, a column it writes', (dim) => {
+    expect(
+      expectRejected(() =>
+        level('by_col', { dims: { [dim]: str() }, resolution: '10s', write: discard }),
+      ).message,
+    ).toBe(
+      `by_col: dim "${dim}" is a reserved column. MetricHouse writes [id, bucket_ts, value] ` +
+        'on every row',
+    )
+  })
+
+  it('marks a dim with a default as a column every row carries', () => {
+    const metric = level('l', {
+      dims: { queue: str().default('email') },
+      resolution: '10s',
+      write: discard,
+    })
+    expect(metric.rowShape().columns[2]).toEqual({ name: 'queue', kind: 'str', optional: false })
+  })
+
   it('describes the row a sink will receive', () => {
     expect(make().rowShape().columns).toEqual([
       { name: 'id', kind: 'str', optional: false },
@@ -183,6 +211,41 @@ describe('writing', () => {
   it('refuses a fraction on an integer level', () => {
     const metric = bound({ value: int() })
     expect(expectRejected(() => metric.set(1.5, EMAIL)).message).toMatch(/integer level/)
+  })
+
+  it('says a whole number past the safe range is too large, not a fraction', () => {
+    const metric = bound({ value: int() })
+    expect(expectRejected(() => metric.inc(2 ** 53, EMAIL)).message).toBe(
+      'queue_depth: 9007199254740992 is past 9007199254740991, the largest whole number a ' +
+        'double holds exactly, so an integer level cannot take it',
+    )
+  })
+
+  it('refuses an integer level that would pass the largest safe integer', async () => {
+    const errors: unknown[] = []
+    const metric = make({ value: int() })
+    metric.bind({ driver, now, onError: (error) => errors.push(error) })
+    metric.set(Number.MAX_SAFE_INTEGER, EMAIL)
+    metric.inc(EMAIL)
+    await metric.drain()
+
+    expect(errors.map((error) => (error as Error).message)).toEqual([
+      'memory driver: queue_depth level would be 9007199254740992, which is past ' +
+        '9007199254740991, the largest whole number a double holds exactly, so the write ' +
+        'was refused',
+    ])
+    expect(await metric.current(EMAIL)).toBe(Number.MAX_SAFE_INTEGER)
+  })
+
+  it('refuses a first argument to inc or dec that is neither a delta nor dims', () => {
+    const inFlight = level('in_flight', { resolution: '10s', flush: '10s', write: discard })
+    inFlight.bind({ driver, now })
+    expect(() => inFlight.inc(5n as unknown as number)).toThrow(
+      'in_flight: the first argument must be a number or a dims object, got bigint',
+    )
+    expect(() => inFlight.dec(true as unknown as number)).toThrow(
+      'in_flight: the first argument must be a number or a dims object, got boolean',
+    )
   })
 
   it('refuses an undeclared dim', () => {

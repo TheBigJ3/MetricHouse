@@ -28,6 +28,8 @@ batch: { maxAge: '10s' }
 A plain `number` is accepted and read as milliseconds, so `5_000` and `'5s'`
 mean the same thing. Whitespace around a string is trimmed. Zero is a valid
 duration wherever zero is meaningful, which in practice means `grace: '0s'`.
+The settings a timer waits for take a narrower range, covered
+[below](#settings-a-timer-waits-for).
 
 ## Every setting that takes one
 
@@ -67,6 +69,26 @@ The strictness is deliberate. Loosening what parses later is a change nobody
 has to think about, and tightening it is a change that breaks a running
 deployment.
 
+## Settings a timer waits for
+
+`flush`, `defaults.flush` and `batch.maxAge` each become the delay of a
+JavaScript timer, and a timer has limits a plain duration does not. Those three
+settings refuse two more inputs.
+
+| Rejected | Why |
+| --- | --- |
+| `'0s'` | A timer with no delay fires in a tight loop |
+| Anything past `2147483647` milliseconds, just under 25 days | The longest a JavaScript timer can wait. Node treats a longer delay as one millisecond, so a `'30d'` cadence would flush every millisecond |
+
+```
+signups: flush must be longer than zero, got "0s"
+requests: flush is 30d, longer than 2147483647ms (just under 25 days), which is
+the longest a JavaScript timer can wait. A longer one fires every millisecond
+```
+
+A cadence that long is better served by a cron that calls `flush()` than by a
+timer.
+
 ## resolution has to divide flush
 
 A flush ships whole windows, so `flush` has to be a whole multiple of
@@ -75,7 +97,7 @@ A flush ships whole windows, so `flush` has to be a whole multiple of
 ```ts
 counter('requests', { resolution: '10s', flush: '1m', write })   // 6 windows per flush
 counter('requests', { resolution: '7s', flush: '1m', write })
-// Error: resolution 7s does not divide flush 1m evenly - a shipment would
+// Error: resolution 7s does not divide flush 1m evenly, and a shipment would
 // split a bucket
 ```
 

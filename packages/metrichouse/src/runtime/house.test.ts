@@ -118,6 +118,20 @@ describe('createHouse', () => {
   })
 })
 
+describe('house config', () => {
+  it('refuses a default flush cadence of zero', () => {
+    expect(() => createHouse({ driver, defaults: { flush: '0s' } })).toThrow(
+      'createHouse: defaults.flush must be longer than zero, got "0s"',
+    )
+  })
+
+  it('refuses a default flush cadence a timer cannot wait for', () => {
+    expect(() => createHouse({ driver, defaults: { flush: '25d' } })).toThrow(
+      /^createHouse: defaults.flush is 25d, longer than 2147483647ms/,
+    )
+  })
+})
+
 describe('register', () => {
   it('binds metrics declared after boot', async () => {
     const house = createHouse({ driver, now })
@@ -268,6 +282,15 @@ describe('registration is all or nothing', () => {
     expect(first.isBound).toBe(false)
 
     expect(() => createHouse({ driver, schema: [first], defaults: { flush: '1m' } })).not.toThrow()
+  })
+
+  it('leaves the metric that failed unbound too, so it can be registered again', () => {
+    const broken = counter('broken', { resolution: '1s', write: discard })
+    expect(() => createHouse({ driver, schema: [broken] })).toThrow(/no flush cadence/)
+    expect(broken.isBound).toBe(false)
+
+    createHouse({ driver, schema: [broken], defaults: { flush: '1m' } })
+    expect(broken.isBound).toBe(true)
   })
 
   it('accepts a schema module that exports one metric under two names', () => {

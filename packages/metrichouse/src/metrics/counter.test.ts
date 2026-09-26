@@ -160,6 +160,22 @@ describe('dimensionless counters', () => {
     await metric.drain()
     expect(await metric.current({})).toBe(3)
   })
+
+  it('refuses a first argument that is neither a delta nor dims', async () => {
+    // TypeScript accepts these on a metric with no dims, where the first
+    // position also takes a dims object
+    const metric = online()
+    metric.bind({ driver, now })
+    expect(expectRejected(() => metric.add(5n as unknown as number)).message).toBe(
+      'online_users: the first argument must be a number or a dims object, got bigint. ' +
+        'Convert a bigint with Number() first',
+    )
+    expect(expectRejected(() => metric.add(true as unknown as number)).message).toBe(
+      'online_users: the first argument must be a number or a dims object, got boolean',
+    )
+    await metric.drain()
+    expect(await metric.current()).toBe(0)
+  })
 })
 
 describe('inert until bound', () => {
@@ -184,6 +200,24 @@ describe('inert until bound', () => {
   it('refuses a second binding — a metric belongs to one house', () => {
     const metric = bound()
     expectRejected(() => metric.bind({ driver: memory(), now }))
+  })
+
+  it('stays unbound when a binding with no cadence is refused', () => {
+    const metric = counter('odd', { resolution: '1s', write: discard })
+    expect(expectRejected(() => metric.bind({ driver, now })).message).toBe(
+      'odd: no flush cadence. Declare flush on the counter, or defaults.flush on the house',
+    )
+    expect(metric.isBound).toBe(false)
+    metric.bind({ driver, now, defaults: { flushMs: 60_000 } })
+    expect(metric.isBound).toBe(true)
+  })
+
+  it('stays unbound when the house cadence does not divide its resolution', () => {
+    const metric = counter('odd', { resolution: '7s', write: discard })
+    expect(() => metric.bind({ driver, now, defaults: { flushMs: 60_000 } })).toThrow(
+      /does not divide/,
+    )
+    expect(metric.isBound).toBe(false)
   })
 })
 
@@ -293,6 +327,30 @@ describe('add — validation is synchronous', () => {
   it('rejects a fractional delta on an integer counter', () => {
     const metric = bound()
     expectRejected(() => metric.add(1.5, WILLOW))
+  })
+
+  it('says a whole delta past the safe range is too large, not a fraction', () => {
+    const metric = bound()
+    expect(expectRejected(() => metric.add(2 ** 53, WILLOW)).message).toBe(
+      'dog_poops: 9007199254740992 is past 9007199254740991, the largest whole number a ' +
+        'double holds exactly, so an integer counter cannot take it',
+    )
+  })
+
+  it('refuses an integer total that would pass the largest safe integer', async () => {
+    const errors: unknown[] = []
+    const metric = make()
+    metric.bind({ driver, now, onError: (error) => errors.push(error) })
+    metric.add(Number.MAX_SAFE_INTEGER, WILLOW)
+    metric.add(2, WILLOW)
+    await metric.drain()
+
+    expect(errors.map((error) => (error as Error).message)).toEqual([
+      'memory driver: dog_poops total would be 9007199254740992, which is past ' +
+        '9007199254740991, the largest whole number a double holds exactly, so the write ' +
+        'was refused',
+    ])
+    expect(await metric.current(WILLOW)).toBe(Number.MAX_SAFE_INTEGER)
   })
 
   it('accepts a fractional delta when the counter declares float', async () => {
@@ -465,6 +523,20 @@ describe('rowShape', () => {
       false,
     ])
   })
+
+  it('marks a dim with a default as a column every row carries', () => {
+    const metric = counter('d', {
+      write: discard,
+      dims: { referrer: str().default('direct') },
+      resolution: '1s',
+      flush: '5m',
+    })
+    expect(metric.rowShape().columns[2]).toEqual({
+      name: 'referrer',
+      kind: 'str',
+      optional: false,
+    })
+  })
 })
 
 /**
@@ -544,6 +616,39 @@ describe('declaration checks every kind shares', () => {
         typeof counter
       >[1]),
     ).toThrow(/write must be a function/)
+  })
+
+  it('refuses a name no report could be keyed by', () => {
+    const write: WriteFn = () => {}
+    expect(() => counter('__proto__', { resolution: '1s', flush: '1m', write })).toThrow(
+      'counter: a metric cannot be named "__proto__", because reports are keyed by metric ' +
+        "name and JavaScript treats that key as an object's prototype",
+    )
+  })
+
+  it('refuses a name holding half of a surrogate pair', () => {
+    const write: WriteFn = () => {}
+    expect(() => counter('a\uD800', { resolution: '1s', flush: '1m', write })).toThrow(
+      /half of a surrogate pair/,
+    )
+    expect(() => counter('a\uD83D\uDE00', { resolution: '1s', flush: '1m', write })).not.toThrow()
+  })
+
+  it.each(['id', 'bucket_ts', 'value'])('refuses a dim named %s, a column it writes', (dim) => {
+    const write: WriteFn = () => {}
+    expect(() =>
+      counter('by_col', { dims: { [dim]: str() }, resolution: '1s', flush: '1m', write }),
+    ).toThrow(
+      `by_col: dim "${dim}" is a reserved column. MetricHouse writes [id, bucket_ts, value] ` +
+        'on every row',
+    )
+  })
+
+  it('refuses a flush cadence a timer cannot wait for', () => {
+    const write: WriteFn = () => {}
+    expect(() => counter('c', { resolution: '1d', flush: '25d', write })).toThrow(
+      /^c: flush is 25d, longer than 2147483647ms/,
+    )
   })
 })
 

@@ -73,6 +73,32 @@ describe('declaration', () => {
     ).toMatch(/non-empty/)
   })
 
+  it('stays unbound when a binding is refused', () => {
+    const odd = timer('odd', { resolution: '7s', write: discard })
+    expect(() => odd.bind({ driver, now, defaults: { flushMs: 60_000 } })).toThrow(
+      /does not divide/,
+    )
+    expect(odd.isBound).toBe(false)
+    odd.bind({ driver, now, defaults: { flushMs: 7_000 } })
+    expect(odd.isBound).toBe(true)
+  })
+
+  it('tells the sink every duration added up when sum is not a column', async () => {
+    const totals: number[] = []
+    const latency = bound({
+      aggregate: ['min', 'max', 'count'],
+      write: (_rows: Row[], context: WriteContext) => {
+        totals.push(context.total)
+      },
+    })
+    latency.observe(10, { route: '/a', status: 'ok' })
+    latency.observe(30, { route: '/a', status: 'ok' })
+    await latency.drain()
+    clock += 60_000
+    await latency.flush({ force: true })
+    expect(totals).toEqual([40])
+  })
+
   it('reports itself as a timer, not as the gauge it is built on', () => {
     expect(bound().kind).toBe('timer')
   })
@@ -382,6 +408,30 @@ describe('record', () => {
   const matchingEvent = () =>
     event('latency_events', { write: discard, fields: { ...makeDims(), duration_ms: float() } })
 
+  it('names a dim the event lacks even when the name is on every object', async () => {
+    const latency = timer('latency', {
+      write: discard,
+      dims: { constructor: str() },
+      resolution: '10s',
+      flush: '1m',
+      record: 'latency_events',
+    })
+    const events = event('latency_events', { write: discard, fields: { duration_ms: float() } })
+    const errors: unknown[] = []
+    createHouse({
+      driver,
+      now,
+      schema: [latency, events],
+      onError: (error) => errors.push(error),
+    })
+
+    latency.observe(5, { constructor: 'x' })
+    expect(errors.map((error) => (error as Error).message)).toEqual([
+      'latency: record target "latency_events" does not declare [constructor], so spread ' +
+        "the timer's dims into its fields",
+    ])
+  })
+
   it('records every timing to the event, with its dims and duration', async () => {
     const events = matchingEvent()
     const { latency, house: h, errors } = house([events])
@@ -590,5 +640,12 @@ describe('observe() precision', () => {
     at += 5_000
     await t.flush()
     expect(rows[0]?.sum).toBe(1.235)
+  })
+
+  it('records a finite duration too large to scale to microseconds', async () => {
+    const latency = bound()
+    latency.observe(1e306, { route: '/a', status: 'ok' })
+    await latency.drain()
+    expect((await latency.current({ route: '/a', status: 'ok' }))?.max).toBe(1e306)
   })
 })

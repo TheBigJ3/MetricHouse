@@ -84,6 +84,9 @@ const heapUsedMb = gauge('heap_used_mb', { resolution: '10s', flush: '1m', write
 heapUsedMb.set(process.memoryUsage().heapUsed / 1024 / 1024)
 ```
 
+A dim cannot be named `id`, `bucket_ts`, or any aggregate the gauge ships,
+because each of those is already a column of the row.
+
 [dims](/reference/dims) covers the whole argument.
 
 ### resolution
@@ -147,7 +150,8 @@ import { GAUGE_AGGREGATES } from 'metrichouse/core'
 // ['last', 'min', 'max', 'sum', 'count']
 ```
 
-An empty array throws, and so does a name that is not one of the five.
+An empty array throws, and so does a name that is not one of the five or a name
+given twice.
 
 ### write
 
@@ -163,7 +167,9 @@ Where the rows go. Required.
 | `context` | `WriteContext` | Which metric, which window, how many, and which attempt |
 
 The aggregates are optional in the type because `aggregate` decides at run time
-which of them a row carries. [Writing a sink](/guide/writing-a-sink) covers the
+which of them a row carries. `context.total` is every observed value added up
+whichever columns ship, so a gauge that ships only `min` and `max` still reports
+the sum of what it saw. [Writing a sink](/guide/writing-a-sink) covers the
 contract in full.
 
 ## gauge.set()

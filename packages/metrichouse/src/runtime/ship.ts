@@ -35,6 +35,17 @@ import type {
 } from '../metrics/types.js'
 import type { Attempts } from './flush.js'
 
+/**
+ * What a sink threw, or an error saying it threw nothing.
+ *
+ * `Promise.reject()` rejects with `undefined`, and a report whose `error` is
+ * `undefined` reads as a success. The rows would be released and the flush
+ * counted as done, so the next one waits a full cadence for no reason.
+ */
+function sinkFailure(metric: string, thrown: unknown): unknown {
+  return thrown === undefined ? new Error(`${metric}: the sink rejected without a reason`) : thrown
+}
+
 export interface ShipOutcome {
   readonly buckets: number
   readonly rows: number
@@ -85,13 +96,17 @@ export async function shipClaim(
       attempt: options.attempts.current,
       source: options.source,
     })
-  } catch (error) {
+  } catch (thrown) {
     // counted before the release, so a send that picks these rows up the
     // moment they are back already sees the failure
     options.attempts.current += 1
     // the data becomes claimable again, unchanged and with the same row ids
     await metric.releaseBatch(claim)
-    return { buckets: batch?.buckets ?? 0, rows: batch?.rows.length ?? 0, error }
+    return {
+      buckets: batch?.buckets ?? 0,
+      rows: batch?.rows.length ?? 0,
+      error: sinkFailure(metric.name, thrown),
+    }
   }
 
   options.attempts.current = 1
@@ -187,9 +202,9 @@ export async function shipOpenSeries(ship: OpenSeriesShip): Promise<void> {
       attempt: ship.attempts.current,
       source: 'immediate',
     })
-  } catch (error) {
+  } catch (thrown) {
     ship.attempts.current += 1
-    throw error
+    throw sinkFailure(ship.metric, thrown)
   }
   ship.attempts.current = 1
 }

@@ -227,6 +227,13 @@ local function mh_landing(wmKey, bucketTs)
 end
 
 local MH_RANGE = 'MHRANGE would pass the largest number a metric can store, so the write was refused'
+local MH_INT = 'MHRANGE would pass 9007199254740991, the largest whole number a double holds exactly, so the write was refused'
+
+-- true for a whole number a double holds exactly, which is all a metric
+-- declared as whole numbers may store
+local function mh_safe(x)
+  return x == math.floor(x) and x >= -9007199254740991 and x <= 9007199254740991
+end
 `
 
 /**
@@ -244,19 +251,32 @@ local MH_RANGE = 'MHRANGE would pass the largest number a metric can store, so t
  * it is removed, because nothing below it can be resent. The whole record
  * expires a day after its writer's last write.
  *
+ * A script whose reply carries information, such as how many claims a
+ * recovery put back, passes that reply to `mh_mark`. It is kept beside the
+ * number, and `mh_seen` hands it back, so the second arrival answers the way
+ * the first did instead of reporting that it found nothing to do.
+ *
  * `MH_N` is the index of the last argument that belongs to the script itself.
  */
 const LUA_ONCE = `
 local MH_N = #ARGV - 2
 
+-- nil when this write has not run yet, otherwise the reply it recorded, or an
+-- empty string when it recorded none
 local function mh_seen()
-  return redis.call('ZSCORE', KEYS[#KEYS], ARGV[#ARGV]) ~= false
+  local hit = redis.call('ZRANGEBYSCORE', KEYS[#KEYS], ARGV[#ARGV], ARGV[#ARGV])
+  if #hit == 0 then return nil end
+  local bar = string.find(hit[1], '|', 1, true)
+  if bar == nil then return '' end
+  return string.sub(hit[1], bar + 1)
 end
 
-local function mh_mark()
+local function mh_mark(reply)
   local w = KEYS[#KEYS]
+  local member = ARGV[#ARGV]
+  if reply ~= nil then member = member .. '|' .. reply end
   redis.call('ZREMRANGEBYSCORE', w, '-inf', '(' .. ARGV[#ARGV - 1])
-  redis.call('ZADD', w, ARGV[#ARGV], ARGV[#ARGV])
+  redis.call('ZADD', w, ARGV[#ARGV], member)
   redis.call('EXPIRE', w, 86400)
 end
 `
@@ -291,27 +311,29 @@ end
  * does not roll a script back, so a refusal halfway through would otherwise
  * leave half a batch applied.
  *
- * KEYS: bucket index, watermark. ARGV: bucket key prefix, bucketTs, then
+ * KEYS: bucket index, watermark. ARGV: bucket key prefix, bucketTs, `1` when
+ * every total must stay a whole number a double holds exactly, then
  * dimKey/delta pairs.
  */
 const INCREMENT = `${LUA_HELPERS}${LUA_ONCE}
 if mh_seen() then return 0 end
 local target = mh_landing(KEYS[2], ARGV[2])
 local key = ARGV[1] .. target
+local integer = ARGV[3] == '1'
 local totals = {}
 local order = {}
 
-for i = 3, MH_N, 2 do
+for i = 4, MH_N, 2 do
   local field = ARGV[i]
   local total = totals[field]
   if total == nil then
     local cur = redis.call('HGET', key, field)
     local parsed = mh_parse(cur)
     if parsed == 'level' then
-      return redis.error_reply('MHKIND holds level cells - increment is a counter op')
+      return redis.error_reply('MHKIND holds level cells, and increment is a counter op')
     end
     if type(parsed) == 'table' then
-      return redis.error_reply('MHKIND holds gauge cells - increment is a counter op')
+      return redis.error_reply('MHKIND holds gauge cells, and increment is a counter op')
     end
     total = 0
     if cur ~= false then total = tonumber(cur) end
@@ -319,6 +341,7 @@ for i = 3, MH_N, 2 do
   end
   total = total + tonumber(ARGV[i + 1])
   if not mh_finite(total) then return redis.error_reply(MH_RANGE) end
+  if integer and not mh_safe(total) then return redis.error_reply(MH_INT) end
   totals[field] = total
 end
 
@@ -356,10 +379,10 @@ for i = 3, MH_N, 2 do
   if cur == nil then
     local parsed = mh_parse(redis.call('HGET', key, field))
     if parsed == false then
-      return redis.error_reply('MHKIND holds counter cells - observe is a gauge op')
+      return redis.error_reply('MHKIND holds counter cells, and observe is a gauge op')
     end
     if parsed == 'level' then
-      return redis.error_reply('MHKIND holds level cells - observe is a gauge op')
+      return redis.error_reply('MHKIND holds level cells, and observe is a gauge op')
     end
     cur = parsed
     order[#order + 1] = field
@@ -423,7 +446,8 @@ end
  * names, because that window now ends at this value.
  *
  * KEYS: bucket index, watermark, level hash. ARGV: bucket key prefix,
- * bucketTs, mode, then dimKey/value pairs.
+ * bucketTs, mode, `1` when every level must stay a whole number a double holds
+ * exactly, then dimKey/value pairs.
  */
 const SET_LEVEL = `${LUA_HELPERS}${LUA_LEVEL_STATE}${LUA_ONCE}
 if mh_seen() then return 0 end
@@ -431,6 +455,7 @@ local target = mh_landing(KEYS[2], ARGV[2])
 local bucketTs = tonumber(target)
 local prefix = ARGV[1]
 local add = ARGV[3] == 'add'
+local integer = ARGV[4] == '1'
 
 -- the level one window holds for a series, or nil when it holds nothing
 local function level_at(at, field)
@@ -439,12 +464,12 @@ local function level_at(at, field)
   if not mh_is_level(cur) then
     local held = 'counter'
     if mh_parse(cur) ~= false then held = 'gauge' end
-    error(redis.error_reply('MHKIND holds ' .. held .. ' cells - set is a level op'))
+    error(redis.error_reply('MHKIND holds ' .. held .. ' cells, and set is a level op'))
   end
   return tonumber(string.sub(cur, 2))
 end
 
-for i = 4, MH_N, 2 do
+for i = 5, MH_N, 2 do
   local field = ARGV[i]
   local v = tonumber(ARGV[i + 1])
   local state = mh_read_state(KEYS[3], field)
@@ -511,6 +536,12 @@ for i = 4, MH_N, 2 do
   for _, c in ipairs(cells) do
     if not mh_finite(c[2]) then return redis.error_reply(MH_RANGE) end
   end
+  if integer then
+    if not mh_safe(value) then return redis.error_reply(MH_INT) end
+    for _, c in ipairs(cells) do
+      if not mh_safe(c[2]) then return redis.error_reply(MH_INT) end
+    end
+  end
 
   for _, c in ipairs(cells) do
     redis.call('HSET', prefix .. c[1], field, mh_pack_level(c[2]))
@@ -528,7 +559,12 @@ return 1
  *
  * Write-if-absent, so an observed value always beats a carried one: a set
  * that raced this hold into the same window keeps the number somebody
- * actually wrote.
+ * actually wrote, and `carried` takes that number too. The hold's own value
+ * was read before the set landed, and carrying it on would repeat a level the
+ * series has already left in every empty window after this one.
+ *
+ * Safe to run twice for the same reason: a second arrival finds the cell the
+ * first one wrote, or a newer one, and carries what it finds.
  *
  * A series the metric asked to hold but storage has never seen is skipped.
  * There is nothing to carry, and a zero would put a line on a chart for a
@@ -551,8 +587,13 @@ for i = 3, #ARGV, 2 do
   local state = mh_read_state(KEYS[3], field)
 
   if state ~= nil then
-    if not claimed and redis.call('HSETNX', key, field, mh_pack_level(value)) == 1 then
-      written = written + 1
+    if not claimed then
+      if redis.call('HSETNX', key, field, mh_pack_level(value)) == 1 then
+        written = written + 1
+      else
+        local cur = redis.call('HGET', key, field)
+        if mh_is_level(cur) then value = tonumber(string.sub(cur, 2)) end
+      end
     end
     -- carried belongs to the pointer's window, so a hold for an older one,
     -- from a flusher whose clock runs behind, leaves both alone
@@ -635,13 +676,19 @@ return { claimedAt, redis.call('HGETALL', KEYS[2]) }
  * Settle a claim by discarding it.
  *
  * The ZREM is the interlock: it reports whether this claim was in flight at
- * all, which is what makes a double-ack an error instead of a silent no-op.
+ * all, which is what makes a double ack an error instead of a silent no-op.
+ *
+ * Applied once, like a write. An ack whose reply was lost is resent, and the
+ * second arrival would find the claim already gone and report it as never
+ * having been in flight, turning a successful flush into an error.
  *
  * KEYS: claims, in-flight. ARGV: claimId.
  */
-const ACK_CLAIM = `
+const ACK_CLAIM = `${LUA_ONCE}
+if mh_seen() then return 1 end
 if redis.call('ZREM', KEYS[1], ARGV[1]) == 0 then return 0 end
 redis.call('DEL', KEYS[2])
+mh_mark()
 return 1
 `
 
@@ -830,12 +877,16 @@ end
 /**
  * Settle a claim by putting the data back.
  *
+ * Applied once, as {@link ACK_CLAIM} is.
+ *
  * KEYS: claims, in-flight hash, index. ARGV: claimId, bucket key prefix.
  */
-const RELEASE_BUCKETS = `${LUA_RESTORE_BUCKETS}
+const RELEASE_BUCKETS = `${LUA_RESTORE_BUCKETS}${LUA_ONCE}
+if mh_seen() then return 1 end
 if redis.call('ZREM', KEYS[1], ARGV[1]) == 0 then return 0 end
 mh_restore_buckets(KEYS[2], ARGV[2], KEYS[3])
 redis.call('DEL', KEYS[2])
+mh_mark()
 return 1
 `
 
@@ -846,13 +897,17 @@ return 1
  * what bounds a backlog larger than the sink will take, and `-1` means all of
  * it.
  *
- * The reply is everything in the in-flight list, not only what this call
- * took, so a claim resent after a reconnect, which runs twice, still hands
- * back every record it holds. Returns Redis's time and the records.
+ * Applied once. A claim resent after a reconnect would otherwise take a
+ * second `limit` of records into the same in-flight list. The second arrival
+ * takes nothing, and replies with the time the first one recorded and
+ * everything the list holds. Returns Redis's time and the records.
  *
  * KEYS: records, in-flight list, claims. ARGV: limit, claimId.
  */
-const CLAIM_RECORDS = `${LUA_NOW}
+const CLAIM_RECORDS = `${LUA_NOW}${LUA_ONCE}
+local replayed = mh_seen()
+if replayed then return { tonumber(replayed), redis.call('LRANGE', KEYS[2], 0, -1) } end
+
 local claimedAt = mh_now()
 local n = tonumber(ARGV[1])
 local len = redis.call('LLEN', KEYS[1])
@@ -870,18 +925,23 @@ if n > 0 then
 end
 
 redis.call('ZADD', KEYS[3], claimedAt, ARGV[2])
+mh_mark(string.format('%.0f', claimedAt))
 return { claimedAt, redis.call('LRANGE', KEYS[2], 0, -1) }
 `
 
 /**
  * Settle a record claim by putting the records back.
  *
+ * Applied once, as {@link ACK_CLAIM} is.
+ *
  * KEYS: records, in-flight list, claims. ARGV: claimId.
  */
-const RELEASE_RECORDS = `${LUA_RESTORE_RECORDS}
+const RELEASE_RECORDS = `${LUA_RESTORE_RECORDS}${LUA_ONCE}
+if mh_seen() then return 1 end
 if redis.call('ZREM', KEYS[3], ARGV[1]) == 0 then return 0 end
 mh_restore_records(KEYS[2], KEYS[1])
 redis.call('DEL', KEYS[2])
+mh_mark()
 return 1
 `
 
@@ -900,9 +960,19 @@ return 1
  * owner's `ack`. Waiting longer costs a later delivery, which is the cheaper
  * mistake by a wide margin.
  *
+ * Applied once, with its counts recorded. A recovery resent after a reconnect
+ * would otherwise find nothing left to recover and report zero claims, which
+ * hides the crash that stranded them.
+ *
  * KEYS: claims, index, records. ARGV: cutoff, in-flight prefix, bucket prefix.
  */
-const RECOVER_CLAIMS = `${LUA_NOW}${LUA_RESTORE_BUCKETS}${LUA_RESTORE_RECORDS}
+const RECOVER_CLAIMS = `${LUA_NOW}${LUA_RESTORE_BUCKETS}${LUA_RESTORE_RECORDS}${LUA_ONCE}
+local replayed = mh_seen()
+if replayed then
+  local c, b, r, o = string.match(replayed, '^(%d+),(%d+),(%d+),(%d+)$')
+  return { tonumber(c), tonumber(b), tonumber(r), tonumber(o) }
+end
+
 local cutoff = mh_now() - tonumber(ARGV[1])
 local abandoned = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', cutoff, 'WITHSCORES')
 local claims = 0
@@ -936,6 +1006,11 @@ for i = 1, #abandoned, 2 do
   claims = claims + 1
 end
 
+-- a pass that found nothing has nothing to repeat, and nearly every pass is
+-- one, so only a pass that put something back leaves a record
+if claims > 0 then
+  mh_mark(string.format('%.0f,%.0f,%.0f,%.0f', claims, buckets, records, oldest))
+end
 return { claims, buckets, records, oldest }
 `
 
@@ -965,12 +1040,36 @@ return n
  */
 const DATE_TAG = '__mh_date'
 
+/**
+ * What every key the driver reserves starts with.
+ *
+ * A key of the caller's own that starts with it is stored with the prefix
+ * written twice, and loses one copy on the way back. So `{ __mh_date: 5 }`
+ * inside a field is stored as `{ __mh___mh_date: 5 }` and can never be read
+ * back as a `Date`.
+ */
+const RESERVED_PREFIX = '__mh_'
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) && !isDate(value)
+}
+
 function encodeRecord(op: AppendOp): string {
   return JSON.stringify({ id: op.id, ts: op.ts, fields: op.fields }, function (key, value) {
     // `value` has already been through Date.prototype.toJSON by the time a
-    // replacer sees it — the original is only reachable through `this`
+    // replacer sees it. The original is only reachable through `this`
     const raw = (this as Record<string, unknown>)[key]
-    return isDate(raw) ? { [DATE_TAG]: raw.getTime() } : value
+    if (isDate(raw)) return { [DATE_TAG]: raw.getTime() }
+    if (!isPlainObject(value) || !Object.keys(value).some((k) => k.startsWith(RESERVED_PREFIX))) {
+      return value
+    }
+    // fromEntries rather than assignment, so an own `__proto__` key stays a key
+    return Object.fromEntries(
+      Object.entries(value).map(([k, v]) => [
+        k.startsWith(RESERVED_PREFIX) ? RESERVED_PREFIX + k : k,
+        v,
+      ]),
+    )
   })
 }
 
@@ -979,11 +1078,17 @@ function decodeRecord(stored: string): StagedRecord {
   // before stamps existed starts with the JSON itself
   const json = stored.startsWith('{') ? stored : stored.slice(stored.indexOf('|') + 1)
   return JSON.parse(json, (_key, value) => {
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) return value
-    const tagged = value as Record<string, unknown>
-    const ms = tagged[DATE_TAG]
-    if (typeof ms === 'number' && Object.keys(tagged).length === 1) return new Date(ms)
-    return value
+    if (!isPlainObject(value)) return value
+    const keys = Object.keys(value)
+    const ms = value[DATE_TAG]
+    if (typeof ms === 'number' && keys.length === 1) return new Date(ms)
+    if (!keys.some((k) => k.startsWith(RESERVED_PREFIX))) return value
+    return Object.fromEntries(
+      Object.entries(value).map(([k, v]) => [
+        k.startsWith(RESERVED_PREFIX) ? k.slice(RESERVED_PREFIX.length) : k,
+        v,
+      ]),
+    )
   }) as StagedRecord
 }
 
@@ -1039,7 +1144,7 @@ function typedError(error: unknown, metric: string): Error {
   }
   if (message.includes('not a float') || message.includes('not an integer')) {
     return new Error(
-      `ioredis driver: ${metric} holds gauge or level cells — increment is a counter op`,
+      `ioredis driver: ${metric} holds gauge or level cells, and increment is a counter op`,
     )
   }
   return error instanceof Error ? error : new Error(message)
@@ -1165,6 +1270,16 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
   }
 
   /**
+   * One read, issued only after every send made before it.
+   *
+   * A read sent straight to the client could reach Redis ahead of a write
+   * that was made first but is still loading its script, and would miss it.
+   */
+  function afterSends<T>(read: () => Promise<T>): Promise<T> {
+    return inOrder(async () => ({ reply: read() }))
+  }
+
+  /**
    * Run scripts pipelined, reloading them if Redis has forgotten.
    *
    * Split into round trips of at most `maxPipelineSize` scripts, as commands
@@ -1257,31 +1372,41 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
   }
 
   /**
-   * Ops grouped by metric and bucket, each group's args flattened in order.
+   * Neighbouring ops for one metric and bucket, each group's args flattened
+   * in order.
    *
-   * One script call per group: one bucket hash, one batch of fields.
+   * One script call per group: one bucket hash, one batch of fields. Only
+   * neighbours share a group, so the groups run in the order the ops were
+   * written. Ops aimed at two different windows below the watermark both land
+   * at the watermark, and folding them there out of order would give a gauge
+   * the wrong `last` and a float counter a sum in the wrong order.
    */
-  function grouped<Op extends { metric: string; bucketTs: number }>(
+  function grouped<Op extends { metric: string; bucketTs: number; integer?: boolean }>(
     ops: readonly Op[],
     pair: (op: Op) => [string, number],
-  ): { metric: string; bucketTs: number; args: (string | number)[] }[] {
-    const groups = new Map<
-      string,
-      { metric: string; bucketTs: number; args: (string | number)[] }
-    >()
-    const full: { metric: string; bucketTs: number; args: (string | number)[] }[] = []
+  ): { metric: string; bucketTs: number; integer: boolean; args: (string | number)[] }[] {
+    const groups: {
+      metric: string
+      bucketTs: number
+      integer: boolean
+      args: (string | number)[]
+    }[] = []
     for (const op of ops) {
-      const groupKey = key.bucket(op.metric, op.bucketTs)
-      let group = groups.get(groupKey)
-      if (!group || group.args.length >= MAX_PAIRS_PER_SCRIPT * 2) {
-        if (group) full.push(group)
-        group = { metric: op.metric, bucketTs: op.bucketTs, args: [] }
-        groups.set(groupKey, group)
+      let group = groups.at(-1)
+      if (
+        !group ||
+        group.metric !== op.metric ||
+        group.bucketTs !== op.bucketTs ||
+        group.integer !== (op.integer === true) ||
+        group.args.length >= MAX_PAIRS_PER_SCRIPT * 2
+      ) {
+        group = { metric: op.metric, bucketTs: op.bucketTs, integer: op.integer === true, args: [] }
+        groups.push(group)
       }
       const [field, value] = pair(op)
       group.args.push(field, value)
     }
-    return [...full, ...groups.values()]
+    return groups
   }
 
   /** The flat `HGETALL` of an in-flight key, back into buckets and series. */
@@ -1327,7 +1452,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
     async scanSeries(metric: string): Promise<string[]> {
       const client = await connect()
-      const buckets = await client.zrangebyscore(key.idx(metric), '-inf', '+inf')
+      const buckets = await afterSends(() => client.zrangebyscore(key.idx(metric), '-inf', '+inf'))
       // through the index rather than SCAN: it is exact, it costs one call per
       // live bucket instead of a keyspace sweep, and it already excludes
       // anything a claim has taken
@@ -1346,7 +1471,12 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
             script: INCREMENT,
             once: true,
             keys: [key.idx(group.metric), key.watermark(group.metric)],
-            args: [key.bucketPrefix(group.metric), group.bucketTs, ...group.args],
+            args: [
+              key.bucketPrefix(group.metric),
+              group.bucketTs,
+              group.integer ? 1 : 0,
+              ...group.args,
+            ],
           })),
           'increment',
         )
@@ -1386,6 +1516,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         readonly metric: string
         readonly bucketTs: number
         readonly mode: LevelOp['mode']
+        readonly integer: boolean
         readonly args: (string | number)[]
       }
       const groups: Group[] = []
@@ -1397,9 +1528,16 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           group.mode !== op.mode ||
           group.metric !== op.metric ||
           group.bucketTs !== op.bucketTs ||
+          group.integer !== (op.integer === true) ||
           group.args.length >= MAX_PAIRS_PER_SCRIPT * 2
         ) {
-          group = { metric: op.metric, bucketTs: op.bucketTs, mode: op.mode, args: [] }
+          group = {
+            metric: op.metric,
+            bucketTs: op.bucketTs,
+            mode: op.mode,
+            integer: op.integer === true,
+            args: [],
+          }
           groups.push(group)
         }
         group.args.push(op.dimKey, op.value)
@@ -1415,7 +1553,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
             args: [
               key.bucketPrefix(group.metric),
               group.bucketTs,
-              ...(group.mode === 'hold' ? [] : [group.mode]),
+              ...(group.mode === 'hold' ? [] : [group.mode, group.integer ? 1 : 0]),
               ...group.args,
             ],
           })),
@@ -1428,7 +1566,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
     async readLevels(metric: string): Promise<LevelSeries[]> {
       const client = await connect()
-      const flat = await client.hgetall(key.levels(metric))
+      const flat = await afterSends(() => client.hgetall(key.levels(metric)))
 
       const series: LevelSeries[] = []
       for (const [dimKey, packed] of Object.entries(flat)) {
@@ -1491,11 +1629,13 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     async readBuckets(query: BucketQuery): Promise<BucketRow[]> {
       const client = await connect()
 
-      const buckets = await client.zrangebyscore(
-        key.idx(query.metric),
-        query.from ?? '-inf',
-        // half-open: `(` is Redis for an exclusive bound
-        query.to === undefined ? '+inf' : `(${query.to}`,
+      const buckets = await afterSends(() =>
+        client.zrangebyscore(
+          key.idx(query.metric),
+          query.from ?? '-inf',
+          // half-open: `(` is Redis for an exclusive bound
+          query.to === undefined ? '+inf' : `(${query.to}`,
+        ),
       )
       if (buckets.length === 0) return []
 
@@ -1546,7 +1686,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       // no ts bound: the limit is the range, and one LRANGE answers it
       if (query.from === undefined && query.to === undefined) {
         const stop = query.limit === undefined ? -1 : query.limit - 1
-        return (await client.lrange(listKey, 0, stop)).map(decodeRecord)
+        return (await afterSends(() => client.lrange(listKey, 0, stop))).map(decodeRecord)
       }
 
       // bounded: paged rather than one LRANGE of everything, so a backlog the
@@ -1555,7 +1695,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       const page = maxPipeline
 
       for (let start = 0; ; start += page) {
-        const raw = await client.lrange(listKey, start, start + page - 1)
+        const raw = await afterSends(() => client.lrange(listKey, start, start + page - 1))
         if (raw.length === 0) break
 
         for (const encoded of raw) {
@@ -1620,6 +1760,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         [
           {
             script: CLAIM_RECORDS,
+            once: true,
             keys: [key.records(metric), key.inflight(id), key.claims(metric)],
             args: [limit === undefined ? -1 : Math.max(0, limit), id],
           },
@@ -1642,6 +1783,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         [
           {
             script: ACK_CLAIM,
+            once: true,
             keys: [key.claims(claim.metric), key.inflight(claim.id)],
             args: [claim.id],
           },
@@ -1650,7 +1792,9 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       )
 
       if (settled === 0) {
-        throw new Error(`ioredis driver: claim ${claim.id} is not in flight — already settled?`)
+        throw new Error(
+          `ioredis driver: claim ${claim.id} is not in flight. Was it already settled?`,
+        )
       }
     },
 
@@ -1658,11 +1802,13 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       const call: ScriptCall = isRecordClaim(claim)
         ? {
             script: RELEASE_RECORDS,
+            once: true,
             keys: [key.records(claim.metric), key.inflight(claim.id), key.claims(claim.metric)],
             args: [claim.id],
           }
         : {
             script: RELEASE_BUCKETS,
+            once: true,
             keys: [key.claims(claim.metric), key.inflight(claim.id), key.idx(claim.metric)],
             args: [claim.id, key.bucketPrefix(claim.metric)],
           }
@@ -1676,7 +1822,9 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       }
 
       if (settled === 0) {
-        throw new Error(`ioredis driver: claim ${claim.id} is not in flight — already settled?`)
+        throw new Error(
+          `ioredis driver: claim ${claim.id} is not in flight. Was it already settled?`,
+        )
       }
     },
 
@@ -1691,6 +1839,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           [
             {
               script: RECOVER_CLAIMS,
+              once: true,
               keys: [key.claims(metric), key.idx(metric), key.records(metric)],
               // `inflight('')` rather than a literal, so the prefix cannot
               // drift from the key the claim was actually written to

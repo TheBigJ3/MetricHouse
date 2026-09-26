@@ -51,6 +51,14 @@ describe('resolveDelivery', () => {
     expect(resolveDelivery('auto', caps(false))).toBe('immediate')
     expect(resolveDelivery('auto', caps(true))).toBe('staged')
   })
+
+  it('refuses a mode it does not know', () => {
+    // read from an environment variable, where TypeScript cannot check it
+    const typo = 'immedate' as unknown as 'immediate'
+    expect(() => resolveDelivery(typo, caps(true))).toThrow(
+      `createHouse: delivery must be 'staged', 'immediate' or 'auto', got "immedate"`,
+    )
+  })
 })
 
 describe('house delivery resolution', () => {

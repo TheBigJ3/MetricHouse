@@ -67,7 +67,7 @@ Naming a dim the metric does not declare throws. A typo would otherwise match
 nothing and render as an empty chart, which reads like an outage.
 
 ```
-http_requests: dims names "pakr", which is not a declared dim — this metric
+http_requests: dims names "pakr", which is not a declared dim. This metric
 has [route, status]
 ```
 
@@ -83,6 +83,10 @@ await httpRequests.snapshot({ from: Date.now() - 600_000 })
 The bound applies to the start of a window, so a window that began before
 `from` is left out even when part of it falls inside the range. Round `from`
 down to a boundary when you want the window containing it.
+
+An invalid `Date`, such as `new Date('garbage')`, throws rather than reading as
+no bound at all. The same goes for `NaN` and `Infinity`. A `to` that read as no
+bound would quietly include the window still filling.
 
 ### to
 
@@ -160,7 +164,9 @@ await httpRequests.snapshot({ rollup: 'sum', groupBy: ['route'] })
 
 `bucket_ts` survives a `groupBy`. `id` survives only on a row where the
 grouping merged nothing, which is a fact about the data rather than about the
-options, so the type reports it as optional.
+options, so the type reports it as optional. An optional dim the group has no
+value for is left off the row, as it is on an ungrouped row, rather than
+appearing as a key that holds `undefined`.
 
 A merged row covers each of its windows once. Three series merged inside one
 ten second window that is five seconds old report `bucket_elapsed_ms: 5000`,
@@ -192,7 +198,7 @@ that have the value being ranked.
 
 ```
 http_requests: orderBy names "bucket_ts", which is not a column on these rows
-— they have [route, status, value, bucket_open, bucket_elapsed_ms]
+. They have [route, status, value, bucket_open, bucket_elapsed_ms]
 ```
 
 ### direction
@@ -270,6 +276,7 @@ await httpRequests.snapshot(options)   // typed as if nothing was rolled up
 | `groupBy names "pakr", which is not a declared dim` | A `groupBy` naming an undeclared dim |
 | `orderBy names "bucket_ts", which is not a column on these rows` | Sorting on a column the other options removed |
 | `limit must be a non-negative integer, got -1` | A negative or fractional limit |
+| `to must be a valid Date or a finite number of milliseconds` | An invalid `Date`, `NaN` or `Infinity` for `from` or `to` |
 
 ## Related
 

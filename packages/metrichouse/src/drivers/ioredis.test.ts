@@ -606,6 +606,82 @@ if (!client) {
       await wipe(ns)
     })
 
+    /**
+     * A client on which every script runs twice and only the second reply
+     * comes back: a command whose reply was lost, resent after a reconnect.
+     */
+    const lostReply = () =>
+      new Proxy(live, {
+        get(target, prop, receiver) {
+          if (prop !== 'pipeline') return Reflect.get(target, prop, receiver)
+          return () => {
+            const pipeline = target.pipeline()
+            const evalsha = pipeline.evalsha.bind(pipeline)
+            const exec = pipeline.exec.bind(pipeline)
+            pipeline.evalsha = ((...args: Parameters<typeof evalsha>) => {
+              evalsha(...args)
+              return evalsha(...args)
+            }) as typeof pipeline.evalsha
+            pipeline.exec = (async () => {
+              const results = await exec()
+              return results?.filter((_, i) => i % 2 === 1) ?? null
+            }) as typeof pipeline.exec
+            return pipeline
+          }
+        },
+      })
+
+    it('acks a claim whose reply was lost and resent', async () => {
+      const ns = fresh()
+      const plain = ioredis(live, { namespace: ns })
+      await plain.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      const claim = await plain.claim(M, 2000)
+
+      await expect(ioredis(lostReply(), { namespace: ns }).ack(claim)).resolves.toBeUndefined()
+      expect(await plain.readBuckets({ metric: M })).toEqual([])
+      await wipe(ns)
+    })
+
+    it('releases a claim whose reply was lost and resent, once', async () => {
+      const ns = fresh()
+      const plain = ioredis(live, { namespace: ns })
+      await plain.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      const claim = await plain.claim(M, 2000)
+
+      await expect(ioredis(lostReply(), { namespace: ns }).release(claim)).resolves.toBeUndefined()
+      expect(await plain.readBuckets({ metric: M })).toEqual([
+        { bucketTs: 1000, dimKey: WILLOW, value: 1 },
+      ])
+      await wipe(ns)
+    })
+
+    it('reports what a recovery put back when its reply was lost and resent', async () => {
+      const ns = fresh()
+      const plain = ioredis(live, { namespace: ns })
+      await plain.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await plain.claim(M, 2000)
+
+      const resent = ioredis(lostReply(), { namespace: ns, recoverAfter: 0 })
+      expect(await resent.recover(M)).toMatchObject({ claims: 1, buckets: 1, records: 0 })
+      expect(await plain.readBuckets({ metric: M })).toEqual([
+        { bucketTs: 1000, dimKey: WILLOW, value: 1 },
+      ])
+      await wipe(ns)
+    })
+
+    it('claims at most limit records when the claim was resent', async () => {
+      const ns = fresh()
+      const plain = ioredis(live, { namespace: ns })
+      await plain.append(
+        ['a', 'b', 'c', 'd'].map((id) => ({ metric: M, id, ts: 1000, fields: {} })),
+      )
+
+      const claim = await ioredis(lostReply(), { namespace: ns }).claimRecords(M, 2)
+      expect(claim.records.map((r) => r.id)).toEqual(['a', 'b'])
+      expect((await plain.readPending({ metric: M })).map((r) => r.id)).toEqual(['c', 'd'])
+      await wipe(ns)
+    })
+
     it('keeps the sets of one writer in order while a script is still loading', async () => {
       // the first call has to load its script, and the calls behind it must
       // not overtake it once the script is cached

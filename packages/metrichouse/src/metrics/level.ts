@@ -33,7 +33,7 @@ import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
 import { assertResolution, bucketRange, bucketStart, closedUpTo } from '../time/buckets.js'
-import { type DurationInput, parseDuration } from '../time/duration.js'
+import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
 import { bucketedLifecycle, DEFAULT_GRACE_MS } from './bucketed.js'
 import type {
   AnyMetric,
@@ -45,7 +45,13 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink } from './types.js'
+import {
+  assertDeltaOrDims,
+  assertMetricName,
+  assertSink,
+  assertWhole,
+  dimColumns,
+} from './types.js'
 
 /**
  * The most windows one flush will carry a single series through.
@@ -201,17 +207,18 @@ export function level<D extends Shape = Record<never, never>>(
   assertSink(config.write, name)
 
   const dims = (config.dims ?? {}) as D
-  assertDimsLegal(dims, name)
+  assertDimsLegal(dims, name, ['id', 'bucket_ts', 'value'])
 
   const resolutionMs = parseDuration(config.resolution)
-  const ownFlushMs = config.flush === undefined ? undefined : parseDuration(config.flush)
+  const ownFlushMs =
+    config.flush === undefined ? undefined : parseInterval(config.flush, `${name}: flush`)
   const ownGraceMs = config.grace === undefined ? undefined : parseDuration(config.grace)
   if (ownFlushMs !== undefined) assertResolution(resolutionMs, ownFlushMs)
 
   const holdForMs = config.holdFor === undefined ? undefined : parseDuration(config.holdFor)
   if (holdForMs !== undefined && holdForMs < resolutionMs) {
     throw new Error(
-      `${name}: holdFor must be at least one resolution — a shorter one would drop a series ` +
+      `${name}: holdFor must be at least one resolution, because a shorter one would drop a series ` +
         'before the window it was written in had closed',
     )
   }
@@ -235,11 +242,11 @@ export function level<D extends Shape = Record<never, never>>(
   }
 
   /** The metric's own cadence, or the house's. See the counter for the rule. */
-  function effectiveFlushMs(): number {
-    const ms = ownFlushMs ?? binding?.defaults?.flushMs
+  function effectiveFlushMs(from: MetricBinding | undefined = binding): number {
+    const ms = ownFlushMs ?? from?.defaults?.flushMs
     if (ms === undefined) {
       throw new Error(
-        `${name}: no flush cadence — declare flush on the level, or defaults.flush on the house`,
+        `${name}: no flush cadence. Declare flush on the level, or defaults.flush on the house`,
       )
     }
     return ms
@@ -252,7 +259,7 @@ export function level<D extends Shape = Record<never, never>>(
   function activeBinding(): MetricBinding {
     if (!binding) {
       throw new Error(
-        `${name}: not bound to a house — pass it to createHouse({ schema }) before writing`,
+        `${name}: not bound to a house. Pass it to createHouse({ schema }) before writing`,
       )
     }
     return binding
@@ -312,19 +319,21 @@ export function level<D extends Shape = Record<never, never>>(
     if (typeof amount !== 'number' || !Number.isFinite(amount)) {
       throw new Error(`${name}: value must be a finite number, got ${String(amount)}`)
     }
-    if (!isFloat && !Number.isSafeInteger(amount)) {
-      throw new Error(
-        `${name}: declares an integer level, so ${amount} is not a legal value — ` +
-          'declare `value: float()` if fractions are intended',
-      )
-    }
+    if (!isFloat) assertWhole(name, 'level', amount, mode === 'set' ? 'value' : 'delta')
 
     // validated before the clock is read, so a rejected write never
     // half-commits and never depends on when it was rejected
     const dimKey = keyFor(values)
     const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
 
-    const op: LevelOp = { metric: name, bucketTs, dimKey, value: amount, mode }
+    const op: LevelOp = {
+      metric: name,
+      bucketTs,
+      dimKey,
+      value: amount,
+      mode,
+      ...(!isFloat && { integer: true }),
+    }
     track(deliver(active.driver.setLevel([op]), bucketTs, dimKey), active.onError)
   }
 
@@ -581,7 +590,7 @@ export function level<D extends Shape = Record<never, never>>(
   async function snapshotWithCarry(options: SnapshotOptions = {}): Promise<LiveRow[]> {
     const driver = activeDriver()
     const now = nowMs()
-    const range = snapshotRange(options, resolutionMs, now)
+    const range = snapshotRange(options, resolutionMs, now, name)
     // the newest window that can hold anything: the open one, unless the
     // range or `complete` stops short of it. A `to` in the future does not
     // reach further, because a window that has not started has no value yet
@@ -672,10 +681,11 @@ export function level<D extends Shape = Record<never, never>>(
 
     bind(next: MetricBinding): void {
       if (binding) {
-        throw new Error(`${name}: already bound to a house — a metric belongs to exactly one`)
+        throw new Error(`${name}: already bound to a house, and a metric belongs to exactly one`)
       }
+      // checked before the binding is kept, as the counter does
+      if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs(next))
       binding = next
-      if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs())
     },
 
     unbind(): void {
@@ -698,11 +708,13 @@ export function level<D extends Shape = Record<never, never>>(
     // `InferShape<{}>` accepts a number, so `.inc(5)` on a dimensionless
     // level would otherwise bind 5 as the dims argument
     inc(first?: number | InferShape<D>, second?: InferShape<D>): void {
+      assertDeltaOrDims(name, first)
       const delta = typeof first === 'number' ? first : 1
       write('add', delta, (typeof first === 'number' ? second : first) as InferShape<D>)
     },
 
     dec(first?: number | InferShape<D>, second?: InferShape<D>): void {
+      assertDeltaOrDims(name, first)
       const delta = typeof first === 'number' ? first : 1
       write('add', -delta, (typeof first === 'number' ? second : first) as InferShape<D>)
     },
@@ -733,10 +745,7 @@ export function level<D extends Shape = Record<never, never>>(
         columns: [
           { name: 'id', kind: 'str', optional: false },
           { name: 'bucket_ts', kind: 'ts', optional: false },
-          ...Object.keys(dims).map((column) => {
-            const type = dims[column] as FieldType
-            return { name: column, kind: type.kind, optional: type.isOptional }
-          }),
+          ...dimColumns(dims),
           { name: 'value', kind: isFloat ? 'float' : 'int', optional: false },
         ],
       }

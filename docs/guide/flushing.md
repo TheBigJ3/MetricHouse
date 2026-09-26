@@ -174,7 +174,8 @@ What it does:
 - Skips a tick if the previous one for that metric has not finished, so a slow
   database does not stack writes on top of each other.
 - Sends failures to `onError`, since a scheduled flush has no caller to return a
-  report to.
+  report to. A failed recovery pass goes there too, as its `recoveryError`,
+  although the flush below it still ran.
 - Unreferences its timers, so metrics never keep your process alive.
 - Picks up metrics registered after it started.
 

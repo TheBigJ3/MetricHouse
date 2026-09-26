@@ -19,7 +19,7 @@
 import type { Driver } from '../drivers/types.js'
 import { type AnyMetric, isMetric } from '../metrics/types.js'
 import { bucketStart } from '../time/buckets.js'
-import { type DurationInput, parseDuration } from '../time/duration.js'
+import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
 import {
   type DeliveryConfig,
   type DeliveryMode,
@@ -169,7 +169,9 @@ export function createHouse(config: HouseConfig): House {
   const delivery: DeliveryMode = resolveDelivery(config.delivery, config.driver.capabilities)
 
   const defaults: HouseDefaults = {
-    ...(config.defaults?.flush !== undefined && { flushMs: parseDuration(config.defaults.flush) }),
+    ...(config.defaults?.flush !== undefined && {
+      flushMs: parseInterval(config.defaults.flush, 'createHouse: defaults.flush'),
+    }),
     ...(config.defaults?.grace !== undefined && { graceMs: parseDuration(config.defaults.grace) }),
   }
 
@@ -178,7 +180,7 @@ export function createHouse(config: HouseConfig): House {
   // incident
   if (!config.driver.capabilities.durable) {
     config.onWarn?.(
-      'driver is not durable — at-least-once degrades to best-effort, and a crash ' +
+      'driver is not durable, so at-least-once degrades to best-effort, and a crash ' +
         'between claim and ack loses that window',
       {},
     )
@@ -189,7 +191,7 @@ export function createHouse(config: HouseConfig): House {
   // hearing it at boot
   if (delivery === 'immediate') {
     config.onWarn?.(
-      "delivery is 'immediate' — bucketed rows are resent as their bucket fills, so the sink " +
+      "delivery is 'immediate', so bucketed rows are resent as their bucket fills. The sink " +
         'must keep the newest row per id rather than fold duplicates together. Staged kinds ' +
         'ship without flush(); bucketed kinds still need it to retire closed buckets',
       {},
@@ -216,7 +218,7 @@ export function createHouse(config: HouseConfig): House {
       }
       if (metric.isBound) {
         throw new Error(
-          `${metric.name}: already bound to a house — a metric belongs to exactly one`,
+          `${metric.name}: already bound to a house, and a metric belongs to exactly one`,
         )
       }
       names.set(metric.name, metric)

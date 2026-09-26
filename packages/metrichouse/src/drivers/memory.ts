@@ -171,6 +171,20 @@ function plainZero(value: number): number {
 }
 
 /**
+ * Refuse a whole number a double cannot hold exactly, for a metric that only
+ * counts whole numbers.
+ */
+function assertSafe(value: number, metric: string, what: string): void {
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(
+      `memory driver: ${metric} ${what} would be ${value}, which is past ` +
+        `${Number.MAX_SAFE_INTEGER}, the largest whole number a double holds exactly, so the ` +
+        'write was refused',
+    )
+  }
+}
+
+/**
  * Refuse a stored number that has left the range a double can hold.
  *
  * A counter at 1e308 that takes another 1e308 would otherwise read back as
@@ -294,8 +308,8 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     if (count === undefined) {
       if (byKey.size >= maxSeries) {
         throw new Error(
-          `memory driver: ${metric} exceeded maxSeries (${maxSeries}) — ` +
-            'a dim with unbounded values will do this; put it on an event instead',
+          `memory driver: ${metric} exceeded maxSeries (${maxSeries}), which a dim with ` +
+            'unbounded values will do. Put that value on an event instead',
         )
       }
       byKey.set(dimKey, 1)
@@ -333,15 +347,75 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
   /** Get or create the bucket a write lands in, capping series on a new key. */
   function cellSlot(metric: string, bucketTs: number, dimKey: string): Map<string, Cell> {
     const byBucket = bucketsFor(metric)
-    let bucket = byBucket.get(bucketTs)
-    if (!bucket) {
-      bucket = new Map()
-      byBucket.set(bucketTs, bucket)
-    }
-    // may throw on the cap — before mutating, so a refused write leaves no
-    // partial state behind
-    if (!bucket.has(dimKey)) addHolder(metric, dimKey)
+    const existing = byBucket.get(bucketTs)
+    // may throw on the cap, so it runs before the bucket is created. An empty
+    // bucket left behind by a refused write would still be claimed, and ship
+    // as a window with no rows in it
+    if (!existing?.has(dimKey)) addHolder(metric, dimKey)
+    if (existing) return existing
+
+    const bucket = new Map<string, Cell>()
+    byBucket.set(bucketTs, bucket)
     return bucket
+  }
+
+  /**
+   * Refuse a batch that would take a metric past `maxSeries`, before any of
+   * it is stored.
+   *
+   * `addHolder` checks one key at a time, so a batch refused on its tenth new
+   * series would otherwise keep the first nine.
+   */
+  function assertRoomFor(ops: readonly { metric: string; bucketTs: number; dimKey: string }[]) {
+    const fresh = new Map<string, Set<string>>()
+    for (const op of ops) {
+      if (holders.get(op.metric)?.has(op.dimKey)) continue
+      let keys = fresh.get(op.metric)
+      if (!keys) {
+        keys = new Set()
+        fresh.set(op.metric, keys)
+      }
+      keys.add(op.dimKey)
+    }
+    for (const [metric, keys] of fresh) {
+      if ((holders.get(metric)?.size ?? 0) + keys.size > maxSeries) {
+        throw new Error(
+          `memory driver: ${metric} exceeded maxSeries (${maxSeries}), which a dim with ` +
+            'unbounded values will do. Put that value on an event instead',
+        )
+      }
+    }
+  }
+
+  /**
+   * Work out every cell a batch of increments or observations ends with,
+   * without storing any of them.
+   *
+   * The whole batch is checked before any of it lands, so a refusal halfway
+   * through changes nothing. `fold` gets the cell as the batch has left it so
+   * far, which is what keeps two ops for one series in one call in order.
+   */
+  function planCells<Op extends { metric: string; bucketTs: number; dimKey: string }>(
+    ops: readonly Op[],
+    fold: (op: Op, existing: Cell | undefined) => Cell,
+  ): { metric: string; bucketTs: number; dimKey: string; cell: Cell }[] {
+    const planned = new Map<
+      string,
+      { metric: string; bucketTs: number; dimKey: string; cell: Cell }
+    >()
+    for (const op of ops) {
+      const bucketTs = landing(op.metric, op.bucketTs)
+      const slot = `${op.metric}\u0000${bucketTs}\u0000${op.dimKey}`
+      const existing = planned.get(slot)?.cell ?? live.get(op.metric)?.get(bucketTs)?.get(op.dimKey)
+      planned.set(slot, {
+        metric: op.metric,
+        bucketTs,
+        dimKey: op.dimKey,
+        cell: fold(op, existing),
+      })
+    }
+    assertRoomFor([...planned.values()])
+    return [...planned.values()]
   }
 
   return {
@@ -352,54 +426,50 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     },
 
     async increment(ops: readonly IncrOp[]): Promise<void> {
-      for (const op of ops) {
-        const bucket = cellSlot(op.metric, landing(op.metric, op.bucketTs), op.dimKey)
-        const existing = bucket.get(op.dimKey)
-
-        if (existing === undefined) {
-          bucket.set(op.dimKey, plainZero(op.delta))
-          continue
-        }
-        if (typeof existing !== 'number') {
+      const cells = planCells(ops, (op, existing) => {
+        if (existing !== undefined && typeof existing !== 'number') {
           throw new Error(
             `memory driver: ${op.metric} holds ${isGaugeCell(existing) ? 'gauge' : 'level'} ` +
-              'cells — increment is a counter op',
+              'cells, and increment is a counter op',
           )
         }
-
-        const next = existing + op.delta
+        const next = (existing ?? 0) + op.delta
         assertFinite(next, op.metric, 'total')
-        bucket.set(op.dimKey, plainZero(next))
+        if (op.integer) assertSafe(next, op.metric, 'total')
+        return plainZero(next)
+      })
+      for (const { metric, bucketTs, dimKey, cell } of cells) {
+        cellSlot(metric, bucketTs, dimKey).set(dimKey, cell)
       }
     },
 
     async observe(ops: readonly GaugeOp[]): Promise<void> {
-      for (const op of ops) {
-        const bucket = cellSlot(op.metric, landing(op.metric, op.bucketTs), op.dimKey)
-        const existing = bucket.get(op.dimKey)
+      const cells = planCells(ops, (op, existing) => {
         const value = plainZero(op.value)
-
         if (existing === undefined) {
-          bucket.set(op.dimKey, { last: value, min: value, max: value, sum: value, count: 1 })
-          continue
+          assertFinite(value, op.metric, 'sum')
+          return { last: value, min: value, max: value, sum: value, count: 1 }
         }
         if (!isGaugeCell(existing)) {
           throw new Error(
             `memory driver: ${op.metric} holds ${isLevelCell(existing) ? 'level' : 'counter'} ` +
-              'cells — observe is a gauge op',
+              'cells, and observe is a gauge op',
           )
         }
 
-        // read-modify-write: min, max and last are not increments
+        // read, modify, write: min, max and last are not increments
         const sum = existing.sum + value
         assertFinite(sum, op.metric, 'sum')
-        bucket.set(op.dimKey, {
+        return {
           last: value,
           min: plainZero(Math.min(existing.min, value)),
           max: plainZero(Math.max(existing.max, value)),
           sum: plainZero(sum),
           count: existing.count + 1,
-        })
+        }
+      })
+      for (const { metric, bucketTs, dimKey, cell } of cells) {
+        cellSlot(metric, bucketTs, dimKey).set(dimKey, cell)
       }
     },
 
@@ -413,32 +483,35 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           // must not be what brings one into existence
           if (!held) continue
 
+          // the value the window ends at: the one carried into it, or the one
+          // a write already put there
+          let carried = plainZero(op.value)
+
           // a window some claim has already taken is not filled again: that
           // would ship it a second time. The pointer still moves past it
           if (landing(op.metric, op.bucketTs) === op.bucketTs) {
             const bucket = cellSlot(op.metric, op.bucketTs, op.dimKey)
+            const written = bucket.get(op.dimKey)
             // a written value always beats a carried one, so a window that
-            // already has a cell keeps it
-            if (!bucket.has(op.dimKey)) bucket.set(op.dimKey, { level: plainZero(op.value) })
+            // already has a cell keeps it, and so does `carried`. The hold's
+            // value was read before that write landed
+            if (written === undefined) bucket.set(op.dimKey, { level: carried })
+            else if (isLevelCell(written)) carried = written.level
           }
 
           // `carried` belongs to the pointer's window. A hold for an older
           // window, from a flusher whose clock runs behind, arrives after the
           // pointer has passed it and must not drag `carried` back with it
           if (op.bucketTs >= held.heldThrough) {
-            series.set(op.dimKey, {
-              ...held,
-              carried: plainZero(op.value),
-              heldThrough: op.bucketTs,
-            })
+            series.set(op.dimKey, { ...held, carried, heldThrough: op.bucketTs })
           }
           continue
         }
 
         if (!held && series.size >= maxSeries) {
           throw new Error(
-            `memory driver: ${op.metric} exceeded maxSeries (${maxSeries}) — ` +
-              'a dim with unbounded values will do this; put it on an event instead',
+            `memory driver: ${op.metric} exceeded maxSeries (${maxSeries}), which a dim with ` +
+              'unbounded values will do. Put that value on an event instead',
           )
         }
 
@@ -450,7 +523,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           if (!isLevelCell(cell)) {
             throw new Error(
               `memory driver: ${op.metric} holds ${isGaugeCell(cell) ? 'gauge' : 'counter'} ` +
-                'cells — set is a level op',
+                'cells, and set is a level op',
             )
           }
           return cell.level
@@ -489,6 +562,10 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
 
         for (const [, level] of plan.cells) assertFinite(level, op.metric, 'level')
         assertFinite(plan.series.value, op.metric, 'level')
+        if (op.integer) {
+          for (const [, level] of plan.cells) assertSafe(level, op.metric, 'level')
+          assertSafe(plan.series.value, op.metric, 'level')
+        }
 
         // the bucket first, because `cellSlot` is the other thing that can
         // refuse on the cap, and a held value written before it would name a
@@ -538,9 +615,8 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       for (const [metric, count] of wanted) {
         if (stagedHeld(metric) + count > maxStaged) {
           throw new Error(
-            `memory driver: ${metric} exceeded maxStaged (${maxStaged}) — ` +
-              'staged events are only drained by flush(), so this is a backlog that ' +
-              'nothing is shipping',
+            `memory driver: ${metric} exceeded maxStaged (${maxStaged}). Staged events ` +
+              'are only drained by flush(), so this is a backlog that nothing is shipping',
           )
         }
       }
@@ -661,7 +737,9 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
 
     async ack(claim: Claim): Promise<void> {
       if (!inFlight.delete(claim.id)) {
-        throw new Error(`memory driver: claim ${claim.id} is not in flight — already settled?`)
+        throw new Error(
+          `memory driver: claim ${claim.id} is not in flight. Was it already settled?`,
+        )
       }
 
       if (isRecordClaim(claim)) {
@@ -678,7 +756,9 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
 
     async release(claim: Claim): Promise<void> {
       if (!inFlight.delete(claim.id)) {
-        throw new Error(`memory driver: claim ${claim.id} is not in flight — already settled?`)
+        throw new Error(
+          `memory driver: claim ${claim.id} is not in flight. Was it already settled?`,
+        )
       }
 
       if (isRecordClaim(claim)) {
