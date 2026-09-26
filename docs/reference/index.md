@@ -63,9 +63,9 @@ metrics on timers without a house. It returns a `Scheduler` with these members.
 
 | Member | What it does |
 | --- | --- |
-| `scheduler.start()` | Starts one interval per metric, at that metric's `flushMs`. Calling it again does nothing |
+| `scheduler.start()` | Starts one interval per metric, at that metric's `flushMs`, each from its own point in the interval. Calling it again does nothing |
 | `scheduler.add(metric)` | Schedules a metric that arrived after `start()`. Does nothing while stopped |
-| `scheduler.stop()` | Clears every interval. It does not flush |
+| `scheduler.stop()` | Clears every timer, including a first tick still waiting. It does not flush |
 | `scheduler.running` | `true` between `start()` and `stop()` |
 
 ## The house

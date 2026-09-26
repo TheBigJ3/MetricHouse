@@ -54,8 +54,8 @@ This is a loop over `metric.flush()`. Each metric still honours its own cadence.
 house.start()
 ```
 
-One timer per metric, at that metric's own cadence. For a server that stays
-running.
+One timer per metric, at that metric's own cadence, each starting at its own
+point in the interval. For a server that stays running.
 
 ## The report
 
@@ -193,8 +193,22 @@ What follows from how the turn works:
   running ahead, by less than one interval, holds the others back like any
   other. One more than an interval away is taken as a clock that stepped, and
   the flush goes ahead.
-- **`force` and `final` ship regardless**, and still record their turn, so the
-  other servers count the interval from that shipment.
+- **`force` ships regardless**, and still records its turn, so the other
+  servers count the interval from that shipment.
+- **A final flush waits for the turn too**, when the driver is durable as well
+  as shared. That is the flush `house.stop()` makes. In a rolling deploy each
+  stopping server would otherwise ship the few seconds since the last
+  shipment, one small insert per server. What it leaves stays in Redis, and the
+  next server to take the turn ships it, including one started by the deploy.
+  If every server stops, the rows wait in Redis until one runs again. A process
+  that knows it is the last one can ship them anyway:
+
+  ```ts
+  await house.drain()
+  await house.flush({ final: true, force: true })   // ignores the turn
+  await house.stop()
+  ```
+
 - **A locally staged event takes no turn.** Its records sit in one process's
   memory, and only that process can ship them.
 - **`memory()` takes no turn either.** It serves one process, and the clock
@@ -231,6 +245,11 @@ house.start()
 What it does:
 
 - Creates one interval per metric, at that metric's `flushMs`.
+- Starts each metric at its own point in the interval, so a server's metrics do
+  not all send their inserts in the same second. The point comes from a hash of
+  the metric's name, so it is the same after a restart and on every server. A
+  metric's first tick fires within one interval of `start()`, then once per
+  interval from there.
 - Skips a tick if the previous one for that metric has not finished, so a slow
   database does not stack writes on top of each other.
 - Sends failures to `onError`, since a scheduled flush has no caller to return a
@@ -254,9 +273,11 @@ await house.stop()
 Clears the timers, waits for every flush still running, then drains writes
 still on their way to the driver and waits for flushes again, and keeps taking
 those two turns until a wait for flushes that follows a drain finds none. Then
-it makes a [final flush](/reference/flush-options#final): past every cadence,
-and past grace, so every window that has ended ships. It returns the report
-from that final flush. A second call while the first is still running returns
+it makes a [final flush](/reference/flush-options#final): past this process's
+cadence, and past grace, so every window that has ended ships. On a shared,
+durable driver such as `ioredis()`, the final flush still waits for the
+[turn](#several-processes-on-one-driver). It returns the report from that
+final flush. A second call while the first is still running returns
 the same promise, unless `house.start()` ran in between.
 
 Waiting for a running flush matters. If its `write` function fails after

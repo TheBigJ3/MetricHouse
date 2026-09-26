@@ -897,9 +897,9 @@ describe('metric.flush()', () => {
 
 describe('cadence across processes sharing a driver', () => {
   /** A memory driver that says it is shared, as every process on one Redis sees theirs. */
-  const sharedMemory = (): Driver => {
+  const sharedMemory = (durable = true): Driver => {
     const inner = memory()
-    return { ...inner, capabilities: { ...inner.capabilities, shared: true } }
+    return { ...inner, capabilities: { ...inner.capabilities, shared: true, durable } }
   }
 
   /** One process: its own metric and house, on the driver every process shares. */
@@ -1041,6 +1041,61 @@ describe('cadence across processes sharing a driver', () => {
     })
     expect(write).not.toHaveBeenCalled()
     expect(await shared.readBuckets({ metric: 'm' })).toHaveLength(1)
+  })
+
+  it('leaves a final flush inside the turn to whichever process takes the next one', async () => {
+    const shared = sharedMemory()
+    const one = processOn(shared)
+    const two = processOn(shared)
+    await written(one)
+    await one.metric.flush()
+
+    await written(two)
+    expect(await two.metric.flush({ final: true })).toMatchObject({
+      skipped: true,
+      reason: 'cadence',
+    })
+    expect(await shared.readBuckets({ metric: 'm' })).toHaveLength(1)
+  })
+
+  it('leaves what stop() cannot ship in storage for the next turn', async () => {
+    const shared = sharedMemory()
+    const one = processOn(shared)
+    const second = vi.fn()
+    const two = processOn(shared, second)
+    await written(one)
+    await one.metric.flush()
+
+    await written(two)
+    const report = await two.house.stop()
+    expect(report.metrics.m).toMatchObject({ skipped: true, reason: 'cadence' })
+    expect(second).not.toHaveBeenCalled()
+    expect(await shared.readBuckets({ metric: 'm' })).toHaveLength(1)
+  })
+
+  it('ships a final flush inside the turn when the shared storage is not durable', async () => {
+    const shared = sharedMemory(false)
+    const one = processOn(shared)
+    const two = processOn(shared)
+    await written(one)
+    await one.metric.flush()
+
+    await written(two)
+    expect(await two.metric.flush({ final: true })).toMatchObject({ skipped: false, rows: 1 })
+  })
+
+  it('ships a final flush inside the turn under force', async () => {
+    const shared = sharedMemory()
+    const one = processOn(shared)
+    const two = processOn(shared)
+    await written(one)
+    await one.metric.flush()
+
+    await written(two)
+    expect(await two.metric.flush({ final: true, force: true })).toMatchObject({
+      skipped: false,
+      rows: 1,
+    })
   })
 
   it('keeps the flush report when the turn cannot be given back', async () => {
