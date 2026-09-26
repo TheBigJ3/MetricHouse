@@ -30,8 +30,14 @@ export interface FlushOptions {
   /** Ignore the cadence and ship everything closed now. */
   readonly force?: boolean
   /**
-   * The last flush this process will make. Implies `force`, and also ships
-   * windows that have ended but are still inside grace.
+   * The last flush this process will make. Ignores this process's own
+   * cadence, and also ships windows that have ended but are still inside
+   * grace.
+   *
+   * On a driver that is shared and durable it still waits for the turn every
+   * process takes, unless `force` is passed too. The rows it leaves stay in
+   * storage, and whichever process takes the next turn ships them, so a
+   * rolling deploy does not send one small insert per stopping process.
    *
    * Grace exists for writes still on their way to the driver. A process that
    * is stopping has drained its own writes already, so the only window worth
@@ -287,15 +293,18 @@ export function metricFlush(
     }
 
     //    Then the turn every process sharing the driver keeps, since this
-    //    process may not be the one that shipped last. `force` and `final`
-    //    still take it, with no gap, so the processes that keep to the
-    //    cadence count from what they shipped.
+    //    process may not be the one that shipped last. `force` takes it with
+    //    no gap, so the processes that keep to the cadence count from what it
+    //    shipped. `final` waits for it like any flush when storage outlives
+    //    this process, since whoever takes the next turn ships what it
+    //    leaves, and takes it with no gap when storage does not.
     const driver = options.sharedDriver?.()
     let turn: { readonly driver: Driver; readonly previous: number | undefined } | undefined
     if (driver?.capabilities.shared === true && driver.takeTurn !== undefined) {
+      const waits = flushOptions.force !== true && (!final || driver.capabilities.durable)
       let taken: ShipTurn
       try {
-        taken = await driver.takeTurn(options.name, now, ignoreCadence ? 0 : gapMs)
+        taken = await driver.takeTurn(options.name, now, waits ? gapMs : 0)
       } catch (error) {
         return { buckets: 0, rows: 0, skipped: false, error }
       }

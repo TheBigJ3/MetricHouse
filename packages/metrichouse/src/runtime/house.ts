@@ -126,7 +126,9 @@ export interface House {
    * Clears the intervals, waits for every flush still running however it was
    * started and drains the writes still on their way to the driver, taking
    * turns until a wait for flushes that follows a drain finds none, then
-   * makes a final flush past every cadence and every grace period. A call
+   * makes a final flush past this process's cadence and every grace period.
+   * On shared durable storage that flush still waits for the turn every
+   * process takes, and what it leaves ships with the next one. A call
    * while one is running returns the same promise, unless `start()` came in
    * between: that call clears the intervals again at once and runs its own
    * steps once the earlier call has finished. What it cannot ship is the open
@@ -373,8 +375,10 @@ export function createHouse(config: HouseConfig): House {
         // only the waiting matters here
         await settleEverything()
         // final, so windows still inside grace go too. Only the open window
-        // is left, which is the one thing a stopping process cannot finish
-        return await runFlush(flushContext, { force: true, final: true })
+        // is left, which is the one thing a stopping process cannot finish.
+        // Not forced: on shared durable storage a final flush waits for the
+        // turn, and what it leaves ships with whoever takes the next one
+        return await runFlush(flushContext, { final: true })
       } finally {
         if (stopping === run) stopping = undefined
         finished()

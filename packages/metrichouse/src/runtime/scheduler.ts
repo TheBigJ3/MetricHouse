@@ -8,9 +8,18 @@
  * cadences needs no cron entries and no coordination.
  *
  * ```
- * house.start()   ->  setInterval(metric.flushMs) per metric
+ * house.start()   ->  per metric, a first tick at its offset, then
+ *                     setInterval(metric.flushMs)
  * house.stop()    ->  clear, wait for running ticks, drain, final flush
  * ```
+ *
+ * **Offset per metric, so a server's metrics do not all ship in one
+ * second.** Timers armed together fire together, and forty metrics on
+ * `flush: '1m'` would send forty inserts in the same moment every minute.
+ * Each metric's first tick waits {@link firstTickDelay}, a fixed point
+ * inside its interval worked out from its name. The same name gets the same
+ * offset on every server, and none of it changes how often a metric ships:
+ * that is still the cadence, and on a shared driver the turn.
  *
  * **Opt-in, and started by you, because a timer is not portable.** On Workers,
  * Vercel edge and Lambda the isolate is frozen the moment a response is
@@ -54,8 +63,25 @@ export interface Scheduler {
   stop(): Promise<void>
 }
 
+/**
+ * How long after `start()` a metric's first tick fires: a point in
+ * `[0, flushMs)` taken from a 32 bit FNV-1a hash of its name.
+ *
+ * A hash rather than a random draw, so a restart or another server puts the
+ * metric at the same point, and a test can say where that is.
+ */
+export function firstTickDelay(name: string, flushMs: number): number {
+  let h = 0x811c9dc5
+  for (let i = 0; i < name.length; i++) {
+    h ^= name.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0) % flushMs
+}
+
 export function createScheduler(options: SchedulerOptions): Scheduler {
-  const timers = new Map<string, ReturnType<typeof setInterval>>()
+  /** metric -> the timer it is waiting on: its first tick's, then its interval. */
+  const timers = new Map<string, ReturnType<typeof setTimeout>>()
   /**
    * Metrics whose tick has not returned yet.
    *
@@ -98,19 +124,28 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     inFlight.set(metric.name, run(metric))
   }
 
+  // metrics should not be the reason a process stays alive. A server is held
+  // open by its listener; when that closes, a pending flush timer keeping the
+  // process running would look like a hang. Node-only, hence the guard.
+  function unref(timer: ReturnType<typeof setTimeout>): void {
+    if (typeof timer === 'object' && typeof timer.unref === 'function') timer.unref()
+  }
+
   function schedule(metric: AnyMetric): void {
     if (timers.has(metric.name)) return
 
-    const timer = setInterval(() => {
+    const delay = firstTickDelay(metric.name, metric.flushMs)
+    const first = setTimeout(() => {
       tick(metric)
-    }, metric.flushMs)
+      const interval = setInterval(() => {
+        tick(metric)
+      }, metric.flushMs)
+      unref(interval)
+      timers.set(metric.name, interval)
+    }, delay)
+    unref(first)
 
-    // metrics should not be the reason a process stays alive. A server is held
-    // open by its listener; when that closes, a pending flush interval keeping
-    // the process running would look like a hang. Node-only, hence the guard.
-    if (typeof timer === 'object' && typeof timer.unref === 'function') timer.unref()
-
-    timers.set(metric.name, timer)
+    timers.set(metric.name, first)
   }
 
   return {
@@ -131,7 +166,9 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
 
     async stop(): Promise<void> {
       running = false
-      for (const timer of timers.values()) clearInterval(timer)
+      // clearTimeout clears an interval too, so one call covers a metric
+      // still waiting on its first tick and one already ticking
+      for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()
       // `run` never rejects, so this only waits
       await Promise.all([...inFlight.values()])

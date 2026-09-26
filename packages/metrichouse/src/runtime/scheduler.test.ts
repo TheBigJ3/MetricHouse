@@ -6,6 +6,7 @@ import { event } from '../metrics/event.js'
 import type { WriteFn } from '../metrics/types.js'
 import { str } from '../schema/types.js'
 import { createHouse } from './house.js'
+import { firstTickDelay } from './scheduler.js'
 
 const A = { dogName: 'Willow' } as const
 
@@ -371,5 +372,116 @@ describe('house.stop()', () => {
 
     await tick(60_000)
     expect(write).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('firstTickDelay', () => {
+  it('puts a name at a fixed point inside its interval', () => {
+    expect(firstTickDelay('m', 60_000)).toBe(12_696)
+    expect(firstTickDelay('http_requests', 60_000)).toBe(16)
+    expect(firstTickDelay('lazy', 300_000)).toBe(161_615)
+  })
+
+  it('is zero for an interval of one millisecond', () => {
+    expect(firstTickDelay('m', 1)).toBe(0)
+  })
+})
+
+describe('first tick offsets', () => {
+  it("fires a metric's first tick at its offset, then once per interval", async () => {
+    const write = vi.fn()
+    const metric = make('m', write, '1m')
+    const house = createHouse({ driver, schema: [metric], now })
+    metric.add(A)
+    await house.drain()
+    settle()
+    house.start()
+
+    await tick(12_695)
+    expect(write).not.toHaveBeenCalled()
+    await tick(1)
+    expect(write).toHaveBeenCalledTimes(1)
+
+    metric.add(A)
+    await house.drain()
+    await tick(59_999)
+    expect(write).toHaveBeenCalledTimes(1)
+    await tick(1)
+    expect(write).toHaveBeenCalledTimes(2)
+  })
+
+  it('spreads metrics on one cadence across the interval', async () => {
+    const early = vi.fn()
+    const late = vi.fn()
+    const first = make('b', early, '1m')
+    const second = make('a', late, '1m')
+    const house = createHouse({ driver, schema: [first, second], now })
+    first.add(A)
+    second.add(A)
+    await house.drain()
+    settle()
+    house.start()
+
+    // 'b' fires at 35_077 and 'a' at 42_220
+    await tick(35_077)
+    expect(early).toHaveBeenCalledTimes(1)
+    expect(late).not.toHaveBeenCalled()
+    await tick(42_220 - 35_077)
+    expect(late).toHaveBeenCalledTimes(1)
+  })
+
+  it('fires nothing once stopped before the first tick', async () => {
+    const write = vi.fn()
+    const metric = make('m', write, '1m')
+    const house = createHouse({ driver, schema: [metric], now })
+    house.start()
+    await house.stop()
+
+    metric.add(A)
+    await house.drain()
+    settle()
+    await tick(120_000)
+    expect(write).not.toHaveBeenCalled()
+  })
+})
+
+describe('two processes started seconds apart on a shared driver', () => {
+  it('ships one full interval per insert, from whichever asks first', async () => {
+    const inner = memory()
+    const shared: Driver = {
+      ...inner,
+      capabilities: { ...inner.capabilities, shared: true, durable: true },
+    }
+    const inserts: { process: string; at: number; rows: number }[] = []
+    const processOn = (name: string) => {
+      const metric = make('m', (rows) => {
+        inserts.push({ process: name, at: clock, rows: rows.length })
+      })
+      const house = createHouse({ driver: shared, schema: [metric], now })
+      return { metric, house }
+    }
+
+    const one = processOn('one')
+    const two = processOn('two')
+    const started = clock
+    one.house.start()
+    await tick(3_000)
+    two.house.start()
+
+    // a write every second for ten minutes, alternating between the two
+    for (let second = 3; second < 600; second++) {
+      const proc = second % 2 === 0 ? one : two
+      proc.metric.add(A)
+      await proc.house.drain()
+      await tick(1_000)
+    }
+
+    // one's ticks land at 12.696s, then every minute. two's land three
+    // seconds after each of those, inside the interval, and are refused
+    expect(inserts.map((i) => i.process)).toEqual(Array(10).fill('one'))
+    expect(inserts.map((i) => i.at - started)).toEqual(
+      Array.from({ length: 10 }, (_, n) => 13_000 + n * 60_000),
+    )
+    expect(inserts.slice(1).map((i) => i.rows)).toEqual(Array(9).fill(60))
   })
 })

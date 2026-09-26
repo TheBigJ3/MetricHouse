@@ -220,8 +220,10 @@ process.on('SIGTERM', async () => {
 3. Drains writes still on their way to the driver. Steps 2 and 3 then take
    turns until a wait for flushes that follows a drain finds none, so a flush
    that starts while the writes drain is waited for as well.
-4. Makes a [final flush](/reference/flush-options#final) past every cadence and
-   every grace period.
+4. Makes a [final flush](/reference/flush-options#final) past this process's
+   cadence and every grace period. On a shared, durable driver it still waits
+   for the [turn](/guide/flushing#several-processes-on-one-driver), and what it
+   leaves ships with the next one.
 
 A write or a flush that failed, or an `onError` that threw, is reported and
 does not stop the steps after it. A flush whose sink fails during steps 2 and

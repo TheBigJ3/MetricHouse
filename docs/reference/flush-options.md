@@ -18,7 +18,7 @@ await house.flush({ force: true, only: ['http_requests'] })
 | --- | --- | --- |
 | `metric.flush(options?)` | [`force`](#force), [`final`](#final) | [`MetricFlushReport`](#the-metric-report) |
 | `house.flush(options?)` | [`force`](#force), [`final`](#final), [`only`](#only), [`strict`](#strict) | [`FlushReport`](#the-house-report) |
-| `house.stop()` | none, it passes `force` and `final` itself | [`FlushReport`](#the-house-report) |
+| `house.stop()` | none, it passes `final` itself | [`FlushReport`](#the-house-report) |
 
 Every metric type takes the same options, whether it folds writes into windows
 or keeps each record whole.
@@ -55,8 +55,8 @@ turn, so the other processes count their next interval from it. See
 
 What `force` does not do is ship the window that is still filling. That window
 has not closed, and a partial fold carrying the same row id is the corruption
-[`delivery: 'immediate'`](/guide/delivery) exists to handle. `house.stop()`
-forces a flush for the same reason and has the same limit.
+[`delivery: 'immediate'`](/guide/delivery) exists to handle. The final flush
+`house.stop()` makes has the same limit.
 
 Nor does `force` skip [grace](/primitives/counter#grace). A window that ended a
 second ago is still held back, in case a write stamped inside it has not reached
@@ -68,8 +68,17 @@ storage yet.
 final?: boolean      // default false
 ```
 
-The last flush this process will make. It does what `force` does, and it also
-ships windows that have ended but are still inside grace.
+The last flush this process will make. It ignores this process's own cadence,
+as `force` does, and it also ships windows that have ended but are still inside
+grace.
+
+On a driver that is shared and durable, such as `ioredis()`, it still waits for
+the metric's [turn](/guide/flushing#several-processes-on-one-driver). A final
+flush another process beat to it reports `skipped: true` with
+`reason: 'cadence'`, and leaves its rows in storage for whichever process takes
+the next turn. Pass `force` as well to ship them now whatever the turn says.
+On a driver that is shared but not durable, a final flush takes the turn at
+once, since nothing else may be left to ship its rows.
 
 ```ts
 await house.drain()
