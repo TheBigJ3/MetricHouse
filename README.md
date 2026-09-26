@@ -20,7 +20,7 @@ aggregation, durable staging and flush. The full comparison is in
 
 > **Status: six primitives run.** `counter`, `gauge`, `level`, `event`, `log`
 > and `timer` all write through the memory driver, live-read, and flush to your
-> `write()` with stable row ids — the snippet below is a working program, not a
+> `write()` with stable row ids. The snippet below is a working program, not a
 > sketch. `event` brought the second storage model with it: records are staged
 > and shipped whole, never folded, so the driver contract covers both
 > aggregation and durable staging. The two newest add no storage of their own:
@@ -47,12 +47,12 @@ your database. That one line settles most of the design:
 
 - There is a `counter` primitive, because discarded increments cannot be
   recovered. There is **no histogram**, because `quantile()` is a `SELECT`.
-- Gauges store `sum` and `count`, never `avg` — an average does not merge across
+- Gauges store `sum` and `count`, never `avg`, because an average does not merge across
   buckets and can be derived from two numbers that do.
 - There is no query engine, no dashboard, and no database driver. You write the
   function that puts rows wherever you want them.
 - There is **no SQL**. MetricHouse emits none, diffs no schema and opens no
-  connection — the table your rows land in is yours to create and evolve.
+  connection. The table your rows land in is yours to create and evolve.
 
 ## Install
 
@@ -65,7 +65,7 @@ you import `metrichouse/ioredis`.
 
 ## Documentation
 
-**[www.metrichouse.dev](https://www.metrichouse.dev/guide/getting-started)** —
+**[www.metrichouse.dev](https://www.metrichouse.dev/guide/getting-started)** has
 getting started, one page per primitive, deployment guides, worked examples, and
 an API reference. Every snippet in it is checked against the built package.
 
@@ -99,7 +99,7 @@ export const dogPoops = counter('dog_poops', {
 ```
 
 Bind it to a house once, at startup. A metric is an inert declaration until a
-house registers it — writing to an unbound metric throws rather than dropping
+house registers it, and writing to an unbound metric throws rather than dropping
 data silently:
 
 ```ts
@@ -122,8 +122,8 @@ await dogPoops.current({ dogName: 'Willow', park: 'riverside', kind: 'solid' })
 
 ### Getting it out
 
-A metric is a complete unit — what it measures, how often it ships, and where
-it ships to — so flushing one needs no house at all:
+A metric is a complete unit, covering what it measures, how often it ships, and where
+it ships to, so flushing one needs no house at all:
 
 ```ts
 await dogPoops.flush()
@@ -142,7 +142,7 @@ process.on('SIGTERM', async () => {
 
 On **edge and serverless**, where the isolate is frozen between requests and a
 timer never fires, you pump it yourself. `house.flush()` is a fan-out over
-`metric.flush()`, and each metric still honours its own cadence — so a cron
+`metric.flush()`, and each metric still honours its own cadence, so a cron
 every ten seconds still ships `dog_poops` only every five minutes:
 
 ```ts
@@ -153,7 +153,7 @@ Three separate knobs, and it is worth keeping them apart:
 
 | | what it is | who owns it |
 |---|---|---|
-| `resolution: '1s'` | bucket width — the fidelity of the stored series | the metric |
+| `resolution: '1s'` | bucket width, the fidelity of the stored series | the metric |
 | `flush: '5m'` | a **minimum** on how often this metric ships | the metric |
 | `start()` / `flush()` | what actually asks it to | you |
 
@@ -163,7 +163,7 @@ bucket, so five minutes of one-second buckets arrive as 300 rows at once.
 ## Repository layout
 
 ```
-packages/             published to npm — the runtime and the CLI, split apart
+packages/             published to npm, the runtime and the CLI, split apart
 runtime-tests/        the same suite against Node, Bun, Deno, Workers, Edge, Lambda
 benchmarks/           write-path overhead, Lua contention, flush throughput
 examples/             small runnable apps, all in CI
@@ -172,12 +172,12 @@ docs/                 the documentation site
 
 One package: `metrichouse`, the runtime, small enough to ship to an edge
 bundle. Subpath exports keep the write path separate from the drivers. A CLI
-package will follow once the runtime exists — see
+package will follow once the runtime exists. See
 [`packages/README.md`](packages/README.md).
 
 `runtime-tests/` and `benchmarks/` are level 1 because both design decisions
-they cover — a network call on the hot path, and a write path that can be
-silently discarded by a serverless isolate — are only defensible with numbers
+they cover, a network call on the hot path and a write path that can be
+silently discarded by a serverless isolate, are only defensible with numbers
 and a matrix, not with prose.
 
 ## Where it stands
@@ -187,12 +187,9 @@ explicit `flush()`, per-metric write functions, pre-declared dimensions.
 
 Open, and worth arguing about:
 
-- **`house.ingest()` is doing a lot of work.** It arrived for historical
-  backfill, then answered edge federation and multi-region latency. That is
-  either good design or a bucket that catches everything.
-- **No cardinality guard on Redis.** Deliberate — the answer is a static
-  projection in `metrichouse check`, not a runtime cap. The memory driver caps
-  anyway, and that asymmetry is a real seam.
+- **No cardinality guard on Redis.** Deliberate. The memory driver caps its
+  series with `maxSeries`, and Redis does not, and that asymmetry is a real
+  seam.
 - **No live percentiles.** Live read cannot see staged events, so p95 for the
   current window is unavailable. Accepted, and documented rather than hidden.
 
@@ -207,7 +204,7 @@ pnpm check          # everything CI runs
 ```
 
 Requires Node 20+ and pnpm 12. If `pnpm` on your machine is Corepack's shim
-from a Node install older than Corepack 0.35, it cannot launch pnpm 12 — pnpm
+from a Node install older than Corepack 0.35, it cannot launch pnpm 12, because pnpm
 moved to a native binary and Corepack still looks for `bin/pnpm.cjs`. Install
 pnpm directly instead:
 
@@ -217,4 +214,4 @@ brew install pnpm            # or: npm i -g pnpm@12 --force
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

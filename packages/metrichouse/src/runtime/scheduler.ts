@@ -1,9 +1,9 @@
 /**
- * The opt-in scheduler — what turns `flush: '5m'` from a floor into a cadence.
+ * The opt-in scheduler, which turns `flush: '5m'` from a floor into a cadence.
  *
  * A metric's `flush` setting is a **minimum**: it bounds how often a metric is
  * willing to ship, and something still has to ask. On a long-lived process
- * that something can be a timer, and this is it — one interval per metric, at
+ * that something can be a timer, and this is it. One interval per metric, at
  * that metric's own cadence, so a schema of forty metrics on nine different
  * cadences needs no cron entries and no coordination.
  *
@@ -29,8 +29,8 @@ export interface SchedulerOptions {
   /**
    * Where a failed tick goes.
    *
-   * A scheduled flush has no caller to return a report to — nobody is holding
-   * the promise — so a sink that throws would otherwise be an unhandled
+   * A scheduled flush has no caller to return a report to, since nobody is holding
+   * the promise, so a sink that throws would otherwise be an unhandled
    * rejection or, worse, silence.
    */
   readonly onError?: (error: unknown, context: { metric: string }) => void
@@ -60,7 +60,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
    * Metrics whose tick has not returned yet.
    *
    * A sink slower than the cadence would otherwise stack ticks on top of each
-   * other, and the second one claims what the first is still writing — which
+   * other, and the second one claims what the first is still writing, which
    * is legal (the claims are disjoint) but doubles the pressure on the sink
    * exactly when it is already struggling. Skipping is the right answer: the
    * next tick is one interval away, and the data is not going anywhere.

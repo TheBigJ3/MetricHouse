@@ -1,25 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { formatDuration, MAX_TIMER_MS, parseDuration, parseInterval, UNIT_MS } from './duration.js'
 
-/**
- * Asserts `fn` throws a *real* validation error — not the `not implemented`
- * sentinel the stub throws. Without this guard every rejection test below
- * would pass trivially against an unimplemented function and report a false
- * green. Delete it once the stubs are gone if you like; it costs nothing.
- */
-function expectRejected(fn: () => unknown): Error {
-  let caught: unknown
-  try {
-    fn()
-  } catch (err) {
-    caught = err
-  }
-  expect(caught, 'expected the call to throw').toBeInstanceOf(Error)
-  const err = caught as Error
-  expect(err.message, 'still throwing the stub sentinel').not.toMatch(/not implemented/i)
-  return err
-}
-
 describe('parseDuration', () => {
   it('parses every unit', () => {
     expect(parseDuration('500ms')).toBe(500)
@@ -36,7 +17,7 @@ describe('parseDuration', () => {
     }
   })
 
-  it('accepts zero — a zero grace is meaningful', () => {
+  it('accepts zero, since a zero grace is meaningful', () => {
     expect(parseDuration('0s')).toBe(0)
     expect(parseDuration('0ms')).toBe(0)
     expect(parseDuration(0)).toBe(0)
@@ -72,7 +53,7 @@ describe('parseDuration', () => {
     ['5 m', 'internal whitespace'],
     ['abc', 'not a duration'],
   ])('rejects %j (%s)', (input) => {
-    expectRejected(() => parseDuration(input))
+    expect(() => parseDuration(input)).toThrow(`parseDuration: ${JSON.stringify(input.trim())}`)
   })
 
   it.each([
@@ -81,11 +62,11 @@ describe('parseDuration', () => {
     [Number.NaN, 'NaN'],
     [Number.POSITIVE_INFINITY, 'Infinity'],
   ])('rejects the number %p (%s)', (input) => {
-    expectRejected(() => parseDuration(input))
+    expect(() => parseDuration(input)).toThrow(`parseDuration: ${input}`)
   })
 
   it('names the offending input in the error', () => {
-    expect(expectRejected(() => parseDuration('5y')).message).toMatch(/5y/)
+    expect(() => parseDuration('5y')).toThrow('parseDuration: "5y"')
   })
 })
 
@@ -122,7 +103,7 @@ describe('formatDuration', () => {
   })
 
   it('does not emit a fraction it could not parse back', () => {
-    // 90s is 1.5m — must stay seconds, because '1.5m' is rejected on the way in
+    // 90s is 1.5m, but it must stay seconds, because '1.5m' is rejected on the way in
     expect(formatDuration(90_000)).toBe('90s')
     expect(formatDuration(1500)).toBe('1500ms')
   })
@@ -132,7 +113,7 @@ describe('formatDuration', () => {
   })
 
   it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])('rejects %p', (ms) => {
-    expectRejected(() => formatDuration(ms))
+    expect(() => formatDuration(ms)).toThrow(`formatDuration: ${ms}`)
   })
 })
 

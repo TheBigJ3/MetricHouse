@@ -1,10 +1,10 @@
 /**
- * Gauge — point-in-time values, folded per series per bucket into the
+ * Gauge. Point-in-time values, folded per series per bucket into the
  * mergeable set: `last`, `min`, `max`, `sum`, `count`.
  *
  * Average is deliberately **not** stored. It is `sum / count` at query time,
  * and unlike the five stored aggregates it cannot be merged across buckets
- * without lying — the mean of two means is not the mean.
+ * without lying. The mean of two means is not the mean.
  *
  * **Not a level.** A gauge answers "what values were observed in this bucket".
  * A bucket with no observations is *absent*, which on a chart is a hole rather
@@ -13,16 +13,15 @@
  * value per series and carries it into the buckets nobody wrote to.
  */
 
-import { type Cell, type Driver, type GaugeCell, isGaugeCell } from '../drivers/types.js'
+import { type Cell, type GaugeCell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
-import { createAttempts, metricFlush } from '../runtime/flush.js'
+import { metricFlush } from '../runtime/flush.js'
 import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
-import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
 import type { InferShape, Shape, Simplify } from '../schema/types.js'
-import { assertResolution, bucketStart } from '../time/buckets.js'
-import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
-import { bucketedLifecycle, bucketedReader, DEFAULT_GRACE_MS } from './bucketed.js'
+import { bucketStart } from '../time/buckets.js'
+import type { DurationInput } from '../time/duration.js'
+import { bucketedBinding, bucketedLifecycle, bucketedReader, seriesKey } from './bucketed.js'
 import type {
   AnyMetric,
   DimsArgs,
@@ -34,7 +33,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink, dimColumns, reportError } from './types.js'
+import { assertMetricName, assertSink, dimColumns, pendingWrites } from './types.js'
 
 /** The five stored aggregates, in column order. */
 export const GAUGE_AGGREGATES = ['last', 'min', 'max', 'sum', 'count'] as const
@@ -80,13 +79,13 @@ export interface GaugeConfig<D extends Shape> {
   /**
    * Which aggregates reach your sink. Defaults to all five.
    *
-   * All five are always folded — the saving is columns written, not work done,
+   * All five are always folded. The saving is columns written, not work done,
    * and keeping the fold complete means widening this later needs no
    * migration of what is already in flight.
    */
   readonly aggregate?: readonly GaugeAggregate[]
   /**
-   * Where this gauge's rows go. Required — see the counter for why.
+   * Where this gauge's rows go. Required. See the counter for why.
    *
    * Receives {@link GaugeRow}: dims typed, aggregates `Partial` for the same
    * reason the row type gives.
@@ -102,11 +101,11 @@ export interface GaugeConfig<D extends Shape> {
  *
  * The claim path reads `kind` off whatever object the flush engine was handed,
  * so a wrapper's own `kind` is enough there. Immediate delivery has no such
- * indirection — the gauge ships itself, from inside — so the kind has to be
+ * indirection, because the gauge ships itself from inside, so the kind has to be
  * something it knows.
  */
 export interface Gauge<D extends Shape, K extends MetricKind = 'gauge'> extends AnyMetric {
-  /** @internal — shared read path behind `current` and `totals`. */
+  /** @internal The shared read path behind `current` and `totals`. */
   openFolds(dims?: InferShape<D>): Promise<GaugeCell[]>
   readonly name: string
   readonly kind: K
@@ -145,7 +144,7 @@ export interface Gauge<D extends Shape, K extends MetricKind = 'gauge'> extends 
   ): Promise<GaugeLiveRow<D, O>[]>
 
   /**
-   * Every series in the open bucket, merged — the gauge equivalent of a
+   * Every series in the open bucket, merged, the gauge equivalent of a
    * counter's total.
    *
    * Returns {@link GaugeTotals}, which has no `last`: with several series
@@ -159,14 +158,14 @@ export interface Gauge<D extends Shape, K extends MetricKind = 'gauge'> extends 
 
   /** Turn one stored fold into the row a sink receives. */
   materialize(bucketTs: number, dimKey: string, cell: Cell): Row
-  /** This batch's headline number — every observed value in it. */
+  /** This batch's headline number, every observed value in it. */
   totalOf(rows: readonly Row[]): number
 }
 
 /**
  * Declare a gauge.
  *
- * @throws if the configuration is invalid — see `counter()` for the same
+ * @throws if the configuration is invalid. See `counter()` for the same
  * declare-time checks on name, dims and resolution.
  */
 export function gauge<D extends Shape = Record<never, never>, K extends MetricKind = 'gauge'>(
@@ -179,11 +178,20 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
 
   const dims = (config.dims ?? {}) as D
 
-  const resolutionMs = parseDuration(config.resolution)
-  const ownFlushMs =
-    config.flush === undefined ? undefined : parseInterval(config.flush, `${name}: flush`)
-  const ownGraceMs = config.grace === undefined ? undefined : parseDuration(config.grace)
-  if (ownFlushMs !== undefined) assertResolution(resolutionMs, ownFlushMs)
+  // erased for the engine, which carries rows of every kind. See the counter
+  const sink = config.write as WriteFn
+
+  const slot = bucketedBinding({
+    name,
+    kind,
+    resolution: config.resolution,
+    flush: config.flush,
+    grace: config.grace,
+    materialize,
+    totalOf,
+    sink,
+  })
+  const { resolutionMs } = slot
 
   const aggregate = config.aggregate ?? GAUGE_AGGREGATES
   if (aggregate.length === 0) {
@@ -204,13 +212,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
   // and a dim may take none of them
   assertDimsLegal(dims, name, ['id', 'bucket_ts', ...aggregate])
 
-  // erased for the engine, which carries rows of every kind. See the counter
-  const sink = config.write as WriteFn
-
-  let binding: MetricBinding | undefined
-  const pending = new Set<Promise<void>>()
-  /** One failure count for flushes and immediate sends alike. */
-  const attempts = createAttempts()
+  const writes = pendingWrites(name)
 
   function asFold(cell: Cell): GaugeCell {
     if (!isGaugeCell(cell)) {
@@ -219,78 +221,8 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     return cell
   }
 
-  /** The metric's own cadence, or the house's. See the counter for the rule. */
-  function effectiveFlushMs(from: MetricBinding | undefined = binding): number {
-    const ms = ownFlushMs ?? from?.defaults?.flushMs
-    if (ms === undefined) {
-      throw new Error(
-        `${name}: no flush cadence. Declare flush on the ${kind}, or defaults.flush on the house`,
-      )
-    }
-    return ms
-  }
-
-  function effectiveGraceMs(): number {
-    return ownGraceMs ?? binding?.defaults?.graceMs ?? DEFAULT_GRACE_MS
-  }
-
-  function activeBinding(): MetricBinding {
-    if (!binding) {
-      throw new Error(
-        `${name}: not bound to a house. Pass it to createHouse({ schema }) before writing`,
-      )
-    }
-    return binding
-  }
-
   function keyFor(values: InferShape<D> | undefined): string {
     return encodeDimKey(dims, (values ?? {}) as Record<string, unknown>)
-  }
-
-  /**
-   * Under `delivery: 'immediate'`, follow the observation with a send of the
-   * whole open fold for this series — `min` and `max` are only right once the
-   * driver has merged the value that triggered the send.
-   */
-  function deliver(write: Promise<void>, bucketTs: number, dimKey: string): Promise<void> {
-    if (binding?.delivery !== 'immediate') return write
-    return write.then(() => shipOpen(bucketTs, dimKey))
-  }
-
-  async function shipOpen(bucketTs: number, dimKey: string): Promise<void> {
-    const active = activeBinding()
-
-    await shipOpenSeries({
-      metric: name,
-      kind,
-      resolutionMs,
-      driver: active.driver,
-      bucketTs,
-      dimKey,
-      materialize,
-      totalOf,
-      sink,
-      attempts,
-    })
-  }
-
-  function track(write: Promise<void>, onError: MetricBinding['onError']): void {
-    const settled = write
-      // reported and never rethrown, so `drain()` waits for every write
-      // rather than stopping at the first that failed
-      .catch((error: unknown) => reportError(onError, error, { metric: name }))
-      .finally(() => {
-        pending.delete(settled)
-      })
-    pending.add(settled)
-  }
-
-  function activeDriver(): Driver {
-    return activeBinding().driver
-  }
-
-  function nowMs(): number {
-    return (activeBinding().now ?? Date.now)()
   }
 
   /**
@@ -327,7 +259,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
   /**
    * Merge folds the way the five aggregates merge, which is the reason those
    * five and not `avg`: `sum` and `count` add, `min` and `max` take the
-   * extreme, and `last` is the latest — answerable only because rows arrive in
+   * extreme, and `last` is the latest, answerable only because rows arrive in
    * ascending bucket order.
    *
    * Merging across *series* takes the same path, and `last` is the one column
@@ -376,18 +308,18 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     const series = new Set<string>()
     for (const row of rows) {
       if ((row.bucket_ts as Date).getTime() !== newestAt) continue
-      series.add(JSON.stringify(dimNames.map((dim) => row[dim])))
+      series.add(seriesKey(dimNames, row))
     }
     return series.size === 1 ? (newest.last as number | undefined) : undefined
   }
 
-  // named, so the flush mixin can reach the finished metric — see the counter
+  // named, so the flush mixin can reach the finished metric. See the counter
   const self: Gauge<D, K> = {
     ...bucketedLifecycle({
       name,
       resolutionMs,
-      graceMs: effectiveGraceMs,
-      driver: activeDriver,
+      graceMs: slot.graceMs,
+      driver: slot.driver,
       materialize,
       totalOf,
     }),
@@ -396,19 +328,19 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       name,
       resolutionMs,
       dims,
-      driver: activeDriver,
-      now: nowMs,
+      driver: slot.driver,
+      now: slot.now,
       materialize,
       mergeValues,
     }),
 
     ...metricFlush({
       name,
-      flushMs: effectiveFlushMs,
+      flushMs: slot.flushMs,
       sink: () => sink,
-      now: nowMs,
+      now: slot.now,
       self: () => self,
-      attempts,
+      attempts: slot.attempts,
     }),
 
     name,
@@ -418,35 +350,25 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
     resolutionMs,
 
     get flushMs(): number {
-      return effectiveFlushMs()
+      return slot.flushMs()
     },
 
     get graceMs(): number {
-      return effectiveGraceMs()
+      return slot.graceMs()
     },
 
     aggregate,
     write: config.write,
 
     get isBound(): boolean {
-      return binding !== undefined
+      return slot.isBound()
     },
 
-    bind(next: MetricBinding): void {
-      if (binding) {
-        throw new Error(`${name}: already bound to a house, and a metric belongs to exactly one`)
-      }
-      // checked before the binding is kept, as the counter does
-      if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs(next))
-      binding = next
-    },
-
-    unbind(): void {
-      binding = undefined
-    },
+    bind: slot.bind,
+    unbind: slot.unbind,
 
     set(value: number, ...args: DimsArgs<D>): void {
-      const active = activeBinding()
+      const active = slot.active()
 
       if (typeof value !== 'number' || !Number.isFinite(value)) {
         throw new Error(`${name}: an observation must be a finite number, got ${String(value)}`)
@@ -456,11 +378,11 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
 
       const write = active.driver.observe([{ metric: name, bucketTs, dimKey, value }])
-      track(deliver(write, bucketTs, dimKey), active.onError)
+      writes.track(slot.deliver(write, bucketTs, dimKey), () => active.onError)
     },
 
     async openFolds(values?: InferShape<D>): Promise<GaugeCell[]> {
-      const active = activeBinding()
+      const active = slot.active()
       const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
 
       const rows = await active.driver.readBuckets({
@@ -493,10 +415,8 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       }
     },
 
-    async drain(): Promise<void> {
-      while (pending.size > 0) {
-        await Promise.all([...pending])
-      }
+    drain(): Promise<void> {
+      return writes.drain()
     },
 
     materialize,

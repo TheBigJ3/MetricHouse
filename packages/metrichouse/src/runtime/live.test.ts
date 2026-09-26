@@ -13,7 +13,7 @@ import { oneOf, str, ts } from '../schema/types.js'
 import { createHouse } from './house.js'
 import { liveness, snapshotRange } from './live.js'
 
-/** A sink that keeps nothing — for declaration tests that never ship. */
+/** A sink that keeps nothing, for declaration tests that never ship. */
 const discard: WriteFn = () => {}
 
 const DIMS = { park: str(), kind: oneOf(['solid', 'liquid'] as const) }
@@ -30,7 +30,7 @@ beforeEach(() => {
 })
 
 // ---------------------------------------------------------------------------
-// the pure half — no driver, no metric
+// the pure half, with no driver, no metric
 // ---------------------------------------------------------------------------
 
 describe('liveness', () => {
@@ -57,7 +57,7 @@ describe('snapshotRange', () => {
     expect(snapshotRange({ complete: false }, 1_000, 10_400)).toEqual({})
   })
 
-  it('applies `to` and `complete` together — one does not waive the other', () => {
+  it('applies `to` and `complete` together, since one does not waive the other', () => {
     expect(snapshotRange({ to: 50_000 }, 1_000, 10_400)).toEqual({ to: 10_000 })
     expect(snapshotRange({ to: 5_000 }, 1_000, 10_400)).toEqual({ to: 5_000 })
     expect(snapshotRange({ to: 5_000, complete: false }, 1_000, 10_400)).toEqual({ to: 5_000 })
@@ -551,7 +551,7 @@ describe('house.current', () => {
 // ---------------------------------------------------------------------------
 // types
 // ---------------------------------------------------------------------------
-// Never called — declared solely so `tsc` checks these call sites. The runtime
+// Never called. Declared solely so `tsc` checks these call sites. The runtime
 // behaviour above says the rows are right; this says the types describing them
 // are, which is the half a passing test cannot see. Rows are read by iterating
 // rather than indexing, so none of it needs a non-null assertion.
@@ -609,7 +609,7 @@ async function _gaugeRowTypes(metric: Gauge<{ park: ReturnType<typeof str> }>): 
     const _min: number | undefined = row.min
     void [_park, _min]
 
-    // @ts-expect-error avg is never stored — it is sum / count at query time
+    // @ts-expect-error avg is never stored, since it is sum / count at query time
     void row.avg
   }
 }
@@ -641,7 +641,7 @@ async function _stagedRowTypes(
   }
 }
 
-/** The erased surface stays erased — that is what makes a mixed house work. */
+/** The erased surface stays erased, which is what makes a mixed house work. */
 async function _erasedStaysErased(metric: AnyMetric): Promise<void> {
   for (const row of await metric.snapshot()) {
     const _open: boolean = row.bucket_open

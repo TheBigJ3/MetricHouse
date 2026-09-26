@@ -5,21 +5,8 @@ import { float, int, json, oneOf, str } from '../schema/types.js'
 import { type Counter, type CounterRow, counter } from './counter.js'
 import type { WriteFn } from './types.js'
 
-/** A sink that keeps nothing — for declaration tests that never ship. */
+/** A sink that keeps nothing, for declaration tests that never ship. */
 const discard: WriteFn = () => {}
-
-function expectRejected(fn: () => unknown): Error {
-  let caught: unknown
-  try {
-    fn()
-  } catch (err) {
-    caught = err
-  }
-  expect(caught, 'expected the call to throw').toBeInstanceOf(Error)
-  const err = caught as Error
-  expect(err.message, 'still throwing the stub sentinel').not.toMatch(/not implemented/i)
-  return err
-}
 
 const makeDims = () => ({
   dogName: str(),
@@ -83,32 +70,37 @@ describe('declaration', () => {
 
   it('rejects a resolution that does not divide the flush interval', () => {
     // a shipment would split a bucket in half
-    expectRejected(() => make({ resolution: '7s', flush: '1m' }))
+    expect(() => make({ resolution: '7s', flush: '1m' })).toThrow(
+      'assertResolution: resolution 7s does not divide flush 1m evenly, and a shipment would ' +
+        'split a bucket',
+    )
   })
 
-  it('rejects a json() dim — a payload cannot be a series key', () => {
-    const err = expectRejected(() =>
+  it('rejects a json() dim, since a payload cannot be a series key', () => {
+    expect(() =>
       counter('dog_poops', {
         write: discard,
         dims: { payload: json() },
         resolution: '1s',
         flush: '5m',
       }),
+    ).toThrow(
+      'dog_poops: dim "payload" declares json(), which cannot be encoded into a series key. ' +
+        'Put it on an event instead',
     )
-    expect(err.message).toMatch(/payload/)
   })
 
   it('rejects an empty name', () => {
-    expectRejected(() =>
+    expect(() =>
       counter('', { write: discard, dims: makeDims(), resolution: '1s', flush: '5m' }),
-    )
-    expectRejected(() =>
+    ).toThrow('counter: name must be a non-empty string')
+    expect(() =>
       counter('   ', { write: discard, dims: makeDims(), resolution: '1s', flush: '5m' }),
-    )
+    ).toThrow('counter: name must be a non-empty string')
   })
 
   it('rejects a malformed duration', () => {
-    expectRejected(() => make({ resolution: '1.5s' }))
+    expect(() => make({ resolution: '1.5s' })).toThrow('parseDuration: "1.5s"')
   })
 
   it('accepts a metric with no dims', () => {
@@ -166,12 +158,13 @@ describe('dimensionless counters', () => {
     // position also takes a dims object
     const metric = online()
     metric.bind({ driver, now })
-    expect(expectRejected(() => metric.add(5n as unknown as number)).message).toBe(
-      'online_users: the first argument must be a number or a dims object, got bigint. ' +
-        'Convert a bigint with Number() first',
+    expect(() => metric.add(5n as unknown as number)).toThrow(
+      new Error(
+        'online_users: the first argument must be a number or a dims object, got bigint. Convert a bigint with Number() first',
+      ),
     )
-    expect(expectRejected(() => metric.add(true as unknown as number)).message).toBe(
-      'online_users: the first argument must be a number or a dims object, got boolean',
+    expect(() => metric.add(true as unknown as number)).toThrow(
+      new Error('online_users: the first argument must be a number or a dims object, got boolean'),
     )
     await metric.drain()
     expect(await metric.current()).toBe(0)
@@ -181,16 +174,21 @@ describe('dimensionless counters', () => {
     // each is an object, and TypeScript accepts all three on a metric with no dims
     const metric = online()
     metric.bind({ driver, now })
-    const refusal = (value: unknown) =>
-      expectRejected(() => metric.add(value as Record<never, never>)).message
-    expect(refusal(new Date())).toBe(
-      'online_users: the first argument must be a number or a plain dims object, got a Date',
+    const refusal = (value: unknown) => () => metric.add(value as Record<never, never>)
+    expect(refusal(new Date())).toThrow(
+      new Error(
+        'online_users: the first argument must be a number or a plain dims object, got a Date',
+      ),
     )
-    expect(refusal([])).toBe(
-      'online_users: the first argument must be a number or a plain dims object, got an array',
+    expect(refusal([])).toThrow(
+      new Error(
+        'online_users: the first argument must be a number or a plain dims object, got an array',
+      ),
     )
-    expect(refusal(new Number(5))).toBe(
-      'online_users: the first argument must be a number or a plain dims object, got a Number',
+    expect(refusal(new Number(5))).toThrow(
+      new Error(
+        'online_users: the first argument must be a number or a plain dims object, got a Number',
+      ),
     )
     metric.add(Object.create(null))
     await metric.drain()
@@ -204,9 +202,9 @@ describe('inert until bound', () => {
   })
 
   it('throws on add rather than dropping the write', () => {
-    const err = expectRejected(() => make().add(WILLOW))
-    expect(err.message).toMatch(/dog_poops/)
-    expect(err.message).toMatch(/bound|register|house/i)
+    expect(() => make().add(WILLOW)).toThrow(
+      'dog_poops: not bound to a house. Pass it to createHouse({ schema }) before writing',
+    )
   })
 
   it('throws on current', async () => {
@@ -217,15 +215,19 @@ describe('inert until bound', () => {
     expect(bound().isBound).toBe(true)
   })
 
-  it('refuses a second binding — a metric belongs to one house', () => {
+  it('refuses a second binding, since a metric belongs to one house', () => {
     const metric = bound()
-    expectRejected(() => metric.bind({ driver: memory(), now }))
+    expect(() => metric.bind({ driver: memory(), now })).toThrow(
+      new Error('dog_poops: already bound to a house, and a metric belongs to exactly one'),
+    )
   })
 
   it('stays unbound when a binding with no cadence is refused', () => {
     const metric = counter('odd', { resolution: '1s', write: discard })
-    expect(expectRejected(() => metric.bind({ driver, now })).message).toBe(
-      'odd: no flush cadence. Declare flush on the counter, or defaults.flush on the house',
+    expect(() => metric.bind({ driver, now })).toThrow(
+      new Error(
+        'odd: no flush cadence. Declare flush on the counter, or defaults.flush on the house',
+      ),
     )
     expect(metric.isBound).toBe(false)
     metric.bind({ driver, now, defaults: { flushMs: 60_000 } })
@@ -301,7 +303,7 @@ describe('add', () => {
   it('keeps writes inside one bucket regardless of where in it they land', async () => {
     const metric = bound()
     metric.add(WILLOW) // at .482
-    clock += 517 // .999 — the last millisecond of the same second
+    clock += 517 // .999, the last millisecond of the same second
     metric.add(WILLOW)
     await metric.drain()
     expect(await metric.current(WILLOW)).toBe(2)
@@ -321,39 +323,44 @@ describe('add', () => {
   })
 })
 
-describe('add — validation is synchronous', () => {
+describe('add validates synchronously', () => {
   it('rejects a missing required dim', () => {
     const metric = bound()
     // a programming error: it surfaces at the call site, not in onError
-    expect(
-      expectRejected(() => metric.add({ dogName: 'W', kind: 'solid' } as never)).message,
-    ).toMatch(/park/)
+    expect(() => metric.add({ dogName: 'W', kind: 'solid' } as never)).toThrow(
+      'missing required dim "park"',
+    )
   })
 
   it('rejects an unknown dim', () => {
     const metric = bound()
-    expect(
-      expectRejected(() => metric.add({ ...WILLOW, breed: 'corgi' } as never)).message,
-    ).toMatch(/breed/)
+    expect(() => metric.add({ ...WILLOW, breed: 'corgi' } as never)).toThrow(
+      'unknown dim "breed". The declared dims are [dogName, park, kind]',
+    )
   })
 
   it('rejects a value outside a oneOf set', () => {
     const metric = bound()
-    expect(expectRejected(() => metric.add({ ...WILLOW, kind: 'gas' } as never)).message).toMatch(
-      /kind/,
+    expect(() => metric.add({ ...WILLOW, kind: 'gas' } as never)).toThrow(
+      'kind: "gas" is not one of ["solid", "liquid"]',
     )
   })
 
   it('rejects a fractional delta on an integer counter', () => {
     const metric = bound()
-    expectRejected(() => metric.add(1.5, WILLOW))
+    expect(() => metric.add(1.5, WILLOW)).toThrow(
+      new Error(
+        'dog_poops: declares an integer counter, so 1.5 is not a legal delta. Declare `value: float()` if fractions are intended',
+      ),
+    )
   })
 
   it('says a whole delta past the safe range is too large, not a fraction', () => {
     const metric = bound()
-    expect(expectRejected(() => metric.add(2 ** 53, WILLOW)).message).toBe(
-      'dog_poops: 9007199254740992 is past 9007199254740991, the largest whole number a ' +
-        'double holds exactly, so an integer counter cannot take it',
+    expect(() => metric.add(2 ** 53, WILLOW)).toThrow(
+      new Error(
+        'dog_poops: 9007199254740992 is past 9007199254740991, the largest whole number a double holds exactly, so an integer counter cannot take it',
+      ),
     )
   })
 
@@ -385,13 +392,17 @@ describe('add — validation is synchronous', () => {
   it('rejects a non-finite delta', () => {
     const metric = make({ value: float() })
     metric.bind({ driver, now })
-    expectRejected(() => metric.add(Number.NaN, WILLOW))
-    expectRejected(() => metric.add(Number.POSITIVE_INFINITY, WILLOW))
+    expect(() => metric.add(Number.NaN, WILLOW)).toThrow(
+      'dog_poops: delta must be a finite number, got NaN',
+    )
+    expect(() => metric.add(Number.POSITIVE_INFINITY, WILLOW)).toThrow(
+      'dog_poops: delta must be a finite number, got Infinity',
+    )
   })
 
   it('writes nothing when validation fails', async () => {
     const metric = bound()
-    expectRejected(() => metric.add({ dogName: 'W' } as never))
+    expect(() => metric.add({ dogName: 'W' } as never)).toThrow('missing required dim "park"')
     await metric.drain()
     expect(await driver.readBuckets({ metric: 'dog_poops' })).toEqual([])
   })
@@ -411,11 +422,10 @@ describe('transport failures', () => {
     expect(() => metric.add(WILLOW)).not.toThrow()
     await metric.drain()
 
-    expect(onError).toHaveBeenCalledTimes(1)
-    expect(onError.mock.calls[0]?.[1]).toEqual({ metric: 'dog_poops' })
+    expect(onError.mock.calls).toEqual([[new Error('redis is down'), { metric: 'dog_poops' }]])
   })
 
-  it('does not reject drain — a failed write is reported, not thrown at the flusher', async () => {
+  it('does not reject drain, since a failed write is reported, not thrown at the flusher', async () => {
     const metric = make()
     metric.bind({ driver: failing(), now, onError: () => {} })
     metric.add(WILLOW)
@@ -488,7 +498,7 @@ describe('current() with no dims is the metric total', () => {
     await metric.drain()
     expect(await metric.current()).toBe(2 ** 53)
   })
-  it('sums every series — the counter tracks one thing', async () => {
+  it('sums every series, since the counter tracks one thing', async () => {
     const metric = bound()
     metric.add(WILLOW)
     metric.add(WILLOW)
@@ -583,7 +593,7 @@ describe('rowShape', () => {
 })
 
 /**
- * Type-level assertions — checked by `pnpm typecheck`, not by vitest. A green
+ * Type-level assertions, checked by `pnpm typecheck`, not by vitest. A green
  * test run does not mean these hold.
  */
 type Equal<X, Y> =
@@ -604,7 +614,7 @@ type _RowIsFlat = Expect<
   >
 >
 
-// Never called — declared solely so `tsc` checks these call sites. A
+// Never called. Declared solely so `tsc` checks these call sites. A
 // `declare const` at module scope has no runtime binding, so this has to live
 // inside a function body or it executes on import.
 function _callSiteTypes(metric: Counter<Dims>): void {

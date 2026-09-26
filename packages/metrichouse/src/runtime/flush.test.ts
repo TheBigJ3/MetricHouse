@@ -11,7 +11,7 @@ import type { Row, WriteContext, WriteFn } from '../metrics/types.js'
 import { oneOf, type Shape, str } from '../schema/types.js'
 import { createHouse, type House } from './house.js'
 
-/** A sink that keeps nothing — for declaration tests that never ship. */
+/** A sink that keeps nothing, for declaration tests that never ship. */
 const discard: WriteFn = () => {}
 
 const A = { dogName: 'Willow' } as const
@@ -20,7 +20,7 @@ let clock: number
 let driver: Driver
 const now = () => clock
 
-/** Past the bucket, past grace — everything written so far is claimable. */
+/** Past the bucket, past grace, so everything written so far is claimable. */
 const settle = () => {
   clock += 1000 + 2000
 }
@@ -53,7 +53,7 @@ describe('cadence', () => {
     settle()
   })
 
-  it('ships on the first call — a fresh house does not sit on data', async () => {
+  it('ships on the first call, since a fresh house does not sit on data', async () => {
     const report = await house.flush()
     expect(report.metrics.m?.skipped).toBe(false)
     expect(report.metrics.m?.rows).toBe(1)
@@ -87,7 +87,7 @@ describe('cadence', () => {
     }
     expect(coarse).not.toHaveBeenCalled()
 
-    // the bucket closes and grace expires — it must ship now, not in 10 minutes
+    // the bucket closes and grace expires, so it must ship now, not in 10 minutes
     clock += 60_000 + 2000
     expect((await own.flush()).metrics.slow).toMatchObject({ rows: 1, skipped: false })
     expect(coarse).toHaveBeenCalledTimes(1)
@@ -317,7 +317,7 @@ describe('failure and retry', () => {
     expect(report.ok).toBe(false)
     expect(report.metrics.m?.error).toBeInstanceOf(Error)
 
-    // released, not deleted — it is claimable again
+    // released, not deleted, so it is claimable again
     const rows = await driver.readBuckets({ metric: 'm' })
     expect(rows).toEqual([{ bucketTs: 1_788_616_987_000, dimKey: 'Willow', value: 4 }])
   })
@@ -623,7 +623,7 @@ describe('gauge', () => {
     settle()
 
     expect((await house.flush()).ok).toBe(false)
-    // released — the fold is unchanged, not re-folded or doubled
+    // released, so the fold is unchanged, not re-folded or doubled
     const rows = await driver.readBuckets({ metric: 'bowl_level' })
     expect(rows[0]?.value).toEqual({ last: 6, min: 2, max: 6, sum: 8, count: 2 })
   })
@@ -733,7 +733,7 @@ describe('mixed kinds', () => {
 })
 
 // ---------------------------------------------------------------------------
-// the metric as the unit — no house in sight
+// the metric as the unit, with no house in sight
 // ---------------------------------------------------------------------------
 
 describe('metric.flush()', () => {
@@ -803,7 +803,7 @@ describe('metric.flush()', () => {
     expect(failed.error).toBeInstanceOf(Error)
     expect(write.mock.calls[0]?.[1]).toMatchObject({ attempt: 1 })
 
-    // released, so the same rows come back — as a second attempt
+    // released, so the same rows come back as a second attempt
     const retried = await metric.flush()
     expect(retried.rows).toBe(1)
     expect(write.mock.calls[1]?.[1]).toMatchObject({ attempt: 2 })
@@ -813,7 +813,7 @@ describe('metric.flush()', () => {
     await expect(make('m').flush()).rejects.toThrow(/not bound to a house/)
   })
 
-  it("keeps its cadence state to itself — one metric flushing does not spend another's", async () => {
+  it("keeps its cadence state to itself, so one metric flushing does not spend another's", async () => {
     const a = vi.fn()
     const b = vi.fn()
     const first = make('a', { write: a })
@@ -837,7 +837,7 @@ describe('metric.flush()', () => {
 // ---------------------------------------------------------------------------
 // types
 // ---------------------------------------------------------------------------
-// Never called — declared solely so `tsc` checks these declarations. The tests
+// Never called. Declared solely so `tsc` checks these declarations. The tests
 // above say the sink receives the right rows; this says the types describing
 // them are right, which a passing test cannot see. Each `write` is left
 // unannotated on purpose: the row type has to come from the dims or fields

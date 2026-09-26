@@ -2,7 +2,7 @@
  * The memory driver.
  *
  * Most of what this driver must do lives in `contract.ts` and is shared with
- * every other backend — see that file for why. What stays here is the part
+ * every other backend. See that file for why. What stays here is the part
  * memory is *allowed* to differ on: it is the only driver that caps series and
  * staged records, because it is the only one with no server to watch it.
  */
@@ -35,7 +35,7 @@ describe('memory · maxStaged', () => {
     expect(await capped.countPending(M)).toBe(0)
   })
 
-  it('counts in-flight records — an unacked claim still occupies memory', async () => {
+  it('counts in-flight records, since an unacked claim still occupies memory', async () => {
     const capped = memory({ maxStaged: 2 })
     await capped.append([one('a'), one('b')])
     await capped.claimRecords(M)
@@ -129,7 +129,12 @@ describe('memory · maxSeries', () => {
     await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
     await expect(
       capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'b', delta: 1 }]),
-    ).rejects.toThrow()
+    ).rejects.toThrow(
+      new Error(
+        `memory driver: ${M} exceeded maxSeries (1), which a dim with unbounded values will ` +
+          'do. Put that value on an event instead',
+      ),
+    )
 
     expect(await capped.readBuckets({ metric: M })).toEqual([
       { bucketTs: 1000, dimKey: 'a', value: 1 },

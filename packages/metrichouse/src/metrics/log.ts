@@ -1,5 +1,5 @@
 /**
- * Log — an event preset with three reserved fields: `ts`, `level`, `message`.
+ * Log. An event preset with three reserved fields: `ts`, `level`, `message`.
  *
  * A structured log *is* a discrete typed record, which is what an event
  * already is, so this file adds no storage model. What it adds is the part
@@ -11,13 +11,11 @@
  *
  * **Why a preset rather than a second primitive.** The alternative was a
  * logging library beside the metrics library, with its own transport, its own
- * flush cadence and its own crash semantics — and logs are the one signal that
+ * flush cadence and its own crash semantics, and logs are the one signal that
  * matters most in the minute a process is dying. Sharing `stagedMetric` means
  * a log inherits the staging guarantees rather than reimplementing them badly.
  */
 
-import type { Claim, RecoveryReport } from '../drivers/types.js'
-import type { FlushOptions, MetricFlushReport } from '../runtime/flush.js'
 import type { LiveFields, SnapshotOptions } from '../runtime/live.js'
 import type { InferShape, MarkOptional, Shape, ShapeArgs, Simplify } from '../schema/types.js'
 import { oneOf, str } from '../schema/types.js'
@@ -29,17 +27,8 @@ import {
   type EventStage,
   stagedMetric,
 } from './event.js'
-import type {
-  AnyMetric,
-  ClaimOptions,
-  MaterializedBatch,
-  MetricBinding,
-  Row,
-  RowShape,
-  WriteContext,
-  WriteFn,
-} from './types.js'
-import { assertMetricName, assertSink } from './types.js'
+import type { AnyMetric, MetricBinding, Row, RowShape, WriteContext, WriteFn } from './types.js'
+import { assertMetricName, assertSink, delegateBatch } from './types.js'
 
 /** The levels a log declares when it does not say otherwise. */
 export const DEFAULT_LOG_LEVELS = ['debug', 'info', 'warn', 'error'] as const
@@ -123,7 +112,7 @@ function shadows(level: string): boolean {
 }
 
 /**
- * The fields argument — omittable only when nothing in the shape is required,
+ * The fields argument, omittable only when nothing in the shape is required,
  * so a log with no declared fields reads `log.info('started')` rather than
  * `log.info('started', {})`.
  */
@@ -133,7 +122,7 @@ export type LogFieldsArgs<F extends Shape> = ShapeArgs<F>
  * One method per declared level.
  *
  * `levels: ['trace', 'info', 'fatal']` gives you `.trace()`, `.info()` and
- * `.fatal()` and nothing else — which is what "the type narrows to whatever
+ * `.fatal()` and nothing else, which is what "the type narrows to whatever
  * you list" has to mean if it means anything. A level you did not declare is
  * a compile error rather than a row with a level nobody queries.
  */
@@ -147,7 +136,7 @@ export type LogWriters<F extends Shape, L extends readonly string[]> = {
  * Not a metric: it stages into the log that made it, shares its batch, and is
  * the reason `requestId` does not have to be threaded through every call in a
  * request. A required field satisfied by `child()` stops being required at the
- * call site, and may still be overridden there — see `MarkOptional`.
+ * call site, and may still be overridden there. See `MarkOptional`.
  */
 export type ChildLog<F extends Shape, L extends readonly string[]> = LogWriters<F, L> & {
   readonly name: string
@@ -163,7 +152,7 @@ export interface LogConfig<F extends Shape, L extends readonly string[]> {
   /** Extra declared fields, alongside the reserved three. */
   readonly fields?: F
   /**
-   * The closed set of levels, **in ascending severity** — the order is what
+   * The closed set of levels, **in ascending severity**. The order is what
    * `minLevel` compares on, so it is a declaration, not a formality.
    *
    * Default `['debug', 'info', 'warn', 'error']`.
@@ -180,14 +169,14 @@ export interface LogConfig<F extends Shape, L extends readonly string[]> {
   readonly minLevel?: L[number]
   /** Default `'driver'`. See {@link EventStage}. */
   readonly stage?: EventStage
-  /** Local staging only — ignored when `stage: 'driver'`. */
+  /** Local staging only, ignored when `stage: 'driver'`. */
   readonly batch?: EventBatchConfig
   /** Minimum shipping cadence for `flush()`. Default `'30s'`. */
   readonly flush?: DurationInput
   /** Records one flush may carry. Unlimited by default. */
   readonly claimLimit?: number
   /**
-   * Where this log's rows go. Required — see the counter for why.
+   * Where this log's rows go. Required. See the counter for why.
    *
    * Receives {@link LogRow}, so `level` is one of the declared levels.
    */
@@ -246,7 +235,7 @@ export type Log<F extends Shape, L extends readonly string[]> = Omit<
     bind(binding: MetricBinding): void
 
     /**
-     * Write at a level chosen at runtime — a level parsed from an upstream
+     * Write at a level chosen at runtime, such as a level parsed from an upstream
      * payload, or carried in a variable.
      *
      * @throws if `level` is not one of the declared levels. A log line with a
@@ -264,7 +253,7 @@ export type Log<F extends Shape, L extends readonly string[]> = Omit<
     /** The first `n` staged records as rows, without consuming them. */
     peek(n?: number): Promise<Row[]>
 
-    /** Unshipped log lines as typed rows. Never partial — see the event. */
+    /** Unshipped log lines as typed rows. Never partial. See the event. */
     snapshot(options?: SnapshotOptions): Promise<LogLiveRow<F, L>[]>
 
     drain(): Promise<void>
@@ -347,7 +336,7 @@ function splitMessage(message: unknown): { message: string; error_stack?: string
 /**
  * Declare a log.
  *
- * @throws if the configuration is invalid — an empty name, an empty or
+ * @throws if the configuration is invalid, such as an empty name, an empty or
  * duplicated level set, a `minLevel` that is not a declared level, a level
  * that would shadow a method, or a field taking a reserved column name.
  */
@@ -542,32 +531,8 @@ export function log<
       return inner.rowShape()
     },
 
-    // the staged lifecycle, untouched — the flush engine talks to the event
-    // underneath and never learns a log was involved
-    /** Delegated to the event underneath — see the timer for why. */
-    flush(options?: FlushOptions): Promise<MetricFlushReport> {
-      return inner.flush(options)
-    },
-
-    recoverBatch(): Promise<RecoveryReport> {
-      return inner.recoverBatch()
-    },
-
-    claimBatch(nowMs: number, options?: ClaimOptions): Promise<Claim> {
-      return inner.claimBatch(nowMs, options)
-    },
-
-    materializeClaim(claim: Claim): MaterializedBatch {
-      return inner.materializeClaim(claim)
-    },
-
-    ackBatch(claim: Claim): Promise<void> {
-      return inner.ackBatch(claim)
-    },
-
-    releaseBatch(claim: Claim): Promise<void> {
-      return inner.releaseBatch(claim)
-    },
+    // the event underneath holds the records, so it ships them
+    ...delegateBatch(inner),
   }
 
   return self as unknown as Log<F, L>

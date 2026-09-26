@@ -1,16 +1,16 @@
 /**
- * Timer — how long something took, folded into a gauge.
+ * Timer. How long something took, folded into a gauge.
  *
- * `23-patterns.md` already settled where a duration belongs: a completed
- * duration is one observation, so it goes on a gauge for min/max/mean and on
- * an event when you want percentiles. This file adds no storage model. What it
- * adds is the part everyone writes by hand and gets subtly wrong — the start
+ * A completed duration is one observation, so it goes on a gauge for
+ * min/max/mean and on an event when you want percentiles. This file adds no
+ * storage model. What it
+ * adds is the part everyone writes by hand and gets subtly wrong. That is the start
  * timestamp, the `finally`, the clock that can run backwards.
  *
  * **Why a handle, not implicit linking.** `start()` returns the state rather
  * than filing it somewhere for `end()` to find. A call stack cannot tell two
- * concurrent requests apart — they are byte-identical when they share a call
- * site — and async context would tie `core` to `node:async_hooks`, which an
+ * concurrent requests apart, because they are byte-identical when they share a call
+ * site, and async context would tie `core` to `node:async_hooks`, which an
  * edge bundle cannot import. A handle needs no registry, so it cannot leak: an
  * abandoned one is garbage, and not ending it *is* how you cancel it. It also
  * does not care whether two timings nest or merely overlap, which a LIFO stack
@@ -18,14 +18,13 @@
  *
  * **Which clock.** Durations come from `performance.now()`, which is monotonic;
  * `Date.now()` can step backwards under NTP and produce a negative latency.
- * The *bucket* still comes from the house clock, at `end()` — a timing lands in
+ * The *bucket* still comes from the house clock, at `end()`, so a timing lands in
  * the bucket where it completed. On Cloudflare Workers `performance.now()`
  * only advances across I/O, so a timer there measures I/O-bound work and
  * reads pure CPU work as zero.
  */
 
-import type { Claim, GaugeCell, RecoveryReport } from '../drivers/types.js'
-import type { FlushOptions, MetricFlushReport } from '../runtime/flush.js'
+import type { GaugeCell } from '../drivers/types.js'
 import type { SnapshotOptions } from '../runtime/live.js'
 import { encodeDimKey } from '../schema/dims.js'
 import {
@@ -47,28 +46,26 @@ import {
 } from './gauge.js'
 import type {
   AnyMetric,
-  ClaimOptions,
   DimsArgs,
-  MaterializedBatch,
   MetricBinding,
   RowShape,
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink, reportError } from './types.js'
+import { assertMetricName, assertSink, delegateBatch, isEvent, reportError } from './types.js'
 
 /**
  * What a timer ships unless told otherwise: the gauge's five, minus `last`.
  *
  * `last` is the one aggregate that means nothing for a duration. Of many
- * operations finishing in the same bucket, the last to finish is arbitrary —
- * it is not the latest state of anything. Ask for it explicitly if you want it.
+ * operations finishing in the same bucket, the last to finish is arbitrary.
+ * It is not the latest state of anything. Ask for it explicitly if you want it.
  */
 export const TIMER_AGGREGATES = ['min', 'max', 'sum', 'count'] as const
 
 /**
  * The field a timing carries onto a `record` event, and a name no timer dim
- * may take — reserved whether or not `record` is set, so adding it later can
+ * may take. It is reserved whether or not `record` is set, so adding it later can
  * never invalidate a declaration that used to work.
  */
 export const DURATION_FIELD = 'duration_ms'
@@ -87,20 +84,20 @@ export interface TimerConfig<D extends Shape> {
   /** Which aggregates reach your sink. Default {@link TIMER_AGGREGATES}. */
   readonly aggregate?: readonly GaugeAggregate[]
   /**
-   * An event every timing is also recorded to, by metric name — for when
+   * An event every timing is also recorded to, by metric name, for when
    * min/max/mean is not enough and you need percentiles.
    *
    * The event must declare the timer's dims plus `duration_ms: float()`;
    * spreading `...myTimer.dims` into its fields is the whole declaration. It
    * keeps its own staging, sampling and sink, so the gauge can stay exact while
-   * the event table holds a sampled slice — the same split `derive` makes.
+   * the event table holds a sampled slice, the same split `derive` makes.
    *
    * Named rather than passed, like a `derive` target, and resolved at the first
    * timing, so the two may be declared in either order.
    */
   readonly record?: string
   /**
-   * Where this timer's rows go. Required — see the counter for why.
+   * Where this timer's rows go. Required. See the counter for why.
    *
    * A timer is a gauge of durations, so it receives {@link GaugeRow}.
    */
@@ -118,8 +115,8 @@ export interface TimerHandle<D extends Shape> {
   /**
    * Stop, record, and return the duration in milliseconds.
    *
-   * Takes whatever dims `start()` did not — a status code is usually only
-   * known at the end — and a dim given here overrides one bound at start.
+   * Takes whatever dims `start()` did not, since a status code is usually only
+   * known at the end, and a dim given here overrides one bound at start.
    *
    * **Idempotent.** A second call records nothing and returns the first
    * duration. Throwing would be louder, but `end()` lives in `catch` and
@@ -170,14 +167,14 @@ export interface Timer<D extends Shape> extends AnyMetric {
    * and dropping failures would hide it. Split by outcome with a dim on
    * `start()`/`end()` instead.
    *
-   * @throws before `fn` runs if the timer is unbound or the dims are invalid —
+   * @throws before `fn` runs if the timer is unbound or the dims are invalid,
    * never after, when the work has already happened. Whatever `fn` throws is
    * rethrown unchanged.
    */
   time<T>(...args: TimeArgs<D, T>): T
 
   /**
-   * Record a duration measured somewhere else — a query time a database
+   * Record a duration measured somewhere else, such as a query time a database
    * reported, a timing from an upstream header.
    *
    * @throws if `ms` is negative or not finite, or the dims are invalid.
@@ -235,7 +232,7 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 /**
  * Declare a timer.
  *
- * @throws if the configuration is invalid — an empty name, a dim named
+ * @throws if the configuration is invalid, such as an empty name, a dim named
  * `duration_ms`, an empty `record`, plus every check `gauge()` makes.
  */
 export function timer<D extends Shape = Record<never, never>>(
@@ -310,8 +307,8 @@ export function timer<D extends Shape = Record<never, never>>(
    * Find and check the `record` event once.
    *
    * Checked here rather than left to the event's own validation so a
-   * misconfiguration says what is wrong with the *pairing* — "declare
-   * duration_ms: float()" — instead of "unknown field" on every timing.
+   * misconfiguration says what is wrong with the *pairing*, "declare
+   * duration_ms: float()", instead of "unknown field" on every timing.
    */
   function resolveRecordTarget(target: string): RecordTarget {
     if (recordTarget) return recordTarget
@@ -323,14 +320,14 @@ export function timer<D extends Shape = Record<never, never>>(
           'declares. Register it alongside the timer',
       )
     }
-    if (metric.kind !== 'event') {
+    if (!isEvent(metric)) {
       throw new Error(
         `${name}: record target ${JSON.stringify(target)} is a ${metric.kind}, and a timing can ` +
           'only be recorded to an event',
       )
     }
 
-    const fields = (metric as unknown as { fields: Shape }).fields
+    const fields = metric.fields
     if (fields[DURATION_FIELD]?.kind !== 'float') {
       throw new Error(
         `${name}: record target ${JSON.stringify(target)} must declare ` +
@@ -359,12 +356,12 @@ export function timer<D extends Shape = Record<never, never>>(
       )
     }
 
-    recordTarget = metric as unknown as RecordTarget
+    recordTarget = metric
     return recordTarget
   }
 
   /**
-   * The single write path — `end()`, `time()` and `observe()` all land here.
+   * The single write path. `end()`, `time()` and `observe()` all land here.
    *
    * The gauge first, and synchronously, so bad dims throw at the caller. The
    * event second, and detached: the gauge observation has already been made,
@@ -533,36 +530,8 @@ export function timer<D extends Shape = Record<never, never>>(
       return inner.rowShape()
     },
 
-    // the bucketed lifecycle, untouched — the flush engine talks to the gauge
-    // underneath and only learns from `kind` that a timer was involved
-    /**
-     * Delegated, not reimplemented: the cadence and retry state belong to the
-     * one thing that actually holds the buckets. A timer that counted its own
-     * attempts would disagree with the gauge underneath it.
-     */
-    flush(options?: FlushOptions): Promise<MetricFlushReport> {
-      return inner.flush(options)
-    },
-
-    recoverBatch(): Promise<RecoveryReport> {
-      return inner.recoverBatch()
-    },
-
-    claimBatch(nowMs: number, options?: ClaimOptions): Promise<Claim> {
-      return inner.claimBatch(nowMs, options)
-    },
-
-    materializeClaim(claim: Claim): MaterializedBatch {
-      return inner.materializeClaim(claim)
-    },
-
-    ackBatch(claim: Claim): Promise<void> {
-      return inner.ackBatch(claim)
-    },
-
-    releaseBatch(claim: Claim): Promise<void> {
-      return inner.releaseBatch(claim)
-    },
+    // the gauge underneath holds the buckets, so it ships them
+    ...delegateBatch(inner),
   }
 
   return self as unknown as Timer<D>

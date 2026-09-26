@@ -3,7 +3,7 @@
  *
  * `Counter<D>` is generic in its dims, so a house cannot hold a heterogeneous
  * list of them. {@link AnyMetric} is what the house and the flush engine
- * actually need — no `add`, no dim generics, nothing that varies by kind.
+ * actually need, with no `add`, no dim generics, nothing that varies by kind.
  */
 
 import type { Claim, Driver, RecoveryReport } from '../drivers/types.js'
@@ -12,6 +12,8 @@ import type { FlushOptions, MetricFlushReport } from '../runtime/flush.js'
 import type { LiveRow, SnapshotOptions } from '../runtime/live.js'
 import { hasLoneSurrogate } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, TypeKind } from '../schema/types.js'
+import type { Counter } from './counter.js'
+import type { Event } from './event.js'
 
 /**
  * Every primitive, in declaration order. A single list rather than a bare
@@ -25,8 +27,8 @@ export type MetricKind = (typeof METRIC_KINDS)[number]
  * Which of the two storage models a metric's live data sits in.
  *
  * The distinction the whole library is built around, finally said out loud
- * rather than inferred. `'bucketed'` folds writes into a window — counter,
- * gauge, level, timer; `'staged'` appends them to a run — event, log. Everything that
+ * rather than inferred. `'bucketed'` folds writes into a window (counter,
+ * gauge, level, timer), and `'staged'` appends them to a run (event, log). Everything that
  * has to branch on it was otherwise branching on `kind` against a hardcoded
  * list, which is the drift {@link METRIC_KINDS} exists to prevent.
  */
@@ -35,7 +37,7 @@ export type StorageModel = 'bucketed' | 'staged'
 /**
  * The dims argument, required only when the metric declares any.
  *
- * A dimensionless metric — online users, requests served — is one series.
+ * A dimensionless metric, such as online users or requests served, is one series.
  * Forcing `dims: {}` on it, and `{}` at every call site, pushes people toward
  * declaring a dim they do not need; a `userId` dim turns a scalar into one
  * series per user.
@@ -61,7 +63,7 @@ export interface RowShape {
  *
  * `id` is the only column every kind shares. An aggregate row is stamped
  * `bucket_ts` and carries its dims; an event row is stamped `ts` and carries
- * its fields. Nothing else is common, because nothing else should be — the
+ * its fields. Nothing else is common, because nothing else should be. The
  * shape is the metric's to decide, and {@link RowShape} is how it says so.
  */
 export type Row = { id: string } & Record<string, unknown>
@@ -74,7 +76,7 @@ export interface WriteContext {
   readonly bucketFrom: number
   /**
    * One resolution past the newest bucket, or one millisecond past the newest
-   * record — the window is `[from, to)` either way.
+   * record. The window is `[from, to)` either way.
    */
   readonly bucketTo: number
   /**
@@ -91,7 +93,7 @@ export interface WriteContext {
   /** `1` on the first try, higher after a previous release. */
   readonly attempt: number
   /**
-   * What caused this call. `'flush'` is `metric.flush()` — whether a cron, a
+   * What caused this call. `'flush'` is `metric.flush()`, whether a cron, a
    * scheduler tick or `house.flush()` asked for it; `'batch'` is a
    * locally staged event shipping itself on `batch.maxSize` or `maxAge`,
    * which happens without anyone calling flush.
@@ -100,7 +102,7 @@ export interface WriteContext {
    * rows a sink must treat as **last-write-wins on `id`**. The other two send
    * a row once and resend it only as a byte-identical retry, so deduplicating
    * them either way is correct. An immediate bucketed row is a running total
-   * that a later send supersedes — folding those together, rather than keeping
+   * that a later send supersedes, so folding those together, rather than keeping
    * the newest, double-counts.
    */
   readonly source: 'flush' | 'batch' | 'immediate'
@@ -131,7 +133,7 @@ export interface MetricBinding {
   readonly now?: () => number
   /**
    * Where transport failures go. A rejected `driver.increment` cannot be
-   * thrown from `.add()`, which has already returned — so it lands here.
+   * thrown from `.add()`, which has already returned, so it lands here.
    */
   readonly onError?: (error: unknown, context: { metric: string }) => void
   /**
@@ -153,7 +155,7 @@ export interface MetricBinding {
    */
   readonly resolve?: (name: string) => AnyMetric | undefined
   /**
-   * How this house delivers, already resolved — a metric never sees `'auto'`.
+   * How this house delivers, already resolved, so a metric never sees `'auto'`.
    *
    * Absent means `'staged'`, so a metric bound by something that predates
    * delivery behaves exactly as it always did.
@@ -168,7 +170,7 @@ export interface MetricBinding {
  * them.
  *
  * Produced by the metric rather than the flush engine, because the window and
- * the headline number mean different things per kind — a bucket range for a
+ * the headline number mean different things per kind, a bucket range for a
  * counter, the span of record timestamps for an event.
  */
 export interface MaterializedBatch {
@@ -205,8 +207,8 @@ export interface AnyMetric {
   /**
    * Where this metric's rows go.
    *
-   * Declared on the metric, not on the house: a metric is a complete unit —
-   * what it measures, how often it ships, and where it ships to — and a house
+   * Declared on the metric, not on the house: a metric is a complete unit,
+   * what it measures, how often it ships, and where it ships to, and a house
    * is only somewhere to keep a set of them. A schema whose counters go to
    * ClickHouse and whose logs go to S3 needs no special case, because there
    * was never one sink to special-case.
@@ -234,8 +236,8 @@ export interface AnyMetric {
    * Ship everything closed to this metric's own sink, and settle the claim.
    *
    * The whole delivery unit, and callable with no house in sight. Honours the
-   * metric's cadence — an early call reports `skipped` with `reason:
-   * 'cadence'` rather than shipping — unless `force` says otherwise.
+   * metric's cadence. An early call reports `skipped` with `reason:
+   * 'cadence'` rather than shipping, unless `force` says otherwise.
    *
    * Errors come back in the report rather than as a rejection: a flush that
    * fails has already released its claim, so the data is safe and the caller
@@ -247,19 +249,19 @@ export interface AnyMetric {
   rowShape(): RowShape
 
   /**
-   * Everything still in the driver for this metric — the open bucket, plus any
+   * Everything still in the driver for this metric, the open bucket, plus any
    * closed bucket not yet flushed and acked.
    *
-   * On {@link AnyMetric} rather than on each kind because every reader of it —
-   * `house.snapshot()`, a dashboard, the cost projection, the test helpers —
+   * On {@link AnyMetric} rather than on each kind because every reader of it,
+   * `house.snapshot()`, a dashboard, the cost projection, the test helpers,
    * wants live rows without first learning what kind it is holding. The write
-   * path got that abstraction on day one, in the four batch methods below; this
+   * path got that abstraction on day one, in the five batch methods below; this
    * is the same idea for the read path.
    *
    * A staged kind answers with its unshipped records rather than with nothing:
    * a record is complete the instant it is appended, so it is never partial and
    * `complete: true` cannot exclude it. The options that only mean something to
-   * an aggregate — `rollup`, `groupBy`, `orderBy` — are ignored there, so that
+   * an aggregate, `rollup`, `groupBy` and `orderBy`, are ignored there, so that
    * `house.snapshot(options)` stays callable across a mixed schema.
    */
   snapshot(options?: SnapshotOptions): Promise<LiveRow[]>
@@ -273,7 +275,7 @@ export interface AnyMetric {
    * is claimed and shipped by the very same flush.
    *
    * Nothing is shipped from here, only merged back. The reasoning, and the
-   * question of when a claim counts as abandoned, belong to the driver —
+   * question of when a claim counts as abandoned, belong to the driver.
    * {@link Driver.recover} is where both are written down.
    */
   recoverBatch(): Promise<RecoveryReport>
@@ -282,7 +284,7 @@ export interface AnyMetric {
    * Move everything shippable out of the live set and hold it pending a write.
    *
    * The metric decides what "shippable" means, because it is the only thing
-   * that knows its own resolution and grace — an aggregate kind turns `nowMs`
+   * that knows its own resolution and grace. An aggregate kind turns `nowMs`
    * into a watermark, a staged kind takes what is there.
    */
   claimBatch(nowMs: number, options?: ClaimOptions): Promise<Claim>
@@ -290,10 +292,10 @@ export interface AnyMetric {
   /** Turn a claim into rows, and the window and headline they represent. */
   materializeClaim(claim: Claim): MaterializedBatch
 
-  /** The write landed — discard the claimed data. */
+  /** The write landed, so discard the claimed data. */
   ackBatch(claim: Claim): Promise<void>
 
-  /** The write failed — return the claimed data to the live set. */
+  /** The write failed, so return the claimed data to the live set. */
   releaseBatch(claim: Claim): Promise<void>
 }
 
@@ -414,6 +416,24 @@ export function dimColumns(dims: Shape): RowColumn[] {
 }
 
 /**
+ * True when `metric` is a counter, read from its `kind` alone.
+ *
+ * Only `counter()` builds a metric of that kind, so the kind is enough to
+ * reach what a counter has beyond {@link AnyMetric}, such as `add`.
+ */
+export function isCounter(metric: AnyMetric): metric is Counter<Shape> {
+  return metric.kind === 'counter'
+}
+
+/**
+ * True when `metric` is an event, read from its `kind` alone. A log is built
+ * on an event but has a kind of its own, so it is not one here.
+ */
+export function isEvent(metric: AnyMetric): metric is Event<Shape> {
+  return metric.kind === 'event'
+}
+
+/**
  * Hand a failure that cannot be thrown at a caller to `onError`, or raise it
  * as an unhandled rejection when there is no handler.
  *
@@ -437,6 +457,91 @@ export function reportError(
     }
   }
   void Promise.reject(raised)
+}
+
+/** Writes a metric has issued and the driver has not yet acknowledged. */
+export interface PendingWrites {
+  /**
+   * Hold `work` until it settles. A failure goes to the handler `onError`
+   * returns when it fails, and is never rethrown, so `drain()` waits for
+   * every write rather than stopping at the first that failed.
+   */
+  track(work: Promise<void>, onError: () => MetricBinding['onError']): void
+  /** Resolve once every write tracked so far, and any tracked meanwhile, has settled. */
+  drain(): Promise<void>
+}
+
+/**
+ * The writes one metric has in flight.
+ *
+ * A Set with self-removal rather than a growing array: a long-lived server
+ * flushes on a schedule but may never call `drain()`, and an array would
+ * retain every promise it ever created.
+ */
+export function pendingWrites(name: string): PendingWrites {
+  const pending = new Set<Promise<void>>()
+
+  return {
+    track(work: Promise<void>, onError: () => MetricBinding['onError']): void {
+      const settled = work
+        .catch((error: unknown) => reportError(onError(), error, { metric: name }))
+        .finally(() => {
+          pending.delete(settled)
+        })
+      pending.add(settled)
+    },
+
+    async drain(): Promise<void> {
+      // loops rather than awaiting once: a write issued while we were waiting
+      // is still a write issued before drain() resolves
+      while (pending.size > 0) {
+        await Promise.all([...pending])
+      }
+    },
+  }
+}
+
+/** The {@link AnyMetric} methods that ship a batch. */
+export type BatchMethods = Pick<
+  AnyMetric,
+  'flush' | 'recoverBatch' | 'claimBatch' | 'materializeClaim' | 'ackBatch' | 'releaseBatch'
+>
+
+/**
+ * Every batch method of `inner`, forwarded to it.
+ *
+ * For a kind built on another one, as a timer is built on a gauge and a log on
+ * an event. The cadence, the retry count and the claims belong to the one
+ * thing that actually holds the data, so the wrapper forwards rather than
+ * keeping state of its own that could disagree with it. The flush engine talks
+ * to the metric underneath and only learns from `kind` which wrapper it was.
+ */
+export function delegateBatch(inner: AnyMetric): BatchMethods {
+  return {
+    flush(options?: FlushOptions): Promise<MetricFlushReport> {
+      return inner.flush(options)
+    },
+
+    recoverBatch(): Promise<RecoveryReport> {
+      return inner.recoverBatch()
+    },
+
+    claimBatch(nowMs: number, options?: ClaimOptions): Promise<Claim> {
+      return inner.claimBatch(nowMs, options)
+    },
+
+    materializeClaim(claim: Claim): MaterializedBatch {
+      return inner.materializeClaim(claim)
+    },
+
+    ackBatch(claim: Claim): Promise<void> {
+      return inner.ackBatch(claim)
+    },
+
+    releaseBatch(claim: Claim): Promise<void> {
+      return inner.releaseBatch(claim)
+    },
+  }
 }
 
 /** What a flush tells a metric about the claim it is asking for. */

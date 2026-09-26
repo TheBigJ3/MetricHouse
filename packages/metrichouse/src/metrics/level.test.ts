@@ -5,19 +5,8 @@ import { int, str } from '../schema/types.js'
 import { type Level, type LevelConfig, level, MAX_CARRY_BUCKETS } from './level.js'
 import type { Row, WriteContext, WriteFn } from './types.js'
 
-/** A sink that keeps nothing — for declaration tests that never ship. */
+/** A sink that keeps nothing, for declaration tests that never ship. */
 const discard: WriteFn = () => {}
-
-function expectRejected(fn: () => unknown): Error {
-  let caught: unknown
-  try {
-    fn()
-  } catch (err) {
-    caught = err
-  }
-  expect(caught, 'expected the call to throw').toBeInstanceOf(Error)
-  return caught as Error
-}
 
 /** A sink that records every batch it is handed. */
 function collector() {
@@ -92,12 +81,14 @@ describe('declaration', () => {
   })
 
   it('rejects a holdFor shorter than one window', () => {
-    expect(expectRejected(() => make({ holdFor: '1s' })).message).toMatch(/holdFor/)
+    expect(() => make({ holdFor: '1s' })).toThrow(
+      'queue_depth: holdFor must be at least one resolution, because a shorter one would drop a series before the window it was written in had closed',
+    )
   })
 
   it('rejects an empty name', () => {
-    expect(expectRejected(() => level('', { resolution: '1s', write: discard })).message).toMatch(
-      /non-empty/,
+    expect(() => level('', { resolution: '1s', write: discard })).toThrow(
+      'level: name must be a non-empty string',
     )
   })
 
@@ -107,12 +98,16 @@ describe('declaration', () => {
   })
 
   it('is inert until a house binds it', () => {
-    expect(expectRejected(() => make().set(1, EMAIL)).message).toMatch(/not bound/)
+    expect(() => make().set(1, EMAIL)).toThrow(
+      'queue_depth: not bound to a house. Pass it to createHouse({ schema }) before writing',
+    )
   })
 
   it('refuses a second house', () => {
     const metric = bound()
-    expect(expectRejected(() => metric.bind({ driver, now })).message).toMatch(/already bound/)
+    expect(() => metric.bind({ driver, now })).toThrow(
+      'queue_depth: already bound to a house, and a metric belongs to exactly one',
+    )
   })
 
   it('stays unbound when a binding is refused', () => {
@@ -124,13 +119,13 @@ describe('declaration', () => {
   })
 
   it.each(['id', 'bucket_ts', 'value'])('refuses a dim named %s, a column it writes', (dim) => {
-    expect(
-      expectRejected(() =>
-        level('by_col', { dims: { [dim]: str() }, resolution: '10s', write: discard }),
-      ).message,
-    ).toBe(
-      `by_col: dim "${dim}" is a reserved column. MetricHouse writes [id, bucket_ts, value] ` +
-        'on every row',
+    expect(() =>
+      level('by_col', { dims: { [dim]: str() }, resolution: '10s', write: discard }),
+    ).toThrow(
+      new Error(
+        `by_col: dim "${dim}" is a reserved column. MetricHouse writes [id, bucket_ts, value] ` +
+          'on every row',
+      ),
     )
   })
 
@@ -202,22 +197,27 @@ describe('writing', () => {
 
   it('refuses a value that is not a finite number', async () => {
     const metric = bound()
-    expect(expectRejected(() => metric.set(Number.NaN, EMAIL)).message).toMatch(/finite/)
-    expect(expectRejected(() => metric.set(Number.POSITIVE_INFINITY, EMAIL)).message).toMatch(
-      /finite/,
+    expect(() => metric.set(Number.NaN, EMAIL)).toThrow(
+      'queue_depth: value must be a finite number, got NaN',
+    )
+    expect(() => metric.set(Number.POSITIVE_INFINITY, EMAIL)).toThrow(
+      'queue_depth: value must be a finite number, got Infinity',
     )
   })
 
   it('refuses a fraction on an integer level', () => {
     const metric = bound({ value: int() })
-    expect(expectRejected(() => metric.set(1.5, EMAIL)).message).toMatch(/integer level/)
+    expect(() => metric.set(1.5, EMAIL)).toThrow(
+      'queue_depth: declares an integer level, so 1.5 is not a legal value. Declare `value: float()` if fractions are intended',
+    )
   })
 
   it('says a whole number past the safe range is too large, not a fraction', () => {
     const metric = bound({ value: int() })
-    expect(expectRejected(() => metric.inc(2 ** 53, EMAIL)).message).toBe(
-      'queue_depth: 9007199254740992 is past 9007199254740991, the largest whole number a ' +
-        'double holds exactly, so an integer level cannot take it',
+    expect(() => metric.inc(2 ** 53, EMAIL)).toThrow(
+      new Error(
+        'queue_depth: 9007199254740992 is past 9007199254740991, the largest whole number a double holds exactly, so an integer level cannot take it',
+      ),
     )
   })
 
@@ -250,9 +250,9 @@ describe('writing', () => {
 
   it('refuses an undeclared dim', () => {
     const metric = bound()
-    expect(
-      expectRejected(() => metric.set(1, { park: 'riverside' } as unknown as typeof EMAIL)).message,
-    ).toMatch(/park/)
+    expect(() => metric.set(1, { park: 'riverside' } as unknown as typeof EMAIL)).toThrow(
+      'unknown dim "park". The declared dims are [queue]',
+    )
   })
 })
 

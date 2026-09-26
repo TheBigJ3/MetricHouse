@@ -1,7 +1,7 @@
 /**
  * The ioredis driver.
  *
- * The bulk of this is `contract.ts`, shared with the memory driver — that is
+ * The bulk of this is `contract.ts`, shared with the memory driver. That is
  * the point of the file, and passing it unchanged is what "parity" means here.
  * What is left below is the part Redis is *allowed* to differ on, plus the two
  * things memory cannot do at all and so cannot be asked for in a shared suite:
@@ -16,7 +16,7 @@ import { randomUUID } from 'node:crypto'
 import { Redis } from 'ioredis'
 import { afterAll, describe, expect, it } from 'vitest'
 import { describeDriverContract } from './contract.js'
-import { ioredis } from './ioredis.js'
+import { type IoredisClient, ioredis } from './ioredis.js'
 import { isGaugeCell } from './types.js'
 
 const URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379'
@@ -60,9 +60,52 @@ const M = 'dog_poops'
 const G = 'dog_weight'
 const WILLOW = 'Willow|riverside'
 
+/**
+ * A client that answers every script with `1` and every `HGET` with `'1'`,
+ * and lists `buckets` windows in every index. Enough to drive the parts of
+ * the driver that never look at what Redis stored, with no server at all.
+ */
+function stubClient(buckets = 0): IoredisClient {
+  const client = {
+    script: async () => 'sha',
+    zrangebyscore: async () => Array.from({ length: buckets }, (_, i) => String(i * 1000)),
+    pipeline() {
+      let queued = 0
+      const replies: unknown[] = []
+      const pipeline = {
+        evalsha() {
+          queued += 1
+          replies.push(1)
+          return pipeline
+        },
+        hget() {
+          queued += 1
+          replies.push('1')
+          return pipeline
+        },
+        exec: async () => replies.slice(0, queued).map((reply) => [null, reply]),
+      }
+      return pipeline
+    },
+  }
+  return client as unknown as IoredisClient
+}
+
+// no server needed: these never read what a script stored
+describe('ioredis · options and connection', () => {
+  it('refuses a namespace with a colon or whitespace in it', () => {
+    for (const bad of ['org:idx', 'org idx', '']) {
+      expect(() => ioredis(stubClient(), { namespace: bad })).toThrow(
+        `ioredis driver: namespace ${JSON.stringify(bad)} must be non-empty with no colon or ` +
+          'whitespace, because the driver builds every key by joining it to the rest with colons',
+      )
+    }
+  })
+})
+
 if (!client) {
   describe('ioredis', () => {
-    it.skip(`needs a Redis server — set REDIS_URL, or run one on 6379 (tried ${URL})`, () => {})
+    it.skip(`needs a Redis server. Set REDIS_URL, or run one on 6379 (tried ${URL})`, () => {})
   })
 } else {
   const live = client
@@ -75,7 +118,7 @@ if (!client) {
    * A namespace nothing else is using.
    *
    * Every driver the contract builds gets its own, which is what lets a shared
-   * server run the suite without tests seeing each other's keys — and what
+   * server run the suite without tests seeing each other's keys, and what
    * lets two drivers in the *same* test deliberately share one.
    */
   let namespace = ''
@@ -183,7 +226,7 @@ if (!client) {
   })
 
   describe('ioredis · durable', () => {
-    it('hands a claim to a driver that did not take it — the crash path', async () => {
+    it('hands a claim to a driver that did not take it, the crash path', async () => {
       // the difference from memory in one test: its claim is a Map in the
       // process that took it, so a restart loses the window. Here the claim is
       // in Redis, and whoever comes back can still settle it.
@@ -354,7 +397,7 @@ if (!client) {
     })
 
     it('settles an empty claim rather than leaving it registered for ever', async () => {
-      // an empty claim moves nothing, so there is no in-flight key at all —
+      // an empty claim moves nothing, so there is no in-flight key at all,
       // only a registration, which still has to be cleared or it is swept on
       // every flush from now on
       const ns = fresh()
@@ -543,12 +586,6 @@ if (!client) {
       await wipe(ns)
     })
 
-    it('refuses a namespace with a colon or whitespace in it', () => {
-      expect(() => ioredis(live, { namespace: 'org:idx' })).toThrow(/no colon or whitespace/)
-      expect(() => ioredis(live, { namespace: 'org idx' })).toThrow(/no colon or whitespace/)
-      expect(() => ioredis(live, { namespace: '' })).toThrow(/no colon or whitespace/)
-    })
-
     it('closes a client it made from a factory', async () => {
       const own = new Redis(URL, { lazyConnect: true })
       const driver = ioredis(() => own, { namespace: fresh() })
@@ -572,7 +609,7 @@ if (!client) {
   describe('ioredis · batching', () => {
     it('applies a batch larger than maxPipelineSize exactly once', async () => {
       // a split batch is still one logical write, and nothing reads between
-      // the halves — but the halves must not overlap or drop
+      // the halves, but the halves must not overlap or drop
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns, maxPipelineSize: 7 })
       await driver.increment(

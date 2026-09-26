@@ -9,7 +9,7 @@
  *
  * Extracted because there are two callers, not one: `metric.flush()` ships on a
  * cadence, and a locally staged event ships itself the moment `batch.maxSize`
- * is reached — nobody calls flush for that one. Both have to delete after the
+ * is reached, and nobody calls flush for that one. Both have to delete after the
  * write and only after it, and having that rule written down twice is how the
  * two eventually disagree.
  *
@@ -79,14 +79,7 @@ export async function shipClaim(
   sink: WriteFn,
   options: { attempts: Attempts; source: WriteContext['source'] },
 ): Promise<ShipOutcome> {
-  if (isEmptyClaim(claim)) {
-    try {
-      await metric.ackBatch(claim)
-    } catch (ackError) {
-      return { buckets: 0, rows: 0, ackError }
-    }
-    return { buckets: 0, rows: 0 }
-  }
+  if (isEmptyClaim(claim)) return settle(metric, claim, { buckets: 0, rows: 0 })
 
   // inside the try with the sink: a claim that cannot be turned into rows has
   // to go back to the live set exactly as a failed write does, or its data is
@@ -123,14 +116,27 @@ export async function shipClaim(
 
   options.attempts.current = 1
 
-  // only now is anything deleted. The rows are written by this point, so a
-  // failed ack is reported beside a success rather than as a failure
+  // only now is anything deleted
+  return settle(metric, claim, { buckets: batch.buckets, rows: batch.rows.length })
+}
+
+/**
+ * Ack a claim whose rows are written, or that had none.
+ *
+ * A failed ack is reported beside the counts rather than as a failure: the
+ * rows are in the sink by now, and only the claim is left unsettled.
+ */
+async function settle(
+  metric: AnyMetric,
+  claim: Claim,
+  shipped: { buckets: number; rows: number },
+): Promise<ShipOutcome> {
   try {
     await metric.ackBatch(claim)
   } catch (ackError) {
-    return { buckets: batch.buckets, rows: batch.rows.length, ackError }
+    return { ...shipped, ackError }
   }
-  return { buckets: batch.buckets, rows: batch.rows.length }
+  return shipped
 }
 
 /** What {@link shipOpenSeries} needs to turn one live series into a send. */
@@ -141,7 +147,7 @@ export interface OpenSeriesShip {
   readonly driver: Driver
   /** The open bucket the write just landed in. */
   readonly bucketTs: number
-  /** The one series that changed — not the whole bucket. */
+  /** The one series that changed, not the whole bucket. */
   readonly dimKey: string
   readonly materialize: (bucketTs: number, dimKey: string, cell: Cell) => Row
   readonly totalOf: (rows: readonly Row[]) => number
@@ -161,14 +167,14 @@ export interface OpenSeriesShip {
  * bucketed metric, and deliberately **not** built on a claim. A claim moves
  * data out of the live set and an ack deletes it; do that to a bucket that is
  * still folding and the next send carries only what arrived since, while
- * carrying the same row id — which a store upserting on that id would take as
+ * carrying the same row id, which a store upserting on that id would take as
  * the new truth. Reading instead leaves the bucket live and accumulating, so
  * every send is the cumulative value and the last one wins correctly.
  *
  * It follows that there is nothing to release. A sink that throws leaves the
  * data exactly where it was: the next write to this series sends it again, and
  * `flush()` will ship it regardless once the bucket closes. The error is the
- * caller's to report — for a metric that is `onError`, because `.add()` has
+ * caller's to report, and for a metric that is `onError`, because `.add()` has
  * already returned.
  *
  * Only the series that changed is read. The cost of immediate delivery scales

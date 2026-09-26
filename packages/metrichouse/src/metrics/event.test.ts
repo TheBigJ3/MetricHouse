@@ -7,19 +7,8 @@ import { counter } from './counter.js'
 import { type Event, event } from './event.js'
 import type { Row, WriteContext, WriteFn } from './types.js'
 
-/** A sink that keeps nothing — for declaration tests that never ship. */
+/** A sink that keeps nothing, for declaration tests that never ship. */
 const discard: WriteFn = () => {}
-
-function expectRejected(fn: () => unknown): Error {
-  let caught: unknown
-  try {
-    fn()
-  } catch (err) {
-    caught = err
-  }
-  expect(caught, 'expected the call to throw').toBeInstanceOf(Error)
-  return caught as Error
-}
 
 const makeFields = () => ({
   dogName: str(),
@@ -56,16 +45,18 @@ beforeEach(() => {
 })
 
 describe('declaration', () => {
-  it('is inert — a declaration is not bound to anything', () => {
+  it('is inert, a declaration bound to nothing', () => {
     const walks = event('walk_started', { write: discard, fields: makeFields() })
     expect(walks.isBound).toBe(false)
     // and writing before a house has bound it is loud, not silent
-    expect(expectRejected(() => walks.record(WALK)).message).toMatch(/not bound to a house/)
+    expect(() => walks.record(WALK)).toThrow(
+      'walk_started: not bound to a house. Pass it to createHouse({ schema }) before writing',
+    )
   })
 
   it('refuses an empty name', () => {
-    expect(expectRejected(() => event('  ', { write: discard, fields: {} })).message).toMatch(
-      /non-empty/,
+    expect(() => event('  ', { write: discard, fields: {} })).toThrow(
+      'event: name must be a non-empty string',
     )
   })
 
@@ -76,92 +67,85 @@ describe('declaration', () => {
   })
 
   it.each(['id', 'ts', '_ingested_at', '_sample_rate'])(
-    'refuses a field named %s — MetricHouse owns that column',
+    'refuses a field named %s, a column MetricHouse owns',
     (reserved) => {
-      expect(
-        expectRejected(() => event('e', { write: discard, fields: { [reserved]: str() } })).message,
-      ).toMatch(/reserved column/)
+      expect(() => event('e', { write: discard, fields: { [reserved]: str() } })).toThrow(
+        `e: field "${reserved}" is a reserved column. MetricHouse writes ` +
+          '[id, ts, _ingested_at, _sample_rate] on every row',
+      )
     },
   )
 
   it('refuses a timestamp field that is not declared', () => {
-    expect(
-      expectRejected(() =>
-        event('e', { write: discard, fields: { a: str() }, timestamp: 'nope' as never }),
-      ).message,
-    ).toMatch(/not a declared field/)
+    expect(() =>
+      event('e', { write: discard, fields: { a: str() }, timestamp: 'nope' as never }),
+    ).toThrow('e: timestamp names "nope", which is not a declared field')
   })
 
   it('refuses a timestamp naming a property every object inherits', () => {
-    expect(
-      expectRejected(() =>
-        event('e', { write: discard, fields: { a: str() }, timestamp: 'toString' as never }),
-      ).message,
-    ).toBe('e: timestamp names "toString", which is not a declared field')
+    expect(() =>
+      event('e', { write: discard, fields: { a: str() }, timestamp: 'toString' as never }),
+    ).toThrow(new Error('e: timestamp names "toString", which is not a declared field'))
   })
 
   it('refuses a field named like a whole number, which would lose its place', () => {
-    expect(
-      expectRejected(() => event('e', { write: discard, fields: { a: str(), 7: str() } })).message,
-    ).toMatch(/^e: a field cannot be named "7"/)
+    expect(() => event('e', { write: discard, fields: { a: str(), 7: str() } })).toThrow(
+      'e: a field cannot be named "7", because JavaScript lists a key that reads as a whole number before every other key, and the order you declared would be lost. Give it a name such as "field_7"',
+    )
   })
 
   it('refuses a stage it does not know', () => {
-    expect(
-      expectRejected(() =>
-        event('e', { write: discard, fields: {}, stage: 'memory' as unknown as 'local' }),
-      ).message,
-    ).toBe(`e: stage must be 'driver' or 'local', got "memory"`)
+    expect(() =>
+      event('e', { write: discard, fields: {}, stage: 'memory' as unknown as 'local' }),
+    ).toThrow(new Error("e: stage must be 'driver' or 'local', got \"memory\""))
   })
 
   it('refuses a sample that is neither a rate nor a function', () => {
-    expect(
-      expectRejected(() =>
-        event('e', { write: discard, fields: {}, sample: '0.5' as unknown as number }),
-      ).message,
-    ).toBe('e: sample must be a rate between 0 and 1 or a function returning one, got "0.5"')
+    expect(() =>
+      event('e', { write: discard, fields: {}, sample: '0.5' as unknown as number }),
+    ).toThrow(
+      new Error('e: sample must be a rate between 0 and 1 or a function returning one, got "0.5"'),
+    )
   })
 
   it.each(['bucket_open', 'bucket_elapsed_ms'])('refuses a field named %s', (field) => {
-    expect(
-      expectRejected(() => event('e', { write: discard, fields: { [field]: str() } })).message,
-    ).toBe(
-      `e: a field cannot be named "${field}", because every row snapshot() returns carries a ` +
-        'column of that name',
+    expect(() => event('e', { write: discard, fields: { [field]: str() } })).toThrow(
+      new Error(
+        `e: a field cannot be named "${field}", because every row snapshot() returns carries a ` +
+          'column of that name',
+      ),
     )
   })
 
   it('refuses a flush cadence of zero', () => {
-    expect(
-      expectRejected(() => event('e', { write: discard, fields: {}, flush: '0s' })).message,
-    ).toBe('e: flush must be longer than zero, got "0s"')
+    expect(() => event('e', { write: discard, fields: {}, flush: '0s' })).toThrow(
+      new Error('e: flush must be longer than zero, got "0s"'),
+    )
   })
 
   it('refuses a batch age a timer cannot wait for', () => {
-    expect(
-      expectRejected(() =>
-        event('e', { write: discard, fields: {}, stage: 'local', batch: { maxAge: '25d' } }),
-      ).message,
-    ).toMatch(/^e: batch.maxAge is 25d, longer than 2147483647ms/)
+    expect(() =>
+      event('e', { write: discard, fields: {}, stage: 'local', batch: { maxAge: '25d' } }),
+    ).toThrow(
+      'e: batch.maxAge is 25d, longer than 2147483647ms (just under 25 days), which is the longest a JavaScript timer can wait. A longer one fires every millisecond',
+    )
   })
 
   it('refuses a timestamp field that is not ts()', () => {
-    expect(
-      expectRejected(() =>
-        event('e', {
-          write: discard,
-          fields: { a: str() },
-          // @ts-expect-error the types already refuse a field that is not ts()
-          timestamp: 'a',
-        }),
-      ).message,
-    ).toMatch(/declares str\(\).*must be ts\(\)/)
+    expect(() =>
+      event('e', {
+        write: discard,
+        fields: { a: str() },
+        // @ts-expect-error the types already refuse a field that is not ts()
+        timestamp: 'a',
+      }),
+    ).toThrow('e: timestamp field "a" declares str(), and it must be ts()')
   })
 
   it('refuses a sample rate outside [0, 1]', () => {
-    expect(
-      expectRejected(() => event('e', { write: discard, fields: {}, sample: 1.5 })).message,
-    ).toMatch(/between 0 and 1/)
+    expect(() => event('e', { write: discard, fields: {}, sample: 1.5 })).toThrow(
+      'e: sample must be a rate between 0 and 1, got 1.5',
+    )
   })
 
   it('defaults to driver staging', () => {
@@ -171,7 +155,9 @@ describe('declaration', () => {
 
 describe('record', () => {
   it('throws before a house has bound it, rather than dropping the write', () => {
-    expect(expectRejected(() => make().record(WALK)).message).toMatch(/not bound to a house/)
+    expect(() => make().record(WALK)).toThrow(
+      'walk_started: not bound to a house. Pass it to createHouse({ schema }) before writing',
+    )
   })
 
   it('stages one record', async () => {
@@ -181,7 +167,7 @@ describe('record', () => {
     expect(await walks.pending()).toBe(1)
   })
 
-  it('does not aggregate — two identical events are two records', async () => {
+  it('does not aggregate, so two identical events are two records', async () => {
     const walks = bound()
     walks.record(WALK)
     walks.record(WALK)
@@ -191,23 +177,23 @@ describe('record', () => {
 
   it('rejects an unknown field', () => {
     const walks = bound()
-    expect(
-      expectRejected(() => walks.record({ ...WALK, breed: 'corgi' } as never)).message,
-    ).toMatch(/unknown field "breed"/)
+    expect(() => walks.record({ ...WALK, breed: 'corgi' } as never)).toThrow(
+      'unknown field "breed". The declared fields are [dogName, walkerId, requestId, routeMeters, weather]',
+    )
   })
 
   it('rejects a missing required field', () => {
     const walks = bound()
-    expect(expectRejected(() => walks.record({ dogName: 'Willow' } as never)).message).toMatch(
-      /missing required field "walkerId"/,
+    expect(() => walks.record({ dogName: 'Willow' } as never)).toThrow(
+      'missing required field "walkerId"',
     )
   })
 
   it('rejects an ill-typed field', () => {
     const walks = bound()
-    expect(
-      expectRejected(() => walks.record({ ...WALK, routeMeters: 'far' } as never)).message,
-    ).toMatch(/routeMeters: expected a safe integer/)
+    expect(() => walks.record({ ...WALK, routeMeters: 'far' } as never)).toThrow(
+      'routeMeters: expected a safe integer, got "far"',
+    )
   })
 
   it('stamps ts from the clock by default', async () => {
@@ -298,7 +284,7 @@ describe('identity', () => {
 })
 
 describe('materialized rows', () => {
-  it('stringifies a json() field — the column your table wants is text', async () => {
+  it('stringifies a json() field, since the column your table wants is text', async () => {
     const walks = bound()
     walks.record({ ...WALK, weather: { tempC: 14, rain: true } })
     await walks.drain()
@@ -397,7 +383,9 @@ describe('sampling', () => {
   it('refuses a rate a sample function returns outside [0, 1]', () => {
     const walks = event('e', { write: discard, fields: { a: str() }, sample: () => 7 })
     walks.bind({ driver, now })
-    expect(expectRejected(() => walks.record({ a: 'x' })).message).toMatch(/not a rate in \[0, 1\]/)
+    expect(() => walks.record({ a: 'x' })).toThrow(
+      'e: sample returned 7, which is not a rate in [0, 1]',
+    )
   })
 })
 
@@ -468,7 +456,7 @@ describe('derive', () => {
     expect(await tokens.current({ tenantId: 't1', kind: 'output' })).toBe(25)
   })
 
-  it('runs before sampling — counters stay exact while the table is a slice', async () => {
+  it('runs before sampling, so counters stay exact while the table is a slice', async () => {
     const exact = counter('exact', {
       dims: { tenantId: str() },
       resolution: '1s',
@@ -491,7 +479,7 @@ describe('derive', () => {
     expect(await sampled.pending()).toBe(0)
   })
 
-  it('still stages the event when derive throws — a broken fan-out loses no evidence', async () => {
+  it('still stages the event when derive throws, so a broken fan-out loses no evidence', async () => {
     const onError = vi.fn()
     const target = counter('requests', {
       dims: { tenantId: str() },
@@ -648,7 +636,7 @@ describe('flush', () => {
 
     const report = await house.flush()
     expect(report.metrics.walk_started).toMatchObject({ rows: 1, buckets: 0, skipped: false })
-    expect(write).toHaveBeenCalledTimes(1)
+    expect(write.mock.calls.map(([rows]) => rows)).toMatchObject([[WALK]])
   })
 
   it('tells the sink how many events, not how much value', async () => {
@@ -756,7 +744,7 @@ describe('local staging', () => {
     }
   })
 
-  it('drain ships the buffer — leaving it in the heap is the loss drain prevents', async () => {
+  it('drain ships the buffer, since leaving it in the heap is the loss drain prevents', async () => {
     const walks = local({ batch: { maxSize: 1000 } })
     const house = createHouse({ driver, schema: [walks], now })
 
@@ -788,7 +776,7 @@ describe('local staging', () => {
     walks.recordMany([WALK, WALK])
     await walks.drain().catch(() => undefined)
 
-    expect(onError).toHaveBeenCalled()
+    expect(onError.mock.calls).toEqual([[new Error('sink down'), { metric: 'walk_started' }]])
     expect(await walks.pending()).toBe(2)
   })
 
@@ -798,12 +786,12 @@ describe('local staging', () => {
 
     walks.record(WALK)
     await walks.drain()
-    expect(write).toHaveBeenCalledTimes(1)
+    expect(write.mock.calls.map(([rows]) => rows)).toMatchObject([[WALK]])
   })
 })
 
 describe('claim safety', () => {
-  it('refuses a bucket claim — that would silently drop every record', async () => {
+  it('refuses a bucket claim, which would silently drop every record', async () => {
     const walks = bound()
     const bucketClaim = await driver.claim('walk_started', clock)
     expect(() => walks.materializeClaim(bucketClaim)).toThrow(/expected staged records/)
@@ -862,7 +850,10 @@ describe('what record() guarantees', () => {
       shipped.push(...rows)
     })
     order.record({ tier: 'vip', qty: 1, order: { ok: true } })
-    expect(() => order.record({ tier: 'vip', qty: 1, order: { big: 1n } })).toThrow()
+    // the reason after the colon is the engine's own wording, so only ours is asserted
+    expect(() => order.record({ tier: 'vip', qty: 1, order: { big: 1n } })).toThrow(
+      'order: json() needs a value JSON can hold, and this one failed:',
+    )
     order.record({ tier: 'vip', qty: 2 })
     await house.drain()
 
@@ -873,14 +864,16 @@ describe('what record() guarantees', () => {
 
   it('increments nothing when the call throws', async () => {
     const { sold, order, house } = checkout()
-    expect(() => order.record({ tier: 'vip', qty: 'four' as unknown as number })).toThrow()
+    expect(() => order.record({ tier: 'vip', qty: 'four' as unknown as number })).toThrow(
+      'qty: expected a safe integer, got "four"',
+    )
     expect(() =>
       order.recordMany([
         { tier: 'vip', qty: 1 },
         { tier: 'vip', qty: 2 },
         { tier: 'vip', qty: -0.5 },
       ]),
-    ).toThrow()
+    ).toThrow('qty: expected a safe integer, got -0.5')
     await house.drain()
 
     expect(await sold.current()).toBe(0)

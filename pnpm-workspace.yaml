@@ -2,7 +2,7 @@ packages:
   - 'packages/*'
   - 'docs'
   # examples/, runtime-tests/ and benchmarks/ are planned but hold no package
-  # yet — their globs matched nothing, and the vitest equivalent matched a
+  # yet. Their globs matched nothing, and the vitest equivalent matched a
   # README and broke `pnpm test`. Each gets its entry back when it has a
   # package.json.
 

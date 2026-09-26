@@ -12,21 +12,7 @@ import {
 } from './dims.js'
 import { bool, int, json, oneOf, str, ts } from './types.js'
 
-function expectRejected(fn: () => unknown): Error {
-  let caught: unknown
-  try {
-    fn()
-  } catch (err) {
-    caught = err
-  }
-  expect(caught, 'expected the call to throw').toBeInstanceOf(Error)
-  const err = caught as Error
-  expect(err.message, 'still throwing the stub sentinel').not.toMatch(/not implemented/i)
-  return err
-}
-
-// built per-test: the stubs throw, and a module-scope call would take the
-// whole file down instead of failing one assertion at a time
+// built per test, so no test can change the shape another one reads
 const makeDims = () => ({ dogName: str(), park: str(), kind: oneOf(['solid', 'liquid']) })
 let dims: ReturnType<typeof makeDims>
 beforeEach(() => {
@@ -38,7 +24,7 @@ describe('dimOrder', () => {
     expect(dimOrder(dims)).toEqual(['dogName', 'park', 'kind'])
   })
 
-  it('is order-sensitive — reordering dims is a breaking schema change', () => {
+  it('is order-sensitive, so reordering dims is a breaking schema change', () => {
     expect(dimOrder({ b: str(), a: str() })).toEqual(['b', 'a'])
     expect(dimOrder({ a: str(), b: str() })).toEqual(['a', 'b'])
   })
@@ -55,19 +41,20 @@ describe('assertDimsLegal', () => {
     ).not.toThrow()
   })
 
-  it('rejects json() — a payload cannot be a series key', () => {
-    const err = expectRejected(() => assertDimsLegal({ payload: json() }, 'dog_poops'))
-    expect(err.message).toMatch(/payload/)
-    expect(err.message).toMatch(/dog_poops/)
+  it('rejects json(), since a payload cannot be a series key', () => {
+    expect(() => assertDimsLegal({ payload: json() }, 'dog_poops')).toThrow(
+      'dog_poops: dim "payload" declares json(), which cannot be encoded into a series key. ' +
+        'Put it on an event instead',
+    )
   })
 
   it('rejects a name JavaScript would move ahead of the others', () => {
     // `{ region, 2024 }` lists 2024 first, so the declared order is gone
     // before any code can read it
-    expect(expectRejected(() => assertDimsLegal({ region: str(), 2024: str() }, 'm')).message).toBe(
-      'm: a dim cannot be named "2024", because JavaScript lists a key that reads as a whole ' +
-        'number before every other key, and the order you declared would be lost. Give it a ' +
-        'name such as "dim_2024"',
+    expect(() => assertDimsLegal({ region: str(), 2024: str() }, 'm')).toThrow(
+      new Error(
+        'm: a dim cannot be named "2024", because JavaScript lists a key that reads as a whole number before every other key, and the order you declared would be lost. Give it a name such as "dim_2024"',
+      ),
     )
   })
 
@@ -80,9 +67,9 @@ describe('assertDimsLegal', () => {
   })
 
   it('rejects a name among the columns the metric writes itself', () => {
-    expect(
-      expectRejected(() => assertDimsLegal({ value: str() }, 'm', ['id', 'value'])).message,
-    ).toBe('m: dim "value" is a reserved column. MetricHouse writes [id, value] on every row')
+    expect(() => assertDimsLegal({ value: str() }, 'm', ['id', 'value'])).toThrow(
+      new Error('m: dim "value" is a reserved column. MetricHouse writes [id, value] on every row'),
+    )
   })
 })
 
@@ -160,18 +147,19 @@ describe('encodeDimKey', () => {
   })
 
   it('rejects a missing required dim', () => {
-    expect(expectRejected(() => encodeDimKey(dims, { dogName: 'Willow' })).message).toMatch(/park/)
+    expect(() => encodeDimKey(dims, { dogName: 'Willow' })).toThrow('missing required dim "park"')
   })
 
   it('rejects an unknown key', () => {
-    const err = expectRejected(() =>
+    expect(() =>
       encodeDimKey(dims, { dogName: 'W', park: 'r', kind: 'solid', breed: 'corgi' }),
-    )
-    expect(err.message).toMatch(/breed/)
+    ).toThrow('unknown dim "breed". The declared dims are [dogName, park, kind]')
   })
 
   it('rejects a value outside a oneOf set', () => {
-    expectRejected(() => encodeDimKey(dims, { dogName: 'W', park: 'r', kind: 'gas' }))
+    expect(() => encodeDimKey(dims, { dogName: 'W', park: 'r', kind: 'gas' })).toThrow(
+      'kind: "gas" is not one of ["solid", "liquid"]',
+    )
   })
 })
 
@@ -202,8 +190,12 @@ describe('decodeDimKey', () => {
   })
 
   it('rejects a key with the wrong number of segments', () => {
-    expectRejected(() => decodeDimKey(dims, 'Willow|riverside'))
-    expectRejected(() => decodeDimKey(dims, 'Willow|riverside|solid|extra'))
+    expect(() => decodeDimKey(dims, 'Willow|riverside')).toThrow(
+      'decodeDimKey: expected 3 segments for [dogName, park, kind], got 2',
+    )
+    expect(() => decodeDimKey(dims, 'Willow|riverside|solid|extra')).toThrow(
+      'decodeDimKey: expected 3 segments for [dogName, park, kind], got 4',
+    )
   })
 })
 
@@ -239,23 +231,21 @@ describe('validateDims', () => {
   })
 
   it('rejects a missing required dim, naming it', () => {
-    expect(
-      expectRejected(() => validateDims(dims, { dogName: 'W', kind: 'solid' })).message,
-    ).toMatch(/park/)
+    expect(() => validateDims(dims, { dogName: 'W', kind: 'solid' })).toThrow(
+      'missing required dim "park"',
+    )
   })
 
   it('rejects an unknown key, naming it', () => {
-    expect(
-      expectRejected(() =>
-        validateDims(dims, { dogName: 'W', park: 'r', kind: 'solid', breed: 'corgi' }),
-      ).message,
-    ).toMatch(/breed/)
+    expect(() =>
+      validateDims(dims, { dogName: 'W', park: 'r', kind: 'solid', breed: 'corgi' }),
+    ).toThrow('unknown dim "breed". The declared dims are [dogName, park, kind]')
   })
 
   it('rejects a bad oneOf member, naming the key', () => {
-    expect(
-      expectRejected(() => validateDims(dims, { dogName: 'W', park: 'r', kind: 'gas' })).message,
-    ).toMatch(/kind/)
+    expect(() => validateDims(dims, { dogName: 'W', park: 'r', kind: 'gas' })).toThrow(
+      'kind: "gas" is not one of ["solid", "liquid"]',
+    )
   })
 
   it('accepts an omitted optional dim', () => {

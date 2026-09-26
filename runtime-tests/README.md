@@ -3,7 +3,7 @@
 The same test suite, run against every runtime MetricHouse claims to support.
 
 Separate from each package's unit tests because these need real runtimes, not
-mocks — they are slow, they run in CI on a matrix, and a green unit suite says
+mocks. They are slow, they run in CI on a matrix, and a green unit suite says
 nothing about whether a write survives an isolate freeze.
 
 ## Why this is level 1

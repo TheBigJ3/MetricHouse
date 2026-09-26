@@ -1,8 +1,8 @@
 /**
  * Duration parsing.
  *
- * Every time-shaped config field in MetricHouse — `resolution`, `flush`,
- * `grace`, `retention`, `totalTtl` — is a duration. This is the bottom of the
+ * Every time-shaped config field in MetricHouse, `resolution`, `flush`,
+ * `grace`, `retention`, `totalTtl`, is a duration. This is the bottom of the
  * dependency graph: nothing here imports anything.
  */
 
@@ -29,19 +29,19 @@ const UNIT_MS_ENTRIES = Object.entries(UNIT_MS) as [DurationUnit, number][]
  * Parse a duration into milliseconds.
  *
  * Accepted:
- * - `'500ms' | '30s' | '5m' | '2h' | '7d'` — integer + lowercase unit
+ * - `'500ms' | '30s' | '5m' | '2h' | '7d'`, an integer and a lowercase unit
  * - surrounding whitespace, which is trimmed
  * - a plain `number`, taken as milliseconds already
- * - zero (`'0s'` → `0`) — a zero `grace` is meaningful. Rejecting a zero
+ * - zero (`'0s'` → `0`), because a zero `grace` is meaningful. Rejecting a zero
  *   *resolution* is {@link assertResolution}'s job, not this function's.
  *
  * Rejected, each with a message naming the input:
- * - negatives (`'-5m'`) — never meaningful
- * - fractions (`'1.5m'`) — write `'90s'`. Deliberately strict: loosening this
+ * - negatives (`'-5m'`), never meaningful
+ * - fractions (`'1.5m'`). Write `'90s'`. Deliberately strict: loosening this
  *   later is safe, tightening it is not
- * - a bare numeric string (`'5'`) — ambiguous. A bare `number` means ms; a
+ * - a bare numeric string (`'5'`), which is ambiguous. A bare `number` means ms; a
  *   bare numeric *string* is an error
- * - uppercase units (`'5M'`) — `M` is minutes or months depending on who you
+ * - uppercase units (`'5M'`), since `M` is minutes or months depending on who you
  *   ask, so neither is accepted
  * - unknown units, empty strings, `NaN`, `Infinity`, non-integer numbers
  *

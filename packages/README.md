@@ -17,7 +17,7 @@ keep an edge bundle down to the write path.
 | `metrichouse/testing` | assertion helpers, memory driver only | planned |
 
 Only the four above appear in `package.json`. **A subpath is added to the
-exports map together with the code behind it, never ahead of it** — an entry
+exports map together with the code behind it, never ahead of it**. An entry
 resolving to an empty module is worse than an absent one, because the consumer
 importing it gets nothing and no error. The same rule governs
 `peerDependencies`: `ioredis` is optional, and declared only because
@@ -27,7 +27,7 @@ importing it gets nothing and no error. The same rule governs
 
 ## The CLI
 
-A CLI — `init`, `cost`, `inspect`, `flush`, `collect` — is planned as a
+A CLI with `init`, `cost`, `inspect`, `flush` and `collect` is planned as a
 separate package, because it needs `node:fs` and must never be a runtime
 dependency. It is not built yet.
 
@@ -36,5 +36,5 @@ dependency. It is not built yet.
 MetricHouse sits between the data and the datastore. It owns bucketing,
 aggregation, staging, identity and flush; it hands your `write()` typed rows
 and stops. It emits no SQL, diffs no schema, and opens no connection. What
-those rows land in — the table, its types, whether it collapses duplicate
-`id`s — is yours. See [Writing a sink](https://www.metrichouse.dev/guide/writing-a-sink).
+those rows land in, the table, its types, whether it collapses duplicate
+`id`s, is yours. See [Writing a sink](https://www.metrichouse.dev/guide/writing-a-sink).

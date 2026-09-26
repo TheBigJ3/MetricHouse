@@ -1,5 +1,5 @@
 /**
- * Level — a quantity that persists between writes.
+ * Level. A quantity that persists between writes.
  *
  * The gauge answers "what values were observed in this window", and a window
  * nobody wrote to is absent. That is right for something you sample and wrong
@@ -18,10 +18,10 @@
  * the gap between writes is the thing you need filled.
  */
 
-import type { Cell, Claim, Driver, LevelOp, LevelSeries } from '../drivers/types.js'
+import type { Cell, Claim, LevelOp, LevelSeries } from '../drivers/types.js'
 import { isLevelCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
-import { createAttempts, metricFlush } from '../runtime/flush.js'
+import { metricFlush } from '../runtime/flush.js'
 import {
   applySnapshot,
   type LiveRow,
@@ -29,12 +29,11 @@ import {
   type SnapshotOptions,
   snapshotRange,
 } from '../runtime/live.js'
-import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
-import { assertResolution, bucketRange, bucketStart, closedUpTo } from '../time/buckets.js'
-import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
-import { bucketedLifecycle, DEFAULT_GRACE_MS } from './bucketed.js'
+import { bucketRange, bucketStart } from '../time/buckets.js'
+import { type DurationInput, parseDuration } from '../time/duration.js'
+import { bucketedBinding, bucketedLifecycle, claimWatermark, seriesKey } from './bucketed.js'
 import type {
   AnyMetric,
   ClaimOptions,
@@ -51,7 +50,7 @@ import {
   assertSink,
   assertWhole,
   dimColumns,
-  reportError,
+  pendingWrites,
 } from './types.js'
 
 /**
@@ -61,7 +60,7 @@ import {
  * for a day comes back owing 86,400 windows per series at `resolution: '1s'`,
  * and writing them all would mean a flush that takes minutes and a chart
  * claiming the queue was measured the whole time it was not. Past the cap the
- * older windows are skipped, which leaves a gap — the truthful shape for a
+ * older windows are skipped, which leaves a gap, the truthful shape for a
  * stretch when nothing was running.
  */
 export const MAX_CARRY_BUCKETS = 10_000
@@ -109,7 +108,7 @@ export interface LevelConfig<D extends Shape> {
   /** `float()` (default) or `int()`. Decides whether writes accept fractions. */
   readonly value?: FieldType<number, false>
   /**
-   * Where this level's rows go. Required — see the counter for why.
+   * Where this level's rows go. Required. See the counter for why.
    *
    * Receives {@link LevelRow}: one `value` column, which is what the series
    * was at when the window closed.
@@ -158,7 +157,7 @@ export interface Level<D extends Shape> extends AnyMetric {
    * knowing.
    *
    * Read from the held value rather than from the open bucket, because the
-   * open window may well have nothing in it — which is the entire difference
+   * open window may well have nothing in it, which is the entire difference
    * between this and a gauge.
    */
   current(...dims: DimsArgs<D>): Promise<number | undefined>
@@ -189,14 +188,14 @@ export interface Level<D extends Shape> extends AnyMetric {
 
   /** Turn one stored cell into the row a sink receives. */
   materialize(bucketTs: number, dimKey: string, cell: Cell): Row
-  /** This batch's headline number — what every series added up to at the end of it. */
+  /** This batch's headline number, what every series added up to at the end of it. */
   totalOf(rows: readonly Row[]): number
 }
 
 /**
  * Declare a level.
  *
- * @throws if the configuration is invalid — the same declare-time checks
+ * @throws if the configuration is invalid, failing the same declare-time checks
  * `counter()` makes on name, dims and resolution, plus `holdFor`, which must
  * be at least one window or it would expire a series before it ever reported.
  */
@@ -210,11 +209,20 @@ export function level<D extends Shape = Record<never, never>>(
   const dims = (config.dims ?? {}) as D
   assertDimsLegal(dims, name, ['id', 'bucket_ts', 'value'])
 
-  const resolutionMs = parseDuration(config.resolution)
-  const ownFlushMs =
-    config.flush === undefined ? undefined : parseInterval(config.flush, `${name}: flush`)
-  const ownGraceMs = config.grace === undefined ? undefined : parseDuration(config.grace)
-  if (ownFlushMs !== undefined) assertResolution(resolutionMs, ownFlushMs)
+  // erased for the engine, which carries rows of every kind. See the counter
+  const sink = config.write as WriteFn
+
+  const slot = bucketedBinding({
+    name,
+    kind: 'level',
+    resolution: config.resolution,
+    flush: config.flush,
+    grace: config.grace,
+    materialize,
+    totalOf,
+    sink,
+  })
+  const { resolutionMs } = slot
 
   const holdForMs = config.holdFor === undefined ? undefined : parseDuration(config.holdFor)
   if (holdForMs !== undefined && holdForMs < resolutionMs) {
@@ -226,13 +234,7 @@ export function level<D extends Shape = Record<never, never>>(
 
   const isFloat = config.value?.kind !== 'int'
 
-  // erased for the engine, which carries rows of every kind. See the counter
-  const sink = config.write as WriteFn
-
-  let binding: MetricBinding | undefined
-  const pending = new Set<Promise<void>>()
-  /** One failure count for flushes and immediate sends alike. */
-  const attempts = createAttempts()
+  const writes = pendingWrites(name)
 
   /** The driver stores whatever a metric wrote; a level only writes level cells. */
   function asLevel(cell: Cell): number {
@@ -242,79 +244,13 @@ export function level<D extends Shape = Record<never, never>>(
     return cell.level
   }
 
-  /** The metric's own cadence, or the house's. See the counter for the rule. */
-  function effectiveFlushMs(from: MetricBinding | undefined = binding): number {
-    const ms = ownFlushMs ?? from?.defaults?.flushMs
-    if (ms === undefined) {
-      throw new Error(
-        `${name}: no flush cadence. Declare flush on the level, or defaults.flush on the house`,
-      )
-    }
-    return ms
-  }
-
-  function effectiveGraceMs(): number {
-    return ownGraceMs ?? binding?.defaults?.graceMs ?? DEFAULT_GRACE_MS
-  }
-
-  function activeBinding(): MetricBinding {
-    if (!binding) {
-      throw new Error(
-        `${name}: not bound to a house. Pass it to createHouse({ schema }) before writing`,
-      )
-    }
-    return binding
-  }
-
   function keyFor(values: InferShape<D> | undefined): string {
     return encodeDimKey(dims, (values ?? {}) as Record<string, unknown>)
   }
 
-  function track(write: Promise<void>, onError: MetricBinding['onError']): void {
-    const settled = write
-      // reported and never rethrown, so `drain()` waits for every write
-      // rather than stopping at the first that failed
-      .catch((error: unknown) => reportError(onError, error, { metric: name }))
-      .finally(() => {
-        pending.delete(settled)
-      })
-    pending.add(settled)
-  }
-
-  function activeDriver(): Driver {
-    return activeBinding().driver
-  }
-
-  function nowMs(): number {
-    return (activeBinding().now ?? Date.now)()
-  }
-
-  /** Under `delivery: 'immediate'`, follow the write with a send of the open window. */
-  function deliver(write: Promise<void>, bucketTs: number, dimKey: string): Promise<void> {
-    if (binding?.delivery !== 'immediate') return write
-    return write.then(() => shipOpen(bucketTs, dimKey))
-  }
-
-  async function shipOpen(bucketTs: number, dimKey: string): Promise<void> {
-    const active = activeBinding()
-
-    await shipOpenSeries({
-      metric: name,
-      kind: 'level',
-      resolutionMs,
-      driver: active.driver,
-      bucketTs,
-      dimKey,
-      materialize,
-      totalOf,
-      sink,
-      attempts,
-    })
-  }
-
-  /** The one write path — `set`, `inc` and `dec` all land here. */
+  /** The one write path. `set`, `inc` and `dec` all land here. */
   function write(mode: 'set' | 'add', amount: number, values: InferShape<D> | undefined): void {
-    const active = activeBinding()
+    const active = slot.active()
 
     if (typeof amount !== 'number' || !Number.isFinite(amount)) {
       throw new Error(`${name}: value must be a finite number, got ${String(amount)}`)
@@ -334,7 +270,7 @@ export function level<D extends Shape = Record<never, never>>(
       mode,
       ...(!isFloat && { integer: true }),
     }
-    track(deliver(active.driver.setLevel([op]), bucketTs, dimKey), active.onError)
+    writes.track(slot.deliver(active.driver.setLevel([op]), bucketTs, dimKey), () => active.onError)
   }
 
   function materialize(bucketTs: number, dimKey: string, cell: Cell): Row {
@@ -385,7 +321,7 @@ export function level<D extends Shape = Record<never, never>>(
     const latest = new Map<string, number>()
 
     for (const row of rows) {
-      const key = JSON.stringify(dimNames.map((dim) => row[dim]))
+      const key = seriesKey(dimNames, row)
       latest.set(key, row.value as number)
     }
 
@@ -420,9 +356,9 @@ export function level<D extends Shape = Record<never, never>>(
    * a series at its last window.
    */
   async function heldNow(): Promise<LevelSeries[]> {
-    const series = await activeDriver().readLevels(name)
+    const series = await slot.driver().readLevels(name)
     if (holdForMs === undefined) return series
-    const open = bucketStart(nowMs(), resolutionMs)
+    const open = bucketStart(slot.now(), resolutionMs)
     return series.filter((one) => open < (holdUntil(one) ?? Number.POSITIVE_INFINITY))
   }
 
@@ -432,7 +368,7 @@ export function level<D extends Shape = Record<never, never>>(
    * It walks forwards rather than stamping one number across the gap, because
    * a series can have been written several times since the last flush and
    * each window belongs to whatever the value was *then*. Set to 42 at noon
-   * and to 7 at three, and the windows in between are 42, not 7 — a queue
+   * and to 7 at three, and the windows in between are 42, not 7, because a queue
    * that changed at three did not change at noon.
    *
    * The walk is capped at {@link MAX_CARRY_BUCKETS} windows back from
@@ -503,14 +439,10 @@ export function level<D extends Shape = Record<never, never>>(
    * a crash between the two harmless: the carry is durable, so the next flush
    * claims it.
    */
-  async function carryAndClaim(
-    at: number,
-    claimOptions: ClaimOptions,
-    claim: () => Promise<Claim>,
-  ): Promise<Claim> {
-    const driver = activeDriver()
-    const grace = claimOptions.final ? 0 : effectiveGraceMs()
-    const watermark = closedUpTo(resolutionMs, at, grace)
+  async function carryAndClaim(at: number, claimOptions: ClaimOptions): Promise<Claim> {
+    const driver = slot.driver()
+    const watermark = claimWatermark(resolutionMs, at, slot.graceMs, claimOptions)
+    const claim = () => lifecycle.claimBatch(at, claimOptions)
 
     const series = await driver.readLevels(name)
     if (series.length === 0) return claim()
@@ -596,8 +528,8 @@ export function level<D extends Shape = Record<never, never>>(
    * asks for it.
    */
   async function snapshotWithCarry(options: SnapshotOptions = {}): Promise<LiveRow[]> {
-    const driver = activeDriver()
-    const now = nowMs()
+    const driver = slot.driver()
+    const now = slot.now()
     const range = snapshotRange(options, resolutionMs, now, name)
     // the newest window that can hold anything: the open one, unless the
     // range or `complete` stops short of it. A `to` in the future does not
@@ -606,7 +538,7 @@ export function level<D extends Shape = Record<never, never>>(
     const upper = Math.min(range.to ?? openEnd, openEnd)
     // where the next flush will carry up to, which is where its cap counts
     // back from
-    const flushUpTo = closedUpTo(resolutionMs, now, effectiveGraceMs())
+    const flushUpTo = claimWatermark(resolutionMs, now, slot.graceMs)
 
     const [series, stored] = await Promise.all([
       driver.readLevels(name),
@@ -647,12 +579,12 @@ export function level<D extends Shape = Record<never, never>>(
     )
   }
 
-  // named, so the flush mixin can reach the finished metric — see the counter
+  // named, so the flush mixin can reach the finished metric. See the counter
   const lifecycle = bucketedLifecycle({
     name,
     resolutionMs,
-    graceMs: effectiveGraceMs,
-    driver: activeDriver,
+    graceMs: slot.graceMs,
+    driver: slot.driver,
     materialize,
     totalOf,
   })
@@ -662,11 +594,11 @@ export function level<D extends Shape = Record<never, never>>(
 
     ...metricFlush({
       name,
-      flushMs: effectiveFlushMs,
+      flushMs: slot.flushMs,
       sink: () => sink,
-      now: nowMs,
+      now: slot.now,
       self: () => self,
-      attempts,
+      attempts: slot.attempts,
     }),
 
     name,
@@ -676,11 +608,11 @@ export function level<D extends Shape = Record<never, never>>(
     resolutionMs,
 
     get flushMs(): number {
-      return effectiveFlushMs()
+      return slot.flushMs()
     },
 
     get graceMs(): number {
-      return effectiveGraceMs()
+      return slot.graceMs()
     },
 
     holdForMs,
@@ -688,24 +620,14 @@ export function level<D extends Shape = Record<never, never>>(
     write: config.write,
 
     get isBound(): boolean {
-      return binding !== undefined
+      return slot.isBound()
     },
 
-    bind(next: MetricBinding): void {
-      if (binding) {
-        throw new Error(`${name}: already bound to a house, and a metric belongs to exactly one`)
-      }
-      // checked before the binding is kept, as the counter does
-      if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs(next))
-      binding = next
-    },
-
-    unbind(): void {
-      binding = undefined
-    },
+    bind: slot.bind,
+    unbind: slot.unbind,
 
     claimBatch(at: number, claimOptions: ClaimOptions = {}) {
-      return carryAndClaim(at, claimOptions, () => lifecycle.claimBatch(at, claimOptions))
+      return carryAndClaim(at, claimOptions)
     },
 
     // replaces the plain bucket read spread in above, so live rows include the
@@ -743,10 +665,8 @@ export function level<D extends Shape = Record<never, never>>(
       return series.reduce((sum, one) => sum + one.value, 0)
     },
 
-    async drain(): Promise<void> {
-      while (pending.size > 0) {
-        await Promise.all([...pending])
-      }
+    drain(): Promise<void> {
+      return writes.drain()
     },
 
     materialize,

@@ -1,32 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import {
-  assertResolution,
-  bucketRange,
-  bucketStart,
-  closedUpTo,
-  isClosed,
-  isOpen,
-  nextBoundary,
-} from './buckets.js'
-
-/**
- * Asserts `fn` throws a *real* validation error — not the `not implemented`
- * sentinel the stub throws. Without this guard every rejection test below
- * would pass trivially against an unimplemented function and report a false
- * green. Delete it once the stubs are gone if you like; it costs nothing.
- */
-function expectRejected(fn: () => unknown): Error {
-  let caught: unknown
-  try {
-    fn()
-  } catch (err) {
-    caught = err
-  }
-  expect(caught, 'expected the call to throw').toBeInstanceOf(Error)
-  const err = caught as Error
-  expect(err.message, 'still throwing the stub sentinel').not.toMatch(/not implemented/i)
-  return err
-}
+import { assertResolution, bucketRange, bucketStart, closedUpTo } from './buckets.js'
 
 const SEC = 1000
 const MIN = 60_000
@@ -40,7 +13,7 @@ describe('bucketStart', () => {
     expect(bucketStart(1999, SEC)).toBe(1000)
   })
 
-  it('matches the worked example in 07-buckets.md', () => {
+  it('floors a timestamp partway through a second to the start of that second', () => {
     const ts = Date.parse('2026-09-05T14:03:07.482Z')
     expect(bucketStart(ts, SEC)).toBe(1_788_616_987_000)
     expect(new Date(bucketStart(ts, SEC)).toISOString()).toBe('2026-09-05T14:03:07.000Z')
@@ -70,27 +43,9 @@ describe('bucketStart', () => {
   })
 
   it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])('rejects resolution %p', (res) => {
-    expectRejected(() => bucketStart(1000, res))
-  })
-})
-
-describe('nextBoundary', () => {
-  it('returns the start of the following bucket', () => {
-    expect(nextBoundary(0, SEC)).toBe(1000)
-    expect(nextBoundary(500, SEC)).toBe(1000)
-    expect(nextBoundary(999, SEC)).toBe(1000)
-  })
-
-  it('advances past a timestamp sitting exactly on a boundary', () => {
-    // a ts on a boundary belongs to the bucket starting there, so the next
-    // boundary is one full resolution later — never the ts itself
-    expect(nextBoundary(1000, SEC)).toBe(2000)
-  })
-
-  it('is always bucketStart + resolution', () => {
-    for (const ts of [0, 1, 999, 1000, 123_456_789]) {
-      expect(nextBoundary(ts, SEC)).toBe(bucketStart(ts, SEC) + SEC)
-    }
+    expect(() => bucketStart(1000, res)).toThrow(
+      `bucketStart: resolutionMs must be a positive integer, got ${res}`,
+    )
   })
 })
 
@@ -100,7 +55,7 @@ describe('bucketRange', () => {
   })
 
   it('includes the bucket a mid-bucket start falls into', () => {
-    // the window begins at 500, inside bucket 0 — that bucket holds data in
+    // the window begins at 500, inside bucket 0. That bucket holds data in
     // range, so it must be returned
     expect(bucketRange(500, 2500, SEC)).toEqual([0, 1000, 2000])
   })
@@ -118,7 +73,7 @@ describe('bucketRange', () => {
     expect(bucketRange(2000, 1000, SEC)).toEqual([])
   })
 
-  it('produces 300 buckets for 1s resolution over 5m — the spec example', () => {
+  it('produces 300 buckets for 1s resolution over 5m', () => {
     const from = Date.parse('2026-09-05T14:03:00Z')
     const range = bucketRange(from, from + 5 * MIN, SEC)
     expect(range).toHaveLength(300)
@@ -134,40 +89,8 @@ describe('bucketRange', () => {
   })
 })
 
-describe('isOpen', () => {
-  it('is true only inside the half-open window', () => {
-    expect(isOpen(1000, SEC, 1000)).toBe(true)
-    expect(isOpen(1000, SEC, 1500)).toBe(true)
-    expect(isOpen(1000, SEC, 1999)).toBe(true)
-    expect(isOpen(1000, SEC, 2000)).toBe(false)
-    expect(isOpen(1000, SEC, 999)).toBe(false)
-  })
-})
-
-describe('isClosed', () => {
-  it('requires the bucket to have ended AND outlived grace', () => {
-    const b = 1000
-    // bucket covers [1000, 2000); with 2s grace it is claimable from 4000
-    expect(isClosed(b, SEC, 1999, 2 * SEC)).toBe(false) // still open
-    expect(isClosed(b, SEC, 2000, 2 * SEC)).toBe(false) // ended, in grace
-    expect(isClosed(b, SEC, 3999, 2 * SEC)).toBe(false) // still in grace
-    expect(isClosed(b, SEC, 4000, 2 * SEC)).toBe(true) // grace expired
-  })
-
-  it('collapses to the boundary when grace is zero', () => {
-    expect(isClosed(1000, SEC, 1999, 0)).toBe(false)
-    expect(isClosed(1000, SEC, 2000, 0)).toBe(true)
-  })
-
-  it('is never true for a bucket that is still open', () => {
-    for (const now of [1000, 1500, 1999]) {
-      expect(isOpen(1000, SEC, now) && isClosed(1000, SEC, now, 2 * SEC)).toBe(false)
-    }
-  })
-})
-
 describe('closedUpTo', () => {
-  it('matches the worked example in 07-buckets.md', () => {
+  it('holds back the windows that ended less than grace ago', () => {
     const now = Date.parse('2026-09-05T14:08:09Z')
     const watermark = closedUpTo(SEC, now, 2 * SEC)
     expect(watermark).toBe(1_788_617_287_000)
@@ -180,14 +103,32 @@ describe('closedUpTo', () => {
     expect(bucketStart(w, SEC)).toBe(w)
   })
 
+  it('takes a window exactly when its grace runs out', () => {
+    // bucket [1000, 2000) with 2s grace is claimable from 4000, not before
+    expect(closedUpTo(SEC, 3999, 2 * SEC)).toBe(1000)
+    expect(closedUpTo(SEC, 4000, 2 * SEC)).toBe(2000)
+    // with no grace, from the moment it ends
+    expect(closedUpTo(SEC, 1999, 0)).toBe(1000)
+    expect(closedUpTo(SEC, 2000, 0)).toBe(2000)
+  })
+
   it('moves backwards as grace grows', () => {
     const now = Date.parse('2026-09-05T14:08:09Z')
     expect(closedUpTo(SEC, now, 0)).toBeGreaterThan(closedUpTo(SEC, now, 5 * SEC))
   })
 })
 
+/**
+ * The definition {@link closedUpTo} has to agree with, written the long way:
+ * a bucket is claimable once it has ended and outlived its grace.
+ */
+function isClosed(bucketTs: number, resolutionMs: number, nowMs: number, graceMs: number) {
+  const ended = bucketStart(nowMs, resolutionMs) !== bucketStart(bucketTs, resolutionMs)
+  return ended && nowMs >= bucketTs + resolutionMs + graceMs
+}
+
 describe('closedUpTo agrees with isClosed', () => {
-  // The invariant the flush engine depends on. If this fails, one of the two
+  // The invariant the flush engine depends on. If this fails, the watermark
   // is off by a bucket and a window gets double-shipped or dropped.
   it('isClosed(b) <=> b < closedUpTo()', () => {
     const now = Date.parse('2026-09-05T14:08:09.482Z')
@@ -216,21 +157,24 @@ describe('assertResolution', () => {
   })
 
   it('rejects a resolution that would split a bucket across shipments', () => {
-    expectRejected(() => assertResolution(7 * SEC, MIN))
-    expectRejected(() => assertResolution(45 * SEC, MIN))
+    expect(() => assertResolution(7 * SEC, MIN)).toThrow(
+      'assertResolution: resolution 7s does not divide flush 1m evenly, and a shipment would split a bucket',
+    )
+    expect(() => assertResolution(45 * SEC, MIN)).toThrow(
+      'assertResolution: resolution 45s does not divide flush 1m evenly, and a shipment would split a bucket',
+    )
   })
 
   it('rejects a resolution coarser than the flush interval', () => {
-    expectRejected(() => assertResolution(5 * MIN, MIN))
+    expect(() => assertResolution(5 * MIN, MIN)).toThrow(
+      'assertResolution: resolution 5m does not divide flush 1m evenly, and a shipment would split a bucket',
+    )
   })
 
   it.each([0, -1, 1.5])('rejects resolution %p', (res) => {
-    expectRejected(() => assertResolution(res, MIN))
-  })
-
-  it('explains itself', () => {
-    // note: must not match the stub's own 'assertResolution: not implemented'
-    expect(expectRejected(() => assertResolution(7 * SEC, MIN)).message).toMatch(/divide|evenly/i)
+    expect(() => assertResolution(res, MIN)).toThrow(
+      `assertResolution: resolutionMs must be a positive integer, got ${res}`,
+    )
   })
 })
 

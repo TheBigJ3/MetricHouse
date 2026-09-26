@@ -1,16 +1,20 @@
 /**
- * Dimensions — encoding a set of declared values into one series key.
+ * Dimensions. Encoding a set of declared values into one series key.
  *
  * The key is the full cross-product of dim values, which is what makes
  * "Willow at riverside" answerable later, and what makes cardinality
- * multiply. Values are open and unguarded by design; the projection in
- * `metrichouse cost` is the answer, not a runtime cap.
+ * multiply. Values are open and unguarded by design. The memory driver's
+ * `maxSeries` is the only runtime cap.
  */
 
+import type { LiveFields } from '../runtime/live.js'
 import { assertValue, type FieldType, type Shape } from './types.js'
 
 /** Separates encoded values in a key. */
-export const DIM_SEPARATOR = '|'
+const DIM_SEPARATOR = '|'
+
+/** The escape character. A literal one in a value is always doubled. */
+const ESCAPE = '\\'
 
 /**
  * Marks an absent optional dim. Two characters, and unreachable by escaping:
@@ -34,7 +38,7 @@ function splitKey(key: string): string[] {
     const char = key[i] as string
 
     if (char === ESCAPE) {
-      // the next character is literal by construction — carry both through
+      // the next character is literal by construction, so carry both through
       current += char + (key[i + 1] ?? '')
       i++
       continue
@@ -53,9 +57,6 @@ function splitKey(key: string): string[] {
   return segments
 }
 
-/** The escape character. A literal one in a value is always doubled. */
-const ESCAPE = '\\'
-
 /**
  * Canonical declaration order, which is the object's own key order.
  *
@@ -69,9 +70,12 @@ export function dimOrder(dims: Shape): string[] {
 /**
  * The columns every live row a snapshot returns carries, added after the
  * metric's own. A dim or field of either name would be overwritten in every
- * snapshot row.
+ * snapshot row. The same two keys as `LiveFields` in runtime/live.ts.
  */
-export const LIVE_ROW_COLUMNS = ['bucket_open', 'bucket_elapsed_ms'] as const
+const LIVE_ROW_COLUMNS: readonly string[] = [
+  'bucket_open',
+  'bucket_elapsed_ms',
+] satisfies readonly (keyof LiveFields)[]
 
 /**
  * True for a key JavaScript lists before every other key.
@@ -108,7 +112,7 @@ export function assertShapeNames(
     )
   }
   for (const key of Object.keys(shape)) {
-    if ((LIVE_ROW_COLUMNS as readonly string[]).includes(key)) {
+    if (LIVE_ROW_COLUMNS.includes(key)) {
       throw new Error(
         `${metricName}: a ${noun} cannot be named ${JSON.stringify(key)}, because every row ` +
           'snapshot() returns carries a column of that name',
@@ -187,7 +191,7 @@ export function hasLoneSurrogate(text: string): boolean {
   return LONE_SURROGATE.test(text)
 }
 
-export function encodeDimValue(type: FieldType, value: unknown): string {
+function encodeDimValue(type: FieldType, value: unknown): string {
   if (type.kind === 'ts') return String((value as Date).getTime())
   if (type.kind === 'bool') return value ? 'true' : 'false'
 
@@ -201,7 +205,7 @@ export function encodeDimValue(type: FieldType, value: unknown): string {
   return text
 }
 
-export function decodeDimValue(type: FieldType, raw: string): unknown {
+function decodeDimValue(type: FieldType, raw: string): unknown {
   if (type.kind === 'ts') return new Date(Number(raw))
   if (type.kind === 'bool') return raw === 'true'
   if (type.kind === 'int' || type.kind === 'float') return Number(raw)
@@ -271,7 +275,7 @@ export function applyDimDefaults(
   const filled: Record<string, unknown> = { ...values }
 
   for (const [key, type] of Object.entries(dims)) {
-    // only a genuinely absent key is filled — a falsy value the caller
+    // only a genuinely absent key is filled. A falsy value the caller
     // supplied is theirs, and '' or 0 must survive
     if (own(filled, key) === undefined && type.hasDefault) {
       filled[key] = type.defaultValue
@@ -286,7 +290,7 @@ export function applyDimDefaults(
  *
  * `noun` names what is being checked in the error text. Dims are the default
  * because they were the first caller; event fields pass `'field'`, and the
- * only difference between the two is what a mistake should be called — the
+ * only difference between the two is what a mistake should be called. The
  * required/optional/default rules are identical.
  */
 export function validateDims(dims: Shape, values: Record<string, unknown>, noun = 'dim'): void {

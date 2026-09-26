@@ -1,11 +1,11 @@
 /**
- * Delivery — how a house gets rows out, as distinct from what a metric
+ * Delivery. How a house gets rows out, as distinct from what a metric
  * measures.
  *
  * A metric declares **measurement**: resolution, dims, which aggregates it
  * keeps. Those decide what the data *means*, and they belong in the schema
  * file that travels between deployments. How that data reaches your `write()`
- * is a property of the **deployment**, not of the metric — a dev branch on the
+ * is a property of the **deployment**, not of the metric. A dev branch on the
  * memory driver and a production fleet on Redis run the same schema and want
  * opposite answers.
  *
@@ -16,10 +16,10 @@
  *
  * **The two storage models diverge here**, and the difference is not cosmetic:
  *
- * - A **staged** kind — event, log — is complete the moment it is recorded, so
+ * - A **staged** kind (event, log) is complete the moment it is recorded, so
  *   immediate delivery claims it and ships it exactly as a flush would, just
  *   without waiting for one. The records leave the driver.
- * - A **bucketed** kind — counter, gauge, timer — is *not* complete: its bucket
+ * - A **bucketed** kind (counter, gauge, timer) is *not* complete: its bucket
  *   is still open and still folding. Immediate delivery ships the **cumulative**
  *   open bucket through the read path and deletes nothing, so each send carries
  *   a running total that supersedes the one before it. Shipping one row per
@@ -29,10 +29,10 @@
  *
  * That asymmetry means immediate delivery **replaces** flush for staged kinds
  * and **does not** for bucketed ones. A bucketed metric still needs
- * `metric.flush()` — from a scheduler tick, a cron, or `house.flush()` — to
+ * `metric.flush()`, from a scheduler tick, a cron, or `house.flush()`, to
  * claim and delete its closed buckets, or they accumulate in the driver
  * forever. The final flush row carries the same id and the complete fold, so it
- * supersedes every partial send — the two paths converge rather than fight.
+ * supersedes every partial send, and the two paths converge rather than fight.
  */
 
 import type { DriverCapabilities } from '../drivers/types.js'
