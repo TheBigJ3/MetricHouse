@@ -144,8 +144,21 @@ One row per path, per minute. That is the whole point.
 ::: tip Nothing ships until its window has closed
 A flush only takes windows that have finished. If you call `flush()` one second
 after `add()`, the minute is still open and you will get
-`{ buckets: 0, rows: 0 }`. Use `flush({ force: true })` in a test, or move on to
-the next step and let the scheduler handle it.
+`{ buckets: 0, rows: 0 }`. `flush({ force: true })` returns the same, since
+`force` waives the cadence and leaves the open window alone. In a test, give
+the house a clock you control and move it past the end of the window and its
+two second grace:
+
+```ts
+let clock = Date.parse('2026-09-17T14:03:00Z')
+const house = createHouse({ driver: memory(), schema, now: () => clock })
+
+pageViews.add({ path: '/pricing' })
+clock += 62_000               // the minute has ended, and so has its grace
+await pageViews.flush()       // { buckets: 1, rows: 1, skipped: false }
+```
+
+Otherwise, move on to the next step and let the scheduler handle it.
 :::
 
 ## Step 6: make it ship on its own

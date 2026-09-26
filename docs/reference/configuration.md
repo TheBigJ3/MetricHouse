@@ -48,7 +48,7 @@ counter(name, { dims, resolution, flush, grace, value, write })
 | `dims` | shape | none | Labels to break the number down by |
 | `resolution` | duration | required | How wide one window is |
 | `flush` | duration | house default | The fastest this may ship |
-| `grace` | duration | `'2s'` | How long a window waits for writes on their way |
+| `grace` | duration | house default, then `'2s'` | How long a window waits for writes on their way |
 | `value` | `int()` or `float()` | `int()` | Whether fractions are allowed |
 | `write` | `WriteFn` | required | Where the rows go |
 
@@ -65,7 +65,7 @@ gauge(name, { dims, resolution, flush, grace, aggregate, write })
 | `dims` | shape | none | Labels to break the value down by |
 | `resolution` | duration | required | How wide one window is |
 | `flush` | duration | house default | The fastest this may ship |
-| `grace` | duration | `'2s'` | How long a window waits for observations on their way |
+| `grace` | duration | house default, then `'2s'` | How long a window waits for observations on their way |
 | `aggregate` | array | `['last','min','max','sum','count']` | Which columns reach your sink |
 | `write` | `WriteFn` | required | Where the rows go |
 
@@ -82,7 +82,7 @@ level(name, { dims, resolution, flush, grace, holdFor, value, write })
 | `dims` | shape | none | Labels to break the value down by |
 | `resolution` | duration | required | How wide one window is |
 | `flush` | duration | house default | The fastest this may ship |
-| `grace` | duration | `'2s'` | How long a window waits for writes on their way |
+| `grace` | duration | house default, then `'2s'` | How long a window waits for writes on their way |
 | `holdFor` | duration | forever | How long a series keeps reporting after its last write |
 | `value` | `float()` or `int()` | `float()` | Whether fractions are allowed |
 | `write` | `WriteFn` | required | Where the rows go |
@@ -102,7 +102,7 @@ timer(name, { dims, resolution, flush, grace, aggregate, record, write })
 | `dims` | shape | none | Labels to break the duration down by |
 | `resolution` | duration | required | How wide one window is |
 | `flush` | duration | house default | The fastest this may ship |
-| `grace` | duration | `'2s'` | How long a window waits for timings on their way |
+| `grace` | duration | house default, then `'2s'` | How long a window waits for timings on their way |
 | `aggregate` | array | `['min','max','sum','count']` | Which columns reach your sink |
 | `record` | event name | none | An event every timing is also written to |
 | `write` | `WriteFn` | required | Where the rows go |
@@ -178,7 +178,7 @@ ioredis(clientOrFactory, { namespace, maxPipelineSize, recoverAfter })
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `namespace` | string | `'mh'` | Key prefix, with no colon or whitespace. Two houses sharing one Redis need different ones |
-| `maxPipelineSize` | number | `1000` | Commands or Lua scripts per round trip |
+| `maxPipelineSize` | number | `1000` | Commands or Lua scripts per round trip. A positive whole number, or the driver throws when it is created |
 | `recoverAfter` | duration | `'5m'` | How long a claim may be held before a flush treats it as abandoned |
 
 Pass a function rather than a client to delay connecting until the first write.
@@ -206,13 +206,14 @@ rule that `resolution` must divide `flush`.
 
 ```ts
 metric.flush({ force })
-house.flush({ force, only })
+house.flush({ force, only, strict })
 ```
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `force` | boolean | `false` | Ignore the cadence and ship everything finished |
 | `only` | array of names | every metric | Restrict the flush to these metrics. House only |
+| `strict` | boolean | `false` | Reject an `only` naming a metric the house does not hold. House only |
 
 [Flush options](/reference/flush-options) also covers every field of the report
 that comes back.
@@ -221,7 +222,7 @@ that comes back.
 
 ```ts
 metric.snapshot({ dims, from, to, complete, rollup, groupBy, orderBy, direction, limit })
-house.snapshot({ only, ...theSame })
+house.snapshot({ only, strict, ...theSame })
 ```
 
 | Option | Type | Default | Meaning |
@@ -236,6 +237,7 @@ house.snapshot({ only, ...theSame })
 | `direction` | `'asc'` or `'desc'` | `'desc'` | Sort direction |
 | `limit` | number | none | Take this many, after sorting |
 | `only` | array of names | every metric | House only |
+| `strict` | boolean | `false` | Reject an `only` naming a metric the house does not hold. House only |
 
 [Snapshot options](/reference/snapshot-options) covers what each metric type
 does with them, and how the row type follows.

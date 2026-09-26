@@ -385,6 +385,14 @@ export function orderAndLimit<R extends Record<string, unknown>>(
 ): R[] {
   const { orderBy, limit } = options
   if (limit !== undefined) assertLimit(limit, metric)
+  const direction = options.direction ?? 'desc'
+  // a value from JavaScript or from config gets past the type, and anything
+  // but 'desc' would otherwise be taken as 'asc'
+  if (direction !== 'asc' && direction !== 'desc') {
+    throw new Error(
+      `${metric}: direction must be 'asc' or 'desc', got ${JSON.stringify(direction)}`,
+    )
+  }
 
   if (orderBy !== undefined) {
     // any row will do, not only the first: a merged gauge row can leave
@@ -397,7 +405,7 @@ export function orderAndLimit<R extends Record<string, unknown>>(
       )
     }
 
-    const sign = (options.direction ?? 'desc') === 'desc' ? -1 : 1
+    const sign = direction === 'desc' ? -1 : 1
     rows.sort((a, b) => {
       // a row without the column goes last whichever way the sort runs, so
       // a top ten is ten rows that have the value being ranked

@@ -643,6 +643,7 @@ describe('observe() precision', () => {
     const latency = bound()
     let runs = 0
     const query = {
+      where: () => query,
       // biome-ignore lint/suspicious/noThenProperty: a thenable is the point
       then(resolve: (rows: number[]) => void) {
         runs += 1
@@ -650,8 +651,25 @@ describe('observe() precision', () => {
       },
     }
     const returned = latency.time({ route: '/a', status: 'ok' }, () => query)
+    expect(returned).toBeInstanceOf(Promise)
     expect(await returned).toEqual([1, 2, 3])
     expect(runs).toBe(1)
+  })
+
+  it('types a thenable that is not a Promise as a Promise of its result', () => {
+    const latency = bound()
+    const query = {
+      where: () => query,
+      // biome-ignore lint/suspicious/noThenProperty: a thenable is the point
+      then(resolve: (rows: number[]) => void) {
+        resolve([1, 2, 3])
+      },
+    }
+    const returned = latency.time({ route: '/a', status: 'ok' }, () => query)
+    const typed: Promise<number[]> = returned
+    void typed
+    // @ts-expect-error the builder is not what comes back, so neither are its methods
+    expect(returned.where).toBeUndefined()
   })
 
   it('records a finite duration too large to scale to microseconds', async () => {

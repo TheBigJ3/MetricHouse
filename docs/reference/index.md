@@ -80,10 +80,10 @@ Everything on the object `createHouse()` returns.
 | `house.metrics()` | `AnyMetric[]` | Every registered metric, in the order they were registered |
 | `house.get(name)` | `AnyMetric \| undefined` | One metric by name |
 | `house.delivery` | `DeliveryMode` | `'staged'` or `'immediate'`. A house configured with `'auto'` has already picked one |
-| `house.flush(options?)` | `Promise<FlushReport>` | Flushes every metric, one after another. Each still waits for its own cadence unless you pass `force` |
+| `house.flush(options?)` | `Promise<FlushReport>` | Flushes every metric, one after another. Each still waits for its own cadence unless you pass `force`. Names in `only` that match no metric come back in `unmatched` |
 | `house.start()` | `void` | Gives every metric a timer that flushes it at its own cadence. Calling it again does nothing |
 | `house.running` | `boolean` | `true` between `start()` and `stop()` |
-| `house.stop()` | `Promise<FlushReport>` | Clears the timers, waits for queued writes to reach the driver, then flushes every metric ignoring cadence |
+| `house.stop()` | `Promise<FlushReport>` | Clears the timers, waits for every running flush and for queued writes to reach the driver, then flushes every metric ignoring cadence |
 | `house.drain()` | `Promise<void>` | Resolves once every queued write has reached the driver |
 | `house.snapshot(options?)` | `Promise<HouseSnapshot>` | Every metric's unshipped rows, keyed by metric name |
 | `house.current()` | `Promise<HouseSnapshot>` | Only the windows still filling, for counters, gauges, levels and timers |

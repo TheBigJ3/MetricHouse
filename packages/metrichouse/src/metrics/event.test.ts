@@ -1193,6 +1193,24 @@ describe('claimLimit at drain, stop and maxAge', () => {
     expect(await views.pending()).toBe(5)
   })
 
+  it('offers every record once on drain when the sink throws rather than rejects', async () => {
+    const sent: string[][] = []
+    const views = event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      claimLimit: 2,
+      write: (rows) => {
+        sent.push(rows.map((row) => row.path))
+        throw new Error('down')
+      },
+    })
+    createHouse({ driver: memory(), schema: [views], onError: () => {} })
+    views.recordMany(Array.from({ length: 5 }, (_, i) => ({ path: `/${i}` })))
+    await views.drain()
+    expect(sent).toEqual([['/0', '/1'], ['/2', '/3'], ['/4']])
+    expect((await views.peek()).map((row) => row.path)).toEqual(['/0', '/1', '/2', '/3', '/4'])
+  })
+
   it('starts the age clock for what a full batch left behind', async () => {
     vi.useFakeTimers()
     try {

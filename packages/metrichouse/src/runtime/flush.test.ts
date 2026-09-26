@@ -7,7 +7,7 @@ import { event } from '../metrics/event.js'
 import { gauge } from '../metrics/gauge.js'
 import { log } from '../metrics/log.js'
 import { timer } from '../metrics/timer.js'
-import type { Row, WriteContext, WriteFn } from '../metrics/types.js'
+import { type Row, SETTLE, type WriteContext, type WriteFn } from '../metrics/types.js'
 import { oneOf, type Shape, str } from '../schema/types.js'
 import { createHouse, type House } from './house.js'
 
@@ -185,6 +185,67 @@ describe('only', () => {
     const report = await house.flush({ only: ['a'] })
     expect(report.metrics.a?.skipped).toBe(false)
     expect(report.metrics.b).toMatchObject({ skipped: true, reason: 'not-selected' })
+    expect(report.unmatched).toEqual([])
+  })
+
+  it('reports an empty unmatched list when there is no only', async () => {
+    const house = createHouse({ driver, schema: [make('a')], now })
+    expect((await house.flush()).unmatched).toEqual([])
+  })
+
+  it('lists each name that matched no metric once, in the order given, and still flushes', async () => {
+    const write = vi.fn()
+    const a = make('a', { write })
+    const house = createHouse({ driver, schema: [a, make('b')], now })
+    a.add(A)
+    await house.drain()
+    settle()
+
+    const report = await house.flush({ only: ['a', 'typo', 'b_', 'typo'] })
+    expect(report.unmatched).toEqual(['typo', 'b_'])
+    expect(report.ok).toBe(true)
+    expect(report.metrics.a).toMatchObject({ skipped: false, rows: 1 })
+    expect(report.metrics.b).toMatchObject({ skipped: true, reason: 'not-selected' })
+  })
+
+  it('matches a metric registered after startup', async () => {
+    const house = createHouse({ driver, schema: [make('a')], now })
+    expect((await house.flush({ only: ['late'] })).unmatched).toEqual(['late'])
+
+    house.register(make('late'))
+    const report = await house.flush({ only: ['late'], strict: true })
+    expect(report.unmatched).toEqual([])
+    expect(report.metrics.late).toMatchObject({ skipped: false })
+  })
+
+  it('throws under strict for one unmatched name, before anything ships', async () => {
+    const write = vi.fn()
+    const a = make('a', { write })
+    const house = createHouse({ driver, schema: [a, make('b')], now })
+    a.add(A)
+    await house.drain()
+    settle()
+
+    await expect(house.flush({ only: ['a', 'typo'], strict: true })).rejects.toThrow(
+      'house.flush: only names "typo", which is not a registered metric. The registered ' +
+        'metrics are [a, b]',
+    )
+    expect(write).not.toHaveBeenCalled()
+  })
+
+  it('names every unmatched name under strict', async () => {
+    const house = createHouse({ driver, schema: [make('a')], now })
+    await expect(house.flush({ only: ['x', 'y'], strict: true })).rejects.toThrow(
+      'house.flush: only names "x", "y", which are not registered metrics. The registered ' +
+        'metrics are [a]',
+    )
+  })
+
+  it('says none is registered under strict on an empty house', async () => {
+    const house = createHouse({ driver, now })
+    await expect(house.flush({ only: ['x'], strict: true })).rejects.toThrow(
+      'house.flush: only names "x", which is not a registered metric. None is registered',
+    )
   })
 })
 
@@ -1014,3 +1075,61 @@ describe('a scheduled tick that fires a moment early', () => {
     expect(await metric.flush()).toMatchObject({ skipped: true, reason: 'cadence' })
   })
 })
+
+describe('the wait for running flushes', () => {
+  it('resolves false with nothing running', async () => {
+    const metric = make('m')
+    createHouse({ driver, schema: [metric], now })
+    await expect(metric[SETTLE]?.()).resolves.toBe(false)
+  })
+
+  it('counts a flush that rejects as finished, and resolves true for waiting on it', async () => {
+    const metric = make('m')
+    const flushing = metric.flush()
+    await expect(metric[SETTLE]?.()).resolves.toBe(true)
+    await expect(flushing).rejects.toThrow('m: not bound to a house')
+  })
+
+  it('leaves a rejecting flush nobody awaits an unhandled rejection', async () => {
+    const metric = make('m')
+    const raised = await unhandledDuring(() => {
+      void metric.flush()
+    })
+    expect(raised).toEqual([
+      'm: not bound to a house. Pass it to createHouse({ schema }) before writing',
+    ])
+  })
+
+  it('raises nothing unhandled for a rejecting flush its caller awaits', async () => {
+    const metric = make('m')
+    const raised = await unhandledDuring(async () => {
+      await expect(metric.flush()).rejects.toThrow(
+        'm: not bound to a house. Pass it to createHouse({ schema }) before writing',
+      )
+    })
+    expect(raised).toEqual([])
+  })
+})
+
+/**
+ * The messages of every unhandled rejection raised during `run` and the
+ * macrotask after it. The runner's own listeners are set aside meanwhile, so
+ * one raised on purpose does not fail the run.
+ */
+async function unhandledDuring(run: () => unknown): Promise<string[]> {
+  const raised: string[] = []
+  const saved = process.listeners('unhandledRejection')
+  process.removeAllListeners('unhandledRejection')
+  const listen = (reason: unknown): void => {
+    raised.push(reason instanceof Error ? reason.message : String(reason))
+  }
+  process.on('unhandledRejection', listen)
+  try {
+    await run()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  } finally {
+    process.off('unhandledRejection', listen)
+    for (const listener of saved) process.on('unhandledRejection', listener)
+  }
+  return raised
+}

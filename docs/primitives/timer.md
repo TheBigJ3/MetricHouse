@@ -112,7 +112,7 @@ Identical to [the counter's](/primitives/counter#flush).
 ### grace
 
 ```ts
-grace?: DurationInput      // default: '2s'
+grace?: DurationInput      // default: the house default, then '2s'
 ```
 
 How long a window waits after it ends before a flush may claim it, so timings
@@ -235,7 +235,9 @@ const user = await httpLatency.time({ route: '/users/:id', status: 'ok' }, async
 asynchronous: the same `Promise` object, not a new one wrapping it. A thenable
 that is not a `Promise`, such as a query builder that runs its query each time
 `then` is called, is awaited exactly once, and a `Promise` of its result is
-returned in its place, so the work never runs twice.
+returned in its place, so the work never runs twice. The return type says the
+same, so calling a builder method such as `.where()` on the result is a type
+error rather than a crash when the program runs.
 
 The duration is recorded whether `fn` returns or throws. A request that times
 out after thirty seconds is the latency you most need to see, so dropping
@@ -419,7 +421,7 @@ httpLatency.rowShape().columns.map((c) => c.name)
 | `dims` | `Shape` | The declared dims |
 | `resolutionMs` | `number` | `resolution`, parsed |
 | `flushMs` | `number` | `flush`, parsed, including one taken from the house |
-| `graceMs` | `number` | `grace`, parsed. `2000` by default |
+| `graceMs` | `number` | `grace`, parsed, including one taken from the house. `2000` when neither sets it |
 | `aggregate` | `readonly GaugeAggregate[]` | The columns this timer writes |
 | `record` | `string \| undefined` | The event timings are also written to |
 | `isBound` | `boolean` | `true` once a house has registered it |

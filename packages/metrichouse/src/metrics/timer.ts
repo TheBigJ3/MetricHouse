@@ -129,6 +129,21 @@ export interface TimerHandle<D extends Shape> {
 }
 
 /** `time(fn)` is only legal when no dim is required. */
+/**
+ * What `time()` hands back for a function returning `T`.
+ *
+ * A Promise comes back as it is. Any other thenable, a query builder for one,
+ * is subscribed to once and replaced by a Promise of what it resolves to, so
+ * a builder method on the result does not exist at run time and is not
+ * offered by the type either. Anything else comes back unchanged.
+ */
+type TimeResult<T> =
+  T extends Promise<unknown>
+    ? T
+    : T extends { then(onFulfilled: (value: infer U) => unknown, ...rest: never[]): unknown }
+      ? Promise<U>
+      : T
+
 export type TimeArgs<D extends Shape, T> = [RequiredKeys<D>] extends [never]
   ? [fn: () => T] | [dims: InferShape<D>, fn: () => T]
   : [dims: InferShape<D>, fn: () => T]
@@ -167,11 +182,14 @@ export interface Timer<D extends Shape> extends AnyMetric {
    * and dropping failures would hide it. Split by outcome with a dim on
    * `start()`/`end()` instead.
    *
+   * A thenable that is not a Promise comes back as a Promise of its result.
+   * See {@link TimeResult}.
+   *
    * @throws before `fn` runs if the timer is unbound or the dims are invalid,
    * never after, when the work has already happened. Whatever `fn` throws is
    * rethrown unchanged.
    */
-  time<T>(...args: TimeArgs<D, T>): T
+  time<T>(...args: TimeArgs<D, T>): TimeResult<T>
 
   /**
    * Record a duration measured somewhere else, such as a query time a database

@@ -17,7 +17,7 @@ await house.flush({ force: true, only: ['http_requests'] })
 | Callable | Options | Returns |
 | --- | --- | --- |
 | `metric.flush(options?)` | [`force`](#force), [`final`](#final) | [`MetricFlushReport`](#the-metric-report) |
-| `house.flush(options?)` | [`force`](#force), [`final`](#final), [`only`](#only) | [`FlushReport`](#the-house-report) |
+| `house.flush(options?)` | [`force`](#force), [`final`](#final), [`only`](#only), [`strict`](#strict) | [`FlushReport`](#the-house-report) |
 | `house.stop()` | none, it passes `force` and `final` itself | [`FlushReport`](#the-house-report) |
 
 Every metric type takes the same options, whether it folds writes into windows
@@ -106,6 +106,38 @@ sequential on purpose: forty metrics flushing at once into one database is a
 burst nobody asked for. Use `metric.flush()` with `Promise.all` when you want
 the concurrency.
 
+A name that matches no registered metric flushes nothing, and the report lists
+it in [`unmatched`](#the-house-report), so a typo shows up there rather than as
+a metric that seems quiet.
+
+```ts
+const report = await house.flush({ only: ['app_log', 'chekout_attempted'] })
+report.unmatched   // ['chekout_attempted']
+```
+
+The call does not throw for it, because a metric can be registered later with
+[`house.register()`](/guide/the-house#registering-metrics), and a name for a
+metric that has not arrived yet is not a mistake. Pass [`strict`](#strict) when
+it is.
+
+### strict
+
+```ts
+strict?: boolean      // default false, house calls only
+```
+
+Rejects the call before anything is flushed when `only` names a metric the
+house does not hold.
+
+```ts
+await house.flush({ only: ['app_log', 'chekout_attempted'], strict: true })
+// Error: house.flush: only names "chekout_attempted", which is not a registered
+// metric. The registered metrics are [app_log, checkout_attempted]
+```
+
+Several unmatched names are all named, and a house with nothing registered says
+`None is registered`. Without `only`, `strict` has nothing to check.
+
 ## The metric report
 
 `metric.flush()` resolves with a report rather than rejecting, because a flush
@@ -159,6 +191,7 @@ const report = await house.flush()
 | `ok` | `boolean` | `false` when any metric reported an `error`. An `ackError` alone leaves it `true` |
 | `durationMs` | `number` | How long the whole fan out took |
 | `metrics` | `Record<string, MetricFlushReport>` | One report per metric, keyed by name |
+| `unmatched` | `string[]` | The names in [`only`](#only) that matched no registered metric, each once, in the order given. Empty when all matched or there was no `only` |
 | `throwIfFailed()` | `() => void` | Throws naming every metric that failed |
 
 ```ts

@@ -114,7 +114,8 @@ Three rules keep them working:
   seeded stand in, so the server and the browser draw the same bars.
 - **Their arithmetic has to match the library.** The resolution and flush
   sliders reject exactly the pairs `assertResolution` rejects, and show the same
-  error text. There is a check for this in the verification script.
+  error text. Nothing checks this automatically, so a change to
+  `assertResolution` needs the same change in `MhBucketExplorer.vue`.
 - **Biome cannot see a Vue template**, so `noUnusedVariables` and
   `noUnusedImports` are turned off for `.vue` in `biome.json`. Every other rule
   still applies.

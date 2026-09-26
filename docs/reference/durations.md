@@ -37,7 +37,7 @@ The settings a timer waits for take a narrower range, covered
 | --- | --- | --- |
 | [`resolution`](/primitives/counter#resolution) | counter, gauge, level, timer | required |
 | [`flush`](/primitives/counter#flush) | every metric type | the house default, then `'30s'` on event and log |
-| [`grace`](/primitives/counter#grace) | counter, gauge, level, timer | `'2s'` |
+| [`grace`](/primitives/counter#grace) | counter, gauge, level, timer | the house default, then `'2s'` |
 | [`holdFor`](/primitives/level#holdfor) | level | forever |
 | [`batch.maxAge`](/primitives/event#batch) | event, log | `'10s'` |
 | [`defaults.flush`](/reference/configuration#createhouse) | `createHouse` | none |

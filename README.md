@@ -67,7 +67,7 @@ you import `metrichouse/ioredis`.
 
 **[www.metrichouse.dev](https://www.metrichouse.dev/guide/getting-started)** has
 getting started, one page per primitive, deployment guides, worked examples, and
-an API reference. Every snippet in it is checked against the built package.
+an API reference.
 
 The site is a VitePress project in [`docs/`](docs/), so it runs locally too:
 
@@ -127,7 +127,7 @@ it ships to, so flushing one needs no house at all:
 
 ```ts
 await dogPoops.flush()
-// -> { rows: 12, buckets: 300, skipped: false }
+// -> { rows: 12, buckets: 7, skipped: false }
 ```
 
 Nothing ticks on its own. On a **long-lived process**, `house.start()` gives
@@ -158,27 +158,23 @@ Three separate knobs, and it is worth keeping them apart:
 | `start()` / `flush()` | what actually asks it to | you |
 
 Under-pumping costs freshness, never fidelity: a claim takes *every* closed
-bucket, so five minutes of one-second buckets arrive as 300 rows at once.
+bucket, so five minutes of one-second buckets arrive at once, one row for each
+series in each second that saw a write.
 
 ## Repository layout
 
 ```
-packages/             published to npm, the runtime and the CLI, split apart
-runtime-tests/        the same suite against Node, Bun, Deno, Workers, Edge, Lambda
-benchmarks/           write-path overhead, Lua contention, flush throughput
-examples/             small runnable apps, all in CI
-docs/                 the documentation site
+packages/             published to npm, today the one runtime package
+runtime-tests/        empty, nothing here runs yet
+benchmarks/           empty, nothing here runs yet
+examples/             empty, no runnable app is written yet
+docs/                 the documentation site, with worked examples in docs/examples
 ```
 
 One package: `metrichouse`, the runtime, small enough to ship to an edge
 bundle. Subpath exports keep the write path separate from the drivers. A CLI
 package will follow once the runtime exists. See
 [`packages/README.md`](packages/README.md).
-
-`runtime-tests/` and `benchmarks/` are level 1 because both design decisions
-they cover, a network call on the hot path and a write path that can be
-silently discarded by a serverless isolate, are only defensible with numbers
-and a matrix, not with prose.
 
 ## Where it stands
 

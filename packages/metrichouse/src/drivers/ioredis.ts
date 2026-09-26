@@ -102,7 +102,8 @@ export interface IoredisDriverOptions {
   readonly namespace?: string
 
   /**
-   * How many commands go into one pipelined round trip. Defaults to 1000.
+   * How many commands go into one pipelined round trip. Defaults to 1000. A
+   * value that is not a positive integer throws at construction.
    *
    * A batch larger than this is split. The cap is about the reply buffer and
    * the Lua stack, not about correctness: a split batch is still one logical
@@ -1257,7 +1258,14 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         'whitespace, because the driver builds every key by joining it to the rest with colons',
     )
   }
-  const maxPipeline = Math.max(1, options.maxPipelineSize ?? DEFAULT_MAX_PIPELINE)
+  const maxPipeline = options.maxPipelineSize ?? DEFAULT_MAX_PIPELINE
+  // `NaN`, from `Number()` of a variable that is not set, would split every
+  // batch into nothing and send no command at all while reporting success
+  if (!Number.isSafeInteger(maxPipeline) || maxPipeline <= 0) {
+    throw new Error(
+      `ioredis driver: maxPipelineSize must be a positive integer, got ${String(maxPipeline)}`,
+    )
+  }
   const recoverAfterMs = parseDuration(options.recoverAfter ?? DEFAULT_RECOVER_AFTER)
 
   const key = {
@@ -1283,9 +1291,25 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
   let connection: Promise<IoredisClient> | undefined
   /** A factory's client is the driver's to close; a passed client is not. */
   const ownsClient = typeof source === 'function'
+  /**
+   * The client, from the factory's first success.
+   *
+   * A factory that fails is not remembered as the answer. Every call waiting
+   * on that attempt gets its error, and the next call asks the factory again,
+   * so a failure at cold start, a secret not yet readable or a DNS name not yet
+   * resolving, does not fail every write for the rest of the process.
+   */
   function connect(): Promise<IoredisClient> {
     if (!connection) {
-      connection = Promise.resolve(typeof source === 'function' ? source() : source)
+      const attempt = new Promise<IoredisClient>((resolve) => {
+        resolve(typeof source === 'function' ? source() : source)
+      })
+      connection = attempt
+      // registered before any caller can wait on it, so it runs first and a
+      // caller that retries from its own catch reaches the factory again
+      attempt.catch(() => {
+        if (connection === attempt) connection = undefined
+      })
     }
     return connection
   }
@@ -1451,7 +1475,9 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           })
           results = merged
         }
-        out.push(...unwrap(results, what, start))
+        // one at a time: a spread passes every reply as an argument, and a
+        // pipeline of a hundred thousand replies overflows the stack
+        for (const reply of unwrap(results, what, start)) out.push(reply)
       } finally {
         for (const seq of seqs) if (seq > 0) unanswered.delete(seq)
       }
@@ -1473,7 +1499,8 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       for (const queue of commands.slice(start, start + maxPipeline)) queue(pipeline)
       // queued behind any write still loading its script, so a read issued
       // after a write sees it
-      out.push(...unwrap(await inOrder(async () => ({ reply: pipeline.exec() })), what))
+      const replies = unwrap(await inOrder(async () => ({ reply: pipeline.exec() })), what)
+      for (const reply of replies) out.push(reply)
     }
     return out
   }

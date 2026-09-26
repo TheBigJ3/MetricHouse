@@ -68,7 +68,13 @@ A record is complete the instant you write it, so immediate delivery claims it
 and ships it exactly as a flush would, just without waiting. Records leave the
 driver and are deleted normally.
 
-For these, immediate delivery **replaces** flushing.
+For these, immediate delivery **replaces** flushing while the sink succeeds.
+When a send fails, its records go back to where they were staged. A locally
+staged event retries them `batch.maxAge` later on its own. An event staged in
+the driver has no timer of its own, so its records wait until the next
+`record()` sends them together with the new one, or until a flush claims them.
+An event that can go quiet after a failure still wants a flush on a schedule,
+and `house.stop()` makes a final one.
 
 ### Counters, gauges and timers
 
@@ -122,7 +128,7 @@ the complete value.
 | | Events and logs | Counters, gauges, timers |
 | --- | --- | --- |
 | Immediate delivery replaces flush | Yes | No |
-| Still need to call flush | No | Yes, to retire finished windows |
+| Still need to call flush | Only to retry a failed send of a driver staged event | Yes, to retire finished windows |
 | Rows are deleted after sending | Yes | Only by a flush |
 | Duplicate ids in your table | No | Yes, keep the newest |
 

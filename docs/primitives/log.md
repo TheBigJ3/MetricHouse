@@ -239,7 +239,15 @@ are all optional or bound by a [`child()`](#log-child).
 and stages nothing.
 
 **Throws** on an unbound log, or on a field that is unknown, missing or ill
-typed. The message itself never throws, which is the next section.
+typed. A field named after a [column the log writes itself](#reserved-names),
+such as `error_stack`, throws too, whether the call passes it or a
+[`child()`](#log-child) bound it. The message itself never throws, which is the
+next section.
+
+```
+unknown field "userId". The declared fields are [service, requestId]
+app_log: "error_stack" is a column the log writes itself, so a line cannot pass it as a field
+```
 
 ### An Error as the message
 
@@ -319,20 +327,24 @@ Children nest, and each one adds to what its parent bound.
 ```ts
 const serviceLog = appLog.child({ service: 'checkout' })
 const requestLog = serviceLog.child({ requestId: 'req_9f21' })
-const userLog = requestLog.child({ userId: 'u_42' })
+
+requestLog.info('checkout opened')   // carries service and requestId
+requestLog.bound                     // { service: 'checkout', requestId: 'req_9f21' }
 ```
 
 A bound field becomes omittable rather than absent in the child's type, so
 `child({ service })` satisfies a required field and a call site may still
 override it. Passing it as `undefined` at the call site does not count as an
-override: the bound value stays.
+override: the bound value stays. The same goes for a nested `child()` that
+passes a bound field as `undefined`.
 
 ```ts
 requestLog.info('retrying', { requestId: 'req_9f22' })   // the call site wins
 ```
 
 A child carries the same level methods, `at()` and `child()`, plus `bound`,
-which is a frozen copy of the fields it adds.
+which is a frozen copy of every field it merges in, including the ones its
+parents bound.
 
 | Member | Type | Meaning |
 | --- | --- | --- |
@@ -505,7 +517,9 @@ import { RESERVED_LOG_COLUMNS } from 'metrichouse/core'
 ```
 
 A declared field may not take one of those names. A level may not shadow a
-method on the logger. Both are checked at declaration.
+method on the logger. Both are checked at declaration. A line that passes one of
+those names as a field throws when it is written, so `error_stack` only ever
+holds the stack of an `Error` message.
 
 ### Queries
 

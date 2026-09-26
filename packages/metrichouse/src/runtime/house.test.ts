@@ -4,6 +4,7 @@ import type { Driver } from '../drivers/types.js'
 import { rowId } from '../identity.js'
 import { counter } from '../metrics/counter.js'
 import { event } from '../metrics/event.js'
+import { timer } from '../metrics/timer.js'
 import type { Row, WriteFn } from '../metrics/types.js'
 import { oneOf, str } from '../schema/types.js'
 import { createHouse } from './house.js'
@@ -427,4 +428,443 @@ describe('house.stop()', () => {
     expect(raised).toEqual(['clickhouse is down', 'clickhouse is down'])
     expect(shipped.map((row) => row.value)).toEqual([1])
   })
+
+  it('waits for a house flush still inside its sink, and ships what it put back', async () => {
+    const sink = hangingSink(1)
+    const signups = event('signups', { fields: { plan: str() }, write: sink.write })
+    const house = createHouse({ driver, schema: [signups], now })
+    signups.record({ plan: 'pro' })
+    await house.drain()
+
+    const cron = house.flush()
+    await vi.waitFor(() => expect(sink.waiting).toHaveLength(1))
+    signups.record({ plan: 'team' })
+    const stopping = watch(house.stop())
+    await macrotask()
+    expect(stopping.settled).toBe(false)
+
+    sink.waiting[0]?.(new Error('sink timed out'))
+    expect((await cron).metrics.signups?.error).toEqual(new Error('sink timed out'))
+    const report = await stopping.promise
+
+    expect(sink.shipped.map((row) => row.plan)).toEqual(['pro', 'team'])
+    expect(report.metrics.signups).toMatchObject({ rows: 2 })
+    expect(await signups.pending()).toBe(0)
+  })
+
+  it('waits for a direct metric.flush() still inside its sink', async () => {
+    const sink = hangingSink(1)
+    const requests = makeCounter('requests', { write: sink.write })
+    const house = createHouse({ driver, schema: [requests], now })
+    requests.add(3, WILLOW)
+    await house.drain()
+    clock += 3_000
+
+    const direct = requests.flush()
+    await vi.waitFor(() => expect(sink.waiting).toHaveLength(1))
+    const stopping = house.stop()
+    await macrotask()
+    sink.waiting[0]?.(new Error('sink timed out'))
+    expect((await direct).error).toEqual(new Error('sink timed out'))
+    const report = await stopping
+
+    expect(sink.shipped).toEqual([
+      {
+        id: rowId('requests', 1_788_616_987_000, 'Willow|riverside|solid'),
+        bucket_ts: new Date(1_788_616_987_000),
+        ...WILLOW,
+        value: 3,
+      },
+    ])
+    expect(report.metrics.requests).toMatchObject({ rows: 1 })
+    expect(await requests.snapshot({ complete: false })).toEqual([])
+  })
+
+  it('waits for a flush started while it is already waiting', async () => {
+    const sink = hangingSink(2)
+    const signups = event('signups', { fields: { plan: str() }, write: sink.write })
+    const house = createHouse({ driver, schema: [signups], now })
+    signups.record({ plan: 'pro' })
+    await house.drain()
+
+    const first = signups.flush()
+    await vi.waitFor(() => expect(sink.waiting).toHaveLength(1))
+    const stopping = watch(house.stop())
+    await macrotask()
+
+    signups.record({ plan: 'team' })
+    await signups.drain()
+    const second = signups.flush()
+    await vi.waitFor(() => expect(sink.waiting).toHaveLength(2))
+    sink.waiting[0]?.(new Error('sink timed out'))
+    await first
+    await macrotask()
+    expect(stopping.settled).toBe(false)
+
+    sink.waiting[1]?.(new Error('sink timed out'))
+    await second
+    const report = await stopping.promise
+
+    expect(sink.shipped.map((row) => row.plan)).toEqual(['pro', 'team'])
+    expect(report.metrics.signups).toMatchObject({ rows: 2 })
+    expect(await signups.pending()).toBe(0)
+  })
+
+  it('waits for a house flush that reaches its next metric after the one it was in', async () => {
+    const first = hangingSink(1)
+    const second = hangingSink(1)
+    const logins = makeCounter('logins', { write: first.write })
+    const requests = makeCounter('requests', { write: second.write })
+    const house = createHouse({ driver, schema: [logins, requests], now })
+    logins.add(2, WILLOW)
+    requests.add(5, WILLOW)
+    await house.drain()
+    clock += 3_000
+
+    const cron = house.flush()
+    await vi.waitFor(() => expect(first.waiting).toHaveLength(1))
+    const stopping = watch(house.stop())
+    await macrotask()
+    first.waiting[0]?.(new Error('sink timed out'))
+    // the cron moves on to requests while stop() is still waiting
+    await vi.waitFor(() => expect(second.waiting).toHaveLength(1))
+    await macrotask()
+    expect(stopping.settled).toBe(false)
+
+    second.waiting[0]?.(new Error('sink timed out'))
+    expect((await cron).metrics.requests?.error).toEqual(new Error('sink timed out'))
+    const report = await stopping.promise
+
+    expect(second.shipped).toEqual([
+      {
+        id: rowId('requests', 1_788_616_987_000, 'Willow|riverside|solid'),
+        bucket_ts: new Date(1_788_616_987_000),
+        ...WILLOW,
+        value: 5,
+      },
+    ])
+    expect(first.shipped.map((row) => row.value)).toEqual([2])
+    expect(report.metrics).toMatchObject({ logins: { rows: 1 }, requests: { rows: 1 } })
+    expect(await requests.snapshot({ complete: false })).toEqual([])
+    expect(await logins.snapshot({ complete: false })).toEqual([])
+  })
+
+  it('waits for a house flush started while it is already waiting for another', async () => {
+    const first = hangingSink(1)
+    const second = hangingSink(1)
+    const logins = makeCounter('logins', { write: first.write })
+    const requests = makeCounter('requests', { write: second.write })
+    const house = createHouse({ driver, schema: [logins, requests], now })
+    logins.add(2, WILLOW)
+    requests.add(5, WILLOW)
+    await house.drain()
+    clock += 3_000
+
+    const cron = house.flush({ only: ['logins'] })
+    await vi.waitFor(() => expect(first.waiting).toHaveLength(1))
+    const stopping = watch(house.stop())
+    await macrotask()
+    // finds logins already claimed by the first, and goes on to requests
+    const handler = house.flush()
+    await vi.waitFor(() => expect(second.waiting).toHaveLength(1))
+    first.waiting[0]?.(new Error('sink timed out'))
+    await cron
+    await macrotask()
+    expect(stopping.settled).toBe(false)
+
+    second.waiting[0]?.(new Error('sink timed out'))
+    expect((await handler).metrics.requests?.error).toEqual(new Error('sink timed out'))
+    const report = await stopping.promise
+
+    expect(second.shipped.map((row) => row.value)).toEqual([5])
+    expect(first.shipped.map((row) => row.value)).toEqual([2])
+    expect(report.metrics).toMatchObject({ logins: { rows: 1 }, requests: { rows: 1 } })
+    expect(await requests.snapshot({ complete: false })).toEqual([])
+  })
+
+  it('waits for a timer flush, which runs on the gauge underneath it', async () => {
+    const sink = hangingSink(1)
+    const latency = timer('latency', { resolution: '1s', flush: '5m', write: sink.write })
+    const house = createHouse({ driver, schema: [latency], now })
+    latency.observe(12)
+    await house.drain()
+    clock += 3_000
+
+    const direct = latency.flush()
+    await vi.waitFor(() => expect(sink.waiting).toHaveLength(1))
+    const stopping = house.stop()
+    await macrotask()
+    sink.waiting[0]?.(new Error('sink timed out'))
+    await direct
+    const report = await stopping
+
+    expect(sink.shipped).toEqual([
+      {
+        id: rowId('latency', 1_788_616_987_000, ''),
+        bucket_ts: new Date(1_788_616_987_000),
+        min: 12,
+        max: 12,
+        sum: 12,
+        count: 1,
+      },
+    ])
+    expect(report.metrics.latency).toMatchObject({ rows: 1 })
+  })
+
+  it('waits for a flush that starts while it drains writes', async () => {
+    const gated = gatedIncrements(driver)
+    const sink = hangingSink(1)
+    const logins = makeCounter('logins', { write: sink.write })
+    const requests = makeCounter('requests')
+    const house = createHouse({ driver: gated.driver, schema: [logins, requests], now })
+    logins.add(2, WILLOW)
+    await house.drain()
+    clock += 3_000
+
+    gated.close()
+    requests.add(5, WILLOW)
+    const stopping = watch(house.stop())
+    await macrotask()
+    const direct = logins.flush({ force: true })
+    await vi.waitFor(() => expect(sink.waiting).toHaveLength(1))
+    gated.open()
+    await macrotask()
+    expect(stopping.settled).toBe(false)
+
+    sink.waiting[0]?.(new Error('sink timed out'))
+    expect((await direct).error).toEqual(new Error('sink timed out'))
+    const report = await stopping.promise
+
+    expect(sink.shipped).toEqual([
+      {
+        id: rowId('logins', 1_788_616_987_000, 'Willow|riverside|solid'),
+        bucket_ts: new Date(1_788_616_987_000),
+        ...WILLOW,
+        value: 2,
+      },
+    ])
+    expect(report.metrics.logins).toMatchObject({ rows: 1 })
+    expect(await logins.snapshot({ complete: false })).toEqual([])
+  })
+
+  it('answers a second call while it runs with the same final flush', async () => {
+    const gated = gatedIncrements(driver)
+    const shipped: Row[] = []
+    const resume: (() => void)[] = []
+    const requests = makeCounter('requests', {
+      write: (rows: Row[]) => {
+        shipped.push(...rows)
+        return new Promise<void>((resolve) => {
+          resume.push(resolve)
+        })
+      },
+    })
+    const house = createHouse({ driver: gated.driver, schema: [requests], now })
+    requests.add(3, WILLOW)
+    await house.drain()
+    clock += 3_000
+
+    // a write still in flight holds the first call in its drain
+    gated.close()
+    requests.add(1, REX)
+    const first = watch(house.stop())
+    await macrotask()
+    const second = watch(house.stop())
+    gated.open()
+    await vi.waitFor(() => expect(resume).toHaveLength(1))
+    await macrotask()
+    expect(second.settled).toBe(false)
+
+    resume[0]?.()
+    const report = await first.promise
+    expect(await second.promise).toBe(report)
+    expect(shipped).toEqual([
+      {
+        id: rowId('requests', 1_788_616_987_000, 'Willow|riverside|solid'),
+        bucket_ts: new Date(1_788_616_987_000),
+        ...WILLOW,
+        value: 3,
+      },
+    ])
+    expect(report.metrics.requests).toMatchObject({ rows: 1 })
+  })
+
+  it('clears the timers a start() set while an earlier call was still running', async () => {
+    vi.useFakeTimers()
+    try {
+      const sink = hangingSink(1)
+      const requests = makeCounter('requests', { write: sink.write })
+      const sources: string[] = []
+      const views = event('views', {
+        fields: { path: str() },
+        stage: 'local',
+        batch: { maxAge: '10s' },
+        write: (_rows, context) => {
+          sources.push(context.source)
+          throw new Error('down')
+        },
+      })
+      const house = createHouse({ driver, schema: [requests, views], now, onError: () => {} })
+      requests.add(3, WILLOW)
+      views.record({ path: '/' })
+      await house.drain()
+      clock += 3_000
+
+      const direct = requests.flush()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(sink.waiting).toHaveLength(1)
+      const first = watch(house.stop())
+      await vi.advanceTimersByTimeAsync(0)
+      house.start()
+      const second = watch(house.stop())
+      expect(house.running).toBe(false)
+
+      sink.waiting[0]?.(new Error('sink timed out'))
+      await direct
+      const firstReport = await first.promise
+      const secondReport = await second.promise
+      expect(house.running).toBe(false)
+      expect(firstReport.metrics.requests).toMatchObject({ rows: 1 })
+      expect(secondReport.metrics.requests).toMatchObject({ rows: 0 })
+
+      // neither the scheduler nor a local retry calls a sink once both returned
+      requests.add(1, REX)
+      await house.drain()
+      clock += 600_000
+      const atStop = sources.length
+      await vi.advanceTimersByTimeAsync(600_000)
+      expect(sink.shipped.map((row) => row.value)).toEqual([3])
+      expect(sources.slice(atStop)).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('makes a final flush of its own when called again after it returned', async () => {
+    const shipped: Row[] = []
+    const requests = makeCounter('requests', {
+      write: (rows: Row[]) => {
+        shipped.push(...rows)
+      },
+    })
+    const house = createHouse({ driver, schema: [requests], now })
+    const first = await house.stop()
+    requests.add(3, WILLOW)
+    clock += 3_000
+    const second = await house.stop()
+
+    expect(second).not.toBe(first)
+    expect(second.metrics.requests).toMatchObject({ rows: 1 })
+    expect(shipped.map((row) => row.value)).toEqual([3])
+  })
+
+  it('leaves a rejecting house flush nobody awaits an unhandled rejection', async () => {
+    const house = createHouse({ driver, schema: [makeCounter('requests')], now })
+    const raised = await unhandledDuring(() => {
+      void house.flush({ only: ['logouts'], strict: true })
+    })
+    expect(raised).toEqual([
+      'house.flush: only names "logouts", which is not a registered metric. ' +
+        'The registered metrics are [requests]',
+    ])
+  })
+
+  it('raises nothing unhandled for a rejecting house flush its caller awaits', async () => {
+    const house = createHouse({ driver, schema: [makeCounter('requests')], now })
+    const raised = await unhandledDuring(async () => {
+      await expect(house.flush({ only: ['logouts'], strict: true })).rejects.toThrow(
+        'house.flush: only names "logouts"',
+      )
+    })
+    expect(raised).toEqual([])
+  })
 })
+
+/**
+ * `base` with its increments held back while the gate is closed, so a test
+ * can keep a write in flight for as long as it needs.
+ */
+function gatedIncrements(base: Driver) {
+  let gate: Promise<void> = Promise.resolve()
+  let release: () => void = () => {}
+  const gatedDriver: Driver = {
+    ...base,
+    increment: async (ops) => {
+      await gate
+      return base.increment(ops)
+    },
+  }
+  return {
+    driver: gatedDriver,
+    close(): void {
+      gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+    },
+    open(): void {
+      release()
+    },
+  }
+}
+
+/**
+ * The messages of every unhandled rejection raised during `run` and the
+ * macrotask after it. The runner's own listeners are set aside meanwhile, so
+ * one raised on purpose does not fail the run.
+ */
+async function unhandledDuring(run: () => unknown): Promise<string[]> {
+  const raised: string[] = []
+  const saved = process.listeners('unhandledRejection')
+  process.removeAllListeners('unhandledRejection')
+  const listen = (reason: unknown): void => {
+    raised.push(reason instanceof Error ? reason.message : String(reason))
+  }
+  process.on('unhandledRejection', listen)
+  try {
+    await run()
+    await macrotask()
+  } finally {
+    process.off('unhandledRejection', listen)
+    for (const listener of saved) process.on('unhandledRejection', listener)
+  }
+  return raised
+}
+
+/**
+ * A sink whose first `hang` calls wait until they are failed by hand, and
+ * which keeps the rows of every call after those.
+ */
+function hangingSink(hang: number) {
+  const shipped: Row[] = []
+  const waiting: ((error: Error) => void)[] = []
+  const write = (rows: Row[]): Promise<void> | undefined => {
+    if (waiting.length < hang) {
+      return new Promise<void>((_, reject) => {
+        waiting.push(reject)
+      })
+    }
+    shipped.push(...rows)
+    return undefined
+  }
+  return { shipped, waiting, write }
+}
+
+/** Let every pending promise callback run, and one timer turn pass. */
+function macrotask(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+/** A promise, and whether it has settled yet. */
+function watch<T>(promise: Promise<T>): { promise: Promise<T>; readonly settled: boolean } {
+  let settled = false
+  const done = (): void => {
+    settled = true
+  }
+  promise.then(done, done)
+  return {
+    promise,
+    get settled() {
+      return settled
+    },
+  }
+}

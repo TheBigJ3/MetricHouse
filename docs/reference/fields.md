@@ -225,7 +225,8 @@ reads `id, ts, level, message, error_stack`, then your fields, then
 | `timestamp field "occurredAt" declares str(), and it must be ts()` | `timestamp` pointing at the wrong type. At declaration |
 | `default for int(): expected a safe integer, got "five"` | `.default()` given a value its own type rejects. At declaration |
 | `missing required field "plan"` | A declared field with no value and no default |
-| `unknown field "pln". The declared fields are [userId, plan]` | A key that is not declared |
+| `unknown field "pln". The declared fields are [userId, plan]` | A key that is not declared. On a log the list holds only your fields, never the columns the log writes |
+| `app_log: "error_stack" is a column the log writes itself, so a line cannot pass it as a field` | A log line, or a child it came from, passing a reserved log column as a field |
 | `amountCents: expected a safe integer, got 49.99` | A value of the wrong type |
 | `at must be a Date or epoch milliseconds` | `record(fields, { at })` given something else |
 

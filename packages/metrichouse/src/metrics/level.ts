@@ -29,7 +29,7 @@ import {
   type SnapshotOptions,
   snapshotRange,
 } from '../runtime/live.js'
-import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
+import { assertDimsLegal, decodeDimKey, encodeDimKey, isShorterDimKey } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketRange, bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
@@ -327,7 +327,23 @@ export function level<D extends Shape = Record<never, never>>(
 
     let total = 0
     for (const value of latest.values()) total += value
-    return { value: total }
+    return { value: exactSum(total, 'a merged value') }
+  }
+
+  /**
+   * A sum across series, refused for an integer level when a double cannot
+   * hold it exactly. The counter's rule: each series stays below
+   * `Number.MAX_SAFE_INTEGER` on its own, but several added together can pass
+   * it and come back as a different whole number with nothing to say so.
+   */
+  function exactSum(total: number, what: string): number {
+    if (!isFloat && !Number.isSafeInteger(total)) {
+      throw new Error(
+        `${name}: ${what} would be ${total}, which is past ${Number.MAX_SAFE_INTEGER}, the ` +
+          'largest whole number a double holds exactly',
+      )
+    }
+    return total
   }
 
   /**
@@ -348,6 +364,21 @@ export function level<D extends Shape = Record<never, never>>(
   }
 
   /**
+   * True when a held series belongs to the declaration as it is now.
+   *
+   * A series stored before a dim was added at the end has a key with fewer
+   * values than the dims declared, and the metric never writes to that key
+   * again. Carrying it would ship it in every later window beside the series
+   * that replaced it, and add it into every total, for as long as it is held.
+   * So it ships the windows it was written in and nothing after them. Its
+   * stored data is left alone. The flush, a snapshot, `current()` and
+   * `totals()` all ask this one function, so they agree about it.
+   */
+  function carries(one: LevelSeries): boolean {
+    return !isShorterDimKey(dims, one.dimKey)
+  }
+
+  /**
    * Every series still reporting in the open window.
    *
    * A series past its `holdFor` is only removed from storage by the next
@@ -356,7 +387,7 @@ export function level<D extends Shape = Record<never, never>>(
    * a series at its last window.
    */
   async function heldNow(): Promise<LevelSeries[]> {
-    const series = await slot.driver().readLevels(name)
+    const series = (await slot.driver().readLevels(name)).filter(carries)
     if (holdForMs === undefined) return series
     const open = bucketStart(slot.now(), resolutionMs)
     return series.filter((one) => open < (holdUntil(one) ?? Number.POSITIVE_INFINITY))
@@ -454,7 +485,7 @@ export function level<D extends Shape = Record<never, never>>(
     for (const one of series) {
       // an expiring series is carried to its last window and no further
       const until = Math.min(watermark, holdUntil(one) ?? watermark)
-      if (one.heldThrough + resolutionMs < until) {
+      if (carries(one) && one.heldThrough + resolutionMs < until) {
         carrying.push({ series: one, until })
         earliest = Math.min(earliest, one.heldThrough + resolutionMs)
       }
@@ -552,6 +583,7 @@ export function level<D extends Shape = Record<never, never>>(
       cell: row.value,
     }))
     for (const one of series) {
+      if (!carries(one)) continue
       const until = Math.min(upper, holdUntil(one) ?? upper)
       const capAt = Math.min(until, flushUpTo)
       for (const window of walkCarry(one, written.get(one.dimKey), until, capAt)) {
@@ -662,7 +694,10 @@ export function level<D extends Shape = Record<never, never>>(
     async totals(): Promise<number | undefined> {
       const series = await heldNow()
       if (series.length === 0) return undefined
-      return series.reduce((sum, one) => sum + one.value, 0)
+      return exactSum(
+        series.reduce((sum, one) => sum + one.value, 0),
+        'the total across series',
+      )
     },
 
     drain(): Promise<void> {

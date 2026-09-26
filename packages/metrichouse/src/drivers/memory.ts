@@ -199,6 +199,18 @@ function assertFinite(value: number, metric: string, what: string): void {
   }
 }
 
+/**
+ * A cell a read can hand out.
+ *
+ * A gauge fold and a level cell are objects, and handing out the stored one
+ * lets a caller who edits what `gauge.current()` returned change the row a
+ * later flush ships. Redis hands back a fresh object on every read, and this
+ * does the same.
+ */
+function copied(cell: Cell): Cell {
+  return typeof cell === 'number' ? cell : { ...cell }
+}
+
 /** The value `map` holds under `key`, made and stored first if it holds none. */
 function getOrCreate<K, V>(map: Map<K, V>, key: K, make: () => V): V {
   let value = map.get(key)
@@ -703,10 +715,11 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         // window made them slower the more series it held
         if (query.dimKey !== undefined) {
           const value = bucket.get(query.dimKey)
-          if (value !== undefined) rows.push({ bucketTs, dimKey: query.dimKey, value })
+          if (value !== undefined)
+            rows.push({ bucketTs, dimKey: query.dimKey, value: copied(value) })
           continue
         }
-        for (const [dimKey, value] of bucket) rows.push({ bucketTs, dimKey, value })
+        for (const [dimKey, value] of bucket) rows.push({ bucketTs, dimKey, value: copied(value) })
       }
 
       // deterministic order, so callers and tests never depend on Map insertion

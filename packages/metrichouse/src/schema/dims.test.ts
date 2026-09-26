@@ -7,10 +7,11 @@ import {
   dimOrder,
   encodeDimKey,
   escapeDimValue,
+  isShorterDimKey,
   unescapeDimValue,
   validateDims,
 } from './dims.js'
-import { bool, int, json, oneOf, str, ts } from './types.js'
+import { bool, float, int, json, oneOf, str, ts } from './types.js'
 
 // built per test, so no test can change the shape another one reads
 const makeDims = () => ({ dogName: str(), park: str(), kind: oneOf(['solid', 'liquid']) })
@@ -189,13 +190,66 @@ describe('decodeDimKey', () => {
     }
   })
 
-  it('rejects a key with the wrong number of segments', () => {
-    expect(() => decodeDimKey(dims, 'Willow|riverside')).toThrow(
-      'decodeDimKey: expected 3 segments for [dogName, park, kind], got 2',
-    )
+  it('reads the dims a key written before they were added as absent', () => {
+    const decoded = decodeDimKey(dims, 'Willow|riverside')
+    expect(decoded).toEqual({ dogName: 'Willow', park: 'riverside' })
+    expect('kind' in decoded).toBe(false)
+  })
+
+  it('rejects a key with more segments than dims', () => {
     expect(() => decodeDimKey(dims, 'Willow|riverside|solid|extra')).toThrow(
-      'decodeDimKey: expected 3 segments for [dogName, park, kind], got 4',
+      'decodeDimKey: expected at most 3 segments for [dogName, park, kind], got 4',
     )
+  })
+
+  it('reads the empty key as every dim absent when two or more are declared', () => {
+    expect(decodeDimKey({ shard: int(), route: str() }, '')).toEqual({})
+    expect(decodeDimKey({ route: str(), shard: int() }, '')).toEqual({})
+  })
+
+  it('reads the empty key as a single dim absent when its type never encodes to empty', () => {
+    for (const type of [int(), float(), bool(), ts(), oneOf(['a', 1])]) {
+      expect(decodeDimKey({ only: type }, '')).toEqual({})
+    }
+  })
+
+  it('reads the empty key as the empty value of a single dim that can encode to it', () => {
+    expect(decodeDimKey({ only: str() }, '')).toEqual({ only: '' })
+    expect(decodeDimKey({ only: oneOf(['', 'a']) }, '')).toEqual({ only: '' })
+  })
+})
+
+describe('isShorterDimKey', () => {
+  it('is false for the empty key of a metric with no dims', () => {
+    expect(isShorterDimKey({}, '')).toBe(false)
+  })
+
+  it('is true for the empty key under two or more dims', () => {
+    expect(isShorterDimKey({ a: str(), b: str() }, '')).toBe(true)
+  })
+
+  it('is true for the empty key under one dim that never encodes to empty', () => {
+    expect(isShorterDimKey({ a: int() }, '')).toBe(true)
+  })
+
+  it('is false for the empty key under one dim that can encode to empty', () => {
+    expect(isShorterDimKey({ a: str() }, '')).toBe(false)
+    expect(isShorterDimKey({ a: oneOf(['', 'x']) }, '')).toBe(false)
+  })
+
+  it('is true for a key with fewer segments than dims', () => {
+    expect(isShorterDimKey(dims, 'Willow|riverside')).toBe(true)
+  })
+
+  it('counts an escaped separator as part of a value', () => {
+    // `a\|b` is one escaped value, so these keys hold three segments and two
+    expect(isShorterDimKey(dims, 'a\\|b|riverside|solid')).toBe(false)
+    expect(isShorterDimKey(dims, 'a\\|b|riverside')).toBe(true)
+  })
+
+  it('is false for a key with as many segments as dims, or more', () => {
+    expect(isShorterDimKey(dims, 'Willow|riverside|solid')).toBe(false)
+    expect(isShorterDimKey(dims, 'Willow|riverside|solid|extra')).toBe(false)
   })
 })
 

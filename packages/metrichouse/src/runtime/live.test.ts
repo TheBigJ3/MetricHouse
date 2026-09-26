@@ -258,6 +258,15 @@ describe('counter.snapshot', () => {
     await expect(dogPoops.snapshot({ orderBy: 'nope' })).rejects.toThrow(/not a column/)
   })
 
+  it('refuses a direction it does not know', async () => {
+    const dogPoops = makeCounter()
+    const house = createHouse({ driver, schema: [dogPoops], now })
+    await seed(dogPoops, house)
+    await expect(
+      dogPoops.snapshot({ orderBy: 'value', direction: 'up' as unknown as 'asc' }),
+    ).rejects.toThrow(`dog_poops: direction must be 'asc' or 'desc', got "up"`)
+  })
+
   it('cannot see data a flush has claimed', async () => {
     const dogPoops = makeCounter()
     const house = createHouse({ driver, schema: [dogPoops], now })
@@ -490,6 +499,29 @@ describe('house.snapshot', () => {
     await house.drain()
 
     expect(Object.keys(await house.snapshot({ only: ['signups'] }))).toEqual(['signups'])
+  })
+
+  it('reads nothing for a name no metric has, without throwing', async () => {
+    const { house } = build()
+    expect(await house.snapshot({ only: ['typo'] })).toEqual({})
+  })
+
+  it('throws under strict when only names a metric the house does not hold', async () => {
+    const { house } = build()
+    await expect(house.snapshot({ only: ['signups', 'typo'], strict: true })).rejects.toThrow(
+      'house.snapshot: only names "typo", which is not a registered metric. The registered ' +
+        'metrics are [dog_poops, signups]',
+    )
+  })
+
+  it('reads under strict when every name matches', async () => {
+    const { signups, house } = build()
+    signups.record({ plan: 'pro' })
+    await house.drain()
+
+    const snapshot = await house.snapshot({ only: ['signups'], strict: true })
+    expect(Object.keys(snapshot)).toEqual(['signups'])
+    expect(snapshot.signups).toHaveLength(1)
   })
 
   it('takes one set of options across a mixed schema', async () => {

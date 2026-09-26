@@ -48,7 +48,7 @@ house.start()
 
 async function shutdown() {
   server.close()
-  await house.stop()     // clears timers, drains, forces a final flush
+  await house.stop()     // clears timers, waits for running flushes, drains, flushes the rest
   process.exit(0)
 }
 

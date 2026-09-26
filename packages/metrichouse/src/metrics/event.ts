@@ -707,21 +707,21 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       clearTimeout(batchTimer)
       batchTimer = undefined
     }
-    // counted from what was waiting when this call began. A sink that fails
-    // at once puts its records straight back, and a loop that waited for an
-    // empty buffer would send them again for ever
-    let unsent = buffer.length
-    while (unsent > 0 && buffer.length > 0) {
-      unsent -= shipLocalBatch(source)
+    // every claim is taken before any is sent. A sink that throws rather
+    // than rejecting puts its records back before the next claim is taken,
+    // and that claim would take the same records again and never reach the
+    // ones behind them
+    const claims: RecordClaim[] = []
+    while (buffer.length > 0) {
+      claims.push(takeLocalClaim())
       if (!everything && !isImmediate() && buffer.length < maxSize) break
     }
+    for (const claim of claims) sendLocalClaim(claim, source)
     armBatchTimer()
   }
 
-  /** One claim from the local buffer, sent off the caller's stack. Returns its size. */
-  function shipLocalBatch(source: WriteContext['source']): number {
-    const claim = takeLocalClaim()
-
+  /** One claim from the local buffer, sent off the caller's stack. */
+  function sendLocalClaim(claim: RecordClaim, source: WriteContext['source']): void {
     track(
       (async (): Promise<void> => {
         const outcome = await shipClaim(self, claim, sink, { attempts, source })
@@ -731,7 +731,6 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
         if (outcome.error !== undefined) throw outcome.error
       })(),
     )
-    return claim.records.length
   }
 
   /** Move the local buffer into a claim. The local answer to `claimRecords`. */

@@ -186,8 +186,10 @@ differ by method.
 
 ### When the argument is required
 
-`add()`, `set()`, `inc()`, `dec()` and `current()` require the argument as soon
-as the metric declares one dim, whatever modifiers those dims carry.
+`add()`, `set()`, `inc()` and `dec()` require the argument as soon as the
+metric declares one dim, whatever modifiers those dims carry. So does
+`current()` on a gauge, a level or a timer. A counter's `current()` is the one
+exception: left without it, it returns the total across every series.
 
 ```ts
 const signups = counter('signups', {
@@ -291,6 +293,31 @@ groups across the change sees two populations.
 Treat a reorder the way you would treat a column rename in a database. Adding a
 dim at the end is safe for rows written from that point on, and rows already
 stored carry no value for it.
+
+That includes windows still waiting in the driver when the new declaration
+deploys, such as a Redis full of totals written by the previous release. Their
+series ship with the new dim left off the row, under the id they already had,
+so a series written in the same window by the new release is a second row
+beside it rather than the same one. A [level](/primitives/level) ships such a
+series for the windows it was written in and stops there. It does not carry
+the series forward beside the one that replaced it.
+
+A metric that had no dims and gains some follows the same rule, with one
+exception. Its single series was stored under an empty key. When the only dim
+declared is a `str()`, or a `oneOf()` that lists `''`, the value `''` encodes
+to that same empty key, and the two cannot be told apart. That series then
+reads back with the dim set to `''`. With two dims or more, or one dim of any
+other type, it reads back with every dim left off.
+
+Removing a dim leaves stored keys holding more values than the declaration
+names. A flush or a snapshot of that metric throws until those windows are
+deleted from the driver. A level keeps adding such windows while it carries
+the series, which lasts until its [`holdFor`](/primitives/level#holdfor) runs
+out, or until the series is deleted when it has no `holdFor`:
+
+```
+decodeDimKey: expected at most 2 segments for [route, status], got 3
+```
 
 ### Every combination is a running total
 

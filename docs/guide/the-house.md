@@ -120,6 +120,7 @@ const report = await house.flush()
 report.ok                     // false if any metric's write threw
 report.durationMs
 report.metrics.http_requests  // { buckets, rows, skipped, reason?, error? }
+report.unmatched              // names in only that matched no metric
 report.throwIfFailed()        // throw instead of inspecting, if you prefer
 ```
 
@@ -132,6 +133,11 @@ Restrict it to a few metrics with `only`, and ignore cadence with `force`:
 await house.flush({ only: ['http_requests', 'app_log'] })
 await house.flush({ force: true })
 ```
+
+A name in `only` that no registered metric has is listed in `report.unmatched`
+rather than thrown, since the metric may be registered later. Add
+`strict: true` to make it an error, on `flush()` and on `snapshot()` alike. See
+[Flush options](/reference/flush-options#only).
 
 Metrics are flushed one after another on purpose. They are independent writes,
 but they are still writes, and firing forty inserts at one database at the same
@@ -204,11 +210,36 @@ process.on('SIGTERM', async () => {
 })
 ```
 
-`stop()` does four things in order: clears the timers, waits for any flush a
-timer already started, drains writes still on their way to the driver, then
-makes a [final flush](/reference/flush-options#final) past every cadence and
-every grace period. A write or a scheduled flush that failed, or an `onError`
-that threw, is reported and does not stop the steps after it.
+`stop()` does four things in order:
+
+1. Clears the timers.
+2. Waits for every flush still running, however it was started: a timer tick,
+   a cron calling `house.flush()`, or your own `metric.flush()`. A
+   `house.flush()` is waited for until it has visited every metric it was
+   asked to, and a flush that starts while it waits is waited for too.
+3. Drains writes still on their way to the driver. Steps 2 and 3 then take
+   turns until a wait for flushes that follows a drain finds none, so a flush
+   that starts while the writes drain is waited for as well.
+4. Makes a [final flush](/reference/flush-options#final) past every cadence and
+   every grace period.
+
+A write or a flush that failed, or an `onError` that threw, is reported and
+does not stop the steps after it. A flush whose sink fails during steps 2 and
+3 puts its rows back in the driver, and step 4 ships them.
+
+A second call to `stop()` while the first is still running, from a `SIGINT`
+and a `SIGTERM` handler both, returns the same promise and so the same report.
+A call made after `stop()` has returned goes through the four steps again. So
+does a call made after `house.start()` while an earlier `stop()` is still
+running: it clears the timers that `start()` set at once, then waits for the
+earlier call to finish before its own steps 2 to 4, so two calls never run
+those steps at the same time.
+
+Steps 2 and 3 have no timeout. A sink that never returns keeps its flush running, and
+`stop()` keeps waiting for that flush, so give your sink a timeout of its own.
+And stop anything of yours that keeps calling `flush()` before you call
+`stop()`: a flush that starts once the final flush is under way is not waited
+for.
 
 After `stop()` returns, nothing calls a sink on a timer. A locally staged event
 whose send failed during `stop()` keeps its records in memory and arms no

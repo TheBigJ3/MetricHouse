@@ -322,6 +322,18 @@ describe('child', () => {
     expect((await shipped(appLog))[0]).toMatchObject({ service: 'api', requestId: 'req_1' })
   })
 
+  it('keeps what the parent bound when a nested child passes it as undefined', async () => {
+    const appLog = bound()
+    // from JavaScript, or a value that happens to be undefined at runtime
+    const unset = { service: undefined, requestId: 'r' } as unknown as { requestId: string }
+    const deeper = appLog.child({ service: 'api' }).child(unset)
+    expect(deeper.bound).toEqual({ service: 'api', requestId: 'r' })
+    deeper.info('nested')
+    await appLog.drain()
+
+    expect((await shipped(appLog))[0]).toMatchObject({ service: 'api', requestId: 'r' })
+  })
+
   it('stages into the log that made it, since a child is not a second metric', async () => {
     const appLog = bound()
     appLog.child({ service: 'api' }).info('one')
@@ -373,8 +385,37 @@ describe('fields', () => {
     const jobLog = log('job_log', { write: discard, fields: { attempt: int() } })
     jobLog.bind({ driver, now })
     expect(() => jobLog.info('x', { nope: 1 } as unknown as { attempt: number })).toThrow(
+      new Error('unknown field "nope". The declared fields are [attempt]'),
+    )
+  })
+
+  it('refuses a column the log writes itself when a line passes it', async () => {
+    const jobLog = log('job_log', { write: discard, fields: { attempt: int().optional() } })
+    jobLog.bind({ driver, now })
+    const untyped = jobLog.info as (message: string, fields: Record<string, unknown>) => void
+
+    for (const column of ['id', 'ts', 'level', 'message', 'error_stack', '_ingested_at']) {
+      expect(() => untyped('x', { [column]: 'forged' })).toThrow(
+        new Error(
+          `job_log: "${column}" is a column the log writes itself, so a line cannot pass it as a field`,
+        ),
+      )
+    }
+    await jobLog.drain()
+    expect(await jobLog.pending()).toBe(0)
+  })
+
+  it('refuses a column the log writes itself when a child binds it', () => {
+    const jobLog = log('job_log', { write: discard, fields: { attempt: int().optional() } })
+    jobLog.bind({ driver, now })
+    const untyped = jobLog.child as unknown as (fields: Record<string, unknown>) => {
+      info(message: string): void
+    }
+    const child = untyped({ error_stack: 'forged' })
+
+    expect(() => child.info('x')).toThrow(
       new Error(
-        'unknown field "nope". The declared fields are [level, message, error_stack, attempt]',
+        'job_log: "error_stack" is a column the log writes itself, so a line cannot pass it as a field',
       ),
     )
   })
@@ -486,6 +527,23 @@ describe('level names that would hide a method', () => {
     for (const name of reserved) {
       expect(() => log('app', { write, levels: ['info', name] }), name).toThrow(/shadow/)
     }
+  })
+
+  it('keeps a level named settle, which the house still stops around', async () => {
+    const rows: Row[] = []
+    const auditLog = log('audit', {
+      write: (batch) => {
+        rows.push(...batch)
+      },
+      levels: ['routine', 'settle'],
+    })
+    const house = createHouse({ driver, schema: [auditLog], now })
+
+    auditLog.settle('invoice settled')
+    const report = await house.stop()
+
+    expect(report.metrics.audit).toMatchObject({ rows: 1 })
+    expect(rows.map((row) => [row.level, row.message])).toEqual([['settle', 'invoice settled']])
   })
 
   it('refuses a level named then, which would make the logger awaitable', () => {

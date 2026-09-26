@@ -1,6 +1,10 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { randomUUID } from 'node:crypto'
+import { Redis } from 'ioredis'
+import { afterAll, beforeEach, describe, expect, it } from 'vitest'
+import { ioredis } from '../drivers/ioredis.js'
 import { memory } from '../drivers/memory.js'
 import type { Driver } from '../drivers/types.js'
+import { rowId } from '../identity.js'
 import { int, str } from '../schema/types.js'
 import { type Level, type LevelConfig, level, MAX_CARRY_BUCKETS } from './level.js'
 import type { Row, WriteContext, WriteFn } from './types.js'
@@ -270,6 +274,30 @@ describe('reading', () => {
     await metric.drain()
 
     expect(await metric.totals()).toBe(50)
+  })
+
+  it('refuses an integer total across series a double cannot hold exactly', async () => {
+    const metric = bound({ value: int() })
+    metric.set(Number.MAX_SAFE_INTEGER, EMAIL)
+    metric.set(2, EXPORT)
+    await metric.drain()
+
+    await expect(metric.totals()).rejects.toThrow(
+      'queue_depth: the total across series would be 9007199254740992, which is past ' +
+        '9007199254740991, the largest whole number a double holds exactly',
+    )
+    await expect(metric.snapshot({ complete: false, groupBy: [] })).rejects.toThrow(
+      'queue_depth: a merged value would be 9007199254740992, which is past 9007199254740991',
+    )
+  })
+
+  it('adds series past the safe range when the level is fractional', async () => {
+    const metric = bound()
+    metric.set(Number.MAX_SAFE_INTEGER, EMAIL)
+    metric.set(2, EXPORT)
+    await metric.drain()
+
+    expect(await metric.totals()).toBe(Number.MAX_SAFE_INTEGER + 2)
   })
 
   it('answers from the held value, not from the open window', async () => {
@@ -838,3 +866,112 @@ describe('round two', () => {
     expect(await metric.totals()).toBeUndefined()
   })
 })
+
+/**
+ * A Redis client for the tests a level runs on both drivers, or `undefined`
+ * when no server answers. Those tests then run on `memory()` alone.
+ */
+async function probeRedis(): Promise<Redis | undefined> {
+  const client = new Redis(process.env.REDIS_URL ?? 'redis://127.0.0.1:6379', {
+    lazyConnect: true,
+    connectTimeout: 1_000,
+    maxRetriesPerRequest: 1,
+    retryStrategy: () => null,
+  })
+  try {
+    await client.connect()
+    await client.ping()
+    return client
+  } catch {
+    client.disconnect()
+    return undefined
+  }
+}
+
+const redis = await probeRedis()
+afterAll(async () => {
+  await redis?.quit()
+})
+
+/** Each driver the level runs on, and how to clear what a test left in it. */
+const drivers: { name: string; make: () => { driver: Driver; wipe: () => Promise<void> } }[] = [
+  { name: 'memory', make: () => ({ driver: memory(), wipe: async () => {} }) },
+  ...(redis
+    ? [
+        {
+          name: 'ioredis',
+          make: () => {
+            const namespace = `mhtest_${randomUUID()}`
+            return {
+              driver: ioredis(redis, { namespace }),
+              wipe: async () => {
+                const keys = await redis.keys(`${namespace}:*`)
+                if (keys.length > 0) await redis.del(...keys)
+              },
+            }
+          },
+        },
+      ]
+    : []),
+]
+
+for (const { name: driverName, make: makeDriver } of drivers) {
+  describe(`a dim added at the end, on ${driverName}`, () => {
+    it('ships the windows an older series wrote and carries only the series written now', async () => {
+      const { driver: shared, wipe } = makeDriver()
+      try {
+        const before = level('queue_depth', {
+          dims: { queue: str() },
+          resolution: '10s',
+          flush: '10s',
+          write: discard,
+        })
+        before.bind({ driver: shared, now })
+        before.set(5, EMAIL)
+        await before.drain()
+
+        const sink = collector()
+        const after = level('queue_depth', {
+          dims: { queue: str(), region: str().optional() },
+          resolution: '10s',
+          flush: '10s',
+          write: sink.write,
+        })
+        after.bind({ driver: shared, now })
+        clock = at(1)
+        after.set(3, { queue: 'email', region: 'eu' })
+        await after.drain()
+
+        // four windows have closed and outlived grace. The older series wrote
+        // only the first, and the new one wrote the second
+        clock = at(5) + 3_000
+        const expected = [
+          {
+            id: rowId('queue_depth', at(0), 'email'),
+            bucket_ts: new Date(at(0)),
+            queue: 'email',
+            value: 5,
+          },
+          ...[1, 2, 3, 4].map((n) => ({
+            id: rowId('queue_depth', at(n), 'email|eu'),
+            bucket_ts: new Date(at(n)),
+            queue: 'email',
+            region: 'eu',
+            value: 3,
+          })),
+        ]
+
+        const live = await after.snapshot()
+        expect(live.map(({ bucket_open, bucket_elapsed_ms, ...row }) => row)).toEqual(expected)
+        expect(await after.current({ queue: 'email', region: 'eu' })).toBe(3)
+        expect(await after.current({ queue: 'email' })).toBeUndefined()
+        expect(await after.totals()).toBe(3)
+
+        expect((await after.flush()).error).toBeUndefined()
+        expect(sink.rows).toEqual(expected)
+      } finally {
+        await wipe()
+      }
+    })
+  })
+}
