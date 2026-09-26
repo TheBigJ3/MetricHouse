@@ -1,9 +1,12 @@
+import { isDeepStrictEqual } from 'node:util'
 import { beforeEach, describe, expect, it } from 'vitest'
 import {
   applyDimDefaults,
   assertDimsLegal,
   DIM_ABSENT,
   decodeDimKey,
+  dimKeyDecoder,
+  dimKeyEncoder,
   dimOrder,
   encodeDimKey,
   escapeDimValue,
@@ -253,6 +256,87 @@ describe('isShorterDimKey', () => {
   })
 })
 
+describe('dimKeyDecoder', () => {
+  /**
+   * What one decode did: each key in order with its value, or the message it
+   * threw. A Date becomes its time as text, because two Invalid Dates hold NaN
+   * and would never compare equal as dates.
+   */
+  function outcome(decode: () => Record<string, unknown>): unknown {
+    try {
+      return Object.entries(decode()).map(([key, value]) => [
+        key,
+        value instanceof Date ? `date ${value.getTime()}` : value,
+      ])
+    } catch (err) {
+      return { threw: (err as Error).message }
+    }
+  }
+
+  it('returns and throws exactly what decodeDimKey does for every key', () => {
+    // raw segments rather than encoded values, so the keys include ones no
+    // encoder writes: a lone or trailing backslash, an escaped separator, an
+    // absent marker, text an int or a bool cannot hold
+    const fragments = ['', 'a', '\\', '\\|', '\\\\', DIM_ABSENT, '1', 'x1', 'true']
+    const keys = new Set<string>()
+    const grow = (prefix: string[]): void => {
+      keys.add(prefix.join('|'))
+      if (prefix.length === 4) return
+      for (const fragment of fragments) grow([...prefix, fragment])
+    }
+    grow([])
+
+    const declarations = [
+      {},
+      { only: str() },
+      { only: int() },
+      { only: oneOf(['', 1, 'a']) },
+      { name: str(), count: int(), on: bool() },
+      { name: str().optional(), at: ts(), kind: oneOf(['a', '1']), n: float() },
+    ]
+
+    const mismatches: unknown[] = []
+    for (const declared of declarations) {
+      const decode = dimKeyDecoder(declared)
+      for (const key of keys) {
+        const fast = outcome(() => decode(key))
+        const full = outcome(() => decodeDimKey(declared, key))
+        if (!isDeepStrictEqual(fast, full)) mismatches.push({ declared, key, fast, full })
+      }
+    }
+
+    expect(keys.size).toBeGreaterThan(5_000)
+    expect(mismatches).toEqual([])
+  })
+
+  it('reads a key written before a dim was added with that dim absent', () => {
+    const decoded = dimKeyDecoder(dims)('Willow|riverside')
+    expect(decoded).toEqual({ dogName: 'Willow', park: 'riverside' })
+    expect('kind' in decoded).toBe(false)
+  })
+
+  it('reads the empty key as every dim absent when two or more are declared', () => {
+    expect(dimKeyDecoder(dims)('')).toEqual({})
+  })
+
+  it('returns a new object on every call', () => {
+    const decode = dimKeyDecoder(dims)
+    const first = decode('Willow|riverside|solid')
+    first.park = 'hilltop'
+    expect(decode('Willow|riverside|solid')).toEqual({
+      dogName: 'Willow',
+      park: 'riverside',
+      kind: 'solid',
+    })
+  })
+
+  it('rejects a key with more segments than dims, with the message decodeDimKey gives', () => {
+    expect(() => dimKeyDecoder(dims)('Willow|riverside|solid|extra')).toThrow(
+      'decodeDimKey: expected at most 3 segments for [dogName, park, kind], got 4',
+    )
+  })
+})
+
 describe('applyDimDefaults', () => {
   it('fills omitted keys that declare a default', () => {
     const d = { a: str(), b: str().default('riverside') }
@@ -345,5 +429,47 @@ describe('values that used to slip through', () => {
     const shape = { tenant: str() }
     expect(() => encodeDimKey(shape, { tenant: 'a\uD83D' })).toThrow(/surrogate/)
     expect(() => encodeDimKey(shape, { tenant: 'a😀' })).not.toThrow()
+  })
+})
+
+describe('dimKeyEncoder', () => {
+  it('encodes a values object again after the caller changes it', () => {
+    const encode = dimKeyEncoder(dims)
+    const values: Record<string, unknown> = { dogName: 'Willow', park: 'riverside', kind: 'solid' }
+    expect(encode(values)).toBe('Willow|riverside|solid')
+    values.park = 'hilltop'
+    values.kind = 'liquid'
+    expect(encode(values)).toBe('Willow|hilltop|liquid')
+  })
+
+  it('reads a property the caller made non enumerable as absent', () => {
+    const encode = dimKeyEncoder({ dogName: str(), park: str().optional() })
+    const values = { dogName: 'Willow' }
+    Object.defineProperty(values, 'park', { value: 'riverside', enumerable: false })
+    expect(encode(values)).toBe(`Willow|${DIM_ABSENT}`)
+  })
+
+  it('treats null values as no dims', () => {
+    expect(dimKeyEncoder({})(null as never)).toBe('')
+    expect(() => dimKeyEncoder(dims)(null as never)).toThrow('missing required dim "dogName"')
+  })
+
+  it('reports an undeclared key before a missing dim', () => {
+    expect(() => dimKeyEncoder(dims)({ breed: 'corgi' })).toThrow(
+      'unknown dim "breed". The declared dims are [dogName, park, kind]',
+    )
+  })
+
+  it('reports a wrong type in a later dim before an unstorable value in an earlier one', () => {
+    const encode = dimKeyEncoder({ tenant: str(), count: int() })
+    expect(() => encode({ tenant: 'a\uD83D', count: 'x' })).toThrow(
+      'count: expected a safe integer, got "x"',
+    )
+    expect(() => encode({ tenant: 'a\uD83D', count: 1 })).toThrow(/surrogate/)
+  })
+
+  it('fills a default the caller left out', () => {
+    const encode = dimKeyEncoder({ park: str().default('riverside'), kind: str() })
+    expect(encode({ kind: 'solid' })).toBe('riverside|solid')
   })
 })

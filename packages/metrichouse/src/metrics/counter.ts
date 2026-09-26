@@ -13,7 +13,7 @@ import { type Cell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
 import { metricFlush } from '../runtime/flush.js'
 import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
-import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
+import { assertDimsLegal, dimKeyDecoder, dimKeyEncoder } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketStart } from '../time/buckets.js'
 import type { DurationInput } from '../time/duration.js'
@@ -224,16 +224,21 @@ export function counter<D extends Shape = Record<never, never>>(
     return cell
   }
 
+  // built once, here: every write encodes a key and every row a flush or a
+  // snapshot builds decodes one, against a declaration that never changes
+  const encodeKey = dimKeyEncoder(dims)
+  const decodeKey = dimKeyDecoder(dims)
+
   /** Applies defaults, validates, and encodes. Throws on a bad dim set. */
   function keyFor(values: InferShape<D> | undefined): string {
-    return encodeDimKey(dims, (values ?? {}) as Record<string, unknown>)
+    return encodeKey((values ?? {}) as Record<string, unknown>)
   }
 
   function materialize(bucketTs: number, dimKey: string, cell: Cell): Row {
     return {
       id: rowId(name, bucketTs, dimKey),
       bucket_ts: new Date(bucketTs),
-      ...decodeDimKey(dims, dimKey),
+      ...decodeKey(dimKey),
       value: asCount(cell),
     }
   }
@@ -285,6 +290,7 @@ export function counter<D extends Shape = Record<never, never>>(
       now: slot.now,
       materialize,
       mergeValues,
+      assertCell: asCount,
     }),
 
     ...metricFlush({
@@ -350,6 +356,21 @@ export function counter<D extends Shape = Record<never, never>>(
     async current(values?: InferShape<D>): Promise<number> {
       const active = slot.active()
       const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
+
+      // the whole metric's total, added up in storage rather than by reading
+      // every series. Only for whole numbers, and only when the driver says
+      // the sum is exact: then it is the number adding the rows below gives,
+      // and it is always one a double holds exactly. A float counter always
+      // reads the rows, because the order fractions are added in changes the
+      // last bits of their sum
+      if (values === undefined && !isFloat && active.driver.sumBuckets) {
+        const total = await active.driver.sumBuckets({
+          metric: name,
+          from: bucketTs,
+          to: bucketTs + resolutionMs,
+        })
+        if (total !== undefined) return total
+      }
 
       const rows = await active.driver.readBuckets({
         metric: name,

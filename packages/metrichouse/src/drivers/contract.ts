@@ -399,6 +399,25 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect((await driver.readLevels(L))[0]).toMatchObject({ value: 9, carried: 5 })
       })
 
+      it('changes no later window for a late add when only another series wrote one', async () => {
+        // the later window exists, so the add has to look inside it, and
+        // finds nothing of its own series there to move
+        await put(1000, WILLOW, 5)
+        await put(3000, REX, 1)
+        await move(2000, WILLOW, 2)
+
+        expect(await levelAt(1000, WILLOW)).toBe(5)
+        expect(await levelAt(2000, WILLOW)).toBe(7)
+        expect(await levelAt(3000, WILLOW)).toBeUndefined()
+        expect(await levelAt(3000, REX)).toBe(1)
+        expect((await driver.readLevels(L)).sort((a, b) => (a.dimKey < b.dimKey ? -1 : 1))).toEqual(
+          [
+            { dimKey: REX, value: 1, carried: 1, writtenAt: 3000, heldThrough: 3000 },
+            { dimKey: WILLOW, value: 7, carried: 5, writtenAt: 2000, heldThrough: 1000 },
+          ],
+        )
+      })
+
       it('stores a level of negative zero as zero, carried included', async () => {
         await put(1000, WILLOW, -0)
         const [one] = await driver.readLevels(L)
@@ -797,6 +816,149 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         const rows = await driver.readBuckets({ metric: M, from: 4000 })
         await write
         expect(rows).toEqual([{ bucketTs: 4000, dimKey: WILLOW, value: 5 }])
+      })
+
+      it('reads one series across every window that holds it, oldest first', async () => {
+        await incr(5000, WILLOW, 4)
+        expect(await driver.readBuckets({ metric: M, dimKey: WILLOW })).toEqual([
+          { bucketTs: 1000, dimKey: WILLOW, value: 1 },
+          { bucketTs: 2000, dimKey: WILLOW, value: 2 },
+          { bucketTs: 5000, dimKey: WILLOW, value: 4 },
+        ])
+      })
+
+      it('reads one series on a half-open range', async () => {
+        const rows = await driver.readBuckets({ metric: M, dimKey: WILLOW, from: 2000, to: 5000 })
+        expect(rows).toEqual([{ bucketTs: 2000, dimKey: WILLOW, value: 2 }])
+      })
+
+      it('returns [] for a series no window holds', async () => {
+        expect(await driver.readBuckets({ metric: M, dimKey: 'Nobody|home' })).toEqual([])
+        expect(await driver.readBuckets({ metric: 'nope', dimKey: WILLOW })).toEqual([])
+      })
+
+      it('sees a write to one series issued before it and not yet awaited', async () => {
+        const write = incr(4000, REX, 5)
+        const rows = await driver.readBuckets({ metric: M, dimKey: REX, from: 4000 })
+        await write
+        expect(rows).toEqual([{ bucketTs: 4000, dimKey: REX, value: 5 }])
+      })
+    })
+
+    // optional methods: a driver may leave them out, and the metrics fall back
+    // to the required ones. A driver that has one is held to these
+    describe('readLevel', () => {
+      it('is undefined for a metric or a series nothing has written', async () => {
+        if (!driver.readLevel) return
+        await put(1000, WILLOW, 42)
+        expect(await driver.readLevel('nope', WILLOW)).toBeUndefined()
+        expect(await driver.readLevel(L, REX)).toBeUndefined()
+      })
+
+      it('is the series readLevels lists under that key', async () => {
+        if (!driver.readLevel) return
+        await put(1000, WILLOW, 42)
+        await put(1000, REX, 7)
+        await move(2000, WILLOW, 3)
+        await hold(3000, REX, 7)
+        const every = await driver.readLevels(L)
+        expect(await driver.readLevel(L, WILLOW)).toEqual(
+          every.find((one) => one.dimKey === WILLOW),
+        )
+        expect(await driver.readLevel(L, REX)).toEqual({
+          dimKey: REX,
+          value: 7,
+          carried: 7,
+          writtenAt: 1000,
+          heldThrough: 3000,
+        })
+      })
+
+      it('is undefined once the series is dropped', async () => {
+        if (!driver.readLevel) return
+        await put(1000, WILLOW, 42)
+        await driver.dropLevels(L, [WILLOW])
+        expect(await driver.readLevel(L, WILLOW)).toBeUndefined()
+      })
+
+      it('sees a write issued before it and not yet awaited', async () => {
+        if (!driver.readLevel) return
+        const write = put(1000, WILLOW, 2)
+        const one = await driver.readLevel(L, WILLOW)
+        await write
+        expect(one?.value).toBe(2)
+      })
+    })
+
+    describe('sumBuckets', () => {
+      const MAX = Number.MAX_SAFE_INTEGER
+
+      it('is 0 for a metric or a range that holds nothing', async () => {
+        if (!driver.sumBuckets) return
+        await incr(1000, WILLOW, 3)
+        expect(await driver.sumBuckets({ metric: 'nope' })).toBe(0)
+        expect(await driver.sumBuckets({ metric: M, from: 2000 })).toBe(0)
+      })
+
+      it('adds every series in every window of a half-open range', async () => {
+        if (!driver.sumBuckets) return
+        await incr(1000, WILLOW, 3)
+        await incr(1000, REX, -1)
+        await incr(2000, WILLOW, 10)
+        await incr(3000, REX, 100)
+        expect(await driver.sumBuckets({ metric: M })).toBe(112)
+        expect(await driver.sumBuckets({ metric: M, from: 1000, to: 3000 })).toBe(12)
+        expect(await driver.sumBuckets({ metric: M, from: 2000, to: 2001 })).toBe(10)
+      })
+
+      it('answers up to the largest safe integer on either side', async () => {
+        if (!driver.sumBuckets) return
+        await incr(1000, WILLOW, MAX - 1)
+        await incr(1000, REX, 1)
+        await incr(2000, WILLOW, -MAX)
+        expect(await driver.sumBuckets({ metric: M, to: 2000 })).toBe(MAX)
+        expect(await driver.sumBuckets({ metric: M })).toBe(0)
+      })
+
+      it('is undefined when the positive cells pass the largest safe integer', async () => {
+        if (!driver.sumBuckets) return
+        // 2^53 - 1, then 2, then -(2^53 - 1): the true sum is 2, and adding
+        // them in the order a reader lists them gives 1
+        await incr(1000, WILLOW, MAX)
+        await incr(1000, REX, 2)
+        await incr(2000, WILLOW, -MAX)
+        expect(await driver.sumBuckets({ metric: M })).toBeUndefined()
+      })
+
+      it('is undefined when the negative cells pass the largest safe integer', async () => {
+        if (!driver.sumBuckets) return
+        await incr(1000, WILLOW, -MAX)
+        await incr(1000, REX, -1)
+        expect(await driver.sumBuckets({ metric: M })).toBeUndefined()
+      })
+
+      it('is undefined when a cell is not a whole number', async () => {
+        if (!driver.sumBuckets) return
+        await incr(1000, WILLOW, 3)
+        await incr(1000, REX, 0.5)
+        expect(await driver.sumBuckets({ metric: M })).toBeUndefined()
+      })
+
+      it('is undefined for gauge and level cells', async () => {
+        if (!driver.sumBuckets) return
+        await obs(1000, WILLOW, 3)
+        await put(1000, WILLOW, 3)
+        expect(await driver.sumBuckets({ metric: G })).toBeUndefined()
+        expect(await driver.sumBuckets({ metric: L })).toBeUndefined()
+      })
+
+      it('sees a write issued before it and not yet awaited', async () => {
+        if (!driver.sumBuckets) return
+        await incr(1000, WILLOW, 3)
+        const write = incr(1000, REX, 4)
+        const total = await driver.sumBuckets({ metric: M })
+        await write
+        expect(total).toBe(7)
       })
     })
 

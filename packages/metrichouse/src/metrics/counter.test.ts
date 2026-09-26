@@ -268,6 +268,20 @@ describe('add', () => {
     expect(await metric.current(WILLOW)).toBe(7)
   })
 
+  it('counts into two series when one dims object is changed and reused between writes', async () => {
+    const metric = bound()
+    const values: { dogName: string; park: string; kind: 'solid' | 'liquid' } = { ...WILLOW }
+    metric.add(values)
+    values.park = 'hilltop'
+    metric.add(2, values)
+    await metric.drain()
+    const cells = await driver.readBuckets({ metric: 'dog_poops' })
+    expect(cells.map((cell) => [cell.dimKey, cell.value])).toEqual([
+      ['Willow|hilltop|solid', 2],
+      ['Willow|riverside|solid', 1],
+    ])
+  })
+
   it('accepts a negative delta', async () => {
     const metric = bound()
     metric.add(5, WILLOW)
@@ -540,6 +554,57 @@ describe('current() with no dims is the metric total', () => {
     await metric.drain()
     expect(await metric.current()).toBe(3)
     expect(await metric.current({})).toBe(3)
+  })
+
+  it('totals an integer counter in storage without reading its series', async () => {
+    // a driver whose cell read fails, so only a total added up in storage
+    // can answer
+    const base = memory()
+    driver = {
+      ...base,
+      readBuckets: async (query) => {
+        if (query.dimKey === undefined) throw new Error('read every series')
+        return base.readBuckets(query)
+      },
+    }
+    const metric = bound()
+    metric.add(2, WILLOW)
+    metric.add(3, { ...WILLOW, park: 'central' })
+    await metric.drain()
+    expect(await metric.current()).toBe(5)
+  })
+
+  it('answers every total the same through a driver without sumBuckets', async () => {
+    const MAX = Number.MAX_SAFE_INTEGER
+    const cases: { fractional: boolean; deltas: number[] }[] = [
+      { fractional: false, deltas: [2, 3, -1] },
+      { fractional: false, deltas: [MAX, 2] },
+      // the true total is 2, and adding in the order the series are read
+      // gives 1. Both drivers have to give the same one
+      { fractional: false, deltas: [MAX, 2, -MAX] },
+      { fractional: true, deltas: [0.1, 0.2, 0.3] },
+      { fractional: true, deltas: [MAX, 2] },
+    ]
+    const answer = async (plain: boolean, fractional: boolean, deltas: number[]) => {
+      const { sumBuckets: _, ...required } = memory()
+      driver = plain ? required : memory()
+      const metric = make(fractional ? { value: float() } : {})
+      metric.bind({ driver, now })
+      deltas.forEach((delta, i) => {
+        metric.add(delta, { ...WILLOW, dogName: `dog${i}` })
+      })
+      await metric.drain()
+      return metric.current().then(
+        (total) => ({ total }),
+        (error: Error) => ({ error: error.message }),
+      )
+    }
+    for (const { fractional, deltas } of cases) {
+      expect(await answer(false, fractional, deltas)).toEqual(
+        await answer(true, fractional, deltas),
+      )
+    }
+    expect(await answer(false, false, [MAX, 2, -MAX])).toEqual({ total: 1 })
   })
 })
 

@@ -304,6 +304,10 @@ A series past its [`holdFor`](#holdfor) also reads `undefined`, from the first
 window after its last one, even before a flush has removed it from storage.
 [`totals()`](#level-totals) leaves it out the same way.
 
+Only the one series is read, on a driver that implements
+[readLevel](/reference/driver-contract#readlevel), as both built in drivers do.
+[`totals()`](#level-totals) reads every series, because it adds them all.
+
 ## level.totals()
 
 ```ts

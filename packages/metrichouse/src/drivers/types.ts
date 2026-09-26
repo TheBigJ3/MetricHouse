@@ -205,6 +205,9 @@ export interface BucketQuery {
   readonly to?: number
 }
 
+/** A {@link BucketQuery} over every series: the windows `[from, to)` of one metric. */
+export type BucketRange = Pick<BucketQuery, 'metric' | 'from' | 'to'>
+
 /** One series in one bucket. */
 export interface BucketRow {
   readonly bucketTs: number
@@ -376,6 +379,16 @@ export interface Driver {
   readLevels(metric: string): Promise<LevelSeries[]>
 
   /**
+   * The one series a level holds under `dimKey`, or `undefined` when it holds
+   * none. The same series {@link readLevels} would list for that key.
+   *
+   * Optional. `level.current(dims)` uses it to ask about one series without
+   * fetching every series the level holds, and falls back to `readLevels`
+   * when a driver leaves it out.
+   */
+  readLevel?(metric: string, dimKey: string): Promise<LevelSeries | undefined>
+
+  /**
    * Forget these series entirely, with their held value, timestamp and pointer.
    *
    * What a `holdFor` expiry calls. Their already-shipped buckets are
@@ -400,6 +413,22 @@ export interface Driver {
 
   /** Unflushed buckets only. Claimed buckets are not visible here. */
   readBuckets(query: BucketQuery): Promise<BucketRow[]>
+
+  /**
+   * Every counter cell in the range added up, when that sum is exact.
+   *
+   * Exact means the same number whatever order the cells are added in, which
+   * holds when every cell is a whole number, the positive cells add up to less
+   * than 2^53 and the negative cells to more than -2^53. Every partial sum then
+   * lies between the two, where a double holds each whole number. Anything
+   * else answers `undefined`: a fraction, a gauge or level cell, or a sum past
+   * either limit.
+   *
+   * Optional. `counter.current()` on an integer counter uses it to total the
+   * open window without fetching every series in it, and reads the cells with
+   * {@link readBuckets} when a driver leaves it out or answers `undefined`.
+   */
+  sumBuckets?(query: BucketRange): Promise<number | undefined>
 
   /** Staged, unclaimed records only, ascending by `ts`. */
   readPending(query: PendingQuery): Promise<StagedRecord[]>

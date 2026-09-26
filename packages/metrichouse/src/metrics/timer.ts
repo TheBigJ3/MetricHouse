@@ -26,7 +26,7 @@
 
 import type { GaugeCell } from '../drivers/types.js'
 import type { SnapshotOptions } from '../runtime/live.js'
-import { encodeDimKey } from '../schema/dims.js'
+import { dimKeyEncoder } from '../schema/dims.js'
 import {
   assertValue,
   type InferShape,
@@ -261,6 +261,8 @@ export function timer<D extends Shape = Record<never, never>>(
   assertSink(config.write, name)
 
   const dims = (config.dims ?? {}) as D
+  // built once: `time()` checks its dims on every call, before the work runs
+  const encodeKey = dimKeyEncoder(dims)
 
   if (Object.hasOwn(dims, DURATION_FIELD)) {
     throw new Error(
@@ -481,7 +483,7 @@ export function timer<D extends Shape = Record<never, never>>(
 
       // everything that can fail is checked before the work runs
       assertBound()
-      encodeDimKey(dims, (values ?? {}) as Record<string, unknown>)
+      encodeKey((values ?? {}) as Record<string, unknown>)
 
       const handle = start((values ?? {}) as Record<string, unknown>)
 

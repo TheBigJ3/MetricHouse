@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { getHasher, hash, naturalKey, rowId, setHasher, uuidv7 } from './identity.js'
 import { oneOf, str } from './schema/types.js'
 
@@ -108,6 +108,28 @@ describe('rowId', () => {
   it('is 32 hex characters', () => {
     expect(rowId('m', 0, '')).toMatch(/^[0-9a-f]{32}$/)
   })
+
+  it('keeps the exact ids rows already in a database carry', () => {
+    // minted by the hasher as it shipped, before its hex encoding was
+    // rewritten. A single changed character here means every stored row
+    // would stop matching its resend
+    expect(hash([])).toBe('11fd02eb9bb311159b518c6d8c03471f')
+    expect(hash([''])).toBe('25dfb1fdb8449237291eb3d2a64d8578')
+    expect(hash(['a', 'bc'])).toBe('74a03abd8d8abbb8429eaff394f14d79')
+    expect(hash(['ab', 'c'])).toBe('7eef28c8227346ba2ede6a1bbac18131')
+    expect(hash(['queue_depth', '🚀', 'é|ü'])).toBe('9b77707a0d373e729ffba368b84a93b7')
+    expect(rowId('http_requests', 1_788_616_980_000, '/checkout|GET|200')).toBe(
+      '829a217bb9424ef426b1f16c9123e3e4',
+    )
+    expect(rowId('q', 0, '')).toBe('9440568f4051c3c525272b23800f2cdd')
+  })
+
+  it('pads a lane whose value starts with zero bits to eight characters', () => {
+    // each of these has a lane below 0x10000000, the case a byte table and
+    // a padded toString could disagree on
+    expect(rowId('pad', 1_788_618_534_000, 'x')).toBe('8e94baa8b52dc6d1c918bbe9000e66e6')
+    expect(rowId('pad', 1_788_618_668_000, 'x')).toBe('8a2063dead5f24b77d42803b000e8b10')
+  })
 })
 
 describe('naturalKey', () => {
@@ -200,5 +222,43 @@ describe('uuidv7', () => {
 
   it('is not derived from content, so two identical events get two ids', () => {
     expect(uuidv7(1_788_616_987_000)).not.toBe(uuidv7(1_788_616_987_000))
+  })
+
+  it('draws each random byte once, across a refill of the pool', () => {
+    // every fill is numbered, and each byte records its fill and its place,
+    // so an id's random tail says exactly which bytes it was given
+    let fills = 0
+    const spy = vi.spyOn(globalThis.crypto, 'getRandomValues').mockImplementation(((
+      array: Uint8Array,
+    ) => {
+      fills += 1
+      for (let i = 0; i < array.length; i++) array[i] = (i * 7 + fills * 101) & 0xff
+      return array
+    }) as typeof crypto.getRandomValues)
+    try {
+      // mint until an id starts a fresh pool, so the next ones take known bytes
+      let first = uuidv7(1_788_616_990_000)
+      for (let guard = 0; fills === 0 && guard < 300; guard++) first = uuidv7(1_788_616_990_000)
+      expect(fills).toBe(1)
+
+      const ids = [first]
+      for (let n = 1; n <= 256; n++) ids.push(uuidv7(1_788_616_990_000))
+      expect(fills).toBe(2)
+
+      const expectedTail = (fill: number, start: number) =>
+        Array.from({ length: 6 }, (_, k) =>
+          (((start + 10 + k) * 7 + fill * 101) & 0xff).toString(16).padStart(2, '0'),
+        ).join('')
+      ids.forEach((id, n) => {
+        // 256 ids of 16 bytes use up one pool, and the 257th opens the next
+        const fill = n < 256 ? 1 : 2
+        const start = n < 256 ? n * 16 : 0
+        expect(id.slice(-12)).toBe(expectedTail(fill, start))
+        expect(id).toMatch(V7)
+      })
+      expect([...ids].sort()).toEqual(ids)
+    } finally {
+      spy.mockRestore()
+    }
   })
 })

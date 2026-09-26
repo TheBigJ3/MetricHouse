@@ -16,7 +16,14 @@ import { randomUUID } from 'node:crypto'
 import { Redis } from 'ioredis'
 import { afterAll, describe, expect, it } from 'vitest'
 import { describeDriverContract } from './contract.js'
-import { type IoredisClient, ioredis } from './ioredis.js'
+import {
+  decodeRecord,
+  decodeRecordTagged,
+  encodeRecord,
+  encodeRecordTagged,
+  type IoredisClient,
+  ioredis,
+} from './ioredis.js'
 import { isGaugeCell } from './types.js'
 
 const URL = process.env.REDIS_URL ?? 'redis://127.0.0.1:6379'
@@ -60,6 +67,59 @@ const M = 'dog_poops'
 const G = 'dog_weight'
 const WILLOW = 'Willow|riverside'
 
+// pure functions, so they run with or without a server
+describe('ioredis · record encoding', () => {
+  const op = (fields: Record<string, unknown>) => ({ metric: M, id: 'r1', ts: 1000, fields })
+
+  it('writes the same bytes as the tagged encoding for every primitive a field can hold', () => {
+    const edges = op({
+      nan: Number.NaN,
+      inf: Number.POSITIVE_INFINITY,
+      negInf: Number.NEGATIVE_INFINITY,
+      negZero: -0,
+      marker: '__mh_date',
+      tagText: '{"__mh_date":5}',
+      nothing: null,
+      missing: undefined,
+      yes: true,
+      text: 'riverside',
+    })
+    const expected =
+      '{"id":"r1","ts":1000,"fields":{"nan":null,"inf":null,"negInf":null,"negZero":0,' +
+      '"marker":"__mh_date","tagText":"{\\"__mh_date\\":5}","nothing":null,"yes":true,' +
+      '"text":"riverside"}}'
+    expect(encodeRecordTagged(edges)).toBe(expected)
+    expect(encodeRecord(edges)).toBe(expected)
+  })
+
+  it('tags a value only the full encoding can write', () => {
+    const cases = [
+      op({ at: new Date(5000) }),
+      op({ __mh_date: 5 }),
+      op({ nested: { a: 1 } }),
+      op({ list: [1, 2] }),
+      op({ boxed: new Number(3) }),
+      { metric: M, id: 'r1', ts: new Date(7) as unknown as number, fields: {} },
+    ]
+    for (const one of cases) expect(encodeRecord(one)).toBe(encodeRecordTagged(one))
+    expect(encodeRecord(op({ at: new Date(5000) }))).toBe(
+      '{"id":"r1","ts":1000,"fields":{"at":{"__mh_date":5000}}}',
+    )
+  })
+
+  it('reads back what the tagged decoding reads, with and without the prefix', () => {
+    const stored = [
+      '0000000000000001|{"id":"r1","ts":1000,"fields":{"marker":"plain","n":0}}',
+      '{"id":"r1","ts":1000,"fields":{"n":1}}',
+      '0000000000000002|{"id":"r1","ts":1000,"fields":{"at":{"__mh_date":5000}}}',
+      '0000000000000003|{"id":"r1","ts":1000,"fields":{"__mh___mh_date":5}}',
+    ]
+    for (const one of stored) expect(decodeRecord(one)).toEqual(decodeRecordTagged(one))
+    expect(decodeRecord(stored[2] as string).fields.at).toEqual(new Date(5000))
+    expect(decodeRecord(stored[3] as string).fields).toEqual({ __mh_date: 5 })
+  })
+})
+
 /**
  * A client that answers every script with `1` and every `HGET` with `'1'`,
  * and lists `buckets` windows in every index. Enough to drive the parts of
@@ -78,9 +138,9 @@ function stubClient(buckets = 0): IoredisClient {
           replies.push(1)
           return pipeline
         },
-        hget() {
+        hgetall() {
           queued += 1
-          replies.push('1')
+          replies.push({ [WILLOW]: '1' })
           return pipeline
         },
         exec: async () => replies.slice(0, queued).map((reply) => [null, reply]),
@@ -112,7 +172,7 @@ describe('ioredis · options and connection', () => {
 
   it('reads a pipeline with more replies than a call can take as arguments', async () => {
     const driver = ioredis(stubClient(300_000), { maxPipelineSize: 300_000 })
-    const rows = await driver.readBuckets({ metric: M, dimKey: WILLOW })
+    const rows = await driver.readBuckets({ metric: M })
     expect(rows).toHaveLength(300_000)
     expect(rows.at(-1)).toEqual({ bucketTs: 299_999_000, dimKey: WILLOW, value: 1 })
   })
@@ -246,6 +306,43 @@ if (!client) {
       const left = (await live.keys(`${ns}:*`)).filter((k) => !survives(ns, k))
       expect(left).toEqual([])
 
+      await wipe(ns)
+    })
+  })
+
+  describe('ioredis · one series read', () => {
+    it('fails on a bound Redis refuses with the words the plain command uses', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      for (const bound of [{ from: Number.NaN }, { to: Number.NaN }]) {
+        await expect(driver.readBuckets({ metric: M, ...bound })).rejects.toThrow(
+          'ERR min or max is not a float',
+        )
+        await expect(driver.readBuckets({ metric: M, dimKey: WILLOW, ...bound })).rejects.toThrow(
+          'ERR min or max is not a float',
+        )
+      }
+      await wipe(ns)
+    })
+
+    it('fails on a window key of the wrong type as a plain HGET does', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.zadd(`${ns}:idx:${M}`, 1000, '1000')
+      await live.set(`${ns}:b:${M}:1000`, 'not a hash')
+      await expect(driver.readBuckets({ metric: M, dimKey: WILLOW })).rejects.toThrow(
+        'WRONGTYPE Operation against a key holding the wrong kind of value',
+      )
+      await wipe(ns)
+    })
+
+    it('leaves a sum of a window key of the wrong type to the cell read', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.zadd(`${ns}:idx:${M}`, 1000, '1000')
+      await live.set(`${ns}:b:${M}:1000`, 'not a hash')
+      expect(await driver.sumBuckets?.({ metric: M })).toBeUndefined()
       await wipe(ns)
     })
   })

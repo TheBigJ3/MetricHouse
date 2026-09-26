@@ -427,7 +427,7 @@ export function orderAndLimit<R extends Record<string, unknown>>(
  * A `ts()` dim comes back as a fresh `Date`, so `===` against the caller's
  * `Date` is never true. Dates compare by the instant they name.
  */
-function sameValue(actual: unknown, wanted: unknown): boolean {
+export function sameValue(actual: unknown, wanted: unknown): boolean {
   if (isDate(actual) && isDate(wanted)) return actual.getTime() === wanted.getTime()
   return actual === wanted
 }

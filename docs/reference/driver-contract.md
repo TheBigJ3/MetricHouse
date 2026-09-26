@@ -1,8 +1,10 @@
 # Driver contract
 
 A driver is where running totals and staged records live between a write and a
-flush. The interface is fourteen methods and one `capabilities` property.
-Implementing it is how you put MetricHouse on storage it does not ship with.
+flush. The interface is fourteen methods and one `capabilities` property, plus
+two [optional reads](#optional-reads) a driver may add to answer two questions
+with less data on the wire. Implementing it is how you put MetricHouse on
+storage it does not ship with.
 
 ```ts
 import type { Driver } from 'metrichouse/core'
@@ -323,6 +325,11 @@ readBuckets(query: BucketQuery): Promise<BucketRow[]>
 ```
 
 Unflushed, unclaimed windows only. `from` and `to` are half open, `[from, to)`.
+With `dimKey`, only that series, and a window that does not hold it is left
+out. `counter.current(dims)` and every [immediate](/guide/delivery) send read
+this way, so it is worth answering without fetching every series. The Redis
+driver finds the windows and reads the one field in each inside a single
+script, one round trip.
 
 Results are ordered by window, then by series key. Sorted output is part of the
 contract, because merging a rollup and answering `last` both depend on it.
@@ -370,6 +377,64 @@ easy.
 In flight records count because they have not shipped. A sink that hangs holds
 its batch in a claim, and a backlog that read zero during the hang would hide
 it. `readPending` still returns only unclaimed records.
+
+## Optional reads
+
+Two methods a driver may leave out. Each answers a question a metric could
+also answer from the required reads, by fetching everything and picking out
+what it needs. A driver on remote storage adds them so that the answer crosses
+the wire instead of the data. When a driver has neither, every result is the
+same, only slower on a metric with many series.
+
+```ts
+export function myDriver(): Driver {
+  return {
+    // ...the fourteen methods above, then, if storage can do better:
+    async readLevel(metric, dimKey) { return undefined },
+    async sumBuckets(query) { return undefined },
+  }
+}
+```
+
+Both follow the ordering rule of [readBuckets](#readbuckets): they see every
+write the same driver was handed before them.
+
+### readLevel
+
+```ts
+readLevel?(metric: string, dimKey: string): Promise<LevelSeries | undefined>
+```
+
+The one series a level holds under `dimKey`, exactly as `readLevels` would list
+it, or `undefined` when it holds none. `level.current(dims)` asks for one series,
+and without this method it reads every series the level holds to find it. The
+Redis driver reads the one field of the level hash.
+
+### sumBuckets
+
+```ts
+sumBuckets?(query: BucketRange): Promise<number | undefined>
+// BucketRange: { metric, from?, to? }
+```
+
+Every counter cell in the windows `[from, to)` added up, but only when that sum
+is exact, and `undefined` otherwise. `counter.current()` with no dims asks for
+the total of an integer counter's open window, and without this method it reads
+every series in that window and adds them up itself.
+
+Exact has a precise meaning here. The metric adds cells one at a time in the
+order `readBuckets` returns them, and a double rounds any whole number past
+2^53. So the driver may answer only when the order cannot matter: every cell is
+a whole number, the positive cells add up to at most 2^53 minus 1, and the
+negative ones to at least minus that. Every partial sum then lies between those
+two, where a double holds each whole number, so any order gives the same total.
+A fraction, a gauge or level cell, or a sum past either limit answers
+`undefined`, and the metric reads the cells instead. That keeps its answer, and
+the error it raises for a total a double cannot hold, the same as without this
+method. A float counter never asks, because the order fractions are added in
+changes the last bits of their sum.
+
+The Redis driver adds the cells inside a script and sends back one number.
 
 ## Claiming
 
@@ -666,6 +731,10 @@ pass.
 Anything a driver is *allowed* to differ on, such as a series cap, a key layout or
 whether a claim survives a restart, belongs in that driver's own test file rather
 than in the shared suite.
+
+The tests for the [optional reads](#optional-reads) pass without checking
+anything when a driver leaves the method out, and hold it to the rules above
+when it has one.
 
 ## A worked minimal driver
 

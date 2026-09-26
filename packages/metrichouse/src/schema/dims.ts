@@ -155,6 +155,9 @@ export function assertDimsLegal(
 }
 
 export function escapeDimValue(value: string): string {
+  // nearly every value holds neither character, and two scans cost less than
+  // the four copies the split and join below would make of it
+  if (!value.includes(ESCAPE) && !value.includes(DIM_SEPARATOR)) return value
   // backslash first: escaping the separator introduces backslashes of its own
   return value
     .split(ESCAPE)
@@ -226,17 +229,82 @@ function own(values: Record<string, unknown>, key: string): unknown {
   return Object.hasOwn(values, key) ? values[key] : undefined
 }
 
-export function encodeDimKey(dims: Shape, values: Record<string, unknown>): string {
-  const filled = applyDimDefaults(dims, values)
-  validateDims(dims, filled)
+/**
+ * The caller's own enumerable value for `key`, the same set of keys an object
+ * spread copies. A property the caller defined as non enumerable reads as
+ * absent, as it did when the values were copied before they were read.
+ *
+ * {@link own} is enough where the values are a spread copy already, as in
+ * {@link applyDimDefaults}, because a copy holds only enumerable keys. The
+ * series key encoder reads the caller's object itself, so it needs this one.
+ */
+function ownEnumerable(values: object, key: string): unknown {
+  return Object.prototype.propertyIsEnumerable.call(values, key)
+    ? (values as Record<string, unknown>)[key]
+    : undefined
+}
 
-  return dimOrder(dims)
-    .map((key) => {
-      const value = own(filled, key)
-      if (value === undefined) return DIM_ABSENT
-      return escapeDimValue(encodeDimValue(dims[key] as FieldType, value))
-    })
-    .join(DIM_SEPARATOR)
+/**
+ * An encoder for one dims declaration, for a metric to build once and call
+ * on every write.
+ *
+ * Does what {@link encodeDimKey} does, in the same order and with the same
+ * errors: an undeclared key, then each declared dim in order, missing or of
+ * the wrong type, then a value no key can store. Only the work that depends on
+ * the declaration alone moves out of the call, which is listing its dims.
+ * Nothing is kept from one call's values to the next, so a caller may reuse
+ * and change one values object between writes.
+ */
+export function dimKeyEncoder(dims: Shape): (values: Record<string, unknown>) => string {
+  const entries = Object.entries(dims) as [string, FieldType][]
+  const declared = entries.map(([key]) => key)
+
+  return (values) => {
+    // `null` and `undefined` spread to nothing, so they are no dims at all
+    const given: object = values ?? {}
+
+    for (const key of Object.keys(given)) {
+      if (!Object.hasOwn(dims, key)) {
+        throw new Error(
+          `unknown dim ${JSON.stringify(key)}. The declared dims are [${declared.join(', ')}]`,
+        )
+      }
+    }
+
+    // every dim is checked before any is encoded, so a bad type in a later
+    // dim is reported ahead of a value an earlier one cannot store
+    const filled: unknown[] = new Array(entries.length)
+    for (let i = 0; i < entries.length; i++) {
+      const [key, type] = entries[i] as [string, FieldType]
+      let value = ownEnumerable(given, key)
+      if (value === undefined && type.hasDefault) value = type.defaultValue
+      if (value === undefined) {
+        if (!type.isOptional) throw new Error(`missing required dim ${JSON.stringify(key)}`)
+      } else {
+        assertValue(type, value, key)
+      }
+      filled[i] = value
+    }
+
+    let key = ''
+    for (let i = 0; i < entries.length; i++) {
+      if (i > 0) key += DIM_SEPARATOR
+      const value = filled[i]
+      key +=
+        value === undefined
+          ? DIM_ABSENT
+          : escapeDimValue(encodeDimValue((entries[i] as [string, FieldType])[1], value))
+    }
+    return key
+  }
+}
+
+/**
+ * Encode one set of dim values. A metric builds a {@link dimKeyEncoder} once
+ * instead, so its write path never lists the declaration again.
+ */
+export function encodeDimKey(dims: Shape, values: Record<string, unknown>): string {
+  return dimKeyEncoder(dims)(values)
 }
 
 /**
@@ -311,6 +379,38 @@ export function decodeDimKey(dims: Shape, key: string): Record<string, unknown> 
     values[name] = decodeDimValue(dims[name] as FieldType, unescapeDimValue(segment))
   })
   return values
+}
+
+/**
+ * A decoder for one dims declaration, for a metric to build once and call on
+ * every row it materializes.
+ *
+ * Returns what {@link decodeDimKey} returns for every key, and throws what it
+ * throws. Most keys hold no escape character, and for those a plain split is
+ * the exact segmentation and every segment is already unescaped, so the
+ * character by character scan is skipped. Any key the plain split cannot
+ * speak for goes to {@link decodeDimKey} whole: a metric with no dims, the
+ * empty key, a key with an escape or an absent marker in it (the marker holds
+ * one), and a key with more segments than dims, which is an error.
+ */
+export function dimKeyDecoder(dims: Shape): (key: string) => Record<string, unknown> {
+  const order = dimOrder(dims)
+  const types = order.map((name) => dims[name] as FieldType)
+
+  return (key) => {
+    if (order.length === 0 || key === '' || key.includes(ESCAPE)) return decodeDimKey(dims, key)
+
+    const segments = key.split(DIM_SEPARATOR)
+    if (segments.length > order.length) return decodeDimKey(dims, key)
+
+    // fewer segments than dims is a key from before a dim was added at the
+    // end, and the dims past its last segment stay absent, as they do there
+    const values: Record<string, unknown> = {}
+    for (let i = 0; i < segments.length; i++) {
+      values[order[i] as string] = decodeDimValue(types[i] as FieldType, segments[i] as string)
+    }
+    return values
+  }
 }
 
 export function applyDimDefaults(
