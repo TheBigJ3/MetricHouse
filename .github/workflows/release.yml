@@ -33,8 +33,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       # Either opens a "Version Packages" PR that applies the pending
-      # changesets, or — when that PR has been merged and versions are already
-      # bumped — publishes whatever is not yet on npm.
+      # changesets, or, when that PR has been merged and versions are already
+      # bumped, publishes whatever is not yet on npm.
       - uses: changesets/action@v1
         if: env.HAS_NPM_TOKEN == 'true'
         with:

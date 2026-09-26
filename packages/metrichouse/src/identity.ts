@@ -2,7 +2,7 @@
  * Row identity.
  *
  * Every row carries a stable `id` so an at-least-once resend is recognisable.
- * Aggregate rows derive theirs from content — metric name, bucket, dims — so a
+ * Aggregate rows derive theirs from content, meaning metric name, bucket and dims, so a
  * re-sent bucket produces a byte-identical id without any stored state.
  *
  * MetricHouse guarantees the *same id*; whether your store collapses the two
@@ -16,7 +16,7 @@ import type { Shape } from './schema/types.js'
 export type Hasher = (parts: string[]) => string
 
 /**
- * Murmur3's 32-bit finalizer. Strong avalanche — a one-bit input change
+ * Murmur3's 32-bit finalizer. Strong avalanche. A one-bit input change
  * flips about half the output bits, which is what keeps adjacent bucket
  * timestamps from producing adjacent ids.
  */
@@ -38,12 +38,11 @@ function toHex(value: number): string {
  * The default hasher: 128 bits, rendered as 32 lowercase hex characters.
  *
  * Four independent 32-bit lanes are advanced in a single pass, then finalized
- * separately. Non-cryptographic and fast — these ids are for dedupe, not
+ * separately. Non-cryptographic and fast. These ids are for dedupe, not
  * secrecy.
  *
- * **Why 128 and not the 64 bits the spec first specified.** `metrichouse cost`
- * projects 5.4M rows per 30-second flush for a high-cardinality metric, which
- * is ~15B rows/day. At 64 bits the birthday bound makes collisions a daily
+ * **Why 128 bits and not 64.** A high-cardinality metric can produce 5.4M rows
+ * per 30-second flush, which is ~15B rows/day. At 64 bits the birthday bound makes collisions a daily
  * event, and a collision here silently merges two unrelated series into one
  * row. 16 extra bytes per row buys that away permanently.
  *
@@ -78,8 +77,8 @@ export function hash(parts: string[]): string {
 let activeHasher: Hasher = hash
 
 /**
- * Replace the hasher. Returns the previous one, so a caller — a test, usually
- * — can restore it.
+ * Replace the hasher. Returns the previous one, so a caller, usually a test,
+ * can restore it.
  *
  * Changing this changes every id the process produces. Ids already in your
  * database were written by the old hasher and will not converge with new ones,
@@ -122,7 +121,7 @@ export function naturalKey(dims: Shape): string[] {
 /**
  * Random bytes, from the platform.
  *
- * `globalThis.crypto` is present on every runtime this library targets — Node
+ * `globalThis.crypto` is present on every runtime this library targets, which are Node
  * 20+, Bun, Deno, Workers, and the edge runtimes. The fallback is not a
  * quality choice, it is a "some sandbox removed it" choice, and the monotonic
  * counter below is what actually carries uniqueness within a process either
@@ -145,15 +144,15 @@ const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'
 let lastMs = -1
 let sequence = 0
 
-/** 12 bits of `rand_a` — the counter saturates here, not silently wraps. */
+/** 12 bits of `rand_a`. The counter saturates here, not silently wraps. */
 const MAX_SEQUENCE = 0xfff
 
 /**
  * A UUIDv7 for one staged record.
  *
  * Unlike {@link rowId}, this is **not** derived from content. Two identical
- * events are two events — that is the whole reason an event exists rather than
- * a counter — so identity has to come from the act of recording rather than
+ * events are two events, which is the whole reason an event exists rather than
+ * a counter, so identity has to come from the act of recording rather than
  * from what was recorded. Minting it at `record()` (not at flush) is what
  * makes a released batch keep its ids and a retried write recognisable.
  *
@@ -161,7 +160,7 @@ const MAX_SEQUENCE = 0xfff
  * then 62 random bits. The counter is the monotonic variant from the RFC: ids
  * minted in the same millisecond stay strictly ordered, and cannot collide
  * within a process however the random bits land. On the 4097th id inside one
- * millisecond the timestamp borrows from the next — which keeps ordering, at
+ * millisecond the timestamp borrows from the next, which keeps ordering, at
  * the cost of an id being at most a millisecond ahead of the clock.
  */
 export function uuidv7(nowMs: number): string {
@@ -171,7 +170,7 @@ export function uuidv7(nowMs: number): string {
     lastMs = ms
     sequence = 0
   } else {
-    // same millisecond, or a clock that went backwards — either way, keep
+    // same millisecond, or a clock that went backwards. Either way, keep
     // minting forward from where we were rather than re-using a sequence
     ms = lastMs
     sequence += 1

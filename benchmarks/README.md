@@ -4,14 +4,14 @@ Performance harness for the paths where MetricHouse sits in front of a request.
 
 ## Why this is level 1
 
-The design puts a network call on the hot path — writes go straight to the
+The design puts a network call on the hot path. Writes go straight to the
 driver with no local buffer. That is a deliberate trade for exact live reads,
 and it is only defensible if the overhead is measured and published rather than
 asserted.
 
 ## What to measure
 
-**Write path** — the number that goes in the README
+**Write path**, the number that goes in the README
 - `.add()` overhead, single write vs. pipelined batch
 - `httpRedis()` vs. TCP `redis()`
 - `writeMode: 'immediate'` vs `'microtask'`

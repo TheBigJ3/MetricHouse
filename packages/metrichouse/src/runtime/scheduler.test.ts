@@ -13,7 +13,7 @@ let clock: number
 let driver: Driver
 const now = () => clock
 
-/** Past the bucket, past grace — everything written so far is claimable. */
+/** Past the bucket, past grace, so everything written so far is claimable. */
 const settle = (): void => {
   clock += 1_000 + 2_000
 }
@@ -24,8 +24,8 @@ const make = (name: string, write: WriteFn, flush = '1m') =>
 /**
  * Advance the fake timers *and* the metric clock together.
  *
- * They are two different clocks — vitest drives `setInterval`, `now()` drives
- * bucket boundaries — and a tick that fires against a stale `now` would find
+ * They are two different clocks, since vitest drives `setInterval`, `now()` drives
+ * bucket boundaries, and a tick that fires against a stale `now` would find
  * nothing closed and report a false negative.
  */
 async function tick(ms: number): Promise<void> {
@@ -83,7 +83,7 @@ describe('house.start()', () => {
     expect(slow).toHaveBeenCalledTimes(1)
   })
 
-  it('is idempotent — a second start does not double the cadence', async () => {
+  it('is idempotent, so a second start does not double the cadence', async () => {
     const write = vi.fn()
     const metric = make('m', write, '1m')
     const house = createHouse({ driver, schema: [metric], now })
@@ -140,7 +140,7 @@ describe('house.start()', () => {
     release?.()
   })
 
-  it('routes a failing scheduled flush to onError — there is no caller to throw at', async () => {
+  it('routes a failing scheduled flush to onError, since there is no caller to throw at', async () => {
     const onError = vi.fn()
     const write = vi.fn().mockRejectedValue(new Error('sink down'))
     const metric = make('m', write, '1m')
@@ -268,7 +268,7 @@ describe('house.stop()', () => {
     const house = createHouse({ driver, schema: [metric], now })
 
     house.start()
-    metric.add(A) // deliberately not drained — stop() owes us that
+    metric.add(A) // deliberately not drained, since stop() owes us that
     settle()
 
     await house.stop()

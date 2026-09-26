@@ -8,26 +8,15 @@ import { event } from './event.js'
 import { timer } from './timer.js'
 import type { Row, WriteContext, WriteFn } from './types.js'
 
-/** A sink that keeps nothing — for declaration tests that never ship. */
+/** A sink that keeps nothing, for declaration tests that never ship. */
 const discard: WriteFn = () => {}
-
-function expectRejected(fn: () => unknown): Error {
-  let caught: unknown
-  try {
-    fn()
-  } catch (err) {
-    caught = err
-  }
-  expect(caught, 'expected the call to throw').toBeInstanceOf(Error)
-  return caught as Error
-}
 
 const makeDims = () => ({ route: str(), status: oneOf(['ok', 'error']) })
 type Dims = ReturnType<typeof makeDims>
 
-/** Wall clock — decides the bucket. */
+/** Wall clock, which decides the bucket. */
 let clock: number
-/** Monotonic clock — decides the duration. */
+/** Monotonic clock, which decides the duration. */
 let mono: number
 let driver: Driver
 const now = () => clock
@@ -56,7 +45,7 @@ afterEach(() => {
 })
 
 describe('declaration', () => {
-  it('is inert — starting before a house has bound it is loud', () => {
+  it('is inert, so starting before a house has bound it is loud', () => {
     const latency = timer('latency', {
       write: discard,
       dims: makeDims(),
@@ -64,13 +53,15 @@ describe('declaration', () => {
       flush: '1m',
     })
     expect(latency.isBound).toBe(false)
-    expect(expectRejected(() => latency.start()).message).toMatch(/not bound to a house/)
+    expect(() => latency.start()).toThrow(
+      'latency: not bound to a house. Pass it to createHouse({ schema }) before timing',
+    )
   })
 
   it('refuses an empty name', () => {
-    expect(
-      expectRejected(() => timer(' ', { write: discard, resolution: '1s', flush: '1s' })).message,
-    ).toMatch(/non-empty/)
+    expect(() => timer(' ', { write: discard, resolution: '1s', flush: '1s' })).toThrow(
+      'timer: name must be a non-empty string',
+    )
   })
 
   it('stays unbound when a binding is refused', () => {
@@ -104,27 +95,23 @@ describe('declaration', () => {
   })
 
   it('refuses a dim named duration_ms, even with no record event', () => {
-    expect(
-      expectRejected(() =>
-        timer('t', { write: discard, dims: { duration_ms: str() }, resolution: '1s', flush: '1s' }),
-      ).message,
-    ).toMatch(/reserved/)
+    expect(() =>
+      timer('t', { write: discard, dims: { duration_ms: str() }, resolution: '1s', flush: '1s' }),
+    ).toThrow(
+      't: dim "duration_ms" is reserved, because it is the field a timing carries onto a record event',
+    )
   })
 
   it('refuses a record that names nothing, or the timer itself', () => {
-    expect(
-      expectRejected(() =>
-        timer('t', { write: discard, resolution: '1s', flush: '1s', record: '' }),
-      ).message,
-    ).toMatch(/must name an event/)
-    expect(
-      expectRejected(() =>
-        timer('t', { write: discard, resolution: '1s', flush: '1s', record: 't' }),
-      ).message,
-    ).toMatch(/names the timer itself/)
+    expect(() => timer('t', { write: discard, resolution: '1s', flush: '1s', record: '' })).toThrow(
+      't: record must name an event',
+    )
+    expect(() =>
+      timer('t', { write: discard, resolution: '1s', flush: '1s', record: 't' }),
+    ).toThrow('t: record names the timer itself, and it must name an event')
   })
 
-  it('ships min/max/sum/count by default — last means nothing for a duration', () => {
+  it('ships min/max/sum/count by default, since last means nothing for a duration', () => {
     expect(bound().aggregate).toEqual(['min', 'max', 'sum', 'count'])
   })
 
@@ -185,7 +172,7 @@ describe('start / end', () => {
     expect(await latency.current({ route: '/guess', status: 'ok' })).toBeUndefined()
   })
 
-  it('is idempotent — a second end() records nothing and returns the first duration', async () => {
+  it('is idempotent, so a second end() records nothing and returns the first duration', async () => {
     // end() lives in catch and finally blocks, where a throw would replace the
     // error being handled
     const latency = bound()
@@ -205,7 +192,7 @@ describe('start / end', () => {
     mono += 3
 
     const untyped = span as unknown as { end(dims?: object): number }
-    expect(expectRejected(() => untyped.end()).message).toMatch(/missing required dim "status"/)
+    expect(() => untyped.end()).toThrow('missing required dim "status"')
 
     // nothing was recorded, so a corrected call still ends it
     mono += 2
@@ -216,26 +203,25 @@ describe('start / end', () => {
 
   it('rejects an undeclared dim at start(), before any time passes', () => {
     const latency = bound()
-    expect(
-      expectRejected(() => latency.start({ nope: 1 } as unknown as { route: string })).message,
-    ).toMatch(/unknown dim "nope"/)
+    expect(() => latency.start({ nope: 1 } as unknown as { route: string })).toThrow(
+      'unknown dim "nope". The declared dims are [route, status]',
+    )
   })
 
   it('rejects an ill-typed dim at start()', () => {
     const latency = bound()
-    expect(
-      expectRejected(() => latency.start({ status: 'maybe' } as unknown as { route: string }))
-        .message,
-    ).toMatch(/is not one of/)
+    expect(() => latency.start({ status: 'maybe' } as unknown as { route: string })).toThrow(
+      'status: "maybe" is not one of ["ok", "error"]',
+    )
   })
 
-  it('rounds to the microsecond — anything finer is jitter', () => {
+  it('rounds to the microsecond, since anything finer is jitter', () => {
     const span = bound().start({ route: '/a', status: 'ok' })
     mono += 1.234_567_89
     expect(span.end()).toBe(1.235)
   })
 
-  it('times overlapping spans independently — they need not nest', async () => {
+  it('times overlapping spans independently, since they need not nest', async () => {
     // the case a LIFO stack gets wrong: a ends before b, though b started last
     const latency = bound()
     const a = latency.start({ route: '/a', status: 'ok' })
@@ -331,24 +317,24 @@ describe('time', () => {
     const work = vi.fn(() => 1)
     const untyped = latency as unknown as { time(dims: object, fn: () => number): number }
 
-    expect(expectRejected(() => untyped.time({ route: '/a' }, work)).message).toMatch(
-      /missing required dim "status"/,
-    )
+    expect(() => untyped.time({ route: '/a' }, work)).toThrow('missing required dim "status"')
     expect(work).not.toHaveBeenCalled()
   })
 
   it('refuses to run the work when unbound', () => {
     const latency = timer('t', { write: discard, resolution: '1s', flush: '1s' })
     const work = vi.fn(() => 1)
-    expect(expectRejected(() => latency.time(work)).message).toMatch(/not bound/)
+    expect(() => latency.time(work)).toThrow(
+      't: not bound to a house. Pass it to createHouse({ schema }) before timing',
+    )
     expect(work).not.toHaveBeenCalled()
   })
 
   it('refuses a non-function', () => {
     const latency = timer('t', { write: discard, resolution: '1s', flush: '1s' })
     latency.bind({ driver, now })
-    expect(expectRejected(() => (latency.time as (x: unknown) => unknown)('nope')).message).toMatch(
-      /needs a function/,
+    expect(() => (latency.time as (x: unknown) => unknown)('nope')).toThrow(
+      't: time() needs a function to time',
     )
   })
 
@@ -380,9 +366,9 @@ describe('observe', () => {
 
   it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])('refuses a duration of %s', (ms) => {
     const latency = bound()
-    expect(
-      expectRejected(() => latency.observe(ms, { route: '/a', status: 'ok' })).message,
-    ).toMatch(/finite, non-negative/)
+    expect(() => latency.observe(ms, { route: '/a', status: 'ok' })).toThrow(
+      `latency: a duration must be a finite, non-negative number, got ${ms}`,
+    )
   })
 })
 

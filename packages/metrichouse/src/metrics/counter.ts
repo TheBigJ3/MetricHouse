@@ -1,5 +1,5 @@
 /**
- * Counter — an integer (or float) accumulated per series, per time bucket.
+ * Counter. An integer (or float) accumulated per series, per time bucket.
  *
  * The one primitive that genuinely cannot be rebuilt after the fact: once the
  * increments are discarded, no query brings the per-second count back.
@@ -9,16 +9,15 @@
  * dropping the write.
  */
 
-import { type Cell, type Driver, isGaugeCell } from '../drivers/types.js'
+import { type Cell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
-import { createAttempts, metricFlush } from '../runtime/flush.js'
+import { metricFlush } from '../runtime/flush.js'
 import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
-import { shipOpenSeries } from '../runtime/ship.js'
 import { assertDimsLegal, decodeDimKey, encodeDimKey } from '../schema/dims.js'
 import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
-import { assertResolution, bucketStart } from '../time/buckets.js'
-import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
-import { bucketedLifecycle, bucketedReader, DEFAULT_GRACE_MS } from './bucketed.js'
+import { bucketStart } from '../time/buckets.js'
+import type { DurationInput } from '../time/duration.js'
+import { bucketedBinding, bucketedLifecycle, bucketedReader } from './bucketed.js'
 import type {
   AnyMetric,
   DimsArgs,
@@ -34,7 +33,7 @@ import {
   assertSink,
   assertWhole,
   dimColumns,
-  reportError,
+  pendingWrites,
 } from './types.js'
 
 /** The columns a counter writes on every row itself, which no dim may take. */
@@ -51,7 +50,7 @@ export type CounterRow<D extends Shape> = Simplify<
  * One live row from a counter, typed to its dims and to the options asked for.
  *
  * The same columns as {@link CounterRow}, plus `bucket_open` and
- * `bucket_elapsed_ms` — minus whatever a `rollup` or a `groupBy` merged away.
+ * `bucket_elapsed_ms`, minus whatever a `rollup` or a `groupBy` merged away.
  */
 export type CounterLiveRow<
   D extends Shape,
@@ -67,7 +66,7 @@ export interface CounterConfig<D extends Shape> {
    * Minimum shipping cadence, e.g. `'5m'`. Must be a whole multiple of
    * `resolution`.
    *
-   * Omit it to take `defaults.flush` from the house — cadence is a delivery
+   * Omit it to take `defaults.flush` from the house. Cadence is a delivery
    * setting, and a schema shared by a dev branch and a production fleet may
    * have no opinion worth forcing on both.
    */
@@ -97,7 +96,7 @@ export interface Counter<D extends Shape> extends AnyMetric {
   readonly kind: 'counter'
   readonly dims: D
 
-  /** Resolved at declare time — the write path never parses a duration. */
+  /** Resolved at declare time, so the write path never parses a duration. */
   readonly resolutionMs: number
   readonly flushMs: number
   readonly graceMs: number
@@ -132,7 +131,7 @@ export interface Counter<D extends Shape> extends AnyMetric {
   /**
    * The live value of the open bucket, before anything has been flushed.
    *
-   * With dims, that one series. **Without dims, the metric's total** — every
+   * With dims, that one series. **Without dims, the metric's total**, every
    * series summed. A counter tracks one thing; its dims are extra information
    * riding along, and asking for `dogs_walked` should not require naming a
    * breed. For a counter that declares no dims the two are the same number.
@@ -156,7 +155,7 @@ export interface Counter<D extends Shape> extends AnyMetric {
    * Resolve when every write issued so far has reached the driver.
    *
    * `.add()` returns before the driver has acknowledged anything, so this is
-   * the only way to know a write landed — and on a runtime with no `SIGTERM`
+   * the only way to know a write landed, and on a runtime with no `SIGTERM`
    * it is the only write guarantee there is.
    */
   drain(): Promise<void>
@@ -166,7 +165,7 @@ export interface Counter<D extends Shape> extends AnyMetric {
 
   /** Turn one stored cell into the row a sink receives. */
   materialize(bucketTs: number, dimKey: string, cell: Cell): Row
-  /** This batch's headline number — every increment in it. */
+  /** This batch's headline number, every increment in it. */
   totalOf(rows: readonly Row[]): number
 }
 
@@ -177,7 +176,7 @@ export interface Counter<D extends Shape> extends AnyMetric {
  * programming error that should surface when the schema file is read rather
  * than at the first write:
  * - the name must be a non-empty string
- * - dims must all be keyable — `json()` is rejected
+ * - dims must all be keyable, so `json()` is rejected
  * - `resolution` must divide `flush` evenly, or a shipment splits a bucket
  *
  * @throws if the configuration is invalid
@@ -192,36 +191,27 @@ export function counter<D extends Shape = Record<never, never>>(
   const dims = (config.dims ?? {}) as D
   assertDimsLegal(dims, name, COUNTER_COLUMNS)
 
-  // parsed once, here — the write path does integer math and never sees a
-  // duration string
-  const resolutionMs = parseDuration(config.resolution)
-  const ownFlushMs =
-    config.flush === undefined ? undefined : parseInterval(config.flush, `${name}: flush`)
-  const ownGraceMs = config.grace === undefined ? undefined : parseDuration(config.grace)
-  // still eager when the metric declares its own cadence, which is the case
-  // that used to be the only one: a bad pair is a programming error and should
-  // surface when the schema file is read, not at the first flush
-  if (ownFlushMs !== undefined) assertResolution(resolutionMs, ownFlushMs)
-
-  const isFloat = config.value?.kind === 'float'
-
   // the flush engine and the open series path carry rows of every kind, so
   // they take the sink erased. `materialize` builds each row from the declared
   // dims, and that is what makes the narrower type in the config true
   const sink = config.write as WriteFn
 
-  let binding: MetricBinding | undefined
+  const slot = bucketedBinding({
+    name,
+    kind: 'counter',
+    resolution: config.resolution,
+    flush: config.flush,
+    grace: config.grace,
+    materialize,
+    totalOf,
+    sink,
+  })
+  const { resolutionMs } = slot
 
-  /**
-   * Writes issued but not yet acknowledged by the driver.
-   *
-   * A Set with self-removal rather than a growing array: a long-lived server
-   * flushes on a schedule but may never call `drain()`, and an array would
-   * retain every promise it ever created.
-   */
-  const pending = new Set<Promise<void>>()
-  /** One failure count for flushes and immediate sends alike. */
-  const attempts = createAttempts()
+  const isFloat = config.value?.kind === 'float'
+
+  /** Writes issued but not yet acknowledged by the driver. */
+  const writes = pendingWrites(name)
 
   /** The driver stores whatever a metric wrote; a counter only writes numbers. */
   function asCount(cell: Cell): number {
@@ -234,87 +224,9 @@ export function counter<D extends Shape = Record<never, never>>(
     return cell
   }
 
-  /**
-   * The metric's own cadence, or the house's. Resolved on every read rather
-   * than at bind, so nothing has to care which came first. `from` is the
-   * binding to read the house's from, which `bind` passes before it keeps one.
-   */
-  function effectiveFlushMs(from: MetricBinding | undefined = binding): number {
-    const ms = ownFlushMs ?? from?.defaults?.flushMs
-    if (ms === undefined) {
-      throw new Error(
-        `${name}: no flush cadence. Declare flush on the counter, or defaults.flush on the house`,
-      )
-    }
-    return ms
-  }
-
-  function effectiveGraceMs(): number {
-    return ownGraceMs ?? binding?.defaults?.graceMs ?? DEFAULT_GRACE_MS
-  }
-
-  function activeBinding(): MetricBinding {
-    if (!binding) {
-      throw new Error(
-        `${name}: not bound to a house. Pass it to createHouse({ schema }) before writing`,
-      )
-    }
-    return binding
-  }
-
   /** Applies defaults, validates, and encodes. Throws on a bad dim set. */
   function keyFor(values: InferShape<D> | undefined): string {
     return encodeDimKey(dims, (values ?? {}) as Record<string, unknown>)
-  }
-
-  function track(write: Promise<void>, onError: MetricBinding['onError']): void {
-    const settled = write
-      // reported and never rethrown, so `drain()` waits for every write
-      // rather than stopping at the first that failed
-      .catch((error: unknown) => reportError(onError, error, { metric: name }))
-      .finally(() => {
-        pending.delete(settled)
-      })
-
-    pending.add(settled)
-  }
-
-  function activeDriver(): Driver {
-    return activeBinding().driver
-  }
-
-  function nowMs(): number {
-    return (activeBinding().now ?? Date.now)()
-  }
-
-  /**
-   * Under `delivery: 'immediate'`, follow the write with a send of the whole
-   * open bucket for this series.
-   *
-   * Chained onto the driver write rather than racing it: the fold has to
-   * include the increment that triggered the send, or the sink is told a total
-   * that is already stale by one.
-   */
-  function deliver(write: Promise<void>, bucketTs: number, dimKey: string): Promise<void> {
-    if (binding?.delivery !== 'immediate') return write
-    return write.then(() => shipOpen(bucketTs, dimKey))
-  }
-
-  async function shipOpen(bucketTs: number, dimKey: string): Promise<void> {
-    const active = activeBinding()
-
-    await shipOpenSeries({
-      metric: name,
-      kind: 'counter',
-      resolutionMs,
-      driver: active.driver,
-      bucketTs,
-      dimKey,
-      materialize,
-      totalOf,
-      sink,
-      attempts,
-    })
   }
 
   function materialize(bucketTs: number, dimKey: string, cell: Cell): Row {
@@ -353,14 +265,14 @@ export function counter<D extends Shape = Record<never, never>>(
     return { value: exactSum(totalOf(rows), 'a merged value') }
   }
 
-  // named, so the flush mixin can reach the finished metric — it is spread
+  // named, so the flush mixin can reach the finished metric. It is spread
   // into this object while the object is still being built
   const self: Counter<D> = {
     ...bucketedLifecycle({
       name,
       resolutionMs,
-      graceMs: effectiveGraceMs,
-      driver: activeDriver,
+      graceMs: slot.graceMs,
+      driver: slot.driver,
       materialize,
       totalOf,
     }),
@@ -369,19 +281,19 @@ export function counter<D extends Shape = Record<never, never>>(
       name,
       resolutionMs,
       dims,
-      driver: activeDriver,
-      now: nowMs,
+      driver: slot.driver,
+      now: slot.now,
       materialize,
       mergeValues,
     }),
 
     ...metricFlush({
       name,
-      flushMs: effectiveFlushMs,
+      flushMs: slot.flushMs,
       sink: () => sink,
-      now: nowMs,
+      now: slot.now,
       self: () => self,
-      attempts,
+      attempts: slot.attempts,
     }),
 
     name,
@@ -393,39 +305,25 @@ export function counter<D extends Shape = Record<never, never>>(
     // getters, because either may come from the house and a metric is declared
     // before it is bound
     get flushMs(): number {
-      return effectiveFlushMs()
+      return slot.flushMs()
     },
 
     get graceMs(): number {
-      return effectiveGraceMs()
+      return slot.graceMs()
     },
 
     isFloat,
     write: config.write,
 
     get isBound(): boolean {
-      return binding !== undefined
+      return slot.isBound()
     },
 
-    bind(next: MetricBinding): void {
-      if (binding) {
-        throw new Error(`${name}: already bound to a house, and a metric belongs to exactly one`)
-      }
-      // the half of validation that could not run at declare time: a cadence
-      // taken from the house is only knowable now, and createHouse is still
-      // early enough to be a boot failure rather than a flush-time surprise.
-      // Checked before the binding is kept, so a refusal leaves the metric
-      // free to be registered again once the mistake is fixed
-      if (ownFlushMs === undefined) assertResolution(resolutionMs, effectiveFlushMs(next))
-      binding = next
-    },
-
-    unbind(): void {
-      binding = undefined
-    },
+    bind: slot.bind,
+    unbind: slot.unbind,
 
     add(first?: number | InferShape<D>, second?: InferShape<D>): void {
-      const active = activeBinding()
+      const active = slot.active()
 
       // `.add()`, `.add(dims)`, `.add(delta)` and `.add(delta, dims)` all
       // collapse into one implementation
@@ -446,11 +344,11 @@ export function counter<D extends Shape = Record<never, never>>(
       const write = active.driver.increment([
         { metric: name, bucketTs, dimKey, delta, ...(!isFloat && { integer: true }) },
       ])
-      track(deliver(write, bucketTs, dimKey), active.onError)
+      writes.track(slot.deliver(write, bucketTs, dimKey), () => active.onError)
     },
 
     async current(values?: InferShape<D>): Promise<number> {
-      const active = activeBinding()
+      const active = slot.active()
       const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
 
       const rows = await active.driver.readBuckets({
@@ -468,12 +366,8 @@ export function counter<D extends Shape = Record<never, never>>(
       )
     },
 
-    async drain(): Promise<void> {
-      // loops rather than awaiting once: a write issued while we were waiting
-      // is still a write issued before drain() resolves
-      while (pending.size > 0) {
-        await Promise.all([...pending])
-      }
+    drain(): Promise<void> {
+      return writes.drain()
     },
 
     materialize,

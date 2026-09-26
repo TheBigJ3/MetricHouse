@@ -1,5 +1,5 @@
 /**
- * Event — discrete typed records, never aggregated.
+ * Event. Discrete typed records, never aggregated.
  *
  * The home for everything a counter had to throw away: `userId`, `requestId`,
  * a free-text note, a JSON payload. Two identical events are two rows, because
@@ -8,7 +8,7 @@
  * **The other storage model.** A counter folds writes into a bucket; an event
  * appends them to a run. That difference is the whole reason this file exists
  * rather than another `bucketedLifecycle` caller, and it is why the driver
- * grew `append`, `readPending`, `countPending` and `claimRecords` — a bucket's
+ * grew `append`, `readPending`, `countPending` and `claimRecords`. A bucket's
  * worth of methods could not express "keep all of it, in order, exactly once".
  */
 
@@ -41,6 +41,7 @@ import {
   type Simplify,
 } from '../schema/types.js'
 import { type DurationInput, parseInterval } from '../time/duration.js'
+import type { Counter } from './counter.js'
 import type {
   AnyMetric,
   MaterializedBatch,
@@ -52,25 +53,25 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink, reportError } from './types.js'
+import { assertMetricName, assertSink, isCounter, pendingWrites, reportError } from './types.js'
 
 /**
  * Where records wait between `record()` and your `write()`.
  *
- * - `'driver'` — appended to the bound driver, claimed on flush. Durable and
+ * - `'driver'` records are appended to the bound driver and claimed on flush. Durable and
  *   shared exactly as far as that driver is: on Redis this is an audit log
  *   that survives a crash, on the memory driver it is the same code path with
  *   `capabilities.durable: false`.
- * - `'local'` — held in an array inside this process and shipped on
+ * - `'local'` records are held in an array inside this process and shipped on
  *   `batch.maxSize`, on `batch.maxAge`, on `flush()`, or on `drain()`. Costs
  *   nothing per event and loses everything on a crash. Use it for pageviews,
  *   not for money.
  *
- * **Named for what they are, not for a product.** The spec calls these
- * `'redis'` and `'memory'`, which stopped being true the moment a second
- * driver was on the roadmap and a *memory driver* existed to be confused with
- * memory staging — `stage: 'memory'` on the memory driver would have named two
- * unrelated things.
+ * **Named for what they are, not for a product.** `'redis'` and `'memory'`
+ * would stop being true as soon as a second shared driver existed, and a
+ * *memory driver* already exists to be confused with memory staging.
+ * `stage: 'memory'` on the memory driver would have named two unrelated
+ * things.
  */
 export type EventStage = 'driver' | 'local'
 
@@ -108,7 +109,7 @@ export const RESERVED_EVENT_COLUMNS = ['id', 'ts', '_ingested_at', '_sample_rate
 /**
  * The row shape an event's `write()` receives.
  *
- * A `json()` field arrives **stringified** — the type cannot say so, because
+ * A `json()` field arrives **stringified**. The type cannot say so, because
  * `json<T>()` and `str()` are indistinguishable in the type system once
  * inferred, so this is documented rather than encoded.
  */
@@ -130,7 +131,7 @@ export interface EventConfig<F extends Shape> {
   readonly fields: F
   /** Default `'driver'`. See {@link EventStage}. */
   readonly stage?: EventStage
-  /** Local staging only — ignored when `stage: 'driver'`. */
+  /** Local staging only, ignored when `stage: 'driver'`. */
   readonly batch?: EventBatchConfig
   /**
    * Minimum shipping cadence for `flush()`. Takes `defaults.flush` from the
@@ -168,13 +169,13 @@ export interface EventConfig<F extends Shape> {
    */
   readonly derive?: Readonly<Record<string, DeriveFn<InferShape<F>>>>
   /**
-   * Records one flush may carry. Unlimited by default — a claim takes the
+   * Records one flush may carry. Unlimited by default. A claim takes the
    * whole backlog, the same way a counter's claim takes every closed bucket.
    * Set it when the backlog can outgrow what the sink will accept at once.
    */
   readonly claimLimit?: number
   /**
-   * Where this event's rows go. Required — see the counter for why.
+   * Where this event's rows go. Required. See the counter for why.
    *
    * Receives {@link EventRow}, with every declared field typed.
    */
@@ -184,7 +185,7 @@ export interface EventConfig<F extends Shape> {
 /**
  * `K` is the kind this metric reports to a sink. It is a parameter, not the
  * constant `'event'`, because {@link stagedMetric} is also what backs `log()`
- * — a log is stored as an event and must still say `'log'` in a
+ * too, and a log is stored as an event and must still say `'log'` in a
  * {@link WriteContext}.
  */
 export interface Event<F extends Shape, K extends MetricKind = 'event'> extends AnyMetric {
@@ -255,7 +256,7 @@ const DEFAULT_FLUSH_MS = 30_000
 /**
  * Declare an event.
  *
- * @throws if the configuration is invalid — an undeclared or non-`ts()`
+ * @throws if the configuration is invalid, such as an undeclared or non-`ts()`
  * `timestamp` field, a field taking a reserved column name, a `sample` rate
  * outside `[0, 1]`, or an empty name.
  */
@@ -273,8 +274,8 @@ export function event<F extends Shape>(name: string, config: EventConfig<F>): Ev
  * claiming and sampling to get that would have been four hundred lines of
  * duplicate to keep in step forever.
  *
- * `kind` is the only thing a caller varies. Everything else about a log — the
- * composed field shape, the level methods, `child()` — is built on top of the
+ * `kind` is the only thing a caller varies. Everything else about a log, the
+ * composed field shape, the level methods, `child()`, is built on top of the
  * event this returns, not inside it.
  *
  * @throws see {@link event}.
@@ -346,7 +347,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   const sink = config.write as WriteFn
 
   let binding: MetricBinding | undefined
-  const pendingWrites = new Set<Promise<void>>()
+  const writes = pendingWrites(name)
 
   /** Local staging only: records waiting, and claims taken from them. */
   const buffer: StagedRecord[] = []
@@ -400,7 +401,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
    * Report a failure that must not reach the caller.
    *
    * `record()` has already decided to stage the event by the time these fire,
-   * and throwing here would drop it — which is precisely what a broken
+   * and throwing here would drop it, which is precisely what a broken
    * `derive` must not do. With no handler it becomes an unhandled rejection:
    * noisy, and better than a failure disappearing in silence.
    */
@@ -408,14 +409,9 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     reportError(binding?.onError, error, { metric: name })
   }
 
+  /** Hold a detached write for `drain()`, reporting a failure as {@link reportDetached} does. */
   function track(work: Promise<void>): void {
-    const settled = work
-      // reported and never rethrown, so `drain()` waits for every write
-      .catch((error: unknown) => reportDetached(error))
-      .finally(() => {
-        pendingWrites.delete(settled)
-      })
-    pendingWrites.add(settled)
+    writes.track(work, () => binding?.onError)
   }
 
   /** Fill defaults, reject unknown or ill-typed fields. Throws at the caller. */
@@ -492,7 +488,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
               'declares. Register it alongside the event',
           )
         }
-        if (metric.kind !== 'counter') {
+        if (!isCounter(metric)) {
           throw new Error(
             `${name}: derive target ${JSON.stringify(target)} is a ${metric.kind}, and derive ` +
               'can only increment a counter',
@@ -500,8 +496,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
         }
 
         const increments = plannedIncrements(target, metric, fn(values))
-        const add = (metric as unknown as { add: (n: number, dims?: unknown) => void }).add
-        for (const one of increments) add.call(metric, one.value, one.dims)
+        for (const one of increments) metric.add(one.value, one.dims)
       } catch (error) {
         reportDetached(error)
       }
@@ -516,12 +511,12 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
    */
   function plannedIncrements(
     target: string,
-    metric: AnyMetric,
+    metric: Counter<Shape>,
     produced: unknown,
   ): { value: number; dims: Record<string, unknown> }[] {
     const label = `${name}: derive for ${JSON.stringify(target)}`
     const list = Array.isArray(produced) ? produced : [produced]
-    const isFloat = (metric as unknown as { isFloat?: boolean }).isFloat === true
+    const isFloat = metric.isFloat === true
 
     return list.map((one: unknown) => {
       if (typeof one !== 'object' || one === null || Array.isArray(one)) {
@@ -598,7 +593,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
         fields: {
           ...fieldsToStore,
           // stamped at record(), which is what makes a backfilled row
-          // distinguishable from a live one — and stable across a retry, which
+          // distinguishable from a live one, and stable across a retry, which
           // stamping at flush would not be
           _ingested_at: ingestedAt,
           ...(samples && { _sample_rate: rate }),
@@ -634,7 +629,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       // `recordMany`, and by then derive has already run
       for (const record of records) buffer.push(record)
 
-      // immediate delivery is `maxSize: 1` without saying so — the batch
+      // immediate delivery is `maxSize: 1` without saying so. The batch
       // settings still describe the shape of a send, they just stop being what
       // decides when one happens
       if (isImmediate()) {
@@ -654,7 +649,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
 
     // `stage` says *where* a record waits; delivery says *when* it leaves. A
     // driver-staged event under immediate delivery still round-trips through
-    // the driver — it just does not wait for a flush to claim it back.
+    // the driver. It just does not wait for a flush to claim it back.
     track(isImmediate() ? append.then(shipStaged) : append)
   }
 
@@ -662,7 +657,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
    * Claim and ship whatever is staged, right now.
    *
    * Exactly what `flush()` does for this metric, minus the cadence
-   * check — a staged record is complete the instant it is appended, so unlike
+   * check. A staged record is complete the instant it is appended, so unlike
    * a bucketed kind there is no partial state to protect and the ordinary
    * claim/ack path is correct. Immediate delivery therefore *replaces* flush
    * here rather than running alongside it.
@@ -696,7 +691,6 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     batchTimer.unref?.()
   }
 
-  /** Take the local buffer and push it at the sink, off the caller's stack. */
   /**
    * Ship from the local buffer, in batches of at most `claimLimit`.
    *
@@ -820,7 +814,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     // an event has fields, not dims: they are unkeyed, `json()` is legal among
     // them, and no series is built from them
     dims: {},
-    // nor does it bucket — a record is its own instant, and 1ms is the finest
+    // nor does it bucket. A record is its own instant, and 1ms is the finest
     // grain the rest of the system can express
     resolutionMs: 1,
 
@@ -917,7 +911,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     async recoverBatch(): Promise<RecoveryReport> {
       // a locally staged batch is claimed out of `buffer` into `localInFlight`,
       // both of which are this process's heap. A crash takes them with it, so
-      // there is nothing left behind to put back — the same trade `stage:
+      // there is nothing left behind to put back, the same trade `stage:
       // 'local'` already makes everywhere else
       if (stage === 'local') return NOTHING_RECOVERED
       return activeDriver().recover(name)
@@ -951,7 +945,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
         // one millisecond past the newest record, so the window stays
         // half-open like every other kind's
         bucketTo: last + 1,
-        // an event's headline is how many happened — there is no value to sum
+        // an event's headline is how many happened, since there is no value to sum
         total: rows.length,
         // records are not bucketed, and reporting 1 would invent a window
         buckets: 0,
@@ -1000,9 +994,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       // sink that is down until the process dies.
       if (stage === 'local') shipLocal('batch', true)
 
-      while (pendingWrites.size > 0) {
-        await Promise.all([...pendingWrites])
-      }
+      await writes.drain()
     },
 
     rowShape(): RowShape {

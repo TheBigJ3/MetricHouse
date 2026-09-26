@@ -1,11 +1,11 @@
 /**
- * The ioredis driver — shared, durable storage for open buckets and staged
+ * The ioredis driver. Shared, durable storage for open buckets and staged
  * records.
  *
  * Writes go straight to Redis, pipelined, with no local buffer, so every
  * instance contributes to the same bucket and a live read is globally exact.
  * A claim is a real move into a key of its own, so it survives the process
- * that took it — which is what turns the flush guarantee from best-effort into
+ * that took it, which is what turns the flush guarantee from best-effort into
  * at-least-once.
  *
  * ```
@@ -18,8 +18,8 @@
  *
  * **Named for the client, not the database.** `ioredis(client)` rather than
  * `redis(client)`, because the two mainstream clients disagree about
- * everything at the surface — `hincrby` against `hIncrBy`, `pipeline()`
- * against `multi()` — and a driver that pretends otherwise ends up lying about
+ * everything at the surface, `hincrby` against `hIncrBy`, `pipeline()`
+ * against `multi()`, and a driver that pretends otherwise ends up lying about
  * one of them. The name leaves `nodeRedis()` free for whoever wants it, and
  * the {@link describeDriverContract} suite is what will tell them they got it
  * right.
@@ -96,7 +96,7 @@ export interface IoredisDriverOptions {
    * Key prefix. Defaults to `mh`.
    *
    * Two houses sharing one Redis need different namespaces, and so do two
-   * test runs — the suite gives each driver a random one for exactly that
+   * test runs. The suite gives each driver a random one for exactly that
    * reason. No colon and no whitespace, or the constructor throws.
    */
   readonly namespace?: string
@@ -117,7 +117,7 @@ export interface IoredisDriverOptions {
    * **Set this above your sink's timeout.** It is the one number that decides
    * whether a claim belongs to a corpse or to a process that is simply taking
    * its time, and there is no way to tell those apart from here. Too low and a
-   * slow write has its rows taken back and shipped by someone else — a
+   * slow write has its rows taken back and shipped by someone else. That is a
    * duplicate, which the row ids survive, plus a failed `ack` on the original
    * flush, which is only noise. Too high and a genuinely crashed window waits
    * longer to ship. The default is generous for that reason.
@@ -132,7 +132,7 @@ export interface IoredisDriverOptions {
 export interface IoredisDriver extends Driver {
   /** The exact key a bucket lives at, so you can go and look at it. */
   keyFor(metric: string, bucketTs: number): string
-  /** Distinct dim keys currently live for a metric — cardinality, watched. */
+  /** Distinct dim keys currently live for a metric, so cardinality can be watched. */
   scanSeries(metric: string): Promise<string[]>
   /**
    * Close the connection this driver opened.
@@ -173,7 +173,7 @@ const DEFAULT_RECOVER_AFTER = 300_000
 /**
  * A gauge fold, packed into one hash field as `last|min|max|sum|count`.
  *
- * `%.17g` and not `%.14g` — Lua's default `tostring` is the latter, and a fold
+ * `%.17g` and not `%.14g`. Lua's default `tostring` is the latter, and a fold
  * that round-trips through it loses the bottom bits of every `sum` on every
  * observation. Seventeen significant digits is what an f64 needs to survive
  * the trip unchanged.
@@ -723,8 +723,8 @@ return 1
 /**
  * Put one in-flight bucket hash back into the live set.
  *
- * Merge, never overwrite: a write can land in a bucket while it is claimed —
- * backdated, or a straggler from another instance — and overwriting would drop
+ * Merge, never overwrite: a write can land in a bucket while it is claimed,
+ * backdated, or a straggler from another instance, and overwriting would drop
  * it silently. A counter merges by addition, a gauge by folding the two halves
  * with the *newer* one keeping `last`.
  *
@@ -829,7 +829,7 @@ return last
  * stored strings byte by byte compares arrival order.
  *
  * `LPUSH a b c` leaves `c b a`, so each chunk goes in reversed, and the chunks
- * themselves run back to front — which is what lands the whole run in its
+ * themselves run back to front, which is what lands the whole run in its
  * original order.
  *
  * Returns how many records it restored.
@@ -1124,7 +1124,7 @@ return n
  * `fields` is opaque to the driver, but it is not opaque to `JSON`: a `ts()`
  * field reaches storage as a real `Date`, and plain `JSON.stringify` would
  * hand it back as a string. The metric would then put that string in the row
- * where a `Date` belongs — a difference from the memory driver that nothing
+ * where a `Date` belongs. That is a difference from the memory driver that nothing
  * would report, so the contract suite pins it.
  */
 const DATE_TAG = '__mh_date'
@@ -1222,17 +1222,20 @@ function isNoScript(error: unknown): boolean {
  * Two kinds reach here. A gauge script detects the clash itself and says
  * `MHKIND`; a counter's `HINCRBYFLOAT` just fails to parse the packed fold and
  * says "hash value is not a float", which is true and unhelpful.
+ *
+ * Only the methods whose scripts fold or restore cells pass their errors
+ * through here: `increment`, `observe`, `setLevel`, `release` and `recover`.
+ * Those are the ones a series holding another kind of cell can refuse. Every
+ * other method raises what Redis or the client raised.
  */
 function typedError(error: unknown, metric: string): Error {
   const message = error instanceof Error ? error.message : String(error)
 
-  const kind = message.indexOf('MHKIND')
-  if (kind !== -1) {
-    return new Error(`ioredis driver: ${metric} ${message.slice(kind + 'MHKIND'.length).trim()}`)
-  }
-  const range = message.indexOf('MHRANGE')
-  if (range !== -1) {
-    return new Error(`ioredis driver: ${metric} ${message.slice(range + 'MHRANGE'.length).trim()}`)
+  for (const tag of ['MHKIND', 'MHRANGE']) {
+    const at = message.indexOf(tag)
+    if (at !== -1) {
+      return new Error(`ioredis driver: ${metric} ${message.slice(at + tag.length).trim()}`)
+    }
   }
   if (message.includes('not a float') || message.includes('not an integer')) {
     return new Error(
@@ -1274,7 +1277,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
    * Resolved once and reused.
    *
    * A factory is called on first write rather than at module scope, so
-   * importing a schema file never opens a socket — which is what makes the
+   * importing a schema file never opens a socket, which is what makes the
    * same module safe to load in a build step or a test that never writes.
    */
   let connection: Promise<IoredisClient> | undefined
@@ -1475,9 +1478,46 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     return out
   }
 
+  /** Run one script and return its reply. */
+  async function runScript(call: ScriptCall, what: string): Promise<unknown> {
+    const [reply] = await runScripts([call], what)
+    return reply
+  }
+
   async function nextClaimId(metric: string): Promise<string> {
     const client = await connect()
     return `${metric}#${await client.incr(key.seq)}`
+  }
+
+  /**
+   * A claim script's reply: when Redis stamped the claim, and what it took.
+   * A missing reply reads as a claim of nothing at time zero.
+   */
+  function claimReply(reply: unknown): { claimedAt: number; taken: string[] } {
+    const [claimedAt, taken] = (reply ?? [0, []]) as [number, string[] | undefined]
+    return { claimedAt: Number(claimedAt), taken: taken ?? [] }
+  }
+
+  /**
+   * Refuse to settle a claim the script found no longer in flight.
+   *
+   * @throws when `settled` is `0`, the reply ACK_CLAIM and both release
+   * scripts give for a claim that was acked, released or recovered already
+   */
+  function assertSettled(settled: unknown, claim: Claim): void {
+    if (settled === 0) {
+      throw new Error(`ioredis driver: claim ${claim.id} is not in flight. Was it already settled?`)
+    }
+  }
+
+  /** One script call's worth of ops, as {@link grouped} builds them. */
+  interface OpGroup<Op> {
+    /** The op that opened the group. */
+    readonly first: Op
+    readonly metric: string
+    readonly bucketTs: number
+    readonly integer: boolean
+    readonly args: (string | number)[]
   }
 
   /**
@@ -1489,17 +1529,16 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
    * written. Ops aimed at two different windows below the watermark both land
    * at the watermark, and folding them there out of order would give a gauge
    * the wrong `last` and a float counter a sum in the wrong order.
+   *
+   * `apart` names anything else that keeps an op out of the group before it,
+   * given the op that opened that group.
    */
   function grouped<Op extends { metric: string; bucketTs: number; integer?: boolean }>(
     ops: readonly Op[],
     pair: (op: Op) => [string, number],
-  ): { metric: string; bucketTs: number; integer: boolean; args: (string | number)[] }[] {
-    const groups: {
-      metric: string
-      bucketTs: number
-      integer: boolean
-      args: (string | number)[]
-    }[] = []
+    apart: (op: Op, first: Op) => boolean = () => false,
+  ): OpGroup<Op>[] {
+    const groups: OpGroup<Op>[] = []
     for (const op of ops) {
       let group = groups.at(-1)
       if (
@@ -1507,9 +1546,16 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         group.metric !== op.metric ||
         group.bucketTs !== op.bucketTs ||
         group.integer !== (op.integer === true) ||
-        group.args.length >= MAX_PAIRS_PER_SCRIPT * 2
+        group.args.length >= MAX_PAIRS_PER_SCRIPT * 2 ||
+        apart(op, group.first)
       ) {
-        group = { metric: op.metric, bucketTs: op.bucketTs, integer: op.integer === true, args: [] }
+        group = {
+          first: op,
+          metric: op.metric,
+          bucketTs: op.bucketTs,
+          integer: op.integer === true,
+          args: [],
+        }
         groups.push(group)
       }
       const [field, value] = pair(op)
@@ -1621,50 +1667,26 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
       // grouped by bucket for the same reason `observe` is: one script, one
       // hash, so the held value and the cell it names move together. Only
-      // neighbouring ops share a group, so a batch mixing `set` and `add` on
-      // one series still applies in the order it was written
-      interface Group {
-        readonly metric: string
-        readonly bucketTs: number
-        readonly mode: LevelOp['mode']
-        readonly integer: boolean
-        readonly args: (string | number)[]
-      }
-      const groups: Group[] = []
-
-      for (const op of ops) {
-        let group = groups.at(-1)
-        if (
-          !group ||
-          group.mode !== op.mode ||
-          group.metric !== op.metric ||
-          group.bucketTs !== op.bucketTs ||
-          group.integer !== (op.integer === true) ||
-          group.args.length >= MAX_PAIRS_PER_SCRIPT * 2
-        ) {
-          group = {
-            metric: op.metric,
-            bucketTs: op.bucketTs,
-            mode: op.mode,
-            integer: op.integer === true,
-            args: [],
-          }
-          groups.push(group)
-        }
-        group.args.push(op.dimKey, op.value)
-      }
+      // neighbouring ops share a group, and a change of mode starts a new one,
+      // so a batch mixing `set` and `add` on one series still applies in the
+      // order it was written
+      const groups = grouped(
+        ops,
+        (op) => [op.dimKey, op.value],
+        (op, first) => op.mode !== first.mode,
+      )
 
       try {
         await runScripts(
           groups.map((group) => ({
-            script: group.mode === 'hold' ? HOLD_LEVEL : SET_LEVEL,
+            script: group.first.mode === 'hold' ? HOLD_LEVEL : SET_LEVEL,
             // a hold is safe to run twice; a set or an add is not
-            once: group.mode !== 'hold',
+            once: group.first.mode !== 'hold',
             keys: [key.idx(group.metric), key.watermark(group.metric), key.levels(group.metric)],
             args: [
               key.bucketPrefix(group.metric),
               group.bucketTs,
-              ...(group.mode === 'hold' ? [] : [group.mode, group.integer ? 1 : 0]),
+              ...(group.first.mode === 'hold' ? [] : [group.first.mode, group.integer ? 1 : 0]),
               ...group.args,
             ],
           })),
@@ -1753,7 +1775,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       const rows: BucketRow[] = []
 
       if (query.dimKey !== undefined) {
-        // one field, not the whole hash — a metric with a million series
+        // one field, not the whole hash, since a metric with a million series
         // should not come over the wire to answer a question about one of them
         const dimKey = query.dimKey
         const values = await runCommands(
@@ -1814,8 +1836,8 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       let seenUpTo = ''
 
       for (;;) {
-        const [reply] = await runScripts(
-          [{ script: READ_PAGE, keys: [listKey], args: [last, lastAt, page] }],
+        const reply = await runScript(
+          { script: READ_PAGE, keys: [listKey], args: [last, lastAt, page] },
           'readPending',
         )
         const [start, restarted, fetched] = reply as [number, number, string[]]
@@ -1844,16 +1866,14 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     },
 
     async countPending(metric: string): Promise<number> {
-      // LLEN, not an LRANGE the caller counts — the whole reason this is a
+      // LLEN, not an LRANGE the caller counts, and the whole reason this is a
       // method of its own. Plus the in-flight lists, which are few
-      const [count] = await runScripts(
-        [
-          {
-            script: COUNT_PENDING,
-            keys: [key.records(metric), key.claims(metric)],
-            args: [key.inflight('')],
-          },
-        ],
+      const count = await runScript(
+        {
+          script: COUNT_PENDING,
+          keys: [key.records(metric), key.claims(metric)],
+          args: [key.inflight('')],
+        },
         'countPending',
       )
       return Number(count ?? 0)
@@ -1865,70 +1885,49 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       // stamped by Redis, inside the script: the score in the claims ZSET is
       // what decides whether this claim is stale, and a stamp from this
       // host's clock would be compared later against another host's
-      const [reply] = await runScripts(
-        [
+      const { claimedAt, taken } = claimReply(
+        await runScript(
           {
             script: CLAIM_BUCKETS,
             keys: [key.idx(metric), key.inflight(id), key.claims(metric), key.watermark(metric)],
             args: [upToBucketTs, id, key.bucketPrefix(metric)],
           },
-        ],
-        'claim',
+          'claim',
+        ),
       )
-      const [claimedAt, flat] = (reply ?? [0, []]) as [number, string[]]
 
-      return {
-        kind: 'buckets',
-        id,
-        metric,
-        claimedAt: Number(claimedAt),
-        buckets: unflatten(flat ?? []),
-      }
+      return { kind: 'buckets', id, metric, claimedAt, buckets: unflatten(taken) }
     },
 
     async claimRecords(metric: string, limit?: number): Promise<RecordClaim> {
       const id = await nextClaimId(metric)
 
-      const [reply] = await runScripts(
-        [
+      const { claimedAt, taken } = claimReply(
+        await runScript(
           {
             script: CLAIM_RECORDS,
             once: true,
             keys: [key.records(metric), key.inflight(id), key.claims(metric)],
             args: [limit === undefined ? -1 : Math.max(0, limit), id],
           },
-        ],
-        'claimRecords',
+          'claimRecords',
+        ),
       )
-      const [claimedAt, taken] = (reply ?? [0, []]) as [number, string[]]
 
-      return {
-        kind: 'records',
-        id,
-        metric,
-        claimedAt: Number(claimedAt),
-        records: (taken ?? []).map(decodeRecord),
-      }
+      return { kind: 'records', id, metric, claimedAt, records: taken.map(decodeRecord) }
     },
 
     async ack(claim: Claim): Promise<void> {
-      const [settled] = await runScripts(
-        [
-          {
-            script: ACK_CLAIM,
-            once: true,
-            keys: [key.claims(claim.metric), key.inflight(claim.id)],
-            args: [claim.id],
-          },
-        ],
+      const settled = await runScript(
+        {
+          script: ACK_CLAIM,
+          once: true,
+          keys: [key.claims(claim.metric), key.inflight(claim.id)],
+          args: [claim.id],
+        },
         'ack',
       )
-
-      if (settled === 0) {
-        throw new Error(
-          `ioredis driver: claim ${claim.id} is not in flight. Was it already settled?`,
-        )
-      }
+      assertSettled(settled, claim)
     },
 
     async release(claim: Claim): Promise<void> {
@@ -1948,17 +1947,11 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
       let settled: unknown
       try {
-        const results = await runScripts([call], 'release')
-        settled = results[0]
+        settled = await runScript(call, 'release')
       } catch (error) {
         throw typedError(error, claim.metric)
       }
-
-      if (settled === 0) {
-        throw new Error(
-          `ioredis driver: claim ${claim.id} is not in flight. Was it already settled?`,
-        )
-      }
+      assertSettled(settled, claim)
     },
 
     async recover(metric: string): Promise<RecoveryReport> {
@@ -1968,20 +1961,17 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
       let raw: unknown
       try {
-        const results = await runScripts(
-          [
-            {
-              script: RECOVER_CLAIMS,
-              once: true,
-              keys: [key.claims(metric), key.idx(metric), key.records(metric)],
-              // `inflight('')` rather than a literal, so the prefix cannot
-              // drift from the key the claim was actually written to
-              args: [recoverAfterMs, key.inflight(''), key.bucketPrefix(metric)],
-            },
-          ],
+        raw = await runScript(
+          {
+            script: RECOVER_CLAIMS,
+            once: true,
+            keys: [key.claims(metric), key.idx(metric), key.records(metric)],
+            // `inflight('')` rather than a literal, so the prefix cannot
+            // drift from the key the claim was actually written to
+            args: [recoverAfterMs, key.inflight(''), key.bucketPrefix(metric)],
+          },
           'recover',
         )
-        raw = results[0]
       } catch (error) {
         throw typedError(error, metric)
       }

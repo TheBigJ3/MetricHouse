@@ -1,5 +1,5 @@
 /**
- * metrichouse/core — declare, write, drain, live read, identity.
+ * metrichouse/core. Declare, write, drain, live read, identity.
  *
  * Everything an application calls at runtime. No SQL, no filesystem, no build
  * tooling: this entry point must stay small enough to ship to an edge bundle.
@@ -36,7 +36,7 @@ export {
   NOTHING_RECOVERED,
 } from './drivers/types.js'
 export type { Hasher } from './identity.js'
-// identity — public so a sink can reproduce a row id, and so a custom hasher
+// identity, public so a sink can reproduce a row id, and so a custom hasher
 // can be installed before anything writes
 export { getHasher, hash, naturalKey, rowId, setHasher, uuidv7 } from './identity.js'
 export type {
@@ -46,7 +46,7 @@ export type {
   BucketedReaderOptions,
 } from './metrics/bucketed.js'
 // the shared aggregate lifecycle and its read half, for anyone adding a
-// primitive — the staged counterpart is `stagedMetric`, below
+// primitive. The staged counterpart is `stagedMetric`, below
 export { bucketedLifecycle, bucketedReader, DEFAULT_GRACE_MS } from './metrics/bucketed.js'
 export type {
   Counter,
@@ -109,7 +109,7 @@ export type {
   WriteContext,
   WriteFn,
 } from './metrics/types.js'
-// delivery — how a house gets rows out, as opposed to what a metric measures
+// delivery, how a house gets rows out, as opposed to what a metric measures
 export type { DeliveryConfig, DeliveryMode, HouseDefaults } from './runtime/delivery.js'
 export { resolveDelivery } from './runtime/delivery.js'
 export type {
@@ -120,7 +120,7 @@ export type {
   MetricFlushOptions,
   MetricFlushReport,
 } from './runtime/flush.js'
-// the flush half of a metric, for anyone adding a primitive — the storage
+// the flush half of a metric, for anyone adding a primitive. The storage
 // halves are `bucketedLifecycle` and `stagedMetric`
 export { metricFlush } from './runtime/flush.js'
 export type {
@@ -133,7 +133,7 @@ export type {
 } from './runtime/house.js'
 // runtime
 export { createHouse } from './runtime/house.js'
-// live read — the snapshot engine is pure, and exported so a custom primitive
+// live read. The snapshot engine is pure, and exported so a custom primitive
 // can reuse it rather than reimplement rollup and top-K
 export type {
   BucketedRow,

@@ -5,7 +5,7 @@
  * driver *is* the specification: it is the one implementation small enough to
  * read in a sitting, and its behaviour is what the rest of the library was
  * written against. A new backend is not "a driver" because it satisfies the
- * TypeScript interface — a stub of sixteen `async () => {}` methods does that.
+ * TypeScript interface. A stub of sixteen `async () => {}` methods does that.
  * It is a driver when it passes this file.
  *
  * ```
@@ -15,9 +15,9 @@
  *
  * So the rule for adding a backend is mechanical: call this, watch it fail,
  * make it pass. Nothing here may reference a concrete driver, and anything a
- * driver is *allowed* to differ on — a series cap, a key layout, whether a
+ * driver is *allowed* to differ on, a series cap, a key layout, whether a
  * claim survives a restart, how long one has to be held before it counts as
- * abandoned — belongs in that driver's own test file rather than here.
+ * abandoned, belongs in that driver's own test file rather than here.
  *
  * Not a test file itself: `vitest.config.ts` collects `src/**\/*.test.ts`, and
  * this exports a function instead of running one.
@@ -40,8 +40,8 @@ export interface DriverContractOptions {
   /**
    * A driver with no data in it.
    *
-   * Called before every test. A shared driver must isolate here — a fresh
-   * namespace per call — or tests see each other's keys.
+   * Called before every test. A shared driver must isolate here, with a fresh
+   * namespace per call, or tests see each other's keys.
    */
   make(): Promise<Driver> | Driver
 
@@ -151,7 +151,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         ])
       })
 
-      it('accepts fractional deltas — counters may declare float', async () => {
+      it('accepts fractional deltas, since counters may declare float', async () => {
         await incr(1000, WILLOW, 0.5)
         await incr(1000, WILLOW, 0.25)
         expect((await driver.readBuckets({ metric: M }))[0]?.value).toBeCloseTo(0.75)
@@ -781,7 +781,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       })
 
       it('excludes the open bucket when given a watermark as `to`', async () => {
-        // this is all `complete: true` is — the caller supplies bucketStart(now)
+        // this is all `complete: true` is. The caller supplies bucketStart(now)
         const rows = await driver.readBuckets({ metric: M, to: 3000 })
         expect(rows.map((r) => r.bucketTs)).toEqual([1000, 2000])
       })
@@ -824,7 +824,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(rows.map((r) => r.bucketTs)).toEqual([3000])
       })
 
-      it('hides claimed buckets from a second claim — two flushers cannot both ship them', async () => {
+      it('hides claimed buckets from a second claim, so two flushers cannot both ship them', async () => {
         const first = await driver.claim(M, 3000)
         const second = await driver.claim(M, 3000)
         expect(first.buckets).toHaveLength(2)
@@ -899,7 +899,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         ])
       })
 
-      it('makes the data claimable again — the retry path', async () => {
+      it('makes the data claimable again, the retry path', async () => {
         await incr(1000, WILLOW, 7)
         const first = await driver.claim(M, 2000)
         await driver.release(first)
@@ -1034,13 +1034,13 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         ])
       })
 
-      it('does not aggregate — two identical records are two records', async () => {
+      it('does not aggregate, so two identical records are two records', async () => {
         // the entire difference from `increment`, which would have folded these
         await driver.append([rec('a', 1000, { dog: 'Willow' }), rec('b', 1000, { dog: 'Willow' })])
         expect(await driver.countPending(M)).toBe(2)
       })
 
-      it('treats fields as opaque — it never reads inside them', async () => {
+      it('treats fields as opaque and never reads inside them', async () => {
         const weird = { nested: { deep: [1, 2] }, _ingested_at: 7, fn: 'not a function' }
         await driver.append([rec('a', 1000, weird)])
         expect((await driver.readPending({ metric: M }))[0]?.fields).toEqual(weird)
@@ -1243,8 +1243,8 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       })
 
       it('release returns records ahead of anything appended since', async () => {
-        // they are older than the new arrivals, and a claim ships oldest first —
-        // putting them at the back would ship out of order
+        // they are older than the new arrivals, and a claim ships oldest first,
+        // so putting them at the back would ship out of order
         await seed(2)
         const claim = await driver.claimRecords(M)
         await driver.append([{ metric: M, id: 'later', ts: 9000, fields: {} }])

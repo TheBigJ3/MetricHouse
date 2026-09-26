@@ -5,19 +5,8 @@ import { json, str } from '../schema/types.js'
 import { type Gauge, type GaugeAggregate, type GaugeConfig, gauge } from './gauge.js'
 import type { WriteFn } from './types.js'
 
-/** A sink that keeps nothing — for declaration tests that never ship. */
+/** A sink that keeps nothing, for declaration tests that never ship. */
 const discard: WriteFn = () => {}
-
-function expectRejected(fn: () => unknown): Error {
-  let caught: unknown
-  try {
-    fn()
-  } catch (err) {
-    caught = err
-  }
-  expect(caught, 'expected the call to throw').toBeInstanceOf(Error)
-  return caught as Error
-}
 
 type GaugeDims = { bowlId: ReturnType<typeof str>; room: ReturnType<typeof str> }
 
@@ -68,17 +57,29 @@ describe('declaration', () => {
   })
 
   it('rejects an empty or unknown aggregate list', () => {
-    expectRejected(() => make({ aggregate: [] }))
-    expect(
-      expectRejected(() => make({ aggregate: ['avg'] as unknown as GaugeAggregate[] })).message,
-    ).toMatch(/avg/)
+    expect(() => make({ aggregate: [] })).toThrow(
+      'bowl_level: aggregate must name at least one of last, min, max, sum, count',
+    )
+    expect(() => make({ aggregate: ['avg'] as unknown as GaugeAggregate[] })).toThrow(
+      'bowl_level: unknown aggregate "avg"',
+    )
   })
 
   it('runs the same declare-time checks as a counter', () => {
-    expectRejected(() => gauge('', { write: discard, resolution: '1s', flush: '1s' }))
-    expectRejected(() => make({ resolution: '7s', flush: '1m' }))
-    expectRejected(() =>
+    expect(() => gauge('', { write: discard, resolution: '1s', flush: '1s' })).toThrow(
+      new Error('gauge: name must be a non-empty string'),
+    )
+    expect(() => make({ resolution: '7s', flush: '1m' })).toThrow(
+      new Error(
+        'assertResolution: resolution 7s does not divide flush 1m evenly, and a shipment would split a bucket',
+      ),
+    )
+    expect(() =>
       gauge('g', { write: discard, dims: { p: json() }, resolution: '1s', flush: '1s' }),
+    ).toThrow(
+      new Error(
+        'g: dim "p" declares json(), which cannot be encoded into a series key. Put it on an event instead',
+      ),
     )
   })
 
@@ -88,20 +89,20 @@ describe('declaration', () => {
   })
 
   it('refuses an aggregate named twice', () => {
-    expect(expectRejected(() => make({ aggregate: ['sum', 'max', 'sum'] })).message).toBe(
-      'bowl_level: aggregate names ["sum","max","sum"], and each one may appear once, ' +
-        'because each becomes one column of the row',
+    expect(() => make({ aggregate: ['sum', 'max', 'sum'] })).toThrow(
+      new Error(
+        'bowl_level: aggregate names ["sum","max","sum"], and each one may appear once, because each becomes one column of the row',
+      ),
     )
   })
 
   it('refuses a dim named after a column it writes', () => {
-    expect(
-      expectRejected(() =>
-        gauge('by_min', { dims: { min: str() }, resolution: '10s', flush: '1m', write: discard }),
-      ).message,
-    ).toBe(
-      'by_min: dim "min" is a reserved column. MetricHouse writes ' +
-        '[id, bucket_ts, last, min, max, sum, count] on every row',
+    expect(() =>
+      gauge('by_min', { dims: { min: str() }, resolution: '10s', flush: '1m', write: discard }),
+    ).toThrow(
+      new Error(
+        'by_min: dim "min" is a reserved column. MetricHouse writes [id, bucket_ts, last, min, max, sum, count] on every row',
+      ),
     )
   })
 
@@ -125,7 +126,9 @@ describe('declaration', () => {
   })
 
   it('is inert until bound', () => {
-    expect(expectRejected(() => make().set(1, B1)).message).toMatch(/bound/)
+    expect(() => make().set(1, B1)).toThrow(
+      'bowl_level: not bound to a house. Pass it to createHouse({ schema }) before writing',
+    )
   })
 })
 
@@ -170,8 +173,8 @@ describe('set and the fold', () => {
   })
 
   it('is absent, not zero, when nothing was observed', async () => {
-    // a bucket with no observations is a hole on a chart, not a held value —
-    // that is the whole difference from a level
+    // a bucket with no observations is a hole on a chart, not a held value,
+    // and that is the whole difference from a level
     expect(await bound().current(B1)).toBeUndefined()
   })
 
@@ -193,13 +196,17 @@ describe('set and the fold', () => {
 
   it('rejects a non-finite observation', () => {
     const metric = bound()
-    expectRejected(() => metric.set(Number.NaN, B1))
-    expectRejected(() => metric.set(Number.POSITIVE_INFINITY, B1))
+    expect(() => metric.set(Number.NaN, B1)).toThrow(
+      'bowl_level: an observation must be a finite number, got NaN',
+    )
+    expect(() => metric.set(Number.POSITIVE_INFINITY, B1)).toThrow(
+      'bowl_level: an observation must be a finite number, got Infinity',
+    )
   })
 
   it('validates dims synchronously', () => {
     const metric = bound()
-    expect(expectRejected(() => metric.set(1, { bowlId: 'b1' } as never)).message).toMatch(/room/)
+    expect(() => metric.set(1, { bowlId: 'b1' } as never)).toThrow('missing required dim "room"')
   })
 
   it('works with no dims at all', async () => {
@@ -280,8 +287,8 @@ describe('materialize', () => {
   })
 
   it('refuses a counter cell', () => {
-    expect(expectRejected(() => make().materialize(1000, 'b1|kitchen', 7)).message).toMatch(
-      /counter cell/,
+    expect(() => make().materialize(1000, 'b1|kitchen', 7)).toThrow(
+      'bowl_level: expected a gauge fold but the driver returned a counter cell',
     )
   })
 

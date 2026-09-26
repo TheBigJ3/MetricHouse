@@ -34,12 +34,12 @@ your database.
 
 - There is a `counter` primitive, because discarded increments cannot be
   recovered. There is **no histogram**, because `quantile()` is a `SELECT`.
-- Gauges store `sum` and `count`, never `avg` — an average does not merge
+- Gauges store `sum` and `count`, never `avg`, because an average does not merge
   across buckets and can be derived from two numbers that do.
 - There is no query engine, no dashboard, and no database driver. You write the
   function that puts rows wherever you want them.
 - There is **no SQL**. MetricHouse emits none, diffs no schema and opens no
-  connection — the table your rows land in is yours to create and evolve.
+  connection. The table your rows land in is yours to create and evolve.
 
 ## Quickstart
 
@@ -60,7 +60,7 @@ export const dogPoops = counter('dog_poops', {
 ```
 
 Bind it to a house once, at startup. A metric is an inert declaration until a
-house registers it — writing to an unbound metric throws rather than dropping
+house registers it, and writing to an unbound metric throws rather than dropping
 data silently:
 
 ```ts
@@ -85,8 +85,8 @@ await dogPoops.current({ dogName: 'Willow', park: 'riverside', kind: 'solid' })
 
 ### Flush is explicit
 
-Nothing flushes on its own. `house.flush()` is called by you — from a cron, a
-worker, or a timer — and a metric's `flush` setting is a **minimum cadence**,
+Nothing flushes on its own. `house.flush()` is called by you, from a cron, a
+worker, or a timer, and a metric's `flush` setting is a **minimum cadence**,
 not a schedule. Calling `house.flush()` every 10 seconds still ships a
 5-minute metric only every 5 minutes:
 
@@ -95,7 +95,7 @@ setInterval(() => house.flush(), 10_000)
 ```
 
 On a serverless or edge runtime, where the isolate can freeze the moment a
-response is returned, `await house.drain()` is the write guarantee — it
+response is returned, `await house.drain()` is the write guarantee. It
 resolves once every queued write has reached the driver.
 
 ## Primitives
@@ -117,8 +117,8 @@ bundle never pulls in a driver it does not use.
 | Subpath | Contains |
 | --- | --- |
 | `metrichouse/core` | declare, write, drain, live read, identity, buckets |
-| `metrichouse/memory` | `memory()` — plain Maps, for a long-lived single process |
-| `metrichouse/ioredis` | `ioredis()` — shared, durable storage over an `ioredis` client |
+| `metrichouse/memory` | `memory()`, plain Maps, for a long-lived single process |
+| `metrichouse/ioredis` | `ioredis()`, shared, durable storage over an `ioredis` client |
 | `metrichouse` | everything, for Node servers that do not care about bundle size |
 
 `ioredis` is an **optional** peer dependency. Importing `metrichouse/ioredis`
@@ -146,10 +146,10 @@ Node 20 or newer.
 
 ## Documentation
 
-**[www.metrichouse.dev](https://www.metrichouse.dev/guide/getting-started)** —
+**[www.metrichouse.dev](https://www.metrichouse.dev/guide/getting-started)** has
 getting started, one page per primitive, deployment guides, worked examples and
 an API reference.
 
 ## License
 
-MIT — see [LICENSE](https://github.com/TheBigJ3/MetricHouse/blob/main/LICENSE).
+MIT. See [LICENSE](https://github.com/TheBigJ3/MetricHouse/blob/main/LICENSE).

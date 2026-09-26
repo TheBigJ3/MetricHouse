@@ -12,7 +12,7 @@ describe('hash', () => {
     expect(hash(parts)).toBe(hash([...parts]))
   })
 
-  it('separates parts — the boundary is real, not a join', () => {
+  it('separates parts, so the boundary is real, not a join', () => {
     // if parts were concatenated these would be identical, and a metric name
     // ending in a separator could impersonate a dim value
     expect(hash(['a', 'bc'])).not.toBe(hash(['ab', 'c']))
@@ -40,7 +40,7 @@ describe('hash', () => {
     expect(new Set(lanes).size).toBe(4)
   })
 
-  it('avalanches — one changed character moves most of the output', () => {
+  it('avalanches, so one changed character moves most of the output', () => {
     const toBits = (hex: string) =>
       [...hex].map((c) => Number.parseInt(c, 16).toString(2).padStart(4, '0')).join('')
 
@@ -78,7 +78,7 @@ describe('hash', () => {
 })
 
 describe('rowId', () => {
-  it('is stable across calls — the whole at-least-once story', () => {
+  it('is stable across calls, the whole at-least-once story', () => {
     // the same bucket shipped twice, because flush crashed before ack
     const first = rowId('dog_poops', 1_788_616_987_000, 'Willow|riverside|solid')
     const second = rowId('dog_poops', 1_788_616_987_000, 'Willow|riverside|solid')
@@ -168,7 +168,7 @@ describe('uuidv7', () => {
     expect(Number.parseInt(hex, 16)).toBe(ms)
   })
 
-  it('survives a timestamp above 2^32 — the high bytes are not shifted away', () => {
+  it('survives a timestamp above 2^32 without shifting the high bytes away', () => {
     // a 32-bit shift would silently drop them, and every id after 1970 + 49
     // days would carry the wrong day
     const ms = 2_000_000_000_000
@@ -198,7 +198,7 @@ describe('uuidv7', () => {
     expect(second > first).toBe(true)
   })
 
-  it('is not derived from content — two identical events get two ids', () => {
+  it('is not derived from content, so two identical events get two ids', () => {
     expect(uuidv7(1_788_616_987_000)).not.toBe(uuidv7(1_788_616_987_000))
   })
 })

@@ -8,7 +8,7 @@ import type { Row, WriteFn } from '../metrics/types.js'
 import { oneOf, str } from '../schema/types.js'
 import { createHouse } from './house.js'
 
-/** A sink that keeps nothing — for declaration tests that never ship. */
+/** A sink that keeps nothing, for declaration tests that never ship. */
 const discard: WriteFn = () => {}
 
 const WILLOW = { dogName: 'Willow', park: 'riverside', kind: 'solid' } as const
@@ -53,7 +53,7 @@ describe('createHouse', () => {
     expect(dogPoops.isBound).toBe(true)
   })
 
-  it('opens no connections of its own — safe at module scope', () => {
+  it('opens no connections of its own, so it is safe at module scope', () => {
     const spy: Driver = {
       capabilities: { durable: true, shared: true, atomicMerge: true },
       increment: vi.fn(),
@@ -179,7 +179,7 @@ describe('clock and error propagation', () => {
 
     dogPoops.add(WILLOW)
     await dogPoops.drain()
-    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls).toEqual([[new Error('down'), { metric: 'dog_poops' }]])
   })
 })
 
@@ -202,9 +202,42 @@ describe('drain', () => {
   it('resolves when nothing is pending', async () => {
     await expect(createHouse({ driver, schema: [makeCounter()] }).drain()).resolves.toBeUndefined()
   })
+
+  it('waits for every metric when another metric has a failed write in flight', async () => {
+    const inner = memory()
+    const slow: Driver = {
+      ...inner,
+      increment: async (ops) => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        return inner.increment(ops)
+      },
+    }
+    const pageViewed = event('page_viewed', {
+      fields: { path: str() },
+      stage: 'local',
+      batch: { maxSize: 1 },
+      write: async () => {
+        throw new Error('clickhouse is down')
+      },
+    })
+    const requests = makeCounter('requests')
+    // no onError, so the failed write is raised as an unhandled rejection
+    const house = createHouse({ driver: slow, schema: [pageViewed, requests], now })
+
+    const raised = await raisedDuring(async () => {
+      requests.add(WILLOW)
+      pageViewed.record({ path: '/' })
+      await house.drain()
+    })
+
+    expect(raised).toEqual(['clickhouse is down'])
+    expect(await inner.readBuckets({ metric: 'requests' })).toEqual([
+      { bucketTs: 1_788_616_987_000, dimKey: 'Willow|riverside|solid', value: 1 },
+    ])
+  })
 })
 
-describe('slice one — the whole path', () => {
+describe('slice one, the whole path', () => {
   it('takes add() through flush() to rows with stable ids', async () => {
     const shipped: Row[] = []
     const write: WriteFn = (rows) => {
@@ -317,7 +350,7 @@ describe('flush keeps going when one metric fails', () => {
     driver.ack = async (claim) => {
       if (claim.metric === 'first') {
         await ack(claim)
-        throw new Error('claim first#1 is not in flight — already settled?')
+        throw new Error('claim first#1 is not in flight. Was it already settled?')
       }
       return ack(claim)
     }
@@ -364,41 +397,6 @@ async function raisedDuring(run: () => Promise<unknown>): Promise<string[]> {
   }
   return raised
 }
-
-describe('house.drain()', () => {
-  it('waits for every metric when another metric has a failed write in flight', async () => {
-    const inner = memory()
-    const slow: Driver = {
-      ...inner,
-      increment: async (ops) => {
-        await new Promise((resolve) => setTimeout(resolve, 20))
-        return inner.increment(ops)
-      },
-    }
-    const pageViewed = event('page_viewed', {
-      fields: { path: str() },
-      stage: 'local',
-      batch: { maxSize: 1 },
-      write: async () => {
-        throw new Error('clickhouse is down')
-      },
-    })
-    const requests = makeCounter('requests')
-    // no onError, so the failed write is raised as an unhandled rejection
-    const house = createHouse({ driver: slow, schema: [pageViewed, requests], now })
-
-    const raised = await raisedDuring(async () => {
-      requests.add(WILLOW)
-      pageViewed.record({ path: '/' })
-      await house.drain()
-    })
-
-    expect(raised).toEqual(['clickhouse is down'])
-    expect(await inner.readBuckets({ metric: 'requests' })).toEqual([
-      { bucketTs: 1_788_616_987_000, dimKey: 'Willow|riverside|solid', value: 1 },
-    ])
-  })
-})
 
 describe('house.stop()', () => {
   it('makes the final flush when another metric has a failed write in flight', async () => {

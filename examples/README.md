@@ -9,7 +9,7 @@ flushes to a real database, and can be read start to finish in a few minutes.
 | --- | --- |
 | `basic-node` | schema, house, `flush()` from a `setInterval`, ClickHouse sink |
 | `nextjs-vercel` | serverless: `drain()`, `httpRedis()`, cron flush endpoint |
-| `express-dashboard` | live read powering a real chart — the motivating use case |
+| `express-dashboard` | live read powering a real chart, the motivating use case |
 | `postgres-sink` | the same schema, no ClickHouse anywhere |
 | `edge-federation` | two houses, `write()` → `ingest()` across a boundary |
 | `custom-driver` | implementing the driver interface against something else |

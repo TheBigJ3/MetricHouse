@@ -13,7 +13,7 @@ import { str } from '../schema/types.js'
 import { resolveDelivery } from './delivery.js'
 import { createHouse } from './house.js'
 
-/** A sink that keeps nothing — for declaration tests that never ship. */
+/** A sink that keeps nothing, for declaration tests that never ship. */
 const _discard: WriteFn = () => {}
 
 const DIMS = { park: str() }
@@ -47,7 +47,7 @@ describe('resolveDelivery', () => {
     expect(resolveDelivery('staged', caps(false))).toBe('staged')
   })
 
-  it("resolves 'auto' from durability — nothing to gain by holding non-durable data", () => {
+  it("resolves 'auto' from durability, with nothing to gain by holding non-durable data", () => {
     expect(resolveDelivery('auto', caps(false))).toBe('immediate')
     expect(resolveDelivery('auto', caps(true))).toBe('staged')
   })
@@ -84,7 +84,7 @@ describe('house delivery resolution', () => {
   })
 })
 
-describe('immediate delivery — bucketed kinds', () => {
+describe('immediate delivery of bucketed kinds', () => {
   const makeCounter = (sink: WriteFn = write) =>
     counter('dog_poops', { write: sink, dims: DIMS, resolution: '1s', flush: '5m' })
 
@@ -106,7 +106,7 @@ describe('immediate delivery — bucketed kinds', () => {
     const dogPoops = makeCounter()
     const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', now })
 
-    // drained between writes so each send is its own observable step — the
+    // drained between writes so each send is its own observable step. The
     // whole point is that send two says `2`, not `1` again
     dogPoops.add(RIVERSIDE)
     await house.drain()
@@ -152,7 +152,7 @@ describe('immediate delivery — bucketed kinds', () => {
     expect([...ids][0]).toBe(rowId('dog_poops', clock, encodeDimKey(DIMS, RIVERSIDE)))
   })
 
-  it('deletes nothing — the bucket stays live and readable', async () => {
+  it('deletes nothing, so the bucket stays live and readable', async () => {
     const dogPoops = makeCounter()
     const house = createHouse({ driver, schema: [dogPoops], delivery: 'immediate', now })
 
@@ -175,7 +175,7 @@ describe('immediate delivery — bucketed kinds', () => {
 
     expect(report.metrics.dog_poops?.rows).toBe(1)
     expect(sent).toHaveLength(1)
-    // same id as every immediate send, carrying the complete fold — a store
+    // same id as every immediate send, carrying the complete fold, so a store
     // keeping the newest row per id lands on the right number
     expect(sent[0]?.rows[0]).toMatchObject({
       id: rowId('dog_poops', clock - 60_000, encodeDimKey(DIMS, RIVERSIDE)),
@@ -246,7 +246,7 @@ describe('immediate delivery — bucketed kinds', () => {
   })
 })
 
-describe('immediate delivery — staged kinds', () => {
+describe('immediate delivery of staged kinds', () => {
   const makeEvent = (over: Partial<EventConfig<{ plan: ReturnType<typeof str> }>> = {}) =>
     event('signups', { fields: { plan: str() }, ...over, write: over.write ?? write })
 
@@ -275,7 +275,7 @@ describe('immediate delivery — staged kinds', () => {
     expect(await signups.pending()).toBe(0)
   })
 
-  it('keeps stage independent of delivery — where is not when', async () => {
+  it('keeps stage independent of delivery, since where is not when', async () => {
     const signups = makeEvent()
     createHouse({ driver, schema: [signups], delivery: 'immediate', now })
     expect(signups.stage).toBe('driver')

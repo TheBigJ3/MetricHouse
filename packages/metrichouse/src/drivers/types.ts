@@ -1,13 +1,11 @@
 /**
- * The driver contract — storage for open buckets and staged records, and the
+ * The driver contract. Storage for open buckets and staged records, and the
  * claim/ack handshake that makes at-least-once possible.
  *
- * **Deliberately small.** The spec lists seventeen methods, covering
- * primitives and drivers that do not exist yet. Writing them now would enshrine
- * guesses about shapes nothing has exercised. Each one gets added when a second
- * driver or a second primitive actually forces it — `setLevel`, `readLevels`
- * and `dropLevels` are here because `level()` forced them, and for no other
- * reason.
+ * **Deliberately small.** A method is only here once a driver or a primitive
+ * needs it, because a method written ahead of that would enshrine a guess
+ * about a shape nothing has exercised. `setLevel`, `readLevels` and
+ * `dropLevels` are here because `level()` needed them.
  *
  * There are two storage models here, and the split is the whole shape of the
  * file:
@@ -23,7 +21,7 @@
  * lets a window nobody wrote to still ship a row.
  *
  * An aggregate claim takes a **watermark**, because whether a bucket may ship
- * is a question about time — it is still open, or still inside grace. A staged
+ * is a question about time, namely whether it is still open, or still inside grace. A staged
  * claim takes a **limit**, because a record is complete the instant it is
  * appended and the only question left is how many to carry at once.
  *
@@ -123,7 +121,7 @@ export interface LevelSeries {
  *
  * The id is minted by the metric at `record()` time rather than here, so a
  * released batch keeps the ids it was first given and a retried write is
- * recognisable by content — the same property `rowId` gives an aggregate row.
+ * recognisable by content, the same property `rowId` gives an aggregate row.
  */
 export interface AppendOp {
   readonly metric: string
@@ -137,7 +135,7 @@ export interface AppendOp {
  *
  * `fields` is **opaque**: the driver stores it and hands it back untouched. It
  * does not know which keys are declared, which are reserved, or how any of it
- * becomes a column — that is the metric's business, and keeping it out of
+ * becomes a column. That is the metric's business, and keeping it out of
  * storage is what lets a driver serve a primitive it has never heard of.
  */
 export interface StagedRecord {
@@ -176,7 +174,7 @@ export interface LevelCell {
  * What a driver holds for one series in one bucket.
  *
  * A counter keeps a scalar, a gauge keeps a fold, a level keeps its held
- * value. The driver never interprets any of them — it stores what the metric
+ * value. The driver never interprets any of them. It stores what the metric
  * wrote and hands it back. Narrowing is the metric's job, because the metric
  * is the only thing that knows its own kind.
  */
@@ -218,7 +216,7 @@ export interface BucketRow {
  * A live read over staged, unclaimed records.
  *
  * `from`/`to` bound the record timestamp, half-open `[from, to)`. `limit`
- * caps what comes back — `peek(n)` is this, and on a stream-backed driver it
+ * caps what comes back. `peek(n)` is this, and on a stream-backed driver it
  * is the difference between an `XRANGE COUNT n` and dragging the whole
  * backlog over the wire.
  */
@@ -260,7 +258,7 @@ export interface RecordClaim extends ClaimBase {
  * A batch of data moved out of the live set and held pending a `write()`.
  *
  * Invisible to {@link Driver.readBuckets}, to {@link Driver.readPending}, and
- * to a second claim — that invisibility is what stops two flushers from
+ * to a second claim. That invisibility is what stops two flushers from
  * shipping the same window.
  */
 export type Claim = BucketClaim | RecordClaim
@@ -273,7 +271,7 @@ export function isBucketClaim(claim: Claim): claim is BucketClaim {
   return claim.kind === 'buckets'
 }
 
-/** True when a claim carries nothing — the flush has no reason to call a sink. */
+/** True when a claim carries nothing, so the flush has no reason to call a sink. */
 export function isEmptyClaim(claim: Claim): boolean {
   return isRecordClaim(claim) ? claim.records.length === 0 : claim.buckets.length === 0
 }
@@ -301,7 +299,7 @@ export interface RecoveryReport {
 }
 
 /**
- * A pass that found nothing — the overwhelmingly common case.
+ * A pass that found nothing, the overwhelmingly common case.
  *
  * Frozen and shared rather than rebuilt per call: a flush asks every metric
  * every time, and almost every answer is this one.
@@ -349,8 +347,8 @@ export interface Driver {
    * Fold observations into `last / min / max / sum / count`.
    *
    * Unlike `increment`, this is a read-modify-write: `min`, `max` and `last`
-   * are not increments. A shared driver has to make it atomic — a Lua script
-   * on Redis — or concurrent writers lose observations.
+   * are not increments. A shared driver has to make it atomic, with a Lua script
+   * on Redis, or concurrent writers lose observations.
    */
   observe(ops: readonly GaugeOp[]): Promise<void>
 
@@ -378,7 +376,7 @@ export interface Driver {
   readLevels(metric: string): Promise<LevelSeries[]>
 
   /**
-   * Forget these series entirely — held value, timestamp and pointer.
+   * Forget these series entirely, with their held value, timestamp and pointer.
    *
    * What a `holdFor` expiry calls. Their already-shipped buckets are
    * untouched; what goes is the reason to keep emitting new ones.
@@ -411,7 +409,7 @@ export interface Driver {
    * settled.
    *
    * Separate from `readPending` because it is a different call on a real
-   * driver — `XLEN` against an `XRANGE` — and counting by reading a million
+   * driver, `XLEN` against an `XRANGE`, and counting by reading a million
    * staged rows over the wire is not a thing to make easy.
    */
   countPending(metric: string): Promise<number>
@@ -444,10 +442,10 @@ export interface Driver {
    */
   claimRecords(metric: string, limit?: number): Promise<RecordClaim>
 
-  /** The write succeeded — discard the claimed data. */
+  /** The write succeeded, so discard the claimed data. */
   ack(claim: Claim): Promise<void>
 
-  /** The write failed — return the claimed data to the live set. */
+  /** The write failed, so return the claimed data to the live set. */
   release(claim: Claim): Promise<void>
 
   /**
@@ -455,7 +453,7 @@ export interface Driver {
    *
    * The gap `claim` opens and `ack` closes. A claim moves data **out** of the
    * live set, so a process that dies in between leaves a batch that is neither
-   * shipped nor claimable — `claim` only ever reads the live set, and the
+   * shipped nor claimable. `claim` only ever reads the live set, and the
    * abandoned batch is no longer in it. Durable storage is what keeps that
    * batch in existence; this is the pass that makes it reachable again.
    *

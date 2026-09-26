@@ -1,5 +1,5 @@
 /**
- * The house — the runtime instance.
+ * The house, the runtime instance.
  *
  * Binds a driver to your schema and exposes flush, snapshot and drain across
  * all of it. Metrics are inert declarations until a house registers them.
@@ -10,8 +10,8 @@
  * caller holding a whole schema, and `house.start()` is the optional timer
  * that pumps it for you on a long-lived process.
  *
- * `createHouse` opens no connections and starts no timers of its own — it uses
- * the driver you hand it — so it is safe to call at module scope, which is the
+ * `createHouse` opens no connections and starts no timers of its own. It uses
+ * the driver you hand it, so it is safe to call at module scope, which is the
  * only thing that works on a runtime that re-runs module scope on every cold
  * start.
  */
@@ -49,14 +49,14 @@ export interface HouseSnapshotOptions extends SnapshotOptions {
   readonly only?: readonly string[]
 }
 
-/** Live rows per metric, keyed by name — the same shape a flush report uses. */
+/** Live rows per metric, keyed by name, the same shape a flush report uses. */
 export type HouseSnapshot = Record<string, LiveRow[]>
 
 export interface HouseConfig {
   readonly driver: Driver
   readonly schema?: SchemaInput
   /**
-   * How this house gets rows out — `'staged'` (the default) waits for
+   * How this house gets rows out. `'staged'` (the default) waits for
    * `flush()`, `'immediate'` ships as data arrives, `'auto'` asks the driver.
    *
    * A deployment setting, not a schema one: the same metrics run on a dev
@@ -83,7 +83,7 @@ export interface House {
   /**
    * Flush every registered metric to its own sink, in registration order.
    *
-   * A fan-out over `metric.flush()` and nothing more — each metric still
+   * A fan-out over `metric.flush()` and nothing more. Each metric still
    * honours its own cadence, so calling this every ten seconds ships a
    * five-minute metric every five minutes. The convenience is that a cron
    * handler holding a whole schema does not have to loop.
@@ -101,7 +101,7 @@ export interface House {
    * a metric registered afterwards is scheduled as it arrives.
    *
    * **For a long-lived process only.** On Workers, Vercel edge and Lambda the
-   * isolate is frozen between requests and the interval never fires — there,
+   * isolate is frozen between requests and the interval never fires. There,
    * keep calling `flush()` from a cron. Nothing starts on its own precisely so
    * that `createHouse` stays safe at module scope on those runtimes.
    */
@@ -129,11 +129,11 @@ export interface House {
   snapshot(options?: HouseSnapshotOptions): Promise<HouseSnapshot>
 
   /**
-   * Every metric's open bucket — the cheap dashboard call.
+   * Every metric's open bucket, the cheap dashboard call.
    *
    * Bucketed kinds only. A staged metric has no open bucket to report, so it is
    * absent from the result rather than present and empty, which would read as
-   * "nothing happening" instead of "wrong question" — `pending()` is what
+   * "nothing happening" instead of "wrong question". `pending()` is what
    * counts an unshipped backlog.
    */
   current(): Promise<HouseSnapshot>

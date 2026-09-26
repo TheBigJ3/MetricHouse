@@ -13,7 +13,7 @@ export type TypeKind = 'str' | 'int' | 'float' | 'bool' | 'oneOf' | 'ts' | 'json
  * A declared type.
  *
  * `TOptional` tracks omittability *at the call site*, and `.default()` sets it
- * as surely as `.optional()` does — a dim with a default may be omitted, which
+ * as surely as `.optional()` does. A dim with a default may be omitted, which
  * is the only thing the caller's types care about. The runtime difference
  * survives in {@link FieldType.hasDefault}.
  */
@@ -25,7 +25,7 @@ export interface FieldType<TValue = unknown, TOptional extends boolean = boolean
   readonly defaultValue: TValue | undefined
   /** `oneOf` only: the closed set, in declaration order. */
   readonly values: readonly TValue[] | undefined
-  /** False for `json()` — you cannot key a series on a payload. */
+  /** False for `json()`, because you cannot key a series on a payload. */
   readonly dimLegal: boolean
 
   /** Clone, marked omittable. */
@@ -45,7 +45,7 @@ type OptionalKeys<S extends Shape> = {
 }[keyof S]
 
 /**
- * The object a call site passes — required keys required, `.optional()` and
+ * The object a call site passes, with required keys required, `.optional()` and
  * `.default()` keys omittable, `oneOf` narrowed to its union.
  */
 /** Flattens an intersection into one object type, so hovers and type equality behave. */
@@ -59,7 +59,7 @@ export type InferShape<S extends Shape> = Simplify<
   }
 >
 
-/** The keys a call site must supply — neither `.optional()` nor `.default()`. */
+/** The keys a call site must supply, neither `.optional()` nor `.default()`. */
 export type RequiredKeys<S extends Shape> = Exclude<keyof S, OptionalKeys<S>>
 
 /**
@@ -74,7 +74,7 @@ export type ShapeArgs<S extends Shape> = [RequiredKeys<S>] extends [never]
   : [values: InferShape<S>]
 
 /**
- * The same shape with `K` made omittable — what is left to supply once some
+ * The same shape with `K` made omittable, what is left to supply once some
  * values have been bound in advance.
  *
  * Omittable rather than *removed*: removing a bound key satisfies it, which is
@@ -181,7 +181,7 @@ export function oneOf<const T extends readonly (string | number)[]>(
 }
 
 /**
- * An arbitrary payload. Legal on event and log fields, **rejected as a dim** —
+ * An arbitrary payload. Legal on event and log fields, **rejected as a dim**, because
  * a payload cannot be losslessly encoded into a series key.
  */
 export function json<T = unknown>(): FieldType<T, false> {
@@ -228,7 +228,7 @@ export function jsonText(value: unknown, label: string): string {
  * `label` is interpolated into the message so a failure names the offending
  * key rather than making the caller guess which dim was wrong.
  *
- * `undefined` is rejected here — omission is {@link FieldType.isOptional}'s
+ * `undefined` is rejected here. Omission is {@link FieldType.isOptional}'s
  * business, checked before this is called.
  *
  * @throws if the value does not satisfy the type

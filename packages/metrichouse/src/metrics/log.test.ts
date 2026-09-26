@@ -6,19 +6,8 @@ import { int, str } from '../schema/types.js'
 import { log } from './log.js'
 import type { Row, WriteContext, WriteFn } from './types.js'
 
-/** A sink that keeps nothing — for declaration tests that never ship. */
+/** A sink that keeps nothing, for declaration tests that never ship. */
 const discard: WriteFn = () => {}
-
-function expectRejected(fn: () => unknown): Error {
-  let caught: unknown
-  try {
-    fn()
-  } catch (err) {
-    caught = err
-  }
-  expect(caught, 'expected the call to throw').toBeInstanceOf(Error)
-  return caught as Error
-}
 
 const makeFields = () => ({
   requestId: str().optional(),
@@ -57,16 +46,16 @@ beforeEach(() => {
 })
 
 describe('declaration', () => {
-  it('is inert — a declaration is not bound to anything', () => {
+  it('is inert, a declaration bound to nothing', () => {
     const appLog = log('app_log', { write: discard, fields: makeFields() })
     expect(appLog.isBound).toBe(false)
-    expect(expectRejected(() => appLog.info('x', { service: 'api' })).message).toMatch(
-      /not bound to a house/,
+    expect(() => appLog.info('x', { service: 'api' })).toThrow(
+      'app_log: not bound to a house. Pass it to createHouse({ schema }) before writing',
     )
   })
 
   it('refuses an empty name', () => {
-    expect(expectRejected(() => log('  ', { write: discard })).message).toMatch(/non-empty/)
+    expect(() => log('  ', { write: discard })).toThrow('log: name must be a non-empty string')
   })
 
   it('reports itself as a log, not as the event it is built on', () => {
@@ -82,40 +71,40 @@ describe('declaration', () => {
   })
 
   it('refuses an empty level set', () => {
-    expect(expectRejected(() => log('l', { write: discard, levels: [] })).message).toMatch(
-      /at least one level/,
+    expect(() => log('l', { write: discard, levels: [] })).toThrow(
+      'l: levels must declare at least one level',
     )
   })
 
   it('refuses a duplicated level', () => {
-    expect(
-      expectRejected(() => log('l', { write: discard, levels: ['info', 'info'] })).message,
-    ).toMatch(/declared twice/)
+    expect(() => log('l', { write: discard, levels: ['info', 'info'] })).toThrow(
+      'l: level "info" is declared twice',
+    )
   })
 
   it.each(['drain', 'child', 'at', 'name', 'peek', 'toString', 'constructor', '__proto__'])(
     'refuses a level named %s, which would shadow the property of that name',
     (level) => {
-      expect(
-        expectRejected(() => log('l', { write: discard, levels: ['info', level] })).message,
-      ).toMatch(/would shadow an existing property/)
+      expect(() => log('l', { write: discard, levels: ['info', level] })).toThrow(
+        `l: level ${JSON.stringify(level)} would shadow an existing property on the logger. ` +
+          'Pick another',
+      )
     },
   )
 
   it('refuses a minLevel that is not a declared level', () => {
-    expect(
-      expectRejected(() =>
-        log('l', { write: discard, levels: ['low', 'high'], minLevel: 'medium' as 'low' }),
-      ).message,
-    ).toMatch(/not one of the declared levels/)
+    expect(() =>
+      log('l', { write: discard, levels: ['low', 'high'], minLevel: 'medium' as 'low' }),
+    ).toThrow('l: minLevel "medium" is not one of the declared levels [low, high]')
   })
 
   it.each(['id', 'ts', 'level', 'message', 'error_stack', '_ingested_at', '_sample_rate'])(
-    'refuses a field named %s — MetricHouse owns that column',
+    'refuses a field named %s, a column MetricHouse owns',
     (reserved) => {
-      expect(
-        expectRejected(() => log('l', { write: discard, fields: { [reserved]: str() } })).message,
-      ).toMatch(/reserved column/)
+      expect(() => log('l', { write: discard, fields: { [reserved]: str() } })).toThrow(
+        `l: field "${reserved}" is a reserved column. MetricHouse writes ` +
+          '[id, ts, level, message, error_stack, _ingested_at, _sample_rate] on every log row',
+      )
     },
   )
 
@@ -160,9 +149,9 @@ describe('levels', () => {
 
   it('refuses a dynamic level nobody declared', () => {
     const appLog = bound()
-    expect(
-      expectRejected(() => appLog.at('trace' as 'info', 'x', { service: 'api' })).message,
-    ).toMatch(/not one of the declared levels/)
+    expect(() => appLog.at('trace' as 'info', 'x', { service: 'api' })).toThrow(
+      'app_log: "trace" is not one of the declared levels [debug, info, warn, error]',
+    )
   })
 })
 
@@ -184,7 +173,7 @@ describe('minLevel', () => {
   })
 
   it('orders by declaration, not alphabetically', async () => {
-    // 'alpha' sorts before 'zulu' but is declared above it — severity is the
+    // 'alpha' sorts before 'zulu' but is declared above it, so severity is the
     // order you wrote, which is the only ordering that works for custom sets
     const audit = log('audit', { write: discard, levels: ['zulu', 'alpha'], minLevel: 'alpha' })
     audit.bind({ driver, now })
@@ -196,15 +185,15 @@ describe('minLevel', () => {
 
   it('does not even validate a dropped call', () => {
     // the point of minLevel is that a filtered log costs one array index, so
-    // the fields are never touched — a debug line is free in production
+    // the fields are never touched and a debug line is free in production
     const appLog = bound({ minLevel: 'info' })
     expect(() => appLog.debug('x', undefined as unknown as { service: string })).not.toThrow()
   })
 
   it('still validates a kept call', () => {
     const appLog = bound({ minLevel: 'info' })
-    expect(expectRejected(() => appLog.info('x', {} as { service: string })).message).toMatch(
-      /missing required field "service"/,
+    expect(() => appLog.info('x', {} as { service: string })).toThrow(
+      'missing required field "service"',
     )
   })
 })
@@ -333,7 +322,7 @@ describe('child', () => {
     expect((await shipped(appLog))[0]).toMatchObject({ service: 'api', requestId: 'req_1' })
   })
 
-  it('stages into the log that made it — a child is not a second metric', async () => {
+  it('stages into the log that made it, since a child is not a second metric', async () => {
     const appLog = bound()
     appLog.child({ service: 'api' }).info('one')
     appLog.info('two', { service: 'api' })
@@ -375,15 +364,19 @@ describe('fields', () => {
   it('validates a declared field like any other', () => {
     const jobLog = log('job_log', { write: discard, fields: { attempt: int() } })
     jobLog.bind({ driver, now })
-    expect(expectRejected(() => jobLog.info('x', { attempt: 1.5 })).message).toMatch(/safe integer/)
+    expect(() => jobLog.info('x', { attempt: 1.5 })).toThrow(
+      'attempt: expected a safe integer, got 1.5',
+    )
   })
 
   it('rejects a field the log never declared', () => {
     const jobLog = log('job_log', { write: discard, fields: { attempt: int() } })
     jobLog.bind({ driver, now })
-    expect(
-      expectRejected(() => jobLog.info('x', { nope: 1 } as unknown as { attempt: number })).message,
-    ).toMatch(/unknown field "nope"/)
+    expect(() => jobLog.info('x', { nope: 1 } as unknown as { attempt: number })).toThrow(
+      new Error(
+        'unknown field "nope". The declared fields are [level, message, error_stack, attempt]',
+      ),
+    )
   })
 
   it('applies a field default', async () => {

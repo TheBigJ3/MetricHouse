@@ -1,12 +1,11 @@
 /**
- * The memory driver — full parity with a shared driver, in plain Maps.
+ * The memory driver. Full parity with a shared driver, in plain Maps.
  *
  * Legitimate for a long-lived single process. Its `claim` is a read-and-hold
  * rather than a durable move, so `capabilities.durable` is `false` and the
  * guarantee is best-effort: a crash between claim and ack loses that window.
  *
  * It is the only driver that caps series, because nothing else is watching it.
- * A shared driver defers to the static projection in `metrichouse cost`.
  */
 
 import {
@@ -139,7 +138,7 @@ export interface MemoryDriverOptions {
    * The same argument as {@link MemoryDriverOptions.maxSeries}, for the other
    * storage model: an event backlog that nothing drains is an out-of-memory
    * crash, and a loud error naming the metric is a better failure. It is a
-   * *backlog* cap, not a rate limit — a metric that flushes keeps almost
+   * *backlog* cap, not a rate limit. A metric that flushes keeps almost
    * nothing here.
    */
   readonly maxStaged?: number
@@ -198,6 +197,16 @@ function assertFinite(value: number, metric: string, what: string): void {
         'a metric can store, so the write was refused',
     )
   }
+}
+
+/** The value `map` holds under `key`, made and stored first if it holds none. */
+function getOrCreate<K, V>(map: Map<K, V>, key: K, make: () => V): V {
+  let value = map.get(key)
+  if (value === undefined) {
+    value = make()
+    map.set(key, value)
+  }
+  return value
 }
 
 export function memory(options: MemoryDriverOptions = {}): Driver {
@@ -269,24 +278,45 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
   const stagedInFlight = new Map<string, number>()
 
   function stagedFor(metric: string): StagedRecord[] {
-    let records = staged.get(metric)
-    if (!records) {
-      records = []
-      staged.set(metric, records)
-    }
-    return records
+    return getOrCreate(staged, metric, () => [])
   }
 
   function levelsFor(metric: string): Map<string, LevelSeries> {
-    let series = levels.get(metric)
-    if (!series) {
-      series = new Map()
-      levels.set(metric, series)
-    }
-    return series
+    return getOrCreate(levels, metric, () => new Map())
   }
 
-  /** Staged plus in-flight — a claim that is never acked still occupies memory. */
+  /** The error every path that would add a series past `maxSeries` throws. */
+  function seriesLimitError(metric: string): Error {
+    return new Error(
+      `memory driver: ${metric} exceeded maxSeries (${maxSeries}), which a dim with ` +
+        'unbounded values will do. Put that value on an event instead',
+    )
+  }
+
+  function nextClaimId(metric: string): string {
+    claimSeq += 1
+    return `${metric}#${claimSeq}`
+  }
+
+  /** Register a new claim as in flight, and hand it back. */
+  function hold<C extends Claim>(claim: C): C {
+    inFlight.set(claim.id, claim)
+    return claim
+  }
+
+  /**
+   * Take a claim out of the in-flight set, the first step of an ack or a
+   * release.
+   *
+   * @throws if the claim is not in flight, because it was settled already
+   */
+  function settle(claim: Claim): void {
+    if (!inFlight.delete(claim.id)) {
+      throw new Error(`memory driver: claim ${claim.id} is not in flight. Was it already settled?`)
+    }
+  }
+
+  /** Staged plus in-flight, because a claim that is never acked still occupies memory. */
   function stagedHeld(metric: string): number {
     return (staged.get(metric)?.length ?? 0) + (stagedInFlight.get(metric) ?? 0)
   }
@@ -298,20 +328,11 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
   }
 
   function addHolder(metric: string, dimKey: string): void {
-    let byKey = holders.get(metric)
-    if (!byKey) {
-      byKey = new Map()
-      holders.set(metric, byKey)
-    }
+    const byKey = getOrCreate(holders, metric, () => new Map<string, number>())
 
     const count = byKey.get(dimKey)
     if (count === undefined) {
-      if (byKey.size >= maxSeries) {
-        throw new Error(
-          `memory driver: ${metric} exceeded maxSeries (${maxSeries}), which a dim with ` +
-            'unbounded values will do. Put that value on an event instead',
-        )
-      }
+      if (byKey.size >= maxSeries) throw seriesLimitError(metric)
       byKey.set(dimKey, 1)
       return
     }
@@ -336,12 +357,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
   }
 
   function bucketsFor(metric: string): Map<number, Map<string, Cell>> {
-    let byBucket = live.get(metric)
-    if (!byBucket) {
-      byBucket = new Map()
-      live.set(metric, byBucket)
-    }
-    return byBucket
+    return getOrCreate(live, metric, () => new Map())
   }
 
   /** Get or create the bucket a write lands in, capping series on a new key. */
@@ -411,39 +427,32 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
    * `addHolder` checks one key at a time, so a batch refused on its tenth new
    * series would otherwise keep the first nine.
    */
-  function assertRoomFor(ops: readonly { metric: string; bucketTs: number; dimKey: string }[]) {
+  function assertRoomFor(ops: readonly { metric: string; dimKey: string }[]) {
     const fresh = new Map<string, Set<string>>()
     for (const op of ops) {
       if (holders.get(op.metric)?.has(op.dimKey)) continue
-      let keys = fresh.get(op.metric)
-      if (!keys) {
-        keys = new Set()
-        fresh.set(op.metric, keys)
-      }
-      keys.add(op.dimKey)
+      getOrCreate(fresh, op.metric, () => new Set()).add(op.dimKey)
     }
     for (const [metric, keys] of fresh) {
       if ((holders.get(metric)?.size ?? 0) + keys.size > maxSeries) {
-        throw new Error(
-          `memory driver: ${metric} exceeded maxSeries (${maxSeries}), which a dim with ` +
-            'unbounded values will do. Put that value on an event instead',
-        )
+        throw seriesLimitError(metric)
       }
     }
   }
 
   /**
-   * Work out every cell a batch of increments or observations ends with,
-   * without storing any of them.
+   * Work out every cell a batch of increments or observations ends with, then
+   * store them.
    *
-   * The whole batch is checked before any of it lands, so a refusal halfway
-   * through changes nothing. `fold` gets the cell as the batch has left it so
-   * far, which is what keeps two ops for one series in one call in order.
+   * The whole batch is worked out and checked before any of it lands, so a
+   * refusal halfway through changes nothing. `fold` gets the cell as the batch
+   * has left it so far, which is what keeps two ops for one series in one call
+   * in order.
    */
-  function planCells<Op extends { metric: string; bucketTs: number; dimKey: string }>(
+  function applyCells<Op extends { metric: string; bucketTs: number; dimKey: string }>(
     ops: readonly Op[],
     fold: (op: Op, existing: Cell | undefined) => Cell,
-  ): { metric: string; bucketTs: number; dimKey: string; cell: Cell }[] {
+  ): void {
     const planned = new Map<
       string,
       { metric: string; bucketTs: number; dimKey: string; cell: Cell }
@@ -460,7 +469,9 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       })
     }
     assertRoomFor([...planned.values()])
-    return [...planned.values()]
+    for (const { metric, bucketTs, dimKey, cell } of planned.values()) {
+      cellSlot(metric, bucketTs, dimKey).set(dimKey, cell)
+    }
   }
 
   /** One level op, its writes recorded in `undo`. See {@link Driver.setLevel}. */
@@ -501,12 +512,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       return
     }
 
-    if (!held && series.size >= maxSeries) {
-      throw new Error(
-        `memory driver: ${op.metric} exceeded maxSeries (${maxSeries}), which a dim with ` +
-          'unbounded values will do. Put that value on an event instead',
-      )
-    }
+    if (!held && series.size >= maxSeries) throw seriesLimitError(op.metric)
 
     const bucketTs = landing(op.metric, op.bucketTs)
     const byBucket = bucketsFor(op.metric)
@@ -582,7 +588,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     },
 
     async increment(ops: readonly IncrOp[]): Promise<void> {
-      const cells = planCells(ops, (op, existing) => {
+      applyCells(ops, (op, existing) => {
         if (existing !== undefined && typeof existing !== 'number') {
           throw new Error(
             `memory driver: ${op.metric} holds ${isGaugeCell(existing) ? 'gauge' : 'level'} ` +
@@ -594,13 +600,10 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         if (op.integer) assertSafe(next, op.metric, 'total')
         return plainZero(next)
       })
-      for (const { metric, bucketTs, dimKey, cell } of cells) {
-        cellSlot(metric, bucketTs, dimKey).set(dimKey, cell)
-      }
     },
 
     async observe(ops: readonly GaugeOp[]): Promise<void> {
-      const cells = planCells(ops, (op, existing) => {
+      applyCells(ops, (op, existing) => {
         const value = plainZero(op.value)
         if (existing === undefined) {
           assertFinite(value, op.metric, 'sum')
@@ -624,9 +627,6 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           count: existing.count + 1,
         }
       })
-      for (const { metric, bucketTs, dimKey, cell } of cells) {
-        cellSlot(metric, bucketTs, dimKey).set(dimKey, cell)
-      }
     },
 
     async setLevel(ops: readonly LevelOp[]): Promise<void> {
@@ -666,7 +666,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
 
     async append(ops: readonly AppendOp[]): Promise<void> {
       // counted before anything is written, so a refused batch stages none of
-      // itself — a half-appended batch would be re-sent whole on retry and
+      // itself. A half-appended batch would be re-sent whole on retry and
       // duplicate the part that landed
       const wanted = new Map<string, number>()
       for (const op of ops) {
@@ -725,7 +725,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         if (query.to !== undefined && record.ts >= query.to) continue
         matched.push(record)
         // append order is already ts order for anything not backdated, and the
-        // caller asked for the first n — stop rather than scan the backlog
+        // caller asked for the first n, so stop rather than scan the backlog
         if (query.limit !== undefined && matched.length >= query.limit) break
       }
       return matched
@@ -734,7 +734,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     async countPending(metric: string): Promise<number> {
       // claimed and not yet settled still counts: those records have not
       // shipped, and a sink that hangs should not make a backlog read zero
-      return (staged.get(metric)?.length ?? 0) + (stagedInFlight.get(metric) ?? 0)
+      return stagedHeld(metric)
     },
 
     async claim(metric: string, upToBucketTs: number): Promise<BucketClaim> {
@@ -750,7 +750,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           const bucket = byBucket.get(bucketTs)
           if (!bucket) continue
           // moved out of live: invisible to readBuckets and to a second claim.
-          // Holder counts are untouched — the data is still held in memory.
+          // Holder counts are untouched, because the data is still held in memory.
           byBucket.delete(bucketTs)
           claimed.push({ bucketTs, values: bucket })
         }
@@ -760,17 +760,13 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       // that every window below it has been claimed once, whatever was in it
       claimedUpTo.set(metric, Math.max(claimedUpTo.get(metric) ?? upToBucketTs, upToBucketTs))
 
-      claimSeq += 1
-      const claim: BucketClaim = {
+      return hold<BucketClaim>({
         kind: 'buckets',
-        id: `${metric}#${claimSeq}`,
+        id: nextClaimId(metric),
         metric,
         claimedAt: Date.now(),
         buckets: claimed,
-      }
-
-      inFlight.set(claim.id, claim)
-      return claim
+      })
     },
 
     async claimRecords(metric: string, limit?: number): Promise<RecordClaim> {
@@ -782,25 +778,17 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       const taken = limit === undefined ? records.splice(0) : records.splice(0, Math.max(0, limit))
       addStagedInFlight(metric, taken.length)
 
-      claimSeq += 1
-      const claim: RecordClaim = {
+      return hold<RecordClaim>({
         kind: 'records',
-        id: `${metric}#${claimSeq}`,
+        id: nextClaimId(metric),
         metric,
         claimedAt: Date.now(),
         records: taken,
-      }
-
-      inFlight.set(claim.id, claim)
-      return claim
+      })
     },
 
     async ack(claim: Claim): Promise<void> {
-      if (!inFlight.delete(claim.id)) {
-        throw new Error(
-          `memory driver: claim ${claim.id} is not in flight. Was it already settled?`,
-        )
-      }
+      settle(claim)
 
       if (isRecordClaim(claim)) {
         addStagedInFlight(claim.metric, -claim.records.length)
@@ -815,11 +803,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     },
 
     async release(claim: Claim): Promise<void> {
-      if (!inFlight.delete(claim.id)) {
-        throw new Error(
-          `memory driver: claim ${claim.id} is not in flight. Was it already settled?`,
-        )
-      }
+      settle(claim)
 
       if (isRecordClaim(claim)) {
         addStagedInFlight(claim.metric, -claim.records.length)
@@ -847,7 +831,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           continue
         }
 
-        // a write can land in a bucket while it is claimed — backdated, or a
+        // a write can land in a bucket while it is claimed, backdated or a
         // straggler. Merge rather than overwrite, or that increment is lost.
         for (const [dimKey, value] of claimedBucket.values) {
           const current = existing.get(dimKey)
@@ -866,7 +850,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       // Nothing to find, and not because the sweep is unimplemented: this
       // driver's claims live in `inFlight`, a Map in the process that took
       // them. A process that dies takes the Map with it, so there is never an
-      // abandoned claim left behind to return — the window is simply gone.
+      // abandoned claim left behind to return. The window is simply gone.
       // That is the whole of what `durable: false` costs, said once more here
       // so it cannot be mistaken for an oversight.
       return NOTHING_RECOVERED

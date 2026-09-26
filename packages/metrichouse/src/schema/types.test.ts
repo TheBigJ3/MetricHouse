@@ -1,19 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { assertValue, bool, float, type InferShape, int, json, oneOf, str, ts } from './types.js'
 
-function expectRejected(fn: () => unknown): Error {
-  let caught: unknown
-  try {
-    fn()
-  } catch (err) {
-    caught = err
-  }
-  expect(caught, 'expected the call to throw').toBeInstanceOf(Error)
-  const err = caught as Error
-  expect(err.message, 'still throwing the stub sentinel').not.toMatch(/not implemented/i)
-  return err
-}
-
 describe('constructors', () => {
   it('tag their kind', () => {
     expect(str().kind).toBe('str')
@@ -46,7 +33,7 @@ describe('constructors', () => {
   })
 
   it('rejects an empty oneOf', () => {
-    expectRejected(() => oneOf([]))
+    expect(() => oneOf([])).toThrow('oneOf: the set must declare at least one member')
   })
 })
 
@@ -62,7 +49,7 @@ describe('modifiers', () => {
     expect(t.defaultValue).toBe('riverside')
   })
 
-  it('does not mutate the receiver — declarations are inert and shareable', () => {
+  it('does not mutate the receiver, since declarations are inert and shareable', () => {
     const base = str()
     const opt = base.optional()
     const def = base.default('x')
@@ -85,7 +72,9 @@ describe('modifiers', () => {
   })
 
   it('rejects a default that does not satisfy the type', () => {
-    expectRejected(() => oneOf(['solid', 'liquid']).default('gas' as 'solid'))
+    expect(() => oneOf(['solid', 'liquid']).default('gas' as 'solid')).toThrow(
+      'default for oneOf(): "gas" is not one of ["solid", "liquid"]',
+    )
   })
 })
 
@@ -104,39 +93,49 @@ describe('assertValue', () => {
   })
 
   it('rejects a wrong primitive', () => {
-    expectRejected(() => assertValue(str(), 7, 'dogName'))
-    expectRejected(() => assertValue(int(), 'seven', 'n'))
-    expectRejected(() => assertValue(bool(), 'true', 'b'))
-    expectRejected(() => assertValue(ts(), 1_700_000_000_000, 't'))
+    expect(() => assertValue(str(), 7, 'dogName')).toThrow('dogName: expected a string, got 7')
+    expect(() => assertValue(int(), 'seven', 'n')).toThrow(
+      'n: expected a safe integer, got "seven"',
+    )
+    expect(() => assertValue(bool(), 'true', 'b')).toThrow('b: expected a boolean, got "true"')
+    expect(() => assertValue(ts(), 1_700_000_000_000, 't')).toThrow(
+      't: expected a valid Date, got 1700000000000',
+    )
   })
 
   it('requires int to be a safe integer, but lets float be fractional', () => {
-    expectRejected(() => assertValue(int(), 1.5, 'n'))
-    expectRejected(() => assertValue(int(), Number.NaN, 'n'))
+    expect(() => assertValue(int(), 1.5, 'n')).toThrow('n: expected a safe integer, got 1.5')
+    expect(() => assertValue(int(), Number.NaN, 'n')).toThrow('n: expected a safe integer, got NaN')
     expect(() => assertValue(float(), 1.5, 'n')).not.toThrow()
   })
 
   it('rejects non-finite floats', () => {
-    expectRejected(() => assertValue(float(), Number.POSITIVE_INFINITY, 'n'))
-    expectRejected(() => assertValue(float(), Number.NaN, 'n'))
+    expect(() => assertValue(float(), Number.POSITIVE_INFINITY, 'n')).toThrow(
+      'n: expected a finite number, got Infinity',
+    )
+    expect(() => assertValue(float(), Number.NaN, 'n')).toThrow(
+      'n: expected a finite number, got NaN',
+    )
   })
 
   it('rejects a value outside a oneOf set', () => {
-    expectRejected(() => assertValue(oneOf(['solid', 'liquid']), 'gas', 'kind'))
+    expect(() => assertValue(oneOf(['solid', 'liquid']), 'gas', 'kind')).toThrow(
+      'kind: "gas" is not one of ["solid", "liquid"]',
+    )
   })
 
-  it('rejects undefined — omission is checked before this point', () => {
-    expectRejected(() => assertValue(str(), undefined, 'dogName'))
+  it('rejects undefined, since omission is checked before this point', () => {
+    expect(() => assertValue(str(), undefined, 'dogName')).toThrow('dogName: a value is required')
   })
 
   it('names the offending key', () => {
-    expect(expectRejected(() => assertValue(str(), 7, 'dogName')).message).toMatch(/dogName/)
+    expect(() => assertValue(str(), 7, 'dogName')).toThrow('dogName: expected a string, got 7')
   })
 })
 
 /**
  * Type-level assertions. These are checked by `pnpm typecheck`, not at
- * runtime — a red squiggle here is a real failure even though vitest is green.
+ * runtime. A red squiggle here is a real failure even though vitest is green.
  */
 const makeDims = () => ({
   dogName: str(),
@@ -157,7 +156,7 @@ type _InferShapeIsExact = Expect<
   >
 >
 
-// oneOf is the narrowed union, not string — this is what makes a typo at the
+// oneOf is the narrowed union, not string. This is what makes a typo at the
 // call site a compile error rather than a new series
 type _KindIsNarrowed = Expect<
   Equal<InferShape<ReturnType<typeof makeDims>>['kind'], 'solid' | 'liquid'>

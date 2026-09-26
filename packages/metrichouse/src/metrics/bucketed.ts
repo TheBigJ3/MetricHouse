@@ -16,6 +16,7 @@ import {
   isBucketClaim,
   type RecoveryReport,
 } from '../drivers/types.js'
+import { type Attempts, createAttempts } from '../runtime/flush.js'
 import {
   applySnapshot,
   type LiveRow,
@@ -24,9 +25,19 @@ import {
   snapshotRange,
   type TypedSnapshot,
 } from '../runtime/live.js'
+import { shipOpenSeries } from '../runtime/ship.js'
 import type { Shape } from '../schema/types.js'
-import { closedUpTo } from '../time/buckets.js'
-import type { AnyMetric, ClaimOptions, MaterializedBatch, Row } from './types.js'
+import { assertResolution, closedUpTo } from '../time/buckets.js'
+import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
+import type {
+  AnyMetric,
+  ClaimOptions,
+  MaterializedBatch,
+  MetricBinding,
+  MetricKind,
+  Row,
+  WriteFn,
+} from './types.js'
 
 /**
  * How long a window waits after it ends before a flush may claim it, when
@@ -38,12 +49,192 @@ import type { AnyMetric, ClaimOptions, MaterializedBatch, Row } from './types.js
 export const DEFAULT_GRACE_MS = 2_000
 
 /**
+ * The watermark a claim at `nowMs` takes everything strictly below: every
+ * window that has ended and outlived grace. A final flush waives the grace,
+ * see `FlushOptions.final`.
+ */
+export function claimWatermark(
+  resolutionMs: number,
+  nowMs: number,
+  graceMs: () => number,
+  options: ClaimOptions = {},
+): number {
+  return closedUpTo(resolutionMs, nowMs, options.final ? 0 : graceMs())
+}
+
+/**
+ * Which series a materialized row belongs to: its dim values in declared
+ * order, as one string a Map or a Set can key on.
+ */
+export function seriesKey(dimNames: readonly string[], row: Row): string {
+  return JSON.stringify(dimNames.map((dim) => row[dim]))
+}
+
+/** What a bucketed kind declares that {@link bucketedBinding} resolves. */
+export interface BucketedBindingOptions {
+  readonly name: string
+  /** Named in the error for a missing cadence, so it says what to declare it on. */
+  readonly kind: MetricKind
+  readonly resolution: DurationInput
+  readonly flush?: DurationInput | undefined
+  readonly grace?: DurationInput | undefined
+  /** For `delivery: 'immediate'`, which ships the open series after each write. */
+  readonly materialize: (bucketTs: number, dimKey: string, cell: Cell) => Row
+  readonly totalOf: (rows: readonly Row[]) => number
+  /** The sink, erased: the open series path carries rows of every kind. */
+  readonly sink: WriteFn
+}
+
+/** The house a bucketed kind is bound to, and everything read from it. */
+export interface BucketedBinding {
+  /** Parsed once, at declaration. The write path never parses a duration. */
+  readonly resolutionMs: number
+  /** One failure count for flushes and immediate sends alike. */
+  readonly attempts: Attempts
+  isBound(): boolean
+  /** The binding, or a throw naming the metric when there is none. */
+  active(): MetricBinding
+  driver(): Driver
+  /** The bound clock. */
+  now(): number
+  /**
+   * The metric's own cadence, or the house's. Resolved on every read rather
+   * than at bind, so nothing has to care which came first. `from` is the
+   * binding to read the house's from, which `bind` passes before it keeps one.
+   */
+  flushMs(from?: MetricBinding): number
+  graceMs(): number
+  /**
+   * Keep a house. Called by the house; a metric belongs to exactly one, and
+   * binding twice throws rather than quietly redirecting writes.
+   */
+  bind(next: MetricBinding): void
+  unbind(): void
+  /**
+   * Under `delivery: 'immediate'`, follow a write with a send of the whole
+   * open bucket for its series. Otherwise the write as it is.
+   */
+  deliver(write: Promise<void>, bucketTs: number, dimKey: string): Promise<void>
+}
+
+/**
+ * The binding half every bucketed kind shares: its durations, the house it is
+ * bound to, the cadence and grace read from either, and immediate delivery.
+ *
+ * Parses and checks the durations when called, so a kind calls it where its
+ * declaration is validated and a bad duration throws in the same order it
+ * always did.
+ *
+ * @throws if a duration is invalid, or a declared `flush` is not a whole
+ * multiple of `resolution`
+ */
+export function bucketedBinding(options: BucketedBindingOptions): BucketedBinding {
+  const { name, kind, materialize, totalOf, sink } = options
+
+  // parsed once, here. The write path does integer math and never sees a
+  // duration string
+  const resolutionMs = parseDuration(options.resolution)
+  const ownFlushMs =
+    options.flush === undefined ? undefined : parseInterval(options.flush, `${name}: flush`)
+  const ownGraceMs = options.grace === undefined ? undefined : parseDuration(options.grace)
+  // eager when the metric declares its own cadence: a bad pair is a
+  // programming error and should surface when the schema file is read, not at
+  // the first flush
+  if (ownFlushMs !== undefined) assertResolution(resolutionMs, ownFlushMs)
+
+  const attempts = createAttempts()
+  let binding: MetricBinding | undefined
+
+  function active(): MetricBinding {
+    if (!binding) {
+      throw new Error(
+        `${name}: not bound to a house. Pass it to createHouse({ schema }) before writing`,
+      )
+    }
+    return binding
+  }
+
+  function flushMs(from: MetricBinding | undefined = binding): number {
+    const ms = ownFlushMs ?? from?.defaults?.flushMs
+    if (ms === undefined) {
+      throw new Error(
+        `${name}: no flush cadence. Declare flush on the ${kind}, or defaults.flush on the house`,
+      )
+    }
+    return ms
+  }
+
+  return {
+    resolutionMs,
+    attempts,
+
+    isBound(): boolean {
+      return binding !== undefined
+    },
+
+    active,
+
+    driver(): Driver {
+      return active().driver
+    },
+
+    now(): number {
+      return (active().now ?? Date.now)()
+    },
+
+    flushMs,
+
+    graceMs(): number {
+      return ownGraceMs ?? binding?.defaults?.graceMs ?? DEFAULT_GRACE_MS
+    },
+
+    bind(next: MetricBinding): void {
+      if (binding) {
+        throw new Error(`${name}: already bound to a house, and a metric belongs to exactly one`)
+      }
+      // the half of validation that could not run at declare time: a cadence
+      // taken from the house is only knowable now, and createHouse is still
+      // early enough to be a boot failure rather than a surprise at flush.
+      // Checked before the binding is kept, so a refusal leaves the metric
+      // free to be registered again once the mistake is fixed
+      if (ownFlushMs === undefined) assertResolution(resolutionMs, flushMs(next))
+      binding = next
+    },
+
+    unbind(): void {
+      binding = undefined
+    },
+
+    // chained onto the driver write rather than racing it: the fold has to
+    // include the write that triggered the send, or the sink is told a value
+    // that is already stale by one
+    deliver(write: Promise<void>, bucketTs: number, dimKey: string): Promise<void> {
+      if (binding?.delivery !== 'immediate') return write
+      return write.then(() =>
+        shipOpenSeries({
+          metric: name,
+          kind,
+          resolutionMs,
+          driver: active().driver,
+          bucketTs,
+          dimKey,
+          materialize,
+          totalOf,
+          sink,
+          attempts,
+        }),
+      )
+    },
+  }
+}
+
+/**
  * The read half, for a kind whose live data is buckets.
  *
  * Generic in the dims and in the value columns the kind adds, so a counter's
  * snapshot returns rows with `park: string` and `value: number` rather than
- * `unknown` per key. The erased {@link AnyMetric.snapshot} stays as it is —
- * this narrows it, which is legal precisely because a typed row is still a
+ * `unknown` per key. The erased {@link AnyMetric.snapshot} stays as it is.
+ * This narrows it, which is legal precisely because a typed row is still a
  * {@link LiveRow}.
  */
 export type BucketedReader<D extends Shape, V> = TypedSnapshot<D, V>
@@ -65,8 +256,8 @@ export interface BucketedReaderOptions {
  *
  * The sibling of {@link bucketedLifecycle}: that one is the write path's shared
  * half, this one is the read path's. Both exist so a third aggregate kind
- * supplies what is actually different about it — how a cell becomes a row, and
- * how two of them merge — and inherits everything else.
+ * supplies what is actually different about it, how a cell becomes a row, and
+ * how two of them merge, and inherits everything else.
  *
  * The clock is read once per call and passed down, so every row in one snapshot
  * agrees about which bucket is open. Reading it per row would let a snapshot
@@ -102,7 +293,7 @@ export function bucketedReader<D extends Shape, V>(
   return reader as unknown as BucketedReader<D, V>
 }
 
-/** The four {@link AnyMetric} methods that move a batch. */
+/** The five {@link AnyMetric} methods that move a batch. */
 export type BatchLifecycle = Pick<
   AnyMetric,
   'recoverBatch' | 'claimBatch' | 'materializeClaim' | 'ackBatch' | 'releaseBatch'
@@ -142,10 +333,7 @@ export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
     },
 
     async claimBatch(nowMs: number, claimOptions: ClaimOptions = {}): Promise<Claim> {
-      // everything strictly below this has ended and outlived grace. A final
-      // flush waives the grace: see `FlushOptions.final`
-      const grace = claimOptions.final ? 0 : graceMs()
-      return driver().claim(name, closedUpTo(resolutionMs, nowMs, grace))
+      return driver().claim(name, claimWatermark(resolutionMs, nowMs, graceMs, claimOptions))
     },
 
     materializeClaim(claim: Claim): MaterializedBatch {
@@ -164,7 +352,7 @@ export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
       return {
         rows,
         bucketFrom: first,
-        // one resolution past the newest bucket — the window is half-open
+        // one resolution past the newest bucket, because the window is half-open
         bucketTo: last + resolutionMs,
         total: totalOf(rows),
         buckets: claim.buckets.length,

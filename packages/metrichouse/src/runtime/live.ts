@@ -1,11 +1,11 @@
 /**
- * Live read — what is still in the driver, shaped for a dashboard.
+ * Live read. What is still in the driver, shaped for a dashboard.
  *
  * Everything here is **pure**. A driver hands over `BucketRow`s, the metric
  * turns each into the row its sink would receive, and this file does the rest:
  * filter, stamp, collapse, order, cut. Keeping it free of both storage and
- * metric config is what makes the awkward parts — a partial bucket, a rollup
- * that has to merge folds rather than add them — testable without a driver and
+ * metric config is what makes the awkward parts, a partial bucket, a rollup
+ * that has to merge folds rather than add them, testable without a driver and
  * without a clock.
  *
  * ```
@@ -28,14 +28,13 @@ import { type InferShape, isDate, type Shape, type Simplify } from '../schema/ty
 /**
  * How to collapse buckets before returning them.
  *
- * `'none'` keeps one row per bucket per series — the shape a chart wants.
+ * `'none'` keeps one row per bucket per series, the shape a chart wants.
  * `'sum'` merges every bucket of a series into one row, dropping `bucket_ts`
  * and `id` with them, because neither survives the merge: the id identifies one
  * bucket's row and there is no longer one bucket.
  *
- * The spec names a third mode, `'window'`, without defining what it collapses.
- * It is left out rather than guessed at — see the note in the README about
- * adding things when something forces them.
+ * There is no third mode. A new one is added when a caller needs a collapse
+ * these two cannot give.
  */
 export type RollupMode = 'none' | 'sum'
 
@@ -43,7 +42,7 @@ export type Direction = 'asc' | 'desc'
 
 export interface SnapshotOptions {
   /**
-   * Partial match on declared dims — `{ park: 'riverside' }` against a metric
+   * Partial match on declared dims, `{ park: 'riverside' }` against a metric
    * keyed by three of them. Filtered here rather than in the driver: the key
    * is a cross-product, so only a *leading* subset could be matched as a
    * prefix, and a rule that works for some dims and not others is worse than
@@ -55,7 +54,7 @@ export interface SnapshotOptions {
   /** Upper bound on `bucket_ts`, exclusive. */
   readonly to?: number | Date
   /**
-   * Exclude the bucket still accumulating. **Defaults to `true`** — the
+   * Exclude the bucket still accumulating. **Defaults to `true`**, the
    * correct-but-stale answer, because the alternative silently under-reports.
    */
   readonly complete?: boolean
@@ -73,25 +72,25 @@ export interface SnapshotOptions {
 /**
  * One live row: the row a sink would receive, plus how finished it is.
  *
- * Not typed as `Row & …` because a rolled-up row has no `id` — it is no longer
+ * Not typed as `Row & …` because a rolled-up row has no `id`. It is no longer
  * one bucket's row. Without a rollup or a `groupBy`, every row carries `id` and
  * `bucket_ts` exactly as `write()` would see them, which is what lets a
  * dashboard stitch live rows onto history from the database and know when the
  * two are the same row.
  */
-export type LiveRow = Record<string, unknown> & {
-  bucket_open: boolean
-  bucket_elapsed_ms: number
-}
+export type LiveRow = Record<string, unknown> & LiveFields
 
-/** What every live row carries on top of the row a sink would receive. */
+/**
+ * What every live row carries on top of the row a sink would receive.
+ * `LIVE_ROW_COLUMNS` in schema/dims.ts lists the same two names.
+ */
 export type LiveFields = { bucket_open: boolean; bucket_elapsed_ms: number }
 
 /**
  * The identity columns, present only while the row is still one bucket's row.
  *
  * `rollup: 'sum'` merges every bucket of a series, so neither `id` nor
- * `bucket_ts` survives — there is no longer one bucket for them to name. A
+ * `bucket_ts` survives, because there is no longer one bucket for them to name. A
  * `groupBy` keeps buckets but may merge series, so `bucket_ts` survives and
  * `id` becomes optional: it is kept when the grouping turned out to be a no-op
  * for that row and dropped otherwise, which is a runtime fact about the data
@@ -121,7 +120,7 @@ export type LiveDims<D extends Shape, O extends SnapshotOptions> = O extends {
 /**
  * One live row, typed to the metric that produced it.
  *
- * `D` is the declared dims and `V` the value columns the kind adds — `{ value:
+ * `D` is the declared dims and `V` the value columns the kind adds, `{ value:
  * number }` for a counter, the folded aggregates for a gauge. The result stays
  * assignable to {@link LiveRow}, which is what lets a concrete kind narrow
  * `AnyMetric.snapshot()` instead of replacing it.
@@ -230,11 +229,7 @@ export function snapshotRange(
 }
 
 /** Is this bucket still accumulating, and how far into it are we? */
-export function liveness(
-  bucketTs: number,
-  resolutionMs: number,
-  nowMs: number,
-): { bucket_open: boolean; bucket_elapsed_ms: number } {
+export function liveness(bucketTs: number, resolutionMs: number, nowMs: number): LiveFields {
   const elapsed = nowMs - bucketTs
   return {
     bucket_open: elapsed < resolutionMs,
@@ -245,7 +240,7 @@ export function liveness(
 }
 
 /**
- * Filter, collapse, order and cut — the whole read path after materialization.
+ * Filter, collapse, order and cut, the whole read path after materialization.
  *
  * @throws if `dims` or `groupBy` names something the metric does not declare
  */
@@ -266,16 +261,15 @@ export function applySnapshot(
   if (options.groupBy) assertDimsKnown(dims, options.groupBy, 'groupBy', metric)
 
   // 1. partial dim match
-  const matched = options.dims
+  const wanted = options.dims
+  const matched = wanted
     ? rows.filter((one) =>
-        Object.entries(options.dims as Record<string, unknown>).every(([key, value]) =>
-          sameValue(one.row[key], value),
-        ),
+        Object.entries(wanted).every(([key, value]) => sameValue(one.row[key], value)),
       )
     : [...rows]
 
   // ascending, so a merge can answer "last" and a rollup's window reads
-  // forwards — the driver already sorts, and a filter cannot unsort, but
+  // forwards. The driver already sorts, and a filter cannot unsort, but
   // nothing downstream should have to know that
   matched.sort((a, b) => a.bucketTs - b.bucketTs)
 
@@ -299,7 +293,7 @@ export function applySnapshot(
  *
  * The group is the dims being kept, plus the bucket when buckets are being
  * kept. `id` and `bucket_ts` survive only when the group is still one bucket's
- * worth of one series — anything else and they would name a row that no longer
+ * worth of one series. Anything else and they would name a row that no longer
  * exists.
  */
 function collapse(
@@ -345,7 +339,7 @@ function collapse(
           .map((dim) => [dim, first.row[dim]]),
       ),
       ...mergeValues(group.map((one) => one.row)),
-      // partial if any constituent bucket is, and elapsed across all of them —
+      // partial if any constituent bucket is, and elapsed across all of them,
       // "of the window this covers, this much has happened"
       bucket_open: false,
       bucket_elapsed_ms: 0,
@@ -379,7 +373,7 @@ export function assertLimit(limit: unknown, metric: string, label = 'limit'): vo
 }
 
 /**
- * Sort, then take — in that order, so `limit` means top-K and not "the first K".
+ * Sort, then take, in that order, so `limit` means top-K and not "the first K".
  *
  * Exported for the staged kinds, whose rows are records rather than buckets
  * but sort and cut by the same rules.
