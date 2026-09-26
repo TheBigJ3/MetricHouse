@@ -803,6 +803,8 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       now: () => (activeBinding().now ?? Date.now)(),
       self: () => self,
       attempts,
+      // locally staged records are this process's own, and only it can ship them
+      sharedDriver: () => (stage === 'local' ? undefined : activeDriver()),
     }),
 
     name,

@@ -79,6 +79,11 @@ took it. If a flusher dies holding one, a later flush finds it and merges it bac
 into the live set before claiming, so those rows ship rather than sitting in
 Redis for ever. See [Recovering a crashed flush](/guide/reliability#recovering-a-crashed-flush).
 
+The driver also keeps each metric's turn to ship, in one small key per metric,
+`mh:turn:<metric>`. Every instance can run its own flush timers, and each
+metric still ships once per interval for the whole fleet. See
+[Several processes on one driver](/guide/flushing#several-processes-on-one-driver).
+
 ### Passing a client lazily
 
 Pass a function instead of a client and it is called on the first write rather

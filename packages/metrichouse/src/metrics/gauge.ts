@@ -347,6 +347,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       now: slot.now,
       self: () => self,
       attempts: slot.attempts,
+      sharedDriver: slot.driver,
     }),
 
     name,

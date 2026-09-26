@@ -49,6 +49,10 @@ const report = await httpRequests.flush()
 Force is for the moments where the cadence is the wrong rule: a shutdown, a
 test, a cron handler that runs once and will not come back.
 
+On a shared driver, a forced flush that writes rows still records the metric's
+turn, so the other processes count their next interval from it. See
+[Several processes on one driver](/guide/flushing#several-processes-on-one-driver).
+
 What `force` does not do is ship the window that is still filling. That window
 has not closed, and a partial fold carrying the same row id is the corruption
 [`delivery: 'immediate'`](/guide/delivery) exists to handle. `house.stop()`
@@ -156,7 +160,7 @@ const report = await httpRequests.flush()
 | `skipped` | `boolean` | always | Whether anything was attempted |
 | `reason` | `'cadence'` or `'not-selected'` | when skipped | Why nothing was attempted |
 | `nextEligibleInMs` | `number` | when skipped on cadence | How long until this metric may ship again |
-| `error` | `unknown` | when the flush shipped nothing it meant to | What your `write` function threw, or why the claim failed. The rows are back in the live set, or never left it. A `write` that rejects with no reason, as `Promise.reject()` does, reports `Error: <metric>: the sink rejected without a reason` |
+| `error` | `unknown` | when the flush shipped nothing it meant to | What your `write` function threw, or why taking the turn or the claim failed. The rows are back in the live set, or never left it. A `write` that rejects with no reason, as `Promise.reject()` does, reports `Error: <metric>: the sink rejected without a reason` |
 | `releaseError` | `unknown` | when the write failed and putting the rows back failed too | `error` still holds what `write` threw. The rows are held in the claim rather than back in the live set, where a durable driver's recovery returns them once `recoverAfter` has passed |
 | `ackError` | `unknown` | when the rows were written and the claim could not be settled | The rows did ship. Another flusher had usually recovered the claim first, so the same rows, with the same ids, will arrive again |
 | `recovered` | `RecoveryReport` | when a dead flusher left a claim | What this flush put back before claiming |
@@ -210,12 +214,13 @@ half of the same choice.
 ## What a flush does
 
 ```
-cadence -> recover -> claim -> materialise -> write -> ack or release
+cadence -> turn -> recover -> claim -> materialise -> write -> ack or release
 ```
 
 | Step | What happens |
 | --- | --- |
 | Cadence | An early call returns `skipped: true` unless `force` or `final` says otherwise |
+| Turn | On a shared driver, the metric's turn is taken from the driver. A call another process beat to it returns `skipped: true`. A flush that writes nothing gives the turn back |
 | Recover | A claim a previous flusher died holding is put back, so this flush can ship it |
 | Claim | Finished data leaves the live set atomically, so a second flusher cannot take it. `final` counts a window inside grace as finished |
 | Materialise | The claim becomes the rows your `write` function receives |
