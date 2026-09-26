@@ -232,7 +232,10 @@ const user = await httpLatency.time({ route: '/users/:id', status: 'ok' }, async
 ```
 
 **Returns** exactly what `fn` returned, including its promise when `fn` is
-asynchronous.
+asynchronous: the same `Promise` object, not a new one wrapping it. A thenable
+that is not a `Promise`, such as a query builder that runs its query each time
+`then` is called, is awaited exactly once, and a `Promise` of its result is
+returned in its place, so the work never runs twice.
 
 The duration is recorded whether `fn` returns or throws. A request that times
 out after thirty seconds is the latency you most need to see, so dropping

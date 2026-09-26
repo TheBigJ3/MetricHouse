@@ -123,7 +123,7 @@ event(name, { fields, stage, batch, flush, timestamp, sample, derive, claimLimit
 | `stage` | `'driver'` or `'local'` | `'driver'` | Where records wait |
 | `batch.maxSize` | number | `500` | Local staging: ship at this many |
 | `batch.maxAge` | duration | `'10s'` | Local staging: ship this long after the first |
-| `flush` | duration | `'30s'` | The fastest this may ship |
+| `flush` | duration | the house default, then `'30s'` | The fastest this may ship |
 | `timestamp` | `'auto'` or a `ts()` field | `'auto'` | Where `ts` comes from |
 | `sample` | number or function | keep everything | The fraction to keep, 0 to 1 |
 | `derive` | record of functions | none | Counters this event also increments |
@@ -148,7 +148,7 @@ log(name, { fields, levels, minLevel, stage, batch, flush, claimLimit, write })
 | `stage` | `'driver'` or `'local'` | `'driver'` | Where lines wait |
 | `batch.maxSize` | number | `500` | Local staging: ship at this many |
 | `batch.maxAge` | duration | `'10s'` | Local staging: ship this long after the first |
-| `flush` | duration | `'30s'` | The fastest this may ship |
+| `flush` | duration | the house default, then `'30s'` | The fastest this may ship |
 | `claimLimit` | number | unlimited | Lines one flush may carry |
 | `write` | `WriteFn` | required | Where the rows go |
 
@@ -263,6 +263,9 @@ These all throw when the module is first imported, not at the first write.
 | A gauge aggregate named twice | `aggregate names ["sum","sum"], and each one may appear once` |
 | A dim named after a column the metric writes | `dim "id" is a reserved column` |
 | A dim or field named like a whole number | `a dim cannot be named "2024"` |
+| A dim or field named `bucket_open` or `bucket_elapsed_ms` | `a dim cannot be named "bucket_open"` |
+| An unknown event `stage` | `stage must be 'driver' or 'local', got "memory"` |
+| A `sample` that is neither a number nor a function | `sample must be a rate between 0 and 1 or a function returning one` |
 | Reserved event field name | `field "ts" is a reserved column` |
 | Duplicate level | `level "info" is declared twice` |
 | `minLevel` not in `levels` | `minLevel "trace" is not one of the declared levels` |

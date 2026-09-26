@@ -157,6 +157,30 @@ describe('house.start()', () => {
     })
   })
 
+  it('raises a failing scheduled flush as an unhandled rejection with no onError', async () => {
+    const metric = make('m', () => {
+      throw new Error('sink down')
+    })
+    const house = createHouse({ driver, schema: [metric], now })
+    metric.add(A)
+    await house.drain()
+    settle()
+
+    const raised: string[] = []
+    const reject = vi.spyOn(Promise, 'reject').mockImplementation((reason?: unknown) => {
+      raised.push((reason as Error).message)
+      return Promise.resolve() as never
+    })
+    try {
+      house.start()
+      await tick(60_000)
+    } finally {
+      reject.mockRestore()
+    }
+    expect(raised).toEqual(['sink down'])
+    await house.stop()
+  })
+
   it('routes a failed recovery pass on a scheduled flush to onError', async () => {
     const errors: [string, { metric: string }][] = []
     const failing: Driver = {
@@ -182,6 +206,46 @@ describe('house.start()', () => {
 })
 
 describe('house.stop()', () => {
+  it('still makes the final flush when onError threw on a tick', async () => {
+    let calls = 0
+    const shipped: unknown[] = []
+    const write: WriteFn = (rows) => {
+      calls += 1
+      if (calls === 1) throw new Error('sink timed out')
+      shipped.push(...rows.map((row) => row.value))
+    }
+    const metric = make('m', write, '1m')
+    const house = createHouse({
+      driver,
+      schema: [metric],
+      now,
+      // a logger that cannot serialise what it was handed
+      onError: () => {
+        throw new TypeError('Converting circular structure to JSON')
+      },
+    })
+    metric.add(7, A)
+    await house.drain()
+    settle()
+
+    const raised: string[] = []
+    const reject = vi.spyOn(Promise, 'reject').mockImplementation((reason?: unknown) => {
+      raised.push((reason as Error).message)
+      return Promise.resolve() as never
+    })
+    try {
+      house.start()
+      await tick(60_000)
+      expect((await house.stop()).ok).toBe(true)
+    } finally {
+      reject.mockRestore()
+    }
+
+    // the handler's own failure is raised, and the rows ship in the final flush
+    expect(raised).toEqual(['Converting circular structure to JSON'])
+    expect(shipped).toEqual([7])
+  })
+
   it('stops ticking and forces out what is closed', async () => {
     const write = vi.fn()
     const metric = make('m', write, '5m')

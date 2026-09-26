@@ -52,7 +52,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink } from './types.js'
+import { assertMetricName, assertSink, reportError } from './types.js'
 
 /**
  * Where records wait between `record()` and your `write()`.
@@ -291,6 +291,11 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   assertShapeNames(fields, name, 'field', RESERVED_EVENT_COLUMNS)
 
   const stage: EventStage = config.stage ?? 'driver'
+  // checked like `delivery` is, because a value from an environment variable
+  // gets past TypeScript, and an unknown one would behave as `'driver'`
+  if (stage !== 'driver' && stage !== 'local') {
+    throw new Error(`${name}: stage must be 'driver' or 'local', got ${JSON.stringify(stage)}`)
+  }
   const ownFlushMs =
     config.flush === undefined ? undefined : parseInterval(config.flush, `${name}: flush`)
   const maxSize = config.batch?.maxSize ?? DEFAULT_MAX_SIZE
@@ -327,6 +332,11 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     if (!Number.isFinite(config.sample) || config.sample < 0 || config.sample > 1) {
       throw new Error(`${name}: sample must be a rate between 0 and 1, got ${config.sample}`)
     }
+  } else if (config.sample !== undefined && typeof config.sample !== 'function') {
+    throw new Error(
+      `${name}: sample must be a rate between 0 and 1 or a function returning one, got ` +
+        JSON.stringify(config.sample),
+    )
   }
 
   const derive = config.derive ?? {}
@@ -395,21 +405,13 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
    * noisy, and better than a failure disappearing in silence.
    */
   function reportDetached(error: unknown): void {
-    const onError = binding?.onError
-    if (onError) {
-      onError(error, { metric: name })
-      return
-    }
-    void Promise.reject(error)
+    reportError(binding?.onError, error, { metric: name })
   }
 
   function track(work: Promise<void>): void {
     const settled = work
-      .catch((error: unknown) => {
-        const onError = binding?.onError
-        if (!onError) throw error
-        onError(error, { metric: name })
-      })
+      // reported and never rethrown, so `drain()` waits for every write
+      .catch((error: unknown) => reportDetached(error))
       .finally(() => {
         pendingWrites.delete(settled)
       })
@@ -668,6 +670,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   async function shipStaged(): Promise<void> {
     const claim = await activeDriver().claimRecords(name, config.claimLimit)
     const outcome = await shipClaim(self, claim, sink, { attempts, source: 'immediate' })
+    if (outcome.releaseError !== undefined) reportDetached(outcome.releaseError)
     if (outcome.error !== undefined) throw outcome.error
   }
 
@@ -682,6 +685,9 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
    */
   function armBatchTimer(): void {
     if (batchTimer !== undefined || buffer.length === 0) return
+    // a stopped house calls no sink. Records put back by a send that failed
+    // during stop() wait for the next drain() or flush() instead
+    if (binding?.stopped?.()) return
     batchTimer = setTimeout(() => {
       batchTimer = undefined
       // everything, because every record waiting has now waited `maxAge`
@@ -725,8 +731,9 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     track(
       (async (): Promise<void> => {
         const outcome = await shipClaim(self, claim, sink, { attempts, source })
-        // a failed sink already released the records back into the buffer;
-        // rethrow so the failure reaches onError rather than vanishing
+        if (outcome.releaseError !== undefined) reportDetached(outcome.releaseError)
+        // a failed sink already released the records back into the buffer.
+        // Rethrown so the failure reaches onError rather than vanishing
         if (outcome.error !== undefined) throw outcome.error
       })(),
     )
@@ -779,7 +786,9 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     const row: Row = { id: record.id, ts: new Date(record.ts) }
 
     for (const [key, type] of Object.entries(fields)) {
-      const value = record.fields[key]
+      // own keys only: an omitted field named `constructor` would otherwise
+      // read the one every object inherits
+      const value = Object.hasOwn(record.fields, key) ? record.fields[key] : undefined
       if (value === undefined) continue
       // a payload is a string column, and `record()` already turned it into
       // one. A record staged by an older version still holds the value

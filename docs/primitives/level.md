@@ -148,7 +148,8 @@ one that `holdFor` after its last write falls in. With `resolution: '1m'` and
 `00:01`, and the same two rows ship whether you flush every minute or once an
 hour later. `holdFor` has to be at least one `resolution` long, and a shorter
 one throws at declaration, because it would drop a series before the window it
-was written in had closed.
+was written in had closed. A `holdFor` so long that it ends past the largest
+safe timestamp, about 285,000 years from 1970, is the same as holding forever.
 
 Without `holdFor`, a dim whose values come and go grows without bound: every
 `worker` id that has ever appeared keeps writing a row every window. That is
@@ -426,7 +427,9 @@ Three consequences worth knowing:
   Past `MAX_CARRY_BUCKETS`, which is 10,000, the older windows are skipped and
   the gap stays in the data. A write inside the skipped stretch still counts:
   the first window after the gap carries the newest value written before it,
-  not the value from before the gap began.
+  not the value from before the gap began. The 10,000 are counted back from the
+  newest window a flush may claim, and `snapshot()` counts from the same place,
+  so a live read and the next flush skip the same windows.
 - **The window a series was written in ends at its last write.** Set a queue
   to 5 and then to 3 inside one window, or `inc(5)` then `dec(2)`, and that
   window and every empty one after it hold 3.

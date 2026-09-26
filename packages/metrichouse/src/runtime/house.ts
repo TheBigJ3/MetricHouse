@@ -158,6 +158,8 @@ function collect(schema: SchemaInput | undefined): AnyMetric[] {
 export function createHouse(config: HouseConfig): House {
   const now = config.now ?? Date.now
   const registry = new Map<string, AnyMetric>()
+  /** Set by `stop()` and cleared by `start()`. Metrics read it before arming a timer. */
+  let stopped = false
 
   const scheduler: Scheduler = createScheduler({
     metrics: () => [...registry.values()],
@@ -235,6 +237,7 @@ export function createHouse(config: HouseConfig): House {
           // named, not captured: `register` can add a derive target after the
           // event that names it, and a lazy lookup is what makes that legal
           resolve: (target) => registry.get(target),
+          stopped: () => stopped,
           ...(config.onError && { onError: config.onError }),
         })
         bound.push(metric)
@@ -283,10 +286,13 @@ export function createHouse(config: HouseConfig): House {
     },
 
     start(): void {
+      stopped = false
       scheduler.start()
     },
 
     async stop(): Promise<FlushReport> {
+      // first, so a send that fails while stopping arms no retry timer
+      stopped = true
       // a tick still inside its sink finishes first. If it fails, its rows go
       // back to the driver, and the final flush below is what ships them
       await scheduler.stop()

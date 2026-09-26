@@ -106,6 +106,31 @@ describe('declaration', () => {
     ).toMatch(/^e: a field cannot be named "7"/)
   })
 
+  it('refuses a stage it does not know', () => {
+    expect(
+      expectRejected(() =>
+        event('e', { write: discard, fields: {}, stage: 'memory' as unknown as 'local' }),
+      ).message,
+    ).toBe(`e: stage must be 'driver' or 'local', got "memory"`)
+  })
+
+  it('refuses a sample that is neither a rate nor a function', () => {
+    expect(
+      expectRejected(() =>
+        event('e', { write: discard, fields: {}, sample: '0.5' as unknown as number }),
+      ).message,
+    ).toBe('e: sample must be a rate between 0 and 1 or a function returning one, got "0.5"')
+  })
+
+  it.each(['bucket_open', 'bucket_elapsed_ms'])('refuses a field named %s', (field) => {
+    expect(
+      expectRejected(() => event('e', { write: discard, fields: { [field]: str() } })).message,
+    ).toBe(
+      `e: a field cannot be named "${field}", because every row snapshot() returns carries a ` +
+        'column of that name',
+    )
+  })
+
   it('refuses a flush cadence of zero', () => {
     expect(
       expectRejected(() => event('e', { write: discard, fields: {}, flush: '0s' })).message,
@@ -279,6 +304,20 @@ describe('materialized rows', () => {
     await walks.drain()
 
     expect((await walks.peek())[0]?.weather).toBe('{"tempC":14,"rain":true}')
+  })
+
+  it('omits an absent optional field named after an inherited property', async () => {
+    const notes = event('notes', {
+      fields: { body: str(), constructor: str().optional(), toString: json().optional() },
+      write: discard,
+    })
+    notes.bind({ driver, now })
+    // cast: TypeScript reads the inherited `constructor` off the literal too
+    notes.record({ body: 'hello' } as never)
+    await notes.drain()
+
+    const [row] = await notes.peek()
+    expect(Object.keys(row ?? {})).toEqual(['id', 'ts', 'body', '_ingested_at'])
   })
 
   it('omits an absent optional field rather than writing null', async () => {
@@ -1052,6 +1091,63 @@ describe('local staging after a failure', () => {
     fail = false
     await house.flush({ force: true })
     expect(seen.flat()).toEqual(['1', '2', '3', '4'])
+  })
+})
+
+describe('local staging after house.stop()', () => {
+  it('calls the sink no more once stop() has returned', async () => {
+    vi.useFakeTimers()
+    try {
+      const sources: string[] = []
+      const views = event('views', {
+        fields: { path: str() },
+        stage: 'local',
+        batch: { maxAge: '10s' },
+        write: (_rows, context) => {
+          sources.push(context.source)
+          throw new Error('down')
+        },
+      })
+      const house = createHouse({ driver: memory(), schema: [views], onError: () => {} })
+      views.record({ path: '/' })
+
+      await house.stop()
+      const atStop = [...sources]
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      expect({ atStop, after: sources.slice(atStop.length) }).toEqual({
+        atStop: ['batch', 'flush'],
+        after: [],
+      })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries on its timer again once the house is started again', async () => {
+    vi.useFakeTimers()
+    try {
+      const sources: string[] = []
+      const views = event('views', {
+        fields: { path: str() },
+        stage: 'local',
+        batch: { maxAge: '10s' },
+        write: (_rows, context) => {
+          sources.push(context.source)
+          throw new Error('down')
+        },
+      })
+      const house = createHouse({ driver: memory(), schema: [views], onError: () => {} })
+      await house.stop()
+      house.start()
+      views.record({ path: '/' })
+      await vi.advanceTimersByTimeAsync(10_000)
+
+      expect(sources).toEqual(['batch'])
+      await house.stop()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

@@ -229,6 +229,26 @@ if (!client) {
   })
 
   describe('ioredis · recover', () => {
+    it('keeps a claim registered when its release meets a cell of another kind', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await driver.increment([
+        { metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 },
+        { metric: M, bucketTs: 1000, dimKey: 'b', delta: 2 },
+      ])
+      const claim = await driver.claim(M, 2000)
+      // a gauge fold an older driver left in the claimed window
+      await live.hset(`${ns}:b:${M}:1000`, 'a', '1|1|1|1|1')
+      await live.zadd(`${ns}:idx:${M}`, 1000, '1000')
+
+      await expect(driver.release(claim)).rejects.toThrow(/different kinds/)
+      // still named, so a retried release or a recovery pass can finish it
+      expect(await live.zrange(`${ns}:claims:${M}`, '0', '-1')).toEqual([claim.id])
+      // the cell that clashed is still in the claim, whatever was restored before it
+      expect(await live.hget(`${ns}:inflight:${claim.id}`, '1000:a')).toBe('1')
+      await wipe(ns)
+    })
+
     /**
      * A driver that treats every claim as abandoned.
      *
@@ -679,6 +699,102 @@ if (!client) {
       const claim = await ioredis(lostReply(), { namespace: ns }).claimRecords(M, 2)
       expect(claim.records.map((r) => r.id)).toEqual(['a', 'b'])
       expect((await plain.readPending({ metric: M })).map((r) => r.id)).toEqual(['c', 'd'])
+      await wipe(ns)
+    })
+
+    it('refuses a resent level batch again rather than applying its first half', async () => {
+      const ns = fresh()
+      const twice = new Proxy(live, {
+        get(target, prop, receiver) {
+          if (prop !== 'pipeline') return Reflect.get(target, prop, receiver)
+          return () => {
+            const pipeline = target.pipeline()
+            const evalsha = pipeline.evalsha.bind(pipeline)
+            pipeline.evalsha = ((...args: Parameters<typeof evalsha>) => {
+              evalsha(...args)
+              return evalsha(...args)
+            }) as typeof pipeline.evalsha
+            return pipeline
+          }
+        },
+      })
+      const driver = ioredis(twice, { namespace: ns })
+      await expect(
+        driver.setLevel([
+          { metric: 'lvl', bucketTs: 1000, dimKey: 'a', value: 5, mode: 'add' },
+          { metric: 'lvl', bucketTs: 1000, dimKey: 'b', value: Number.MAX_VALUE, mode: 'add' },
+          { metric: 'lvl', bucketTs: 1000, dimKey: 'b', value: Number.MAX_VALUE, mode: 'add' },
+        ]),
+      ).rejects.toThrow(/largest number/)
+      expect(await driver.readLevels('lvl')).toEqual([])
+      await wipe(ns)
+    })
+
+    /**
+     * A reader whose client runs `between` once, right after the first
+     * script reply it gets: another process acting between two pages.
+     */
+    const pausing = (between: () => Promise<unknown>) => {
+      let fired = false
+      const once = async () => {
+        if (fired) return
+        fired = true
+        await between()
+      }
+      return new Proxy(live, {
+        get(target, prop, receiver) {
+          // a page is read either as a script or as a plain LRANGE
+          if (prop === 'lrange') {
+            return async (...args: Parameters<typeof target.lrange>) => {
+              const page = await target.lrange(...args)
+              await once()
+              return page
+            }
+          }
+          if (prop !== 'pipeline') return Reflect.get(target, prop, receiver)
+          return () => {
+            const pipeline = target.pipeline()
+            const exec = pipeline.exec.bind(pipeline)
+            pipeline.exec = (async () => {
+              const results = await exec()
+              await once()
+              return results
+            }) as typeof pipeline.exec
+            return pipeline
+          }
+        },
+      })
+    }
+
+    it('reads every staged record when a claim lands between pages', async () => {
+      const ns = fresh()
+      const other = ioredis(live, { namespace: ns })
+      await other.append(
+        ['a', 'b', 'c', 'd'].map((id, i) => ({ metric: 'ev', id, ts: 1000 + i, fields: {} })),
+      )
+      const reader = ioredis(
+        pausing(() => other.claimRecords('ev', 2)),
+        { namespace: ns, maxPipelineSize: 2 },
+      )
+      const read = await reader.readPending({ metric: 'ev', from: 0 })
+      // a and b were read before the claim took them, and c and d stayed staged
+      expect(read.map((r) => r.id)).toEqual(['a', 'b', 'c', 'd'])
+      await wipe(ns)
+    })
+
+    it('reads no record twice when a release lands between pages', async () => {
+      const ns = fresh()
+      const other = ioredis(live, { namespace: ns })
+      await other.append(
+        ['a', 'b', 'c', 'd'].map((id, i) => ({ metric: 'ev', id, ts: 1000 + i, fields: {} })),
+      )
+      const claim = await other.claimRecords('ev', 2)
+      const reader = ioredis(
+        pausing(() => other.release(claim)),
+        { namespace: ns, maxPipelineSize: 2 },
+      )
+      const read = await reader.readPending({ metric: 'ev', from: 0 })
+      expect(read.map((r) => r.id)).toEqual(['c', 'd'])
       await wipe(ns)
     })
 

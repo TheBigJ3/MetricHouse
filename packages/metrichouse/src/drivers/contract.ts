@@ -191,6 +191,15 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(await driver.readBuckets({ metric: M })).toEqual([])
       })
 
+      it('names the metric it refused in a batch spanning two metrics', async () => {
+        await expect(
+          driver.increment([
+            { metric: 'first', bucketTs: 1000, dimKey: WILLOW, delta: 1 },
+            { metric: 'second', bucketTs: 1000, dimKey: WILLOW, delta: Number.POSITIVE_INFINITY },
+          ]),
+        ).rejects.toThrow(/driver: second /)
+      })
+
       it('refuses an integer total past the largest safe integer', async () => {
         const whole = (delta: number) =>
           driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta, integer: true }])
@@ -486,6 +495,47 @@ export function describeDriverContract(name: string, options: DriverContractOpti
 
         expect(await levelAt(2000, WILLOW)).toBe(7)
         expect((await driver.readLevels(L))[0]).toMatchObject({ value: 7, carried: 7 })
+      })
+
+      it('keeps carried when a hold for the pointer window arrives again after a claim', async () => {
+        // the claim took the cell that says what the window ended at, and a
+        // second flusher, or a resend, repeats the older hold
+        await put(1000, WILLOW, 5)
+        await hold(2000, WILLOW, 5)
+        await put(2000, WILLOW, 9)
+        await driver.claim(L, 3000)
+        await hold(2000, WILLOW, 5)
+
+        expect(await driver.readLevels(L)).toEqual([
+          { dimKey: WILLOW, value: 9, carried: 9, writtenAt: 2000, heldThrough: 2000 },
+        ])
+      })
+
+      it('changes nothing when one level write in a batch is refused', async () => {
+        await expect(
+          driver.setLevel([
+            { metric: L, bucketTs: 1000, dimKey: REX, value: 5, mode: 'add' },
+            { metric: L, bucketTs: 1000, dimKey: WILLOW, value: Number.MAX_VALUE, mode: 'add' },
+            { metric: L, bucketTs: 1000, dimKey: WILLOW, value: Number.MAX_VALUE, mode: 'add' },
+          ]),
+        ).rejects.toThrow(/largest number/)
+        expect(await driver.readBuckets({ metric: L })).toEqual([])
+        expect(await driver.readLevels(L)).toEqual([])
+      })
+
+      it('finds the value in effect before a fifteen digit window', async () => {
+        // more significant digits than Lua prints a number with
+        const P = 100_000_000_000_003
+        await put(P - 1, WILLOW, 10)
+        const claim = await driver.claim(L, P + 1)
+        // below the watermark: no cell, and the pointer moves to P
+        await hold(P, WILLOW, 20)
+        await driver.release(claim)
+        // the cell at P - 1 is live again, before the pointer, so the add
+        // starts from what the pointer carried
+        await move(P + 2, WILLOW, 1)
+
+        expect(await levelAt(P + 2, WILLOW)).toBe(21)
       })
 
       it('holds nothing for a series it has never seen', async () => {
@@ -1007,6 +1057,13 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(back?.fields.at).toBeInstanceOf(Date)
         expect(back?.fields.at).toEqual(at)
         expect(back?.fields.note).toBe('not a date')
+      })
+
+      it('hands back an invalid Date in fields as an invalid Date', async () => {
+        await driver.append([rec('a', 1000, { when: new Date(Number.NaN) })])
+        const when = (await driver.readPending({ metric: M }))[0]?.fields.when
+        expect(when).toBeInstanceOf(Date)
+        expect(Number.isNaN((when as Date).getTime())).toBe(true)
       })
 
       it('hands back a field shaped like its own date marker untouched', async () => {

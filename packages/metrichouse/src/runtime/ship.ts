@@ -49,8 +49,14 @@ function sinkFailure(metric: string, thrown: unknown): unknown {
 export interface ShipOutcome {
   readonly buckets: number
   readonly rows: number
-  /** Set when the sink threw. The claim has been released by then. */
+  /** Set when the sink threw. The claim has been released by then, unless `releaseError` is set. */
   readonly error?: unknown
+  /**
+   * Set when the sink threw and putting the rows back failed as well. The
+   * rows are still held in the claim, where recovery finds them on a durable
+   * driver. Kept apart from `error`, so the sink's own failure is not lost.
+   */
+  readonly releaseError?: unknown
   /**
    * Set when the sink succeeded and the ack after it failed. The rows were
    * written; the claim was usually taken back by another flusher first.
@@ -61,10 +67,11 @@ export interface ShipOutcome {
 /**
  * Materialize a claim, hand it to the sink, then settle it.
  *
- * An empty claim is acked without calling the sink — a sink is a network call
- * and there is nothing to send. `release` failing is not swallowed: it means
- * the data is neither shipped nor back in the live set, which is the one
- * situation worth an exception rather than a report field.
+ * An empty claim is acked without calling the sink, because a sink is a
+ * network call and there is nothing to send. A `release` that fails after the
+ * sink did is reported as `releaseError`, beside the sink's error rather than
+ * in place of it: the data is neither shipped nor back in the live set, and
+ * both facts are worth knowing.
  */
 export async function shipClaim(
   metric: AnyMetric,
@@ -100,13 +107,18 @@ export async function shipClaim(
     // counted before the release, so a send that picks these rows up the
     // moment they are back already sees the failure
     options.attempts.current += 1
-    // the data becomes claimable again, unchanged and with the same row ids
-    await metric.releaseBatch(claim)
-    return {
+    const failed = {
       buckets: batch?.buckets ?? 0,
       rows: batch?.rows.length ?? 0,
       error: sinkFailure(metric.name, thrown),
     }
+    // the data becomes claimable again, unchanged and with the same row ids
+    try {
+      await metric.releaseBatch(claim)
+    } catch (releaseError) {
+      return { ...failed, releaseError }
+    }
+    return failed
   }
 
   options.attempts.current = 1

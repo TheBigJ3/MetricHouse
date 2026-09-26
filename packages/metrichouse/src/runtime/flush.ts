@@ -57,6 +57,15 @@ export interface MetricFlushReport {
   readonly nextEligibleInMs?: number
   readonly error?: unknown
   /**
+   * Set when the sink failed and putting its rows back failed too.
+   *
+   * `error` is still the sink's own failure. This says the rows did not go
+   * back to the live set: they are held in the claim, which a durable
+   * driver's recovery returns once `recoverAfter` has passed, and which a
+   * driver that is not durable loses.
+   */
+  readonly releaseError?: unknown
+  /**
    * Set when this flush found a claim a dead flusher had left behind and put
    * it back before claiming.
    *
@@ -260,7 +269,14 @@ export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush
         buckets += outcome.buckets
         rows += outcome.rows
         if (outcome.error !== undefined) {
-          return { buckets, rows, skipped: false, error: outcome.error, ...repair }
+          return {
+            buckets,
+            rows,
+            skipped: false,
+            error: outcome.error,
+            ...(outcome.releaseError !== undefined && { releaseError: outcome.releaseError }),
+            ...repair,
+          }
         }
         if (outcome.ackError !== undefined) ackError ??= outcome.ackError
         if (!final || outcome.rows === 0) break

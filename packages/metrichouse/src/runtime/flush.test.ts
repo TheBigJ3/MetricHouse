@@ -393,6 +393,28 @@ describe('failure and retry', () => {
     expect(await driver.readBuckets({ metric: 'm' })).toHaveLength(1)
   })
 
+  it('keeps the sink error when putting the rows back fails too', async () => {
+    const failing: Driver = {
+      ...driver,
+      release: async () => {
+        throw new Error('redis went away')
+      },
+    }
+    const metric = make('m', {
+      write: () => {
+        throw new Error('clickhouse is down')
+      },
+    })
+    createHouse({ driver: failing, schema: [metric], now })
+    metric.add(A)
+    await metric.drain()
+    settle()
+
+    const report = await metric.flush()
+    expect(report.error).toEqual(new Error('clickhouse is down'))
+    expect(report.releaseError).toEqual(new Error('redis went away'))
+  })
+
   it('does not spend the cadence on a sink that rejected with no reason', async () => {
     let calls = 0
     const metric = make('m', {

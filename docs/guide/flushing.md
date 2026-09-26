@@ -175,7 +175,8 @@ What it does:
   database does not stack writes on top of each other.
 - Sends failures to `onError`, since a scheduled flush has no caller to return a
   report to. A failed recovery pass goes there too, as its `recoveryError`,
-  although the flush below it still ran.
+  although the flush below it still ran, and so does a `releaseError`. With no
+  `onError`, each becomes an unhandled rejection.
 - Unreferences its timers, so metrics never keep your process alive.
 - Picks up metrics registered after it started.
 

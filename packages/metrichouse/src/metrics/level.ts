@@ -51,6 +51,7 @@ import {
   assertSink,
   assertWhole,
   dimColumns,
+  reportError,
 } from './types.js'
 
 /**
@@ -271,10 +272,9 @@ export function level<D extends Shape = Record<never, never>>(
 
   function track(write: Promise<void>, onError: MetricBinding['onError']): void {
     const settled = write
-      .catch((error: unknown) => {
-        if (!onError) throw error
-        onError(error, { metric: name })
-      })
+      // reported and never rethrown, so `drain()` waits for every write
+      // rather than stopping at the first that failed
+      .catch((error: unknown) => reportError(onError, error, { metric: name }))
       .finally(() => {
         pending.delete(settled)
       })
@@ -404,7 +404,11 @@ export function level<D extends Shape = Record<never, never>>(
    */
   function holdUntil(one: LevelSeries): number | undefined {
     if (holdForMs === undefined) return undefined
-    return bucketStart(one.writtenAt + holdForMs, resolutionMs) + resolutionMs
+    const last = one.writtenAt + holdForMs
+    // a hold that ends past the largest safe timestamp never ends in practice,
+    // and `bucketStart` cannot place a window there
+    if (last > Number.MAX_SAFE_INTEGER) return undefined
+    return bucketStart(last, resolutionMs) + resolutionMs
   }
 
   /**
@@ -432,7 +436,10 @@ export function level<D extends Shape = Record<never, never>>(
    * that changed at three did not change at noon.
    *
    * The walk is capped at {@link MAX_CARRY_BUCKETS} windows back from
-   * `until`. The windows the cap skips still decide where the walk starts:
+   * `capAt`, which is `until` unless the caller says otherwise. A live read
+   * walks further than a flush, into the windows still inside grace, and caps
+   * from where the flush would so the two start at the same window. The
+   * windows the cap skips still decide where the walk starts:
    * the value it begins from is the newest write among them, or `carried`
    * when there is none, so a series that changed during a long gap resumes
    * at the value it changed to.
@@ -443,9 +450,10 @@ export function level<D extends Shape = Record<never, never>>(
     one: LevelSeries,
     written: ReadonlyMap<number, number> | undefined,
     until: number,
+    capAt: number = until,
   ): { bucketTs: number; value: number; observed: boolean }[] {
     const start = one.heldThrough + resolutionMs
-    const from = Math.max(start, until - MAX_CARRY_BUCKETS * resolutionMs)
+    const from = Math.max(start, capAt - MAX_CARRY_BUCKETS * resolutionMs)
 
     // the value in effect at `heldThrough`, moved on by anything written in
     // the windows the cap stepped over
@@ -596,6 +604,9 @@ export function level<D extends Shape = Record<never, never>>(
     // reach further, because a window that has not started has no value yet
     const openEnd = bucketStart(now, resolutionMs) + resolutionMs
     const upper = Math.min(range.to ?? openEnd, openEnd)
+    // where the next flush will carry up to, which is where its cap counts
+    // back from
+    const flushUpTo = closedUpTo(resolutionMs, now, effectiveGraceMs())
 
     const [series, stored] = await Promise.all([
       driver.readLevels(name),
@@ -610,7 +621,8 @@ export function level<D extends Shape = Record<never, never>>(
     }))
     for (const one of series) {
       const until = Math.min(upper, holdUntil(one) ?? upper)
-      for (const window of walkCarry(one, written.get(one.dimKey), until)) {
+      const capAt = Math.min(until, flushUpTo)
+      for (const window of walkCarry(one, written.get(one.dimKey), until, capAt)) {
         if (!window.observed) {
           rows.push({
             bucketTs: window.bucketTs,

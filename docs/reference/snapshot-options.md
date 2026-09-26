@@ -277,6 +277,7 @@ await httpRequests.snapshot(options)   // typed as if nothing was rolled up
 | `orderBy names "bucket_ts", which is not a column on these rows` | Sorting on a column the other options removed |
 | `limit must be a non-negative integer, got -1` | A negative or fractional limit |
 | `to must be a valid Date or a finite number of milliseconds` | An invalid `Date`, `NaN` or `Infinity` for `from` or `to` |
+| `rollup must be 'none' or 'sum', got "avg"` | Any other `rollup` |
 
 ## Related
 

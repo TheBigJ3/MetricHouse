@@ -255,7 +255,9 @@ const house = createHouse({
 - A broken `derive` on an event, or a broken `record` pairing on a timer.
 
 Without a handler these become unhandled promise rejections. That is noisy, and
-deliberately better than a failure disappearing quietly.
+deliberately better than a failure disappearing quietly. A handler that throws
+is raised the same way, and neither case stops `drain()` or `stop()` from
+waiting for the rest.
 
 `onWarn` receives startup warnings about your setup, and there are two of them:
 

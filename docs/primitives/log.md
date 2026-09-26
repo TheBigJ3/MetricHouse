@@ -272,7 +272,9 @@ worth more than an empty column. So does one whose `stack` is not a string. A
 Every other call in MetricHouse throws on a bad value. A log message does not.
 Something that is neither a string nor an `Error` is turned into a string. A
 value `String()` cannot convert, such as an object made with
-`Object.create(null)`, is written as `[object Object]`. This call is made from
+`Object.create(null)`, is written as `[object Object]`, and one that cannot be
+described at all, such as a revoked proxy, as
+`[a value that cannot be printed]`. This call is made from
 inside `catch` blocks, where the value caught can be anything at all, and a
 logger that throws there replaces the error you were handling.
 :::

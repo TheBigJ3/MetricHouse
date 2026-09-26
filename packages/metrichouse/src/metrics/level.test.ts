@@ -771,6 +771,51 @@ describe('regressions', () => {
 })
 
 describe('round two', () => {
+  it('shows the window a flush carries first when the gap passes the cap inside grace', async () => {
+    const sink = collector()
+    const metric = bound({ write: sink.write })
+    metric.set(42, EMAIL)
+    await metric.drain()
+
+    // far past the cap, half a second into a window, so the window before it
+    // is still inside the 2s grace
+    clock = at(MAX_CARRY_BUCKETS + 50) + 500
+    const live = await metric.snapshot()
+    await metric.flush()
+
+    const shown = new Set(live.map((row) => row.id))
+    expect(sink.rows.filter((row) => !shown.has(row.id as string))).toEqual([])
+  })
+
+  it('shows the window a flush carries first when complete is false past the cap', async () => {
+    const sink = collector()
+    const metric = bound({ write: sink.write, grace: '0s' })
+    metric.set(42, EMAIL)
+    await metric.drain()
+
+    clock = at(MAX_CARRY_BUCKETS + 50) + 5_000
+    const live = await metric.snapshot({ complete: false })
+    await metric.flush()
+
+    const shown = new Set(live.map((row) => row.id))
+    expect(sink.rows.filter((row) => !shown.has(row.id as string))).toEqual([])
+  })
+
+  it('reports forever when holdFor runs past the largest safe timestamp', async () => {
+    const sink = collector()
+    const metric = bound({ write: sink.write, holdFor: Number.MAX_SAFE_INTEGER - 1 })
+    metric.set(42, EMAIL)
+    await metric.drain()
+
+    clock = at(2) + 3_000
+    expect((await metric.flush()).error).toBeUndefined()
+    expect(sink.shape).toEqual([
+      [at(0), 42],
+      [at(1), 42],
+    ])
+    expect(await metric.current(EMAIL)).toBe(42)
+  })
+
   it('stops a snapshot at the open window when to reaches into the future', async () => {
     const metric = bound()
     metric.set(42, EMAIL)

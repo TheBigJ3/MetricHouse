@@ -642,6 +642,32 @@ describe('observe() precision', () => {
     expect(rows[0]?.sum).toBe(1.235)
   })
 
+  it('returns the very Promise fn returned, and times it', async () => {
+    const latency = bound()
+    const work = Promise.resolve([1, 2, 3])
+    const returned = latency.time({ route: '/a', status: 'ok' }, () => work)
+    expect(returned).toBe(work)
+    await returned
+    await latency.drain()
+    expect((await latency.current({ route: '/a', status: 'ok' }))?.count).toBe(1)
+  })
+
+  it('subscribes to a thenable that is not a Promise exactly once', async () => {
+    // the shape of a query builder, which runs its query each time `then` is called
+    const latency = bound()
+    let runs = 0
+    const query = {
+      // biome-ignore lint/suspicious/noThenProperty: a thenable is the point
+      then(resolve: (rows: number[]) => void) {
+        runs += 1
+        resolve([1, 2, 3])
+      },
+    }
+    const returned = latency.time({ route: '/a', status: 'ok' }, () => query)
+    expect(await returned).toEqual([1, 2, 3])
+    expect(runs).toBe(1)
+  })
+
   it('records a finite duration too large to scale to microseconds', async () => {
     const latency = bound()
     latency.observe(1e306, { route: '/a', status: 'ok' })

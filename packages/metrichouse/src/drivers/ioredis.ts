@@ -457,8 +457,19 @@ local prefix = ARGV[1]
 local add = ARGV[3] == 'add'
 local integer = ARGV[4] == '1'
 
+-- nothing is written until every op in the call has been worked out and
+-- checked, so a refusal changes nothing, and a resend of a refused call is
+-- refused again rather than applying its first half twice. An op reads what
+-- the ops before it planned, as it would read what they wrote
+local cellPlan = {}
+local cellOrder = {}
+local statePlan = {}
+local stateOrder = {}
+
 -- the level one window holds for a series, or nil when it holds nothing
 local function level_at(at, field)
+  local planned = cellPlan[tostring(at) .. ':' .. field]
+  if planned ~= nil then return planned end
   local cur = redis.call('HGET', prefix .. at, field)
   if cur == false then return nil end
   if not mh_is_level(cur) then
@@ -472,7 +483,8 @@ end
 for i = 5, MH_N, 2 do
   local field = ARGV[i]
   local v = tonumber(ARGV[i + 1])
-  local state = mh_read_state(KEYS[3], field)
+  local state = statePlan[field]
+  if state == nil then state = mh_read_state(KEYS[3], field) end
   local landing = level_at(target, field)
   local pointer = bucketTs
   local writtenAt = bucketTs
@@ -500,7 +512,10 @@ for i = 5, MH_N, 2 do
       base = 0
       if state ~= nil then
         base = state[2]
-        for _, at in ipairs(redis.call('ZREVRANGEBYSCORE', KEYS[1], '(' .. target, '(' .. state[4])) do
+        -- '%.0f', because Lua's own number format keeps fourteen digits
+        -- and would move this bound for a timestamp of fifteen
+        local after = '(' .. string.format('%.0f', state[4])
+        for _, at in ipairs(redis.call('ZREVRANGEBYSCORE', KEYS[1], '(' .. target, after)) do
           local level = level_at(at, field)
           if level ~= nil then
             base = level
@@ -544,10 +559,21 @@ for i = 5, MH_N, 2 do
   end
 
   for _, c in ipairs(cells) do
-    redis.call('HSET', prefix .. c[1], field, mh_pack_level(c[2]))
-    redis.call('ZADD', KEYS[1], c[1], c[1])
+    local slot = tostring(c[1]) .. ':' .. field
+    if cellPlan[slot] == nil then cellOrder[#cellOrder + 1] = { c[1], field, slot } end
+    cellPlan[slot] = c[2]
   end
-  mh_write_state(KEYS[3], field, value, carried, writtenAt, pointer)
+  if statePlan[field] == nil then stateOrder[#stateOrder + 1] = field end
+  statePlan[field] = { value, carried, writtenAt, pointer }
+end
+
+for _, c in ipairs(cellOrder) do
+  redis.call('HSET', prefix .. c[1], c[2], mh_pack_level(cellPlan[c[3]]))
+  redis.call('ZADD', KEYS[1], c[1], c[1])
+end
+for _, field in ipairs(stateOrder) do
+  local st = statePlan[field]
+  mh_write_state(KEYS[3], field, st[1], st[2], st[3], st[4])
 end
 
 mh_mark()
@@ -596,8 +622,10 @@ for i = 3, #ARGV, 2 do
       end
     end
     -- carried belongs to the pointer's window, so a hold for an older one,
-    -- from a flusher whose clock runs behind, leaves both alone
-    if bucketTs >= state[4] then
+    -- from a flusher whose clock runs behind, leaves both alone. So does a
+    -- hold for the pointer's own window arriving again once a claim has taken
+    -- it: the cell that says what it ended at is gone, and carried has it
+    if bucketTs > state[4] or (bucketTs == state[4] and not claimed) then
       mh_write_state(KEYS[3], field, state[1], value, state[3], bucketTs)
     end
   end
@@ -877,14 +905,18 @@ end
 /**
  * Settle a claim by putting the data back.
  *
- * Applied once, as {@link ACK_CLAIM} is.
+ * Applied once, as {@link ACK_CLAIM} is. The claim stays registered until
+ * every cell is back: a restore that aborts on a cell of another kind leaves
+ * the rest of the claim where a retried release, or a recovery pass, still
+ * finds it, rather than in a key nothing names.
  *
  * KEYS: claims, in-flight hash, index. ARGV: claimId, bucket key prefix.
  */
 const RELEASE_BUCKETS = `${LUA_RESTORE_BUCKETS}${LUA_ONCE}
 if mh_seen() then return 1 end
-if redis.call('ZREM', KEYS[1], ARGV[1]) == 0 then return 0 end
+if redis.call('ZSCORE', KEYS[1], ARGV[1]) == false then return 0 end
 mh_restore_buckets(KEYS[2], ARGV[2], KEYS[3])
+redis.call('ZREM', KEYS[1], ARGV[1])
 redis.call('DEL', KEYS[2])
 mh_mark()
 return 1
@@ -1015,6 +1047,63 @@ return { claims, buckets, records, oldest }
 `
 
 /**
+ * One page of the staged list, starting after the last record the caller has
+ * already read.
+ *
+ * A bounded `readPending` reads the list a page at a time, and another process
+ * can claim from the front or release to it between two pages, moving every
+ * record's position. Paging by position would then skip records or read them
+ * twice. So each page starts after a record rather than at an index: the
+ * caller's guess at where that record now is, checked, and a search for it
+ * when the list has moved. A record that has been claimed since is not found,
+ * and the page starts from the front again. Returns where the page started,
+ * whether that was a restart, and the page.
+ *
+ * KEYS: records. ARGV: the last record read or an empty string, the index it
+ * was read at, the page size.
+ */
+const READ_PAGE = `
+local after = ARGV[1]
+local size = tonumber(ARGV[3])
+local start = 0
+local restarted = 0
+
+if after ~= '' then
+  local guess = tonumber(ARGV[2])
+  if redis.call('LINDEX', KEYS[1], guess) == after then
+    start = guess + 1
+  else
+    restarted = 1
+    local n = redis.call('LLEN', KEYS[1])
+    for i = 0, n - 1, 1000 do
+      local chunk = redis.call('LRANGE', KEYS[1], i, i + 999)
+      local found = false
+      for k = 1, #chunk do
+        if chunk[k] == after then
+          start = i + k
+          restarted = 0
+          found = true
+          break
+        end
+      end
+      if found then break end
+    end
+  end
+end
+
+return { start, restarted, redis.call('LRANGE', KEYS[1], start, start + size - 1) }
+`
+
+/**
+ * The sequence stamp {@link APPEND_RECORDS} put in front of a stored record,
+ * fixed width so two compare as text. A record staged before stamps existed
+ * has none, and sorts before every stamped one.
+ */
+function stampOf(stored: string): string {
+  return stored.startsWith('{') ? '' : stored.slice(0, stored.indexOf('|'))
+}
+
+/**
  * Count a metric's records that have not shipped: staged, and in flight.
  *
  * KEYS: records, claims. ARGV: in-flight key prefix.
@@ -1059,7 +1148,8 @@ function encodeRecord(op: AppendOp): string {
     // `value` has already been through Date.prototype.toJSON by the time a
     // replacer sees it. The original is only reachable through `this`
     const raw = (this as Record<string, unknown>)[key]
-    if (isDate(raw)) return { [DATE_TAG]: raw.getTime() }
+    // an invalid Date has no time, and JSON writes its NaN as null
+    if (isDate(raw)) return { [DATE_TAG]: Number.isNaN(raw.getTime()) ? null : raw.getTime() }
     if (!isPlainObject(value) || !Object.keys(value).some((k) => k.startsWith(RESERVED_PREFIX))) {
       return value
     }
@@ -1081,7 +1171,9 @@ function decodeRecord(stored: string): StagedRecord {
     if (!isPlainObject(value)) return value
     const keys = Object.keys(value)
     const ms = value[DATE_TAG]
-    if (typeof ms === 'number' && keys.length === 1) return new Date(ms)
+    if (keys.length === 1 && keys[0] === DATE_TAG && (typeof ms === 'number' || ms === null)) {
+      return new Date(ms ?? Number.NaN)
+    }
     if (!keys.some((k) => k.startsWith(RESERVED_PREFIX))) return value
     return Object.fromEntries(
       Object.entries(value).map(([k, v]) => [
@@ -1207,16 +1299,33 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     return sha
   }
 
+  /**
+   * Which call in a {@link runScripts} batch an error came from, so a write
+   * spanning several metrics names the one that was refused rather than the
+   * first one in the batch.
+   */
+  const failedCall = new WeakMap<object, number>()
+
   function unwrap(
     results: [error: Error | null, result: unknown][] | null,
     what: string,
+    offset = 0,
   ): unknown[] {
     if (results === null) throw new Error(`ioredis driver: ${what} pipeline was discarded`)
 
-    return results.map(([error, value]) => {
-      if (error) throw error
+    return results.map(([error, value], index) => {
+      if (error) {
+        failedCall.set(error, offset + index)
+        throw error
+      }
       return value
     })
+  }
+
+  /** The metric of the call an error came from, or of the first op. */
+  function metricOf(error: unknown, calls: readonly { metric: string }[]): string {
+    const index = typeof error === 'object' && error !== null ? failedCall.get(error) : undefined
+    return calls[index ?? 0]?.metric ?? 'unknown'
   }
 
   interface ScriptCall {
@@ -1339,7 +1448,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           })
           results = merged
         }
-        out.push(...unwrap(results, what))
+        out.push(...unwrap(results, what, start))
       } finally {
         for (const seq of seqs) if (seq > 0) unanswered.delete(seq)
       }
@@ -1465,9 +1574,10 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     async increment(ops: readonly IncrOp[]): Promise<void> {
       if (ops.length === 0) return
 
+      const groups = grouped(ops, (op) => [op.dimKey, op.delta])
       try {
         await runScripts(
-          grouped(ops, (op) => [op.dimKey, op.delta]).map((group) => ({
+          groups.map((group) => ({
             script: INCREMENT,
             once: true,
             keys: [key.idx(group.metric), key.watermark(group.metric)],
@@ -1481,7 +1591,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           'increment',
         )
       } catch (error) {
-        throw typedError(error, ops[0]?.metric ?? 'unknown')
+        throw typedError(error, metricOf(error, groups))
       }
     },
 
@@ -1490,9 +1600,10 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
       // grouped by bucket, so each script touches one hash and one batch for
       // that bucket goes in one call
+      const groups = grouped(ops, (op) => [op.dimKey, op.value])
       try {
         await runScripts(
-          grouped(ops, (op) => [op.dimKey, op.value]).map((group) => ({
+          groups.map((group) => ({
             script: MERGE_GAUGE,
             once: true,
             keys: [key.idx(group.metric), key.watermark(group.metric)],
@@ -1501,7 +1612,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           'observe',
         )
       } catch (error) {
-        throw typedError(error, ops[0]?.metric ?? 'unknown')
+        throw typedError(error, metricOf(error, groups))
       }
     },
 
@@ -1560,7 +1671,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           'setLevel',
         )
       } catch (error) {
-        throw typedError(error, ops[0]?.metric ?? 'unknown')
+        throw typedError(error, metricOf(error, groups))
       }
     },
 
@@ -1690,13 +1801,35 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       }
 
       // bounded: paged rather than one LRANGE of everything, so a backlog the
-      // query will mostly reject never crosses the wire whole
+      // query will mostly reject never crosses the wire whole. Each page
+      // starts after the last record read, which READ_PAGE finds again when
+      // another process has claimed or released in between
       const matched: StagedRecord[] = []
       const page = maxPipeline
+      let last = ''
+      let lastAt = 0
+      // the newest stamp read so far. The list is in stamp order, so a
+      // record at or below it after a restart was read already: a release
+      // put it back at the front
+      let seenUpTo = ''
 
-      for (let start = 0; ; start += page) {
-        const raw = await afterSends(() => client.lrange(listKey, start, start + page - 1))
-        if (raw.length === 0) break
+      for (;;) {
+        const [reply] = await runScripts(
+          [{ script: READ_PAGE, keys: [listKey], args: [last, lastAt, page] }],
+          'readPending',
+        )
+        const [start, restarted, fetched] = reply as [number, number, string[]]
+        const raw = fetched.filter((one) => {
+          const stamp = stampOf(one)
+          if (stamp === '') return !restarted
+          if (stamp <= seenUpTo) return false
+          seenUpTo = stamp
+          return true
+        })
+        if (fetched.length > 0) {
+          last = fetched.at(-1) as string
+          lastAt = Number(start) + fetched.length - 1
+        }
 
         for (const encoded of raw) {
           const record = decodeRecord(encoded)
@@ -1705,7 +1838,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           matched.push(record)
           if (query.limit !== undefined && matched.length >= query.limit) return matched
         }
-        if (raw.length < page) break
+        if (fetched.length < page) break
       }
       return matched
     },

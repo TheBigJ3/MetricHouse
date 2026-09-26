@@ -105,7 +105,9 @@ declaration. [fields](/reference/fields) covers the argument in full.
 stage?: 'driver' | 'local'      // default: 'driver'
 ```
 
-Where records wait between `record()` and your `write` function.
+Where records wait between `record()` and your `write` function. Any other value
+throws at declaration, since one read from an environment variable gets past
+TypeScript.
 
 | | `'driver'` | `'local'` |
 | --- | --- | --- |
@@ -216,7 +218,8 @@ sample?: number | ((fields: InferShape<F>) => number)      // default: keep ever
 ```
 
 The fraction of records to keep, from `0` to `1`. A rate outside that range
-throws, at declaration for a number and at `record()` for a function.
+throws, at declaration for a number and at `record()` for a function. Anything
+that is neither a number nor a function throws at declaration.
 
 ```ts
 sample: 0.05      // keep one in twenty

@@ -293,7 +293,28 @@ function textOf(value: unknown): string {
   try {
     return String(value)
   } catch {
-    return Object.prototype.toString.call(value)
+    // the class tag can throw as well: a revoked proxy, or a
+    // `Symbol.toStringTag` getter that does
+    try {
+      return Object.prototype.toString.call(value)
+    } catch {
+      return '[a value that cannot be printed]'
+    }
+  }
+}
+
+/**
+ * True for an `Error`, from this realm or another.
+ *
+ * The class tag and not only `instanceof`, so an error thrown inside `vm`, a
+ * worker or an iframe keeps its stack too. Both checks can throw for a
+ * revoked proxy, which then counts as not an error.
+ */
+function isErrorLike(value: unknown): boolean {
+  try {
+    return value instanceof Error || Object.prototype.toString.call(value) === '[object Error]'
+  } catch {
+    return false
   }
 }
 
@@ -307,9 +328,7 @@ function textOf(value: unknown): string {
  * value caught can be anything at all.
  */
 function splitMessage(message: unknown): { message: string; error_stack?: string } {
-  // the class tag and not `instanceof`, so an error thrown inside `vm`, a
-  // worker or an iframe keeps its stack too
-  if (message instanceof Error || Object.prototype.toString.call(message) === '[object Error]') {
+  if (isErrorLike(message)) {
     const error = message as object
     const text = textOf(readSafely(error, 'message'))
     const stack = readSafely(error, 'stack')

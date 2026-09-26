@@ -67,6 +67,13 @@ export function dimOrder(dims: Shape): string[] {
 }
 
 /**
+ * The columns every live row a snapshot returns carries, added after the
+ * metric's own. A dim or field of either name would be overwritten in every
+ * snapshot row.
+ */
+export const LIVE_ROW_COLUMNS = ['bucket_open', 'bucket_elapsed_ms'] as const
+
+/**
  * True for a key JavaScript lists before every other key.
  *
  * An object keeps its keys in the order they were written, except for a key
@@ -101,6 +108,12 @@ export function assertShapeNames(
     )
   }
   for (const key of Object.keys(shape)) {
+    if ((LIVE_ROW_COLUMNS as readonly string[]).includes(key)) {
+      throw new Error(
+        `${metricName}: a ${noun} cannot be named ${JSON.stringify(key)}, because every row ` +
+          'snapshot() returns carries a column of that name',
+      )
+    }
     if (columns.includes(key)) {
       throw new Error(
         `${metricName}: ${noun} ${JSON.stringify(key)} is a reserved column. MetricHouse ` +

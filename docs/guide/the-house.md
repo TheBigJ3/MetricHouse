@@ -146,6 +146,10 @@ Resolves once every write you have issued has reached the driver.
 await house.drain()
 ```
 
+A write that failed does not end the wait early and does not make `drain()`
+reject. It goes to `onError`, or becomes an unhandled rejection when there is
+none, and `drain()` still waits for every other write.
+
 `add()`, `set()`, `record()` and the rest return before storage has confirmed
 anything. On a platform that freezes your process the moment a response is
 returned, this is the only guarantee that a write actually landed.
@@ -203,7 +207,13 @@ process.on('SIGTERM', async () => {
 `stop()` does four things in order: clears the timers, waits for any flush a
 timer already started, drains writes still on their way to the driver, then
 makes a [final flush](/reference/flush-options#final) past every cadence and
-every grace period.
+every grace period. A write or a scheduled flush that failed, or an `onError`
+that threw, is reported and does not stop the steps after it.
+
+After `stop()` returns, nothing calls a sink on a timer. A locally staged event
+whose send failed during `stop()` keeps its records in memory and arms no
+retry. The next `drain()` or `flush()` sends them, and `house.start()` lets the
+retry timer run again.
 
 What it cannot ship is the window that is still open. It has not finished, and
 sending a partial value under the same row id is the exact problem that

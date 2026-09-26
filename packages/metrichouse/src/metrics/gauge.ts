@@ -34,7 +34,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink, dimColumns } from './types.js'
+import { assertMetricName, assertSink, dimColumns, reportError } from './types.js'
 
 /** The five stored aggregates, in column order. */
 export const GAUGE_AGGREGATES = ['last', 'min', 'max', 'sum', 'count'] as const
@@ -276,10 +276,9 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
 
   function track(write: Promise<void>, onError: MetricBinding['onError']): void {
     const settled = write
-      .catch((error: unknown) => {
-        if (!onError) throw error
-        onError(error, { metric: name })
-      })
+      // reported and never rethrown, so `drain()` waits for every write
+      // rather than stopping at the first that failed
+      .catch((error: unknown) => reportError(onError, error, { metric: name }))
       .finally(() => {
         pending.delete(settled)
       })
