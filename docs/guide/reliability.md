@@ -109,7 +109,9 @@ your process when the response returns.
 ### The window that is still filling
 
 `house.stop()` ships every window that has ended, including those still inside
-grace, since the process has already drained its own writes. The one it cannot
+grace, since the process has already drained its own writes. It waits for every
+flush still running first, so rows that a failed sink put back during shutdown
+ship with the rest. The one it cannot
 ship is the open window, because it has not ended. At most one `resolution` of
 data is exposed to a shutdown.
 

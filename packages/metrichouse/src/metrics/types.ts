@@ -194,6 +194,14 @@ export interface MaterializedBatch {
  * folded cells or a run of staged records. Adding a primitive means
  * implementing these five, not editing the lifecycle.
  */
+/**
+ * The key of {@link AnyMetric}'s internal wait for its running flushes.
+ *
+ * A symbol, and not exported from the package, so it is no part of the
+ * public API and cannot shadow or be shadowed by a name a user chooses.
+ */
+export const SETTLE: unique symbol = Symbol('metrichouse.settle')
+
 export interface AnyMetric {
   readonly name: string
   readonly kind: MetricKind
@@ -244,6 +252,23 @@ export interface AnyMetric {
    * is being told, not rescued.
    */
   flush(options?: FlushOptions): Promise<MetricFlushReport>
+
+  /**
+   * Resolve once no flush of this metric is running, however it was started,
+   * including one started while this waits. A flush that rejects counts as
+   * finished: its caller already holds that rejection. Resolves `true` when
+   * there was a flush to wait for, and `false` when none was running.
+   *
+   * `house.stop()` calls it before the final flush, so a flush whose sink
+   * fails puts its rows back while the final flush can still ship them. It
+   * calls it again after any pass that waited, because a house flush may
+   * have moved on to a metric whose wait had already resolved.
+   * Keyed by a symbol this package does not export, so it adds no name a
+   * metric or a log level could collide with. Optional, so a metric written
+   * by hand without `metricFlush` still fits; the house then has nothing to
+   * wait for on it.
+   */
+  [SETTLE]?(): Promise<boolean>
 
   /** The runtime column list a sink will receive, in order. */
   rowShape(): RowShape
@@ -504,7 +529,13 @@ export function pendingWrites(name: string): PendingWrites {
 /** The {@link AnyMetric} methods that ship a batch. */
 export type BatchMethods = Pick<
   AnyMetric,
-  'flush' | 'recoverBatch' | 'claimBatch' | 'materializeClaim' | 'ackBatch' | 'releaseBatch'
+  | 'flush'
+  | typeof SETTLE
+  | 'recoverBatch'
+  | 'claimBatch'
+  | 'materializeClaim'
+  | 'ackBatch'
+  | 'releaseBatch'
 >
 
 /**
@@ -520,6 +551,10 @@ export function delegateBatch(inner: AnyMetric): BatchMethods {
   return {
     flush(options?: FlushOptions): Promise<MetricFlushReport> {
       return inner.flush(options)
+    },
+
+    async [SETTLE](): Promise<boolean> {
+      return (await inner[SETTLE]?.()) ?? false
     },
 
     recoverBatch(): Promise<RecoveryReport> {

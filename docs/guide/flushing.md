@@ -68,6 +68,7 @@ interface MetricFlushReport {
   reason?: 'cadence' | 'not-selected'
   nextEligibleInMs?: number   // when the cadence will allow the next attempt
   error?: unknown             // set if your write function threw, or the claim failed
+  releaseError?: unknown      // set if the write threw and putting the rows back failed too
   ackError?: unknown          // set if the rows shipped and settling the claim failed
   recovered?: RecoveryReport  // set if a dead flusher's batch was put back
   recoveryError?: unknown     // set if that repair failed. The flush still ran
@@ -79,6 +80,7 @@ interface FlushReport {
   ok: boolean                 // false if any metric failed
   durationMs: number
   metrics: Record<string, MetricFlushReport>
+  unmatched: string[]         // names in only that matched no registered metric
   throwIfFailed(): void
 }
 ```
@@ -191,15 +193,22 @@ house.start()     // calling again does nothing
 await house.stop()
 ```
 
-Clears the timers, waits for any flush a timer already started, drains writes
-still on their way to the driver, then makes a
-[final flush](/reference/flush-options#final): past every cadence, and past
-grace, so every window that has ended ships. It returns the report from that
-final flush.
+Clears the timers, waits for every flush still running, then drains writes
+still on their way to the driver and waits for flushes again, and keeps taking
+those two turns until a wait for flushes that follows a drain finds none. Then
+it makes a [final flush](/reference/flush-options#final): past every cadence,
+and past grace, so every window that has ended ships. It returns the report
+from that final flush. A second call while the first is still running returns
+the same promise, unless `house.start()` ran in between.
 
 Waiting for a running flush matters. If its `write` function fails after
 `stop()` was called, the rows go back to the driver, and the final flush is what
-ships them.
+ships them. That holds for every flush, whoever started it: a scheduler tick, a
+cron calling `house.flush()`, or a direct `metric.flush()`, including one that
+starts while `stop()` is waiting for flushes or for writes. A `house.flush()`
+flushes its metrics one at a time, and `stop()` waits until it has finished the
+last of them. A sink that never returns keeps `stop()` waiting, so give it a
+timeout.
 
 ```ts
 process.on('SIGTERM', async () => {
@@ -297,8 +306,9 @@ async function pump() {
       }
     }
   } catch (error) {
-    // the driver itself failed, not your write function
-    logger.error({ err: error }, 'flush could not run')
+    // Paging failed. A driver that cannot be reached is not caught here: it
+    // arrives as that metric's report.error, and counts as a failed flush above.
+    logger.error({ err: error }, 'could not page on call')
   }
 }
 

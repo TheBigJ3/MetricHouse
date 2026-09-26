@@ -204,3 +204,28 @@ describe('memory · large batches', () => {
     ])
   })
 })
+
+describe('memory · reads', () => {
+  it('hands out copies of folds and level cells, so editing one changes nothing stored', async () => {
+    const driver = memory()
+    await driver.observe([{ metric: M, bucketTs: 1000, dimKey: 'a', value: 4.6 }])
+    await driver.setLevel([{ metric: 'lvl', bucketTs: 1000, dimKey: 'a', value: 3, mode: 'set' }])
+
+    const [fold] = await driver.readBuckets({ metric: M })
+    const [held] = await driver.readBuckets({ metric: 'lvl', dimKey: 'a' })
+    Object.assign(fold?.value as object, { min: 5 })
+    Object.assign(held?.value as object, { level: 9 })
+
+    const claim = await driver.claim(M, 2000)
+    expect(claim.buckets[0]?.values.get('a')).toEqual({
+      last: 4.6,
+      min: 4.6,
+      max: 4.6,
+      sum: 4.6,
+      count: 1,
+    })
+    expect(await driver.readBuckets({ metric: 'lvl' })).toEqual([
+      { bucketTs: 1000, dimKey: 'a', value: { level: 3 } },
+    ])
+  })
+})

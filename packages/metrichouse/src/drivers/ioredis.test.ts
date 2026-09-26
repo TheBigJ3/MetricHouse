@@ -93,6 +93,14 @@ function stubClient(buckets = 0): IoredisClient {
 
 // no server needed: these never read what a script stored
 describe('ioredis · options and connection', () => {
+  it('refuses a maxPipelineSize that is not a positive integer', () => {
+    for (const bad of [Number.NaN, 0, -1, 2.5, Number.POSITIVE_INFINITY]) {
+      expect(() => ioredis(stubClient(), { maxPipelineSize: bad })).toThrow(
+        `ioredis driver: maxPipelineSize must be a positive integer, got ${String(bad)}`,
+      )
+    }
+  })
+
   it('refuses a namespace with a colon or whitespace in it', () => {
     for (const bad of ['org:idx', 'org idx', '']) {
       expect(() => ioredis(stubClient(), { namespace: bad })).toThrow(
@@ -100,6 +108,51 @@ describe('ioredis · options and connection', () => {
           'whitespace, because the driver builds every key by joining it to the rest with colons',
       )
     }
+  })
+
+  it('reads a pipeline with more replies than a call can take as arguments', async () => {
+    const driver = ioredis(stubClient(300_000), { maxPipelineSize: 300_000 })
+    const rows = await driver.readBuckets({ metric: M, dimKey: WILLOW })
+    expect(rows).toHaveLength(300_000)
+    expect(rows.at(-1)).toEqual({ bucketTs: 299_999_000, dimKey: WILLOW, value: 1 })
+  })
+
+  it('runs a script batch with more replies than a call can take as arguments', async () => {
+    const driver = ioredis(stubClient(), { maxPipelineSize: 300_000 })
+    await expect(
+      driver.increment(
+        Array.from({ length: 300_000 }, (_, i) => ({
+          metric: M,
+          bucketTs: i * 1000,
+          dimKey: WILLOW,
+          delta: 1,
+        })),
+      ),
+    ).resolves.toBeUndefined()
+  })
+
+  it('asks a factory that failed again on the next call, once for callers that raced it', async () => {
+    let calls = 0
+    const driver = ioredis(
+      async () => {
+        calls += 1
+        if (calls === 1) throw new Error('secret not ready')
+        return stubClient()
+      },
+      { namespace: 'stub' },
+    )
+    const op = { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }
+
+    const raced = await Promise.allSettled([driver.increment([op]), driver.increment([op])])
+    expect(raced.map((one) => (one.status === 'rejected' ? String(one.reason) : 'ok'))).toEqual([
+      'Error: secret not ready',
+      'Error: secret not ready',
+    ])
+    expect(calls).toBe(1)
+
+    await driver.increment([op])
+    await driver.increment([op])
+    expect(calls).toBe(2)
   })
 })
 

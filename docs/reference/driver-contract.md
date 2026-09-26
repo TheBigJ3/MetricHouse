@@ -14,6 +14,8 @@ Most applications never read this page. Use [`memory()` or
 ## The shape
 
 ```ts
+import type { Driver } from 'metrichouse/core'
+
 export function myDriver(): Driver {
   return {
     capabilities: { durable: true, shared: true, atomicMerge: true },
@@ -30,14 +32,18 @@ export function myDriver(): Driver {
     async readPending(query) { return [] },
     async countPending(metric) { return 0 },
 
-    async claim(metric, upToBucketTs) { /* BucketClaim */ },
-    async claimRecords(metric, limit) { /* RecordClaim */ },
+    // These return a BucketClaim, a RecordClaim and a RecoveryReport. The
+    // sections below say what each one holds.
+    async claim(metric, upToBucketTs) { throw new Error('not implemented') },
+    async claimRecords(metric, limit) { throw new Error('not implemented') },
     async ack(claim) {},
     async release(claim) {},
-    async recover(metric) { /* RecoveryReport */ },
+    async recover(metric) { throw new Error('not implemented') },
   }
 }
 ```
+
+The bodies are placeholders, so this compiles and does nothing useful yet.
 
 ## Capabilities
 

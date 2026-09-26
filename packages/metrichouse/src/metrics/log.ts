@@ -53,6 +53,9 @@ export const RESERVED_LOG_COLUMNS = [
   '_sample_rate',
 ] as const
 
+/** {@link RESERVED_LOG_COLUMNS}, for the check every line makes. */
+const RESERVED_LOG_SET: ReadonlySet<string> = new Set(RESERVED_LOG_COLUMNS)
+
 /**
  * Names a level may not take, because a level becomes a method on the logger
  * and would otherwise shadow one of these.
@@ -436,7 +439,35 @@ export function log<
     // context, the more specific it is. A key it passes as `undefined` says
     // nothing, so the bound value stays
     const given = Object.entries(values ?? {}).filter(([, value]) => value !== undefined)
-    inner.record({ ...bound, ...Object.fromEntries(given), level, ...splitMessage(message) })
+    const lineFields = { ...bound, ...Object.fromEntries(given) }
+    assertLineFields(lineFields)
+    inner.record({ ...lineFields, level, ...splitMessage(message) })
+  }
+
+  /**
+   * Refuse a field a line may not pass: one the log writes itself, or one it
+   * never declared.
+   *
+   * Checked here rather than left to the event underneath, which is declared
+   * over the log's own columns too. It would let `error_stack` through as a
+   * field, overwrite a `level` or `message` given this way without a word,
+   * and list all three as declared fields in its error.
+   */
+  function assertLineFields(lineFields: Record<string, unknown>): void {
+    for (const key of Object.keys(lineFields)) {
+      if (RESERVED_LOG_SET.has(key)) {
+        throw new Error(
+          `${name}: ${JSON.stringify(key)} is a column the log writes itself, so a line ` +
+            'cannot pass it as a field',
+        )
+      }
+      if (!Object.hasOwn(fields, key)) {
+        throw new Error(
+          `unknown field ${JSON.stringify(key)}. The declared fields are ` +
+            `[${Object.keys(fields).join(', ')}]`,
+        )
+      }
+    }
   }
 
   /** The level methods, for the log itself and for every child of it. */
@@ -463,7 +494,10 @@ export function log<
       // merged, not replaced: a child of a child keeps the request id its
       // parent bound and adds to it
       child(fields: Record<string, unknown>) {
-        return makeChild({ ...bound, ...fields })
+        // a key passed as `undefined` says nothing, as it does at a call site,
+        // so the value the parent bound stays
+        const given = Object.entries(fields ?? {}).filter(([, value]) => value !== undefined)
+        return makeChild({ ...bound, ...Object.fromEntries(given) })
       },
     } as unknown as ChildLog<Shape, L>
   }

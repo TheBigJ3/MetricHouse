@@ -353,8 +353,9 @@ Where the rows go. Required.
 | `rows` | `EventRow<F>[]` | Every declared field typed as declared, plus the reserved columns |
 | `context` | `WriteContext` | Which metric, the span of record timestamps, how many, and which attempt |
 
-`context.buckets` is `0` here, because an event has no windows.
-`context.total` is the number of rows.
+`context.total` is the number of rows, and `context.bucketFrom` and
+`context.bucketTo` span the record timestamps. An event has no windows, so the
+[flush report](/reference/flush-options#the-metric-report) says `buckets: 0`.
 [Writing a sink](/guide/writing-a-sink) covers the whole contract.
 
 ## event.record()
@@ -615,10 +616,13 @@ import { RESERVED_EVENT_COLUMNS } from 'metrichouse/core'
 import { counter, event, float, int, json, oneOf, str } from 'metrichouse/core'
 import { toClickHouse } from './sinks.js'
 
+const STATUS_CLASSES = ['2xx', '3xx', '4xx', '5xx'] as const
+type StatusClass = (typeof STATUS_CLASSES)[number]
+
 export const apiCalls = counter('api_calls', {
   dims: {
     route: str(),
-    status: oneOf(['2xx', '4xx', '5xx']),
+    status: oneOf(STATUS_CLASSES),
     tier: oneOf(['free', 'pro', 'enterprise']),
   },
   resolution: '10s',
@@ -655,13 +659,13 @@ export const apiCallDetail = event('api_call_detail', {
     return fields.tier === 'enterprise' ? 0.5 : 0.02
   },
 
-  // The counter stays exact whatever the sampling does, because derive runs
-  // first.
+  // The counter stays exact whatever the sampling does, because derive counts
+  // every record, the ones sampling drops included.
   derive: {
     api_calls: (fields) => ({
       dims: {
         route: fields.route,
-        status: `${Math.floor(fields.statusCode / 100)}xx` as '2xx' | '4xx' | '5xx',
+        status: `${Math.floor(fields.statusCode / 100)}xx` as StatusClass,
         tier: fields.tier,
       },
     }),

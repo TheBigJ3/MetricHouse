@@ -89,6 +89,11 @@ socket, which matters in tests and build steps.
 const driver = ioredis(() => new Redis(process.env.REDIS_URL!))
 ```
 
+The function may be `async`, for a client that needs a secret fetched first. If
+it throws or rejects, every write waiting on that attempt fails with its error,
+and the next write calls the function again. A failure at startup does not
+leave the driver failing for the rest of the process.
+
 A client made by that function belongs to the driver, and nothing else can
 reach it to close it. Call `driver.close()` when you are done, after
 `house.stop()`, or a script will never exit:
@@ -126,7 +131,10 @@ colon throws when the driver is created.
 `maxPipelineSize` bounds how many commands, or Lua scripts, go to Redis in one
 round trip. A batch larger than that is sent in several. Most writes are one
 script per window, so this mostly matters to a level carrying a series through a
-long gap, which can be ten thousand windows.
+long gap, which can be ten thousand windows. It has to be a positive whole
+number, and anything else throws when the driver is created. That includes
+`NaN`, which is what `Number(process.env.MH_PIPELINE)` gives when the variable
+is not set.
 
 A Redis restart, or a dropped connection, is safe for your totals. ioredis sends
 a command again after it reconnects if the first send got no reply, and the first
@@ -236,22 +244,31 @@ export function myDriver(): Driver {
   return {
     capabilities: { durable: true, shared: true, atomicMerge: true },
 
-    async increment(ops) { /* ... */ },
-    async observe(ops) { /* ... */ },
-    async append(ops) { /* ... */ },
+    // Writes.
+    async increment(ops) {},
+    async observe(ops) {},
+    async setLevel(ops) {},
+    async append(ops) {},
+    async dropLevels(metric, dimKeys, writtenBefore) {},
 
-    async readBuckets(query) { /* ... */ },
-    async readPending(query) { /* ... */ },
-    async countPending(metric) { /* ... */ },
+    // Reads.
+    async readLevels(metric) { return [] },
+    async readBuckets(query) { return [] },
+    async readPending(query) { return [] },
+    async countPending(metric) { return 0 },
 
-    async claim(metric, upToBucketTs) { /* ... */ },
-    async claimRecords(metric, limit) { /* ... */ },
-    async ack(claim) { /* ... */ },
-    async release(claim) { /* ... */ },
-    async recover(metric) { /* ... */ },
+    // Claims. Each returns the claim or report the contract describes.
+    async claim(metric, upToBucketTs) { throw new Error('not implemented') },
+    async claimRecords(metric, limit) { throw new Error('not implemented') },
+    async ack(claim) {},
+    async release(claim) {},
+    async recover(metric) { throw new Error('not implemented') },
   }
 }
 ```
+
+The bodies are placeholders, so this compiles and does nothing useful yet.
+Fill in each one from the contract.
 
 The full method by method contract, including the rules a driver has to obey, is
 in the [driver contract reference](/reference/driver-contract).

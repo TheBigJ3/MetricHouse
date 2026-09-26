@@ -111,20 +111,43 @@ The point of a gauge is that you can read it before it ships.
 import { onlineUsers } from '../metrics/schema.js'
 
 app.get('/status', async (_req, res) => {
-  const overall = await onlineUsers.totals()
+  // One row per series per unshipped minute, oldest minute first, so the last
+  // row seen for a series holds its newest reading.
+  const rows = await onlineUsers.snapshot({
+    complete: false,
+    orderBy: 'bucket_ts',
+    direction: 'asc',
+  })
+  const latest = new Map<string, number>()
+  for (const row of rows) {
+    // `last` is typed optional, because a gauge may leave it out of `aggregate`
+    if (row.last !== undefined) latest.set(`${row.region}:${row.plan}`, row.last)
+  }
+
+  let onlineNow = 0
+  for (const count of latest.values()) onlineNow += count
+
   const usEast = await onlineUsers.current({ region: 'us-east', plan: 'pro' })
 
   res.json({
-    // totals() has no `last`, because with several series there is no single
-    // latest observation.
-    onlineNow: overall?.sum ?? 0,
-    peakThisMinute: overall?.max ?? 0,
+    // every series' newest reading, added up
+    onlineNow,
 
     // current() is undefined when nothing has been observed this minute.
     usEastPro: usEast?.last ?? 0,
   })
 })
 ```
+
+The number of users online is the sum of each series' newest reading, and no
+single call returns it. [`totals()`](/primitives/gauge#gauge-totals) is the
+wrong call here: its `sum` adds up every reading taken this minute, so six
+samples of 150 users report 900, and its `max` is the largest reading of any
+one series rather than the peak of the whole. A rollup across series has no
+`last` for the same reason `totals()` has none, so the route keeps the newest
+reading per series itself. A series whose last minute has shipped and which has
+not been sampled yet in the new one is left out until its next sample, at most
+ten seconds with the sampler above.
 
 A breakdown for a small dashboard:
 

@@ -1,34 +1,5 @@
 # benchmarks/
 
-Performance harness for the paths where MetricHouse sits in front of a request.
-
-## Why this is level 1
-
-The design puts a network call on the hot path. Writes go straight to the
-driver with no local buffer. That is a deliberate trade for exact live reads,
-and it is only defensible if the overhead is measured and published rather than
-asserted.
-
-## What to measure
-
-**Write path**, the number that goes in the README
-- `.add()` overhead, single write vs. pipelined batch
-- `httpRedis()` vs. TCP `redis()`
-- `writeMode: 'immediate'` vs `'microtask'`
-- `memory()` as the floor
-
-**Aggregation**
-- `MERGE_GAUGE` Lua vs. naive read-modify-write
-- `APPLY_DELTA` under contention from N writers
-- dim key encoding at 1, 4, and 8 dimensions
-
-**Flush**
-- rows/second through a no-op sink, by `rowBatch`
-- claim/ack round trips per flush
-- cost of `yieldBetweenBatches` on request latency under load
-
-**Cardinality**
-- Redis memory per series, measured against what `metrichouse cost` predicts
-
-That last one matters most: `cost` makes a promise about production, and a
-prediction nobody checks is a guess with a table around it.
+Empty. The folder is kept for measurements of the write path, the Lua scripts
+and flush throughput, and none of them exists yet. No number in the docs comes
+from here.

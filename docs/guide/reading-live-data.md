@@ -218,6 +218,24 @@ happening" instead of "wrong question".
 A live dashboard endpoint:
 
 ```ts
+// Users online is each region's newest reading, added up. totals() would add
+// every reading taken this minute instead, so six samples of 150 would read 900.
+async function onlineNow(): Promise<number> {
+  // oldest window first, so the last row seen for a region is its newest
+  const rows = await onlineUsers.snapshot({
+    complete: false,
+    orderBy: 'bucket_ts',
+    direction: 'asc',
+  })
+  const latest = new Map<string, number>()
+  for (const row of rows) {
+    if (row.last !== undefined) latest.set(row.region, row.last)
+  }
+  let total = 0
+  for (const count of latest.values()) total += count
+  return total
+}
+
 app.get('/internal/live', async (_req, res) => {
   const [requests, latency, online] = await Promise.all([
     httpRequests.snapshot({
@@ -229,7 +247,7 @@ app.get('/internal/live', async (_req, res) => {
       limit: 20,
     }),
     httpLatency.snapshot({ rollup: 'sum', groupBy: ['route'] }),
-    onlineUsers.totals(),
+    onlineNow(),
   ])
 
   res.json({ requests, latency, online })

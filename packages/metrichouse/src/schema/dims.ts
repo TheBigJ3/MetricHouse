@@ -239,6 +239,42 @@ export function encodeDimKey(dims: Shape, values: Record<string, unknown>): stri
     .join(DIM_SEPARATOR)
 }
 
+/**
+ * True when a value of this type can encode to the empty string: any string,
+ * or a `oneOf` that lists `''`. A number, a boolean and a Date never do.
+ */
+function canEncodeEmpty(type: FieldType): boolean {
+  if (type.kind === 'str') return true
+  return type.kind === 'oneOf' && (type.values ?? []).some((member) => String(member) === '')
+}
+
+/**
+ * True when `key` is the empty key a metric with no dims stores its series
+ * under, rather than a key written under `dims`.
+ *
+ * With two dims or more, a key written under them always holds a separator,
+ * so the empty key can only be an older one. With one dim, it is older unless
+ * that dim can itself encode to the empty string, and then the two cannot be
+ * told apart and the key is read as that value.
+ */
+function isKeyFromNoDims(dims: Shape, order: readonly string[], key: string): boolean {
+  if (key !== '' || order.length === 0) return false
+  return order.length > 1 || !canEncodeEmpty(dims[order[0] as string] as FieldType)
+}
+
+/**
+ * True when `key` was stored under an older declaration that had fewer dims
+ * than `dims`, so {@link decodeDimKey} reads the dims it has no value for as
+ * absent. A level reads its held series through this, because a series under
+ * an older key is not the one the metric writes to now.
+ */
+export function isShorterDimKey(dims: Shape, key: string): boolean {
+  const order = dimOrder(dims)
+  if (isKeyFromNoDims(dims, order, key)) return true
+  if (order.length === 0) return false
+  return splitKey(key).length < order.length
+}
+
 export function decodeDimKey(dims: Shape, key: string): Record<string, unknown> {
   const order = dimOrder(dims)
 
@@ -250,19 +286,28 @@ export function decodeDimKey(dims: Shape, key: string): Record<string, unknown> 
     return {}
   }
 
+  // the one series of a metric that had no dims, stored before its dims were
+  // declared. Splitting it would read its empty text as the first dim's value,
+  // a 0 or a false that was never recorded
+  if (isKeyFromNoDims(dims, order, key)) return {}
+
+  // fewer segments than dims is a key written before a dim was added at the
+  // end. The dims it has no segment for were never recorded, so they come
+  // back absent. More segments than dims means a dim was removed or the dims
+  // were reordered, and nothing says which value belongs to which dim
   const segments = splitKey(key)
-  if (segments.length !== order.length) {
+  if (segments.length > order.length) {
     throw new Error(
-      `decodeDimKey: expected ${order.length} segments for [${order.join(', ')}], ` +
+      `decodeDimKey: expected at most ${order.length} segments for [${order.join(', ')}], ` +
         `got ${segments.length}`,
     )
   }
 
   const values: Record<string, unknown> = {}
   order.forEach((name, index) => {
-    const segment = segments[index] as string
+    const segment = segments[index]
     // an absent optional dim comes back missing, not as an undefined key
-    if (segment === DIM_ABSENT) return
+    if (segment === undefined || segment === DIM_ABSENT) return
     values[name] = decodeDimValue(dims[name] as FieldType, unescapeDimValue(segment))
   })
   return values

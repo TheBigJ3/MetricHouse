@@ -27,7 +27,7 @@ await httpRequests.snapshot({
 | [`timer.snapshot()`](/primitives/timer#timer-snapshot) | all of them | same merge as a gauge |
 | [`event.snapshot()`](/primitives/event#event-snapshot) | `from`, `to`, `orderBy`, `direction`, `limit` | the rest are ignored |
 | [`log.snapshot()`](/primitives/log#log-snapshot) | the same as an event | |
-| [`house.snapshot()`](/guide/the-house#snapshot) | all of them, plus `only` | applied to every registered metric |
+| [`house.snapshot()`](/guide/the-house#snapshot) | all of them, plus `only` and `strict` | applied to every registered metric |
 
 The options an event ignores rather than rejects are the ones that only mean
 something to a window: `dims`, `complete`, `rollup` and `groupBy`. One options
@@ -48,6 +48,7 @@ is.
 | [`direction`](#direction) | `'asc'` or `'desc'` | `'desc'` | Sort direction |
 | [`limit`](#limit) | `number` | none | Take this many, after sorting |
 | [`only`](#only) | array of metric names | every metric | House calls only |
+| [`strict`](#only) | `boolean` | `false` | House calls only. Reject an `only` naming a metric the house does not hold |
 
 ### dims
 
@@ -204,7 +205,8 @@ http_requests: orderBy names "bucket_ts", which is not a column on these rows
 ### direction
 
 `'desc'` by default, which is what makes an unqualified top ten the top rather
-than the bottom. Pass `'asc'` for a chart in time order.
+than the bottom. Pass `'asc'` for a chart in time order. Any other value throws,
+since one read from configuration gets past TypeScript.
 
 ### limit
 
@@ -223,6 +225,17 @@ House calls only. Restricts the snapshot to the named metrics.
 
 ```ts
 await house.snapshot({ only: ['http_requests', 'app_log'] })
+```
+
+A name that matches no registered metric reads nothing and leaves no key in the
+result. That is not an error, since a metric can be registered later with
+[`house.register()`](/guide/the-house#registering-metrics). Pass `strict: true`
+to reject the call instead, before anything is read.
+
+```ts
+await house.snapshot({ only: ['http_requets'], strict: true })
+// Error: house.snapshot: only names "http_requets", which is not a registered
+// metric. The registered metrics are [http_requests, app_log]
 ```
 
 ## The order things happen in
@@ -278,6 +291,8 @@ await httpRequests.snapshot(options)   // typed as if nothing was rolled up
 | `limit must be a non-negative integer, got -1` | A negative or fractional limit |
 | `to must be a valid Date or a finite number of milliseconds` | An invalid `Date`, `NaN` or `Infinity` for `from` or `to` |
 | `rollup must be 'none' or 'sum', got "avg"` | Any other `rollup` |
+| `direction must be 'asc' or 'desc', got "up"` | Any other `direction` |
+| `house.snapshot: only names "x", which is not a registered metric` | `strict: true` with an `only` naming a metric the house does not hold |
 
 ## Related
 

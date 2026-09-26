@@ -117,7 +117,7 @@ gauge with no cadence anywhere throws when the house registers it. Identical to
 ### grace
 
 ```ts
-grace?: DurationInput      // default: '2s'
+grace?: DurationInput      // default: the house default, then '2s'
 ```
 
 How long a window waits after it ends before a flush may claim it, so
@@ -220,7 +220,8 @@ await onlineUsers.current({ region: 'us-east' })
 ```
 
 **Returns** the five numbers, or `undefined` when nothing has been observed in
-this window. A zeroed object would claim a `min` of 0 for a gauge nobody wrote
+this window. The object is a copy, on every driver, so editing it changes
+nothing that ships. A zeroed object would claim a `min` of 0 for a gauge nobody wrote
 to, and a chart should show a gap there.
 
 Unlike a counter, the dims argument is required as soon as the gauge declares
@@ -307,7 +308,7 @@ cacheHitRatio.rowShape().columns.map((c) => c.name)
 | `dims` | `Shape` | The declared dims |
 | `resolutionMs` | `number` | `resolution`, parsed |
 | `flushMs` | `number` | `flush`, parsed, including one taken from the house |
-| `graceMs` | `number` | `grace`, parsed. `2000` by default |
+| `graceMs` | `number` | `grace`, parsed, including one taken from the house. `2000` when neither sets it |
 | `aggregate` | `readonly GaugeAggregate[]` | The columns this gauge writes |
 | `isBound` | `boolean` | `true` once a house has registered it |
 | `write` | `WriteFn` | The function it was declared with |

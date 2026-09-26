@@ -76,7 +76,11 @@ dims: { queue: oneOf(['email', 'export', 'webhooks']) }
 Dims cost more here than on any other type, because every series reports
 forever. A dim whose values come and go wants [`holdFor`](#holdfor). A dim
 cannot be named `id`, `bucket_ts` or `value`, the columns a level writes on
-every row itself. [dims](/reference/dims) covers the argument itself.
+every row itself. [dims](/reference/dims) covers the argument itself. A
+series held from before a dim was
+[added at the end](/reference/dims#reordering-is-a-breaking-change) ships the
+windows it was written in and is carried no further, so `current()`,
+`totals()` and the windows a snapshot carries leave it out.
 
 ### resolution
 
@@ -105,7 +109,7 @@ See [How carry works](#how-carry-works).
 ### grace
 
 ```ts
-grace?: DurationInput      // default: '2s'
+grace?: DurationInput      // default: the house default, then '2s'
 ```
 
 How long a window waits after it ends before a flush may claim it, so writes
@@ -316,6 +320,11 @@ await queueDepth.totals()
 **Returns** the sum of the held values, or `undefined` when no series has ever
 been written to.
 
+On a level declared `value: int()`, a total past `9007199254740991` rejects
+rather than returning a nearby whole number, and so does a `snapshot()` that
+adds series together past it. Each series stays below it on its own, but
+several added together can pass it.
+
 Adding is the merge a level can make honestly, because every held value is true
 at the same moment. A [gauge](/primitives/gauge#gauge-totals) drops `last` from
 its totals for the opposite reason.
@@ -387,7 +396,7 @@ queueDepth.rowShape().columns.map((c) => c.name)
 | `dims` | `Shape` | The declared dims |
 | `resolutionMs` | `number` | `resolution`, parsed |
 | `flushMs` | `number` | `flush`, parsed, including one taken from the house |
-| `graceMs` | `number` | `grace`, parsed. `2000` by default |
+| `graceMs` | `number` | `grace`, parsed, including one taken from the house. `2000` when neither sets it |
 | `holdForMs` | `number \| undefined` | `holdFor`, parsed. `undefined` when a series holds forever |
 | `isFloat` | `boolean` | `true` unless `value: int()` was declared |
 | `isBound` | `boolean` | `true` once a house has registered it |

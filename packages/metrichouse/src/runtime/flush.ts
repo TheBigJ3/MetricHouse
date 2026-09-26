@@ -20,7 +20,7 @@
  */
 
 import type { RecoveryReport } from '../drivers/types.js'
-import type { AnyMetric, WriteFn } from '../metrics/types.js'
+import { type AnyMetric, SETTLE, type WriteFn } from '../metrics/types.js'
 import { type ShipOutcome, shipClaim } from './ship.js'
 
 export type FlushSkipReason = 'cadence' | 'not-selected'
@@ -44,8 +44,17 @@ export interface FlushOptions {
 
 /** What {@link runFlush} accepts, on top of the per-metric options. */
 export interface HouseFlushOptions extends FlushOptions {
-  /** Restrict the flush to these metric names. */
+  /**
+   * Restrict the flush to these metric names. A name no registered metric
+   * has is listed in {@link FlushReport.unmatched}.
+   */
   readonly only?: readonly string[]
+  /**
+   * Throw instead, before anything is flushed, when `only` names a metric
+   * this house does not hold. Off by default, because a metric may be
+   * registered later and a name for it is not a mistake.
+   */
+  readonly strict?: boolean
 }
 
 export interface MetricFlushReport {
@@ -96,6 +105,12 @@ export interface FlushReport {
   readonly ok: boolean
   readonly durationMs: number
   readonly metrics: Record<string, MetricFlushReport>
+  /**
+   * The names in `only` that matched no metric registered when the call was
+   * made, in the order given. Empty when every name matched, or when there
+   * was no `only`.
+   */
+  readonly unmatched: string[]
   /** For callers who would rather have an exception than inspect a report. */
   throwIfFailed(): void
 }
@@ -181,123 +196,156 @@ export interface MetricFlushOptions {
  * happens to one. Every kind gets the identical cadence rule, the identical
  * retry counting, and the identical "an empty flush is not a flush".
  */
-export function metricFlush(options: MetricFlushOptions): Pick<AnyMetric, 'flush'> {
+export function metricFlush(
+  options: MetricFlushOptions,
+): Required<Pick<AnyMetric, 'flush' | typeof SETTLE>> {
   const state: FlushState = { lastFlushMs: undefined }
   const attempts = options.attempts ?? createAttempts()
+  /**
+   * Flushes of this metric that have not returned yet, however they were
+   * started: a scheduler tick, a cron, a direct call.
+   *
+   * `house.stop()` waits for them before its final flush. One still inside
+   * its sink when that flush looks would put its rows back afterwards if the
+   * sink failed, and nothing would ship them.
+   */
+  const running = new Set<Promise<MetricFlushReport>>()
 
   return {
-    async flush(flushOptions: FlushOptions = {}): Promise<MetricFlushReport> {
-      const metric = options.self()
-      // reads the bound clock, so an unbound metric fails here rather than
-      // claiming against `Date.now` and a driver that does not exist
-      const now = options.now()
-      const final = flushOptions.final === true
-
-      // 1. cadence. `flush` is a minimum, so a scheduler tick or a cron call
-      //    that arrives early is a no-op. `lastFlushMs` advances only on
-      //    success.
-      //
-      //    A clock that has stepped backwards since the last flush reads a
-      //    negative elapsed time. That is not "too soon", it is "no longer
-      //    comparable", and holding the metric back until the clock caught up
-      //    would stall it for as long as the step was.
-      //
-      //    A call a hair early counts as on time. The scheduler's interval
-      //    runs on a different clock from `now()`, and a tick can fire a
-      //    millisecond before `now()` agrees a full interval has passed.
-      //    Refusing it would push that metric back a whole interval.
-      const flushMs = options.flushMs()
-      if (!flushOptions.force && !final && state.lastFlushMs !== undefined) {
-        const elapsed = now - state.lastFlushMs
-        if (elapsed >= 0 && elapsed < flushMs - cadenceSlack(flushMs)) {
-          return {
-            buckets: 0,
-            rows: 0,
-            skipped: true,
-            reason: 'cadence',
-            nextEligibleInMs: flushMs - elapsed,
-          }
-        }
-      }
-
-      // 2. recover. A batch claimed by a flusher that then died is already
-      //    out of the live set, so `claimBatch` cannot reach it however long
-      //    it waits. Putting it back first is what lets this flush ship it.
-      //
-      //    After the cadence check, because recovered data can only leave on a
-      //    flush that is actually going to claim, and wrapped because this is
-      //    a repair rather than a precondition: a recovery that keeps failing
-      //    must not turn into a metric that never ships again.
-      let recovered: RecoveryReport | undefined
-      let recoveryError: unknown
-      try {
-        const pass = await metric.recoverBatch()
-        // absent unless it found something, so a caller can treat the field's
-        // presence as the news rather than reading a zero on every flush
-        if (pass.claims > 0) recovered = pass
-      } catch (error) {
-        recoveryError = error
-      }
-      const repair = {
-        ...(recovered !== undefined && { recovered }),
-        ...(recoveryError !== undefined && { recoveryError }),
-      }
-
-      // 3 and 4. claim, then ship. A driver that cannot be reached fails the
-      //    claim, and that comes back in the report like a sink failure does:
-      //    a caller flushing a whole house should hear about it and still see
-      //    every other metric flushed.
-      //
-      //    One claim per flush, except for a final one. A metric with a
-      //    `claimLimit` ships its backlog across several flushes, and a
-      //    process that is stopping has no later flush to wait for, so a final
-      //    flush claims again until the backlog is gone. The cap stops it
-      //    chasing records another process is still appending.
-      let buckets = 0
-      let rows = 0
-      let ackError: unknown
-      for (let claims = 0; claims < FINAL_CLAIM_CAP; claims++) {
-        let outcome: ShipOutcome
-        try {
-          // what is claimable is the metric's judgement, not this file's
-          const claim = await metric.claimBatch(now, { final })
-          outcome = await shipClaim(metric, claim, options.sink(), { attempts, source: 'flush' })
-        } catch (error) {
-          return { buckets, rows, skipped: false, error, ...repair }
-        }
-
-        buckets += outcome.buckets
-        rows += outcome.rows
-        if (outcome.error !== undefined) {
-          return {
-            buckets,
-            rows,
-            skipped: false,
-            error: outcome.error,
-            ...(outcome.releaseError !== undefined && { releaseError: outcome.releaseError }),
-            ...repair,
-          }
-        }
-        if (outcome.ackError !== undefined) ackError ??= outcome.ackError
-        if (!final || outcome.rows === 0) break
-      }
-
-      const settled = { ...repair, ...(ackError !== undefined && { ackError }) }
-
-      if (rows === 0) {
-        // deliberately does NOT advance lastFlushMs. The cadence bounds how
-        // often this metric *ships*, and nothing shipped. Advancing here would
-        // let an empty flush eat the cadence, so data that closed a second
-        // later would then wait a full interval. The coarser the resolution,
-        // the worse it gets, because early flushes always find the only bucket
-        // still open.
-        return { buckets: 0, rows: 0, skipped: false, ...settled }
-      }
-
-      state.lastFlushMs = now
-
-      return { buckets, rows, skipped: false, ...settled }
+    flush(flushOptions: FlushOptions = {}): Promise<MetricFlushReport> {
+      // the tracked chain is what the caller gets, so a flush nobody awaits
+      // that rejects, an unbound one, is still an unhandled rejection rather
+      // than swallowed by the bookkeeping
+      const tracked: Promise<MetricFlushReport> = flushOnce(flushOptions).finally(() => {
+        running.delete(tracked)
+      })
+      running.add(tracked)
+      return tracked
     },
+
+    async [SETTLE](): Promise<boolean> {
+      // loops rather than waiting once: a flush started while this waits is
+      // one that could still put rows back after the final flush has looked
+      let waited = false
+      while (running.size > 0) {
+        waited = true
+        await Promise.allSettled([...running])
+      }
+      return waited
+    },
+  }
+
+  async function flushOnce(flushOptions: FlushOptions): Promise<MetricFlushReport> {
+    const metric = options.self()
+    // reads the bound clock, so an unbound metric fails here rather than
+    // claiming against `Date.now` and a driver that does not exist
+    const now = options.now()
+    const final = flushOptions.final === true
+
+    // 1. cadence. `flush` is a minimum, so a scheduler tick or a cron call
+    //    that arrives early is a no-op. `lastFlushMs` advances only on
+    //    success.
+    //
+    //    A clock that has stepped backwards since the last flush reads a
+    //    negative elapsed time. That is not "too soon", it is "no longer
+    //    comparable", and holding the metric back until the clock caught up
+    //    would stall it for as long as the step was.
+    //
+    //    A call a hair early counts as on time. The scheduler's interval
+    //    runs on a different clock from `now()`, and a tick can fire a
+    //    millisecond before `now()` agrees a full interval has passed.
+    //    Refusing it would push that metric back a whole interval.
+    const flushMs = options.flushMs()
+    if (!flushOptions.force && !final && state.lastFlushMs !== undefined) {
+      const elapsed = now - state.lastFlushMs
+      if (elapsed >= 0 && elapsed < flushMs - cadenceSlack(flushMs)) {
+        return {
+          buckets: 0,
+          rows: 0,
+          skipped: true,
+          reason: 'cadence',
+          nextEligibleInMs: flushMs - elapsed,
+        }
+      }
+    }
+
+    // 2. recover. A batch claimed by a flusher that then died is already
+    //    out of the live set, so `claimBatch` cannot reach it however long
+    //    it waits. Putting it back first is what lets this flush ship it.
+    //
+    //    After the cadence check, because recovered data can only leave on a
+    //    flush that is actually going to claim, and wrapped because this is
+    //    a repair rather than a precondition: a recovery that keeps failing
+    //    must not turn into a metric that never ships again.
+    let recovered: RecoveryReport | undefined
+    let recoveryError: unknown
+    try {
+      const pass = await metric.recoverBatch()
+      // absent unless it found something, so a caller can treat the field's
+      // presence as the news rather than reading a zero on every flush
+      if (pass.claims > 0) recovered = pass
+    } catch (error) {
+      recoveryError = error
+    }
+    const repair = {
+      ...(recovered !== undefined && { recovered }),
+      ...(recoveryError !== undefined && { recoveryError }),
+    }
+
+    // 3 and 4. claim, then ship. A driver that cannot be reached fails the
+    //    claim, and that comes back in the report like a sink failure does:
+    //    a caller flushing a whole house should hear about it and still see
+    //    every other metric flushed.
+    //
+    //    One claim per flush, except for a final one. A metric with a
+    //    `claimLimit` ships its backlog across several flushes, and a
+    //    process that is stopping has no later flush to wait for, so a final
+    //    flush claims again until the backlog is gone. The cap stops it
+    //    chasing records another process is still appending.
+    let buckets = 0
+    let rows = 0
+    let ackError: unknown
+    for (let claims = 0; claims < FINAL_CLAIM_CAP; claims++) {
+      let outcome: ShipOutcome
+      try {
+        // what is claimable is the metric's judgement, not this file's
+        const claim = await metric.claimBatch(now, { final })
+        outcome = await shipClaim(metric, claim, options.sink(), { attempts, source: 'flush' })
+      } catch (error) {
+        return { buckets, rows, skipped: false, error, ...repair }
+      }
+
+      buckets += outcome.buckets
+      rows += outcome.rows
+      if (outcome.error !== undefined) {
+        return {
+          buckets,
+          rows,
+          skipped: false,
+          error: outcome.error,
+          ...(outcome.releaseError !== undefined && { releaseError: outcome.releaseError }),
+          ...repair,
+        }
+      }
+      if (outcome.ackError !== undefined) ackError ??= outcome.ackError
+      if (!final || outcome.rows === 0) break
+    }
+
+    const settled = { ...repair, ...(ackError !== undefined && { ackError }) }
+
+    if (rows === 0) {
+      // deliberately does NOT advance lastFlushMs. The cadence bounds how
+      // often this metric *ships*, and nothing shipped. Advancing here would
+      // let an empty flush eat the cadence, so data that closed a second
+      // later would then wait a full interval. The coarser the resolution,
+      // the worse it gets, because early flushes always find the only bucket
+      // still open.
+      return { buckets: 0, rows: 0, skipped: false, ...settled }
+    }
+
+    state.lastFlushMs = now
+
+    return { buckets, rows, skipped: false, ...settled }
   }
 }
 
@@ -320,10 +368,14 @@ export async function runFlush(
   options: HouseFlushOptions = {},
 ): Promise<FlushReport> {
   const startedAt = context.now()
+  const registered = context.metrics
+  const unmatched = unmatchedNames(options.only, registered)
+  if (options.strict === true) assertMatched('house.flush', unmatched, registered)
+
   const metrics: Record<string, MetricFlushReport> = {}
   let ok = true
 
-  for (const metric of context.metrics) {
+  for (const metric of registered) {
     if (options.only && !options.only.includes(metric.name)) {
       metrics[metric.name] = { buckets: 0, rows: 0, skipped: true, reason: 'not-selected' }
       continue
@@ -348,6 +400,7 @@ export async function runFlush(
     ok,
     durationMs,
     metrics,
+    unmatched,
     throwIfFailed(): void {
       if (ok) return
       const failed = Object.entries(metrics)
@@ -356,4 +409,44 @@ export async function runFlush(
       throw new Error(`flush failed for ${failed.join(', ')}`)
     },
   }
+}
+
+/**
+ * The names in `only` that no metric in `registered` has, each once, in the
+ * order they were given.
+ *
+ * A typo in `only` otherwise flushes or reads nothing and says nothing, which
+ * looks like a quiet metric rather than a mistake.
+ */
+export function unmatchedNames(
+  only: readonly string[] | undefined,
+  registered: readonly AnyMetric[],
+): string[] {
+  if (only === undefined) return []
+  const names = new Set(registered.map((metric) => metric.name))
+  return [...new Set(only)].filter((name) => !names.has(name))
+}
+
+/**
+ * Throw for a `strict` call whose `only` named a metric the house does not
+ * hold.
+ *
+ * @throws naming every unmatched name and every registered metric
+ */
+export function assertMatched(
+  label: string,
+  unmatched: readonly string[],
+  registered: readonly AnyMetric[],
+): void {
+  if (unmatched.length === 0) return
+  const named = unmatched.map((name) => JSON.stringify(name)).join(', ')
+  const which =
+    unmatched.length === 1 ? 'which is not a registered metric' : 'which are not registered metrics'
+  const held = registered.map((metric) => metric.name)
+  throw new Error(
+    `${label}: only names ${named}, ${which}` +
+      (held.length > 0
+        ? `. The registered metrics are [${held.join(', ')}]`
+        : '. None is registered'),
+  )
 }

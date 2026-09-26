@@ -144,7 +144,7 @@ most `2147483647` milliseconds, just under 25 days. See
 ### grace
 
 ```ts
-grace?: DurationInput      // default: '2s'
+grace?: DurationInput      // default: the house default, then '2s'
 ```
 
 How long a window waits after it ends before a flush may claim it. A write is
@@ -408,7 +408,7 @@ Everything a counter reports about itself, all read only.
 | `dims` | `Shape` | The declared dims |
 | `resolutionMs` | `number` | `resolution`, parsed |
 | `flushMs` | `number` | `flush`, parsed, including one taken from the house |
-| `graceMs` | `number` | `grace`, parsed. `2000` by default |
+| `graceMs` | `number` | `grace`, parsed, including one taken from the house. `2000` when neither sets it |
 | `isFloat` | `boolean` | `true` when `value: float()` was declared |
 | `isBound` | `boolean` | `true` once a house has registered it |
 | `write` | `WriteFn` | The function it was declared with |

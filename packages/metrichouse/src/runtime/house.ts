@@ -17,7 +17,7 @@
  */
 
 import type { Driver } from '../drivers/types.js'
-import { type AnyMetric, isMetric } from '../metrics/types.js'
+import { type AnyMetric, isMetric, SETTLE } from '../metrics/types.js'
 import { bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
 import {
@@ -26,7 +26,14 @@ import {
   type HouseDefaults,
   resolveDelivery,
 } from './delivery.js'
-import { type FlushContext, type FlushReport, type HouseFlushOptions, runFlush } from './flush.js'
+import {
+  assertMatched,
+  type FlushContext,
+  type FlushReport,
+  type HouseFlushOptions,
+  runFlush,
+  unmatchedNames,
+} from './flush.js'
 import type { LiveRow, SnapshotOptions } from './live.js'
 import { createScheduler, type Scheduler } from './scheduler.js'
 
@@ -47,6 +54,12 @@ export interface HouseDefaultsConfig {
 export interface HouseSnapshotOptions extends SnapshotOptions {
   /** Restrict the snapshot to these metric names. */
   readonly only?: readonly string[]
+  /**
+   * Throw instead, before anything is read, when `only` names a metric this
+   * house does not hold. Off by default, because a metric may be registered
+   * later and a name for it is not a mistake.
+   */
+  readonly strict?: boolean
 }
 
 /** Live rows per metric, keyed by name, the same shape a flush report uses. */
@@ -110,9 +123,13 @@ export interface House {
   /**
    * Stop the scheduler and get everything out.
    *
-   * Clears the intervals and waits for any flush they started, drains the
-   * writes still on their way to the driver, then makes a final flush past
-   * every cadence and every grace period. What it cannot ship is the open
+   * Clears the intervals, waits for every flush still running however it was
+   * started and drains the writes still on their way to the driver, taking
+   * turns until a wait for flushes that follows a drain finds none, then
+   * makes a final flush past every cadence and every grace period. A call
+   * while one is running returns the same promise, unless `start()` came in
+   * between: that call clears the intervals again at once and runs its own
+   * steps once the earlier call has finished. What it cannot ship is the open
    * bucket: it has not closed, and shipping a partial fold under the same
    * row id is the corruption `delivery: 'immediate'` exists to handle.
    */
@@ -264,6 +281,108 @@ export function createHouse(config: HouseConfig): House {
     },
   }
 
+  /**
+   * Calls to `house.flush()` that have not returned yet.
+   *
+   * A house flush visits its metrics one at a time, so while `stop()` waits
+   * for one metric's flush, the same house flush can still start the next.
+   * `stop()` waits for these as well as for each metric's own flushes.
+   */
+  const houseFlushes = new Set<Promise<FlushReport>>()
+
+  /**
+   * Resolve once no house flush and no metric flush is running, `true` when
+   * there was one to wait for.
+   *
+   * Passes repeat until one finds nothing to wait for. A pass that waited may
+   * have let a house flush move on to a metric whose wait had resolved
+   * earlier in that pass, and the next pass catches that flush.
+   */
+  async function settleFlushes(): Promise<boolean> {
+    let waitedAtAll = false
+    for (;;) {
+      if (houseFlushes.size > 0) {
+        waitedAtAll = true
+        await Promise.allSettled([...houseFlushes])
+        continue
+      }
+      const waited = await Promise.all(
+        [...registry.values()].map((metric) => metric[SETTLE]?.() ?? false),
+      )
+      if (houseFlushes.size === 0 && !waited.includes(true)) return waitedAtAll
+      waitedAtAll = true
+    }
+  }
+
+  /**
+   * Resolve once no flush is running and no write is on its way to the
+   * driver.
+   *
+   * A write may be issued while a flush is waited for, and a flush may start
+   * while the writes drain, so the two waits take turns until a wait for
+   * flushes that follows a drain finds none.
+   */
+  async function settleEverything(): Promise<void> {
+    // the flushes first: a tick or a cron still inside its sink puts its rows
+    // back if it fails, and the final flush is what ships them
+    await settleFlushes()
+    for (;;) {
+      // a write still in flight to the driver is not yet claimable, and
+      // flushing before it lands would leave it behind in a process that is
+      // about to exit
+      await Promise.all([...registry.values()].map((metric) => metric.drain()))
+      if (!(await settleFlushes())) return
+    }
+  }
+
+  /**
+   * The `stop()` in progress, which a second call joins rather than repeats.
+   * `start()` forgets it, so a `stop()` after a restart stops the scheduler
+   * that restart started.
+   */
+  let stopping: Promise<FlushReport> | undefined
+  /**
+   * Resolves once the latest shutdown has finished, however it ended. The
+   * next one waits for it, so two shutdowns never run their steps at once.
+   */
+  let lastShutdown: Promise<void> = Promise.resolve()
+
+  function shutdown(): Promise<FlushReport> {
+    // first, so a send that fails while stopping arms no retry timer
+    stopped = true
+    // cleared now rather than after an earlier shutdown, so no interval a
+    // `start()` armed in between is left running. What it returns waits for
+    // a tick still inside its sink
+    const ticks = scheduler.stop()
+    const earlier = lastShutdown
+    let finished = (): void => {}
+    lastShutdown = new Promise<void>((resolve) => {
+      finished = resolve
+    })
+
+    // assigned before its body gets past the first `await`, which is when the
+    // `finally` below can first compare against it
+    let run: Promise<FlushReport> | undefined
+    run = (async () => {
+      try {
+        await earlier
+        await ticks
+        // then every other flush still running, a cron's `house.flush()` with
+        // metrics still to visit or a direct `metric.flush()`, and every
+        // write. The flushes' failures are already in their own reports, so
+        // only the waiting matters here
+        await settleEverything()
+        // final, so windows still inside grace go too. Only the open window
+        // is left, which is the one thing a stopping process cannot finish
+        return await runFlush(flushContext, { force: true, final: true })
+      } finally {
+        if (stopping === run) stopping = undefined
+        finished()
+      }
+    })()
+    return run
+  }
+
   return {
     delivery,
 
@@ -278,7 +397,14 @@ export function createHouse(config: HouseConfig): House {
     },
 
     flush(options?: HouseFlushOptions): Promise<FlushReport> {
-      return runFlush(flushContext, options)
+      // the tracked chain is what the caller gets, so a flush nobody awaits
+      // that rejects, a strict one naming an unknown metric, is still an
+      // unhandled rejection rather than swallowed by the bookkeeping
+      const tracked: Promise<FlushReport> = runFlush(flushContext, options).finally(() => {
+        houseFlushes.delete(tracked)
+      })
+      houseFlushes.add(tracked)
+      return tracked
     },
 
     get running(): boolean {
@@ -287,26 +413,24 @@ export function createHouse(config: HouseConfig): House {
 
     start(): void {
       stopped = false
+      stopping = undefined
       scheduler.start()
     },
 
-    async stop(): Promise<FlushReport> {
-      // first, so a send that fails while stopping arms no retry timer
-      stopped = true
-      // a tick still inside its sink finishes first. If it fails, its rows go
-      // back to the driver, and the final flush below is what ships them
-      await scheduler.stop()
-      // drain next: a write still in flight to the driver is not yet
-      // claimable, and flushing before it lands would leave it behind in a
-      // process that is about to exit
-      await Promise.all([...registry.values()].map((metric) => metric.drain()))
-      // final, so windows still inside grace go too. Only the open window is
-      // left, which is the one thing a stopping process cannot finish
-      return runFlush(flushContext, { force: true, final: true })
+    stop(): Promise<FlushReport> {
+      // a second call while one is running, from a SIGINT and a SIGTERM
+      // handler both, waits for the same final flush rather than making one
+      // of its own that finds everything already claimed
+      stopping ??= shutdown()
+      return stopping
     },
 
     async snapshot(options: HouseSnapshotOptions = {}): Promise<HouseSnapshot> {
-      const { only, ...perMetric } = options
+      const { only, strict, ...perMetric } = options
+      if (strict === true) {
+        const registered = [...registry.values()]
+        assertMatched('house.snapshot', unmatchedNames(only, registered), registered)
+      }
       const wanted = [...registry.values()].filter(
         (metric) => only === undefined || only.includes(metric.name),
       )

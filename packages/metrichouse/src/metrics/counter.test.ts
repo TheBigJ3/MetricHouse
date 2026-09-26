@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { memory } from '../drivers/memory.js'
 import type { Driver } from '../drivers/types.js'
-import { float, int, json, oneOf, str } from '../schema/types.js'
+import { rowId } from '../identity.js'
+import { bool, type FieldType, float, int, json, oneOf, str, ts } from '../schema/types.js'
 import { type Counter, type CounterRow, counter } from './counter.js'
 import type { WriteFn } from './types.js'
 
@@ -764,5 +765,104 @@ describe('immediate delivery', () => {
     hits.add()
     await hits.drain()
     expect(attempts).toEqual([1, 2, 3, 1])
+  })
+})
+
+describe('a dim added at the end', () => {
+  it('ships a series stored before the change with the new dim absent', async () => {
+    const shared = memory()
+    const at = 1_788_616_980_000
+    const before = counter('orders', {
+      dims: { route: str() },
+      resolution: '1s',
+      flush: '1m',
+      write: discard,
+    })
+    before.bind({ driver: shared, now: () => at })
+    before.add({ route: '/a' })
+    await before.drain()
+
+    const shipped: Record<string, unknown>[] = []
+    const after = counter('orders', {
+      dims: { route: str(), status: str().optional() },
+      resolution: '1s',
+      flush: '1m',
+      write: (rows) => {
+        shipped.push(...rows)
+      },
+    })
+    after.bind({ driver: shared, now: () => at + 10_000 })
+
+    // a dims filter reads the old key back before it builds the row
+    const filtered = await after.snapshot({ dims: { route: '/a' } })
+    expect(filtered.map(({ route, value }) => ({ route, value }))).toEqual([
+      { route: '/a', value: 1 },
+    ])
+    expect('status' in (filtered[0] as object)).toBe(false)
+
+    const report = await after.flush()
+    expect(report.error).toBeUndefined()
+    expect(shipped).toEqual([
+      { id: rowId('orders', at, '/a'), bucket_ts: new Date(at), route: '/a', value: 1 },
+    ])
+  })
+})
+
+describe('dims added to a counter that had none', () => {
+  const at = 1_788_616_980_000
+
+  /** A series written with no dims, then read and shipped under `dims`. */
+  async function after<D extends Record<string, FieldType>>(dims: D) {
+    const shared = memory()
+    const before = counter('orders', { resolution: '1s', flush: '1m', write: discard })
+    before.bind({ driver: shared, now: () => at })
+    before.add()
+    await before.drain()
+
+    const shipped: Record<string, unknown>[] = []
+    const metric = counter('orders', {
+      dims,
+      resolution: '1s',
+      flush: '1m',
+      write: (rows) => {
+        shipped.push(...rows)
+      },
+    })
+    metric.bind({ driver: shared, now: () => at + 10_000 })
+    const live = (await metric.snapshot()).map(({ bucket_open, bucket_elapsed_ms, ...row }) => row)
+    expect((await metric.flush()).error).toBeUndefined()
+    return { live, shipped }
+  }
+
+  const bare = { id: rowId('orders', at, ''), bucket_ts: new Date(at), value: 1 }
+
+  it('leaves an int dim off the row rather than reading it as 0', async () => {
+    const { live, shipped } = await after({ shard: int().optional() })
+    expect(live).toEqual([bare])
+    expect(shipped).toEqual([bare])
+  })
+
+  it('leaves a bool dim off the row rather than reading it as false', async () => {
+    const { live, shipped } = await after({ canary: bool().optional() })
+    expect(live).toEqual([bare])
+    expect(shipped).toEqual([bare])
+  })
+
+  it('leaves a ts dim off the row rather than reading it as the epoch', async () => {
+    const { live, shipped } = await after({ since: ts().optional() })
+    expect(live).toEqual([bare])
+    expect(shipped).toEqual([bare])
+  })
+
+  it('leaves every dim off the row when two are added', async () => {
+    const { live, shipped } = await after({ route: str().optional(), shard: int().optional() })
+    expect(live).toEqual([bare])
+    expect(shipped).toEqual([bare])
+  })
+
+  it('reads a single str dim as the empty string, which the key cannot tell apart', async () => {
+    const { live, shipped } = await after({ route: str().optional() })
+    expect(live).toEqual([{ ...bare, route: '' }])
+    expect(shipped).toEqual([{ ...bare, route: '' }])
   })
 })
