@@ -1,5 +1,282 @@
 # metrichouse
 
+## 0.6.0
+
+### Minor Changes
+
+- 6bbaccd: Less CPU per write, per staged record and per row a flush or a snapshot
+  builds, and fewer bytes on the wire for the live reads that ask about one
+  series or one total. Nothing stored changes, and no result, row id or error
+  does either.
+  
+  A minor bump rather than a patch, because the `Driver` interface gains two
+  optional methods, `readLevel` and `sumBuckets`, and `BucketRange` is exported
+  for the second. A driver written before them still works unchanged: a metric
+  asks for them only when a driver has them, and reads the long way otherwise.
+  
+  - A counter, gauge, level or timer builds its dim key encoder once, when it is
+    declared, instead of reading its declaration again on every write. Encoding
+    five dims takes about 265 ns instead of 800, and `counter.add()` on
+    `memory()` takes about 960 ns instead of 1400.
+  - An event or log record id draws its random bytes from a pool that is
+    refilled from the platform's crypto source, instead of asking the platform
+    once per id. Minting an id takes about 150 ns instead of 700.
+  - The `ioredis()` driver stores and reads a record without the extra JSON
+    pass when there is no date and no reserved key in it. The stored bytes are
+    the same. Reading a claim of 10,000 records takes about 16 ms instead of 30.
+  - A counter or gauge `snapshot({ dims })` builds only the rows the filter
+    keeps. Picking one series out of 50,000 on `memory()` takes about 15 ms
+    instead of 53.
+  - A row id is written out as hex a byte at a time from a table, instead of
+    through `toString(16)` and `padStart`. The ids are the same to the
+    character. Hashing 200,000 ids takes about 50 ms instead of 196.
+  - A counter, gauge or level builds its dim key decoder once, when it is
+    declared. A key with no escape character in it is split in one pass, and
+    every other key is read exactly as before. Decoding 200,000 keys of three
+    dims takes about 55 to 70 ms instead of 125 to 180. With the faster ids,
+    turning a claim of 200,000 counter rows into rows takes about 220 ms
+    instead of 484, and a level carrying 200 series through 1,000 windows on
+    `memory()` flushes in about 340 ms instead of 520.
+  - Keeping track of a write until it lands makes one promise instead of three.
+    Tracking 200,000 writes takes about 80 ms instead of 158, and 200,000
+    `counter.add()` calls on `memory()` take about 213 ms instead of 275.
+  - A level `set()` or `inc()` on `memory()` that lands in the newest window no
+    longer looks through every unflushed window for a later one. With 3,000
+    unflushed windows, 20,000 writes take about 25 ms instead of 498.
+  - The `ioredis()` driver sends a write without waiting on a promise per
+    script once every script it uses is loaded.
+  - The `ioredis()` driver reads one series across its windows in one round
+    trip instead of two. `counter.current(dims)` and every immediate delivery
+    send read this way.
+  - `level.current(dims)` reads the one series it asks about instead of every
+    series the level holds. With 5,000 series on `ioredis()` it takes about
+    0.15 ms instead of 17.
+  - `counter.current()` on an integer counter adds up the open window inside
+    Redis when no order of adding could change the total, instead of fetching
+    every series. With 20,000 series it takes about 5 ms instead of 47. A float
+    counter, and any total that could round, still adds the series itself.
+- ab06cf8: Fixes from a fourth round of bug hunting.
+  
+  **A metric that stopped shipping**
+  
+  - Adding a dim at the end of a declaration, which the docs call safe, made
+    every flush and every snapshot of that metric fail while windows written
+    before the change were still in the driver. A claim takes every closed
+    window, so nothing shipped until someone deleted those keys by hand. A key
+    with fewer values than the declaration names now reads the dims it has no
+    value for as absent, and those series ship with the new dim left off the
+    row. A key with more values than dims, left by a removed dim, still throws.
+    A metric that had no dims and gains some reads its old series with every
+    new dim left off, where a first `int()`, `bool()` or `ts()` dim read back as
+    `0`, `false` or the epoch. The one case that cannot be told apart is a
+    single `str()` dim, or a `oneOf()` listing `''`, which reads it as `''`.
+    A level ships a series held from before the change for the windows it was
+    written in and no further, so it no longer appears in every later window,
+    or in `current()` and `totals()`, beside the series that replaced it.
+  
+  **Failures that were silent or permanent**
+  
+  - An `async` client factory for `ioredis()` that rejected once was kept as the
+    answer, so every write and flush failed for the rest of the process. Every
+    call waiting on the failed attempt now gets its error, and the next call asks
+    the factory again.
+  - `maxPipelineSize: NaN`, which `Number()` gives for an environment variable
+    that is not set, made `ioredis()` send no command at all while every write
+    reported success. It now throws when the driver is created, as does any
+    value that is not a positive whole number, including `0` and fractions that
+    were rounded before.
+  - A `maxPipelineSize` past about 125,000 overflowed the stack when the replies
+    of one round trip came back.
+  - A locally staged event with a `claimLimit`, whose sink threw rather than
+    returning a rejected promise, sent its first batch twice on `drain()` and
+    never offered the records behind it. Every record is now offered once.
+  - `house.stop()` waited only for flushes its own timers had started. A cron's
+    `house.flush()`, or a direct `metric.flush()`, still inside its sink when
+    `stop()` began made its final flush find nothing, and if that sink then
+    failed, its rows went back to the driver after `stop()` had returned. On
+    `memory()` they were lost when the process exited. `stop()` now waits for
+    every flush still running, including one started while it waits, before its
+    final flush, which ships what they put back.
+  - A second `house.stop()` made while the first was still running, from a
+    `SIGINT` and a `SIGTERM` handler both, made a final flush of its own that
+    found everything claimed by the first, and could resolve with nothing
+    shipped before the first had finished. It now returns the same promise as
+    the first call. After a `house.start()` in between, it clears the timers
+    that start set and runs its own steps once the first call has finished.
+  - A name in `only` that matched no metric, a typo for one, made
+    `house.flush()` and `house.snapshot()` do nothing for it and say nothing.
+    The flush report now lists such names in a new `unmatched` field, and
+    `strict: true` on either call rejects before anything runs, naming them and
+    the metrics the house holds. Without `strict` nothing throws, since a metric
+    registered later with `house.register()` is a legitimate name.
+  
+  **Values that read back wrong**
+  
+  - On `memory()`, `gauge.current()` and `timer.current()` returned the stored
+    fold itself, so editing the result changed the row a later flush shipped.
+    Reads now hand out copies, as Redis does.
+  - `level.totals()` on a level declared `value: int()`, and a snapshot that adds
+    its series together, could pass `Number.MAX_SAFE_INTEGER` and return a
+    different whole number. Both now reject, as a counter does.
+  - A nested `child()` on a log that passed a bound field as `undefined` erased
+    the value its parent bound. It now keeps it, as a call site does.
+  - A log line could pass `error_stack` as a field and forge the stack column,
+    and a `level` or `message` passed that way was overwritten without a word.
+    A line, or a child it came from, that passes any column the log writes
+    itself now throws. The unknown field error on a log lists only the fields
+    you declared, rather than `level`, `message` and `error_stack` as well.
+  
+  **Types that disagreed with the runtime**
+  
+  - `timer.time()` was typed to return the thenable `fn` returned when that was
+    not a `Promise`, such as a query builder, although it hands back a `Promise`
+    of its result. Calling a builder method on it compiled and then threw. The
+    return type is now a `Promise` of the result.
+  
+  **Settings accepted and misread**
+  
+  - An unknown snapshot `direction` sorted ascending. It now throws.
+  
+  The delivery guide now says that a driver staged event whose immediate send
+  failed waits for its next `record()` or a flush, rather than retrying on its
+  own.
+  
+  Docs that disagreed with the code are corrected. Getting started no longer
+  suggests `flush({ force: true })` to ship a window that is still open, and
+  shows a test clock instead. The driver skeletons in the drivers guide and the
+  driver contract have all fourteen methods and compile. The grace default reads as the house default,
+  then `'2s'`, on every page that states it. The event page no longer names a
+  `context.buckets` field, and its pattern counts `3xx` responses. The log page's
+  nested child example uses only declared fields. The flushing guide lists
+  `releaseError` in the report, and the dims reference says that a counter's
+  `current()` may leave its dims out.
+- 37ea08a: Fixes for wrong values, lost errors and driver disagreements found by a second
+  round of bug hunting across the drivers, the metric types and the runtime.
+  
+  **Values that shipped wrong**
+  
+  - A level whose flush carried a value into a window that a late `set()` had
+    already written kept the window right but carried the older value into every
+    empty window after it. It now carries the value the window ended at.
+  - A dim named after a column the metric writes, such as `id`, `value` or a
+    gauge's `min`, overwrote that column or was overwritten by it. A dim named
+    `id` gave every window of a series the same row id. These names now throw at
+    declaration.
+  - A gauge or timer that did not ship `sum` told its sink a `total` of `0`. The
+    total is now every observed value added up, whichever columns ship.
+  - `add(5n)` or `add(true)` on a counter with no dims counted 1, and `inc(5n)`
+    moved a level by 1. A first argument that is neither a number nor a dims
+    object now throws.
+  - An integer counter or level could pass `Number.MAX_SAFE_INTEGER` and stop
+    being exact without any error. The driver now refuses that write, and a delta
+    past the limit throws at the call with a message that no longer calls it a
+    fraction.
+  - On Redis, a batch of gauge observations aimed at two windows below the
+    watermark was folded out of order, so `last` could be wrong.
+  - `rowShape()` reported a dim or field with a `.default()` as optional, so a
+    table built from it had a nullable column.
+  
+  **Failures reported as success, or not at all**
+  
+  - A sink that rejected with no reason, as `Promise.reject()` does, counted as a
+    successful flush. `house.stop()` then called it a hundred times. It is now
+    reported as an error naming the metric.
+  - On Redis, an `ack` whose reply was lost and resent after a reconnect failed a
+    flush that had succeeded, a resent recovery reported that it found nothing,
+    and a resent `claimRecords` took twice its limit. Each now answers the way
+    its first arrival did.
+  - A failed recovery pass on a scheduled flush never reached `onError`.
+  - A log line threw for a caught value `String()` cannot convert, and for an
+    `Error` whose `message` or `stack` is not a string. It now writes a row.
+  
+  **Settings and inputs that were accepted and misbehaved**
+  
+  - A `flush`, `defaults.flush` or `batch.maxAge` of zero, or longer than just
+    under 25 days, made the scheduler fire about every millisecond. Both now throw
+    at declaration.
+  - An unknown `delivery` value behaved as `'staged'`. It now throws.
+  - A metric whose own registration failed stayed bound, so calling `createHouse`
+    again with the same metrics, as the docs say to, failed.
+  - A metric named `__proto__` vanished from flush reports and snapshots, and a
+    metric name holding half of a surrogate pair could share Redis keys with
+    another. Both now throw.
+  - A dim or field named like a whole number, such as `'2024'`, lost its declared
+    place in the row. Those names now throw.
+  - An invalid `Date` for a snapshot's `to` included the window still filling. It
+    now throws, as does one for `from`.
+  - A grouped snapshot row carried an absent optional dim as a key holding
+    `undefined`.
+  - A gauge accepted an aggregate named twice, an event `timestamp` naming an
+    inherited property such as `toString` got the wrong error, and a level named
+    `then` made a logger awaitable. All three now throw clearly.
+  
+  **The two drivers now agree on**
+  
+  - Refusing a first increment or observation that is not a finite number.
+  - Changing nothing when one write in a batch is refused, and leaving no empty
+    window behind when the memory driver refuses a new series.
+  - A read on Redis seeing a write issued before it that has not resolved yet.
+  - Handing back a record field shaped like the Redis driver's own date marker
+    unchanged.
+  
+  Error messages no longer use a dash as punctuation, so a few messages read
+  differently. A test matching on the exact old text may need updating.
+- a7f92d6: Fixes from a third round of bug hunting, mostly in code the previous round
+  changed.
+  
+  **Values that shipped or read back wrong**
+  
+  - A level hold for a window that a claim had already taken, arriving a second
+    time from a racing flusher or a resend, put `carried` back to an older value,
+    so every empty window after it shipped that value.
+  - A level `set` or `inc` batch refused partway kept the operations before the
+    refusal, and on Redis a resend applied them a second time. A refused call now
+    changes nothing in its window.
+  - A level snapshot could leave out the oldest window the next flush shipped
+    after a gap longer than 10,000 windows.
+  - An event row, and a grouped snapshot row, carried an inherited value such as
+    `Object`'s `constructor` for an omitted field or dim of that name.
+  - `add(new Date())`, `add([])` or `add(new Number(5))` on a counter with no dims
+    counted 1. They now throw, as `inc()` and `dec()` on a level do.
+  - An integer counter's total across series, from `current()` or a merging
+    `snapshot()`, could pass `Number.MAX_SAFE_INTEGER` and come back as a
+    different whole number. It now rejects.
+  - A dim or field named `bucket_open` or `bucket_elapsed_ms` was overwritten in
+    every snapshot row. Those names now throw at declaration.
+  - `timer.time()` returned a new promise rather than the one `fn` returned, and
+    a thenable whose `then` returns nothing came back as `undefined`.
+  - On Redis, a bounded `readPending`, which `event.snapshot({ from, to })` uses,
+    skipped or repeated records when another process claimed or released between
+    pages.
+  - On Redis, an invalid `Date` in record fields came back as an object, and a
+    level write at a fifteen digit timestamp read the wrong window.
+  
+  **Failures that stopped other work or were lost**
+  
+  - With no `onError`, one failed background write made `house.drain()` and
+    `house.stop()` reject early, and `stop()` then skipped the final flush for
+    every metric. An `onError` that threw on a scheduled flush did the same.
+  - When a sink failed and putting its rows back failed too, the flush report
+    carried only the second error. The sink's error stays in `error`, and the
+    new `releaseError` field reports the other.
+  - A locally staged event kept calling its sink on a timer after `house.stop()`
+    had returned.
+  - A scheduled flush that failed with no `onError` was dropped silently, where
+    the docs say it becomes an unhandled rejection. It now does.
+  - On Redis, a release that met a cell of another kind stranded the rest of its
+    claim where no recovery could find it.
+  - On Redis, an error from a batch spanning several metrics named the first
+    metric rather than the one refused.
+  - A log line still threw for a revoked proxy, or a value whose class tag
+    getter throws.
+  - A level with a `holdFor` long enough to pass the largest safe timestamp
+    failed every flush.
+  
+  **Settings accepted and misread**
+  
+  - An unknown event `stage`, a `sample` that is neither a number nor a function,
+    and an unknown snapshot `rollup` now throw instead of acting as a default.
+
 ## 0.5.0
 
 ### Minor Changes
