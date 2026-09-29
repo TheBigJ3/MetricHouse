@@ -268,6 +268,21 @@ describe('ioredis · options and connection', () => {
     ).resolves.toBeUndefined()
   })
 
+  it('quits a client it made once when close() is called twice together', async () => {
+    let quits = 0
+    const made = {
+      ...(stubClient() as object),
+      quit: async () => {
+        quits += 1
+      },
+    } as unknown as IoredisClient
+    const driver = ioredis(() => made)
+    await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+
+    await Promise.all([driver.close(), driver.close()])
+    expect(quits).toBe(1)
+  })
+
   it('asks a factory that failed again on the next call, once for callers that raced it', async () => {
     let calls = 0
     const driver = ioredis(

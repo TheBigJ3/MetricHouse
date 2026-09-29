@@ -106,6 +106,13 @@ await house.drain()   // resolves once every queued write has reached the driver
 Call `drain()` before exiting, and on every request on a platform that freezes
 your process when the response returns.
 
+A write the driver refuses after `record()` has returned goes to
+[`onError`](#where-errors-go), and that record is lost. For records that must not
+be lost that way, declare the event
+[`durability: 'durable'`](/primitives/event#durability). Its `record()` returns
+a promise that resolves only once the driver has the record, and rejects
+otherwise, so the caller can fail the request instead of reporting success.
+
 ### The window that is still filling
 
 `house.stop()` ships every window that has ended, including those still inside
@@ -252,7 +259,9 @@ const house = createHouse({
 
 `onError` receives:
 
-- A driver write that failed after `add()`, `set()` or `record()` returned.
+- A driver write that failed after `add()`, `set()` or `record()` returned. A
+  durable event's `record()` has not returned by then, so its failure rejects
+  the promise instead and does not come here.
 - A flush that failed on a scheduler tick, where nobody is holding the promise.
 - A broken `derive` on an event, or a broken `record` pairing on a timer.
 
@@ -261,7 +270,7 @@ deliberately better than a failure disappearing quietly. A handler that throws
 is raised the same way, and neither case stops `drain()` or `stop()` from
 waiting for the rest.
 
-`onWarn` receives startup warnings about your setup, and there are two of them:
+`onWarn` receives startup warnings about your setup, and there are three kinds:
 
 ```ts
 onWarn: (message) => logger.warn({ message }, 'metrichouse')
@@ -269,6 +278,9 @@ onWarn: (message) => logger.warn({ message }, 'metrichouse')
 
 - The driver cannot survive a restart, so the guarantee is best effort.
 - Delivery is immediate, so your table has to keep the newest row per id.
+- An event declared `durability: 'durable'` is bound to a driver that cannot
+  survive a restart. This one comes once per such event, when the house
+  registers it, with the event's name in `metric`.
 
 ## Failures you do get to handle
 
@@ -370,6 +382,9 @@ write: async (rows, context) => {
 - [ ] `house.stop()` runs on `SIGTERM`.
 - [ ] `house.drain()` runs before a serverless response returns.
 - [ ] Your dimensions have a small, known set of values.
+- [ ] Events a caller must not lose are `durability: 'durable'`, and Redis runs
+      with `appendonly yes`, `appendfsync always`, and a `maxmemory-policy`
+      that cannot evict them.
 - [ ] Something alerts on repeated flush failures.
 - [ ] Your sink has a timeout, and `recoverAfter` is longer than it.
 - [ ] Your sink chunks very large batches.

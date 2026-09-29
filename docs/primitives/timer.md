@@ -188,6 +188,7 @@ Rules for the pairing:
 | The event is named rather than passed | Resolution happens at the first timing, so the two can be declared in either order |
 | The event keeps its own staging, sampling and sink | The timer stays exact while the sample table holds a slice |
 | A broken pairing goes to `onError` | The timing is still recorded on the timer. A misconfigured sample table must not lose the measurement |
+| A durable event's rejection goes to `onError` too | A timing is written from code that does not await it, so nobody else holds the promise |
 
 ```sql
 SELECT

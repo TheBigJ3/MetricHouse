@@ -394,6 +394,41 @@ describe('record', () => {
   const matchingEvent = () =>
     event('latency_events', { write: discard, fields: { ...makeDims(), duration_ms: float() } })
 
+  it('reports a durable event that could not stage the timing to onError', async () => {
+    const latency = timer('latency', {
+      write: discard,
+      dims: makeDims(),
+      resolution: '10s',
+      flush: '1m',
+      record: 'latency_events',
+    })
+    const events = event('latency_events', {
+      write: discard,
+      fields: { ...makeDims(), duration_ms: float() },
+      durability: 'durable',
+    })
+    const errors: unknown[] = []
+    createHouse({
+      driver: {
+        ...memory(),
+        append: async () => {
+          throw new Error('redis down')
+        },
+      },
+      now,
+      schema: [latency, events],
+      onError: (error) => errors.push(error),
+    })
+
+    latency.observe(5, { route: '/walks', status: 'ok' })
+    await vi.waitFor(() =>
+      expect(errors.map((error) => (error as Error).message)).toEqual([
+        'latency_events: the driver did not confirm the record, which may still be staged ' +
+          'and ship. redis down',
+      ]),
+    )
+  })
+
   it('names a dim the event lacks even when the name is on every object', async () => {
     const latency = timer('latency', {
       write: discard,

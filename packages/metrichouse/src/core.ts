@@ -64,9 +64,11 @@ export type {
   Event,
   EventBatchConfig,
   EventConfig,
+  EventDurability,
   EventLiveRow,
   EventRow,
   EventStage,
+  RecordResult,
 } from './metrics/event.js'
 export { event, RESERVED_EVENT_COLUMNS, stagedMetric } from './metrics/event.js'
 export type {

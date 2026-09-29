@@ -37,7 +37,7 @@ checkoutAttempted.record({
 | Answers | What exactly happened, with all the detail |
 | Storage | Staged whole, never merged |
 | Row | `{ id, ts, ...fields, _ingested_at, _sample_rate? }` |
-| Write with | [`record()`](#event-record), [`recordMany()`](#event-recordmany) |
+| Write with | [`record()`](#event-record), [`recordMany()`](#event-recordmany), awaited when [durable](#durability) |
 | Read with | [`pending()`](#event-pending), [`peek()`](#event-peek), [`snapshot()`](#event-snapshot) |
 | Use it for | Purchases, signups, feature use, audit records, page views, API calls |
 
@@ -48,7 +48,7 @@ values that are unique per record are ordinary here.
 ## event()
 
 ```ts
-event<F>(name: string, config: EventConfig<F>): Event<F>
+event<F, D>(name: string, config: EventConfig<F, D>): Event<F, 'event', D>
 ```
 
 Declares an event. It is inert until a [house](/guide/the-house) binds it, and
@@ -59,6 +59,7 @@ recording to an unbound event throws.
 | `name` | `string` | yes | [The metric name](#name) |
 | `config.fields` | shape | yes | [The record schema](#fields) |
 | `config.stage` | `'driver'` or `'local'` | no | [Where records wait](#stage) |
+| `config.durability` | `'relaxed'` or `'durable'` | no | [What `record()` waits for](#durability) |
 | `config.batch` | object | no | [Local staging size and age limits](#batch) |
 | `config.flush` | duration | no | [The fastest this may ship](#flush) |
 | `config.timestamp` | `'auto'` or a field name | no | [Where `ts` comes from](#timestamp) |
@@ -127,7 +128,100 @@ export const pageViewed = event('page_viewed', {
 ```
 
 Local staging costs nothing per event and loses everything on a crash. Use it
-for page views, and use `'driver'` for money.
+for page views, and use `'driver'` for money. A record a caller must not lose,
+such as an order or an audit entry, also wants [`durability: 'durable'`](#durability).
+
+### durability
+
+```ts
+durability?: 'relaxed' | 'durable'      // default: 'relaxed'
+```
+
+What [`record()`](#event-record) waits for before it returns. Any other value
+throws at declaration.
+
+```ts
+export const orderPlaced = event('order_placed', {
+  fields: { orderId: str(), customerId: str(), totalCents: int() },
+  durability: 'durable',
+  write: toClickHouse('order_placed'),
+})
+
+await orderPlaced.record({ orderId: 'o_981', customerId: 'c_12', totalCents: 4_999 })
+// Redis has it. It ships on the next flush like any other record
+```
+
+| | `'relaxed'` | `'durable'` |
+| --- | --- | --- |
+| `record()` returns | nothing | a promise |
+| It returns | at once, before the driver has the record | once the driver has answered that the record is staged |
+| A write the driver refuses | goes to `onError`, and the record is gone | rejects the promise |
+| Cost to the caller | nothing | one round trip to the driver |
+| Allowed with | any settings | `stage: 'driver'` and no `sample` |
+
+A relaxed record suits page views and API calls, where a crash costs a slightly
+smaller number. A durable record suits the rows somebody will come looking for
+later: an order log, a ticket's audit trail, a refund. The caller awaits it and
+reports success only once it resolves.
+
+**A resolved promise** means the driver has the record. From then on the usual
+promise holds: the record ships at least once, and nothing deletes it before your
+`write` function returns, even if this process dies the next moment. Whether it
+also survives a crash of Redis itself is up to how Redis is run, which
+[Durable events on Redis](/guide/drivers#durable-events-on-redis) covers.
+
+Under `delivery: 'immediate'`, the promise still settles on the append. The send
+that follows is the ordinary one, so a sink that fails reports to `onError` and
+the record waits for the next flush.
+
+**A rejected promise** means the driver did not answer that it has the record,
+and [`derive`](#derive) has not run. The message starts with the event's name,
+says the record may still be staged and ship, and ends with the driver's reason.
+Whether it was staged depends on that reason:
+
+| Why it was rejected | Staged? |
+| --- | --- |
+| The client refused to send while disconnected, with `enableOfflineQueue: false` | no |
+| The driver refused it, such as `memory()` past `maxStaged` | no |
+| The client gave up waiting, with `commandTimeout` | almost always, since Redis usually ran it and was only slow to answer |
+| The connection dropped after the write was sent, and the client ran out of retries | sometimes |
+
+Fail the request or retry it. A retry of a record that was staged anyway stages
+it again under a new `id`, so keep a key of your own among the fields, such as
+`orderId`, that your table can use to spot the repeat.
+
+Declaring `durable` with `stage: 'local'` throws, because a record staged in the
+process dies with it. So does `durable` with `sample`, even at a rate of one,
+because sampling exists to drop records.
+
+Bound to a driver that cannot survive a restart, such as `memory()`, a durable
+record resolves once it is in this process's memory, and the house says so
+through `onWarn` once for each durable event, when it registers the event. That
+keeps the schema usable in tests.
+
+`record()` is typed by the value `durability` has where `event()` sees it. Write
+it as a literal, `durability: 'durable'`, and `record()` returns
+`Promise<void>`. From a variable typed `EventDurability`, such as one read from
+the environment, it returns `void | Promise<void>`, since either is possible.
+`Event<F>` without the third type argument names an event of either kind.
+
+A durable promise that nobody awaits or catches, and that rejects, is an
+unhandled rejection, which Node reports and by default exits on. It does not go
+to `onError`, because the caller was handed the promise.
+
+What durable does not cover:
+
+- **Your own database.** If the order commits in Postgres and the process dies
+  before `record()` resolves, there is an order with no audit row. Only a write
+  inside the same transaction closes that gap, which is the job of an outbox
+  table in that database.
+- **Choosing the `id` yourself.** Every record gets a fresh id at `record()`, and
+  MetricHouse offers no way to pass one in, so a caller that retries cannot make
+  the second attempt the same row.
+- **A sink that refuses one row forever.** The row is retried on every flush and
+  holds up the records claimed with it, as it would on a relaxed event. Watch
+  `attempt` in your sink, as [Reliability](/guide/reliability#the-attempt-counter)
+  shows, and send such a batch somewhere you keep rather than dropping it.
 
 ### batch
 
@@ -361,7 +455,8 @@ Where the rows go. Required.
 ## event.record()
 
 ```ts
-record(fields: InferShape<F>, options?: { at?: Date | number }): void
+record(fields: InferShape<F>, options?: { at?: Date | number }): void            // relaxed
+record(fields: InferShape<F>, options?: { at?: Date | number }): Promise<void>   // durable
 ```
 
 Stages one record.
@@ -377,20 +472,39 @@ checkoutAttempted.record({ userId: 'u_1', plan: 'pro', outcome: 'paid', amountCe
 checkoutAttempted.record(fields, { at: new Date('2026-09-17T09:14:02Z') })
 ```
 
-**Returns** nothing, and returns before storage has acknowledged anything. Use
-[`drain()`](#event-drain) when you need to know it landed.
+**Returns** nothing on a relaxed event, and returns before storage has
+acknowledged anything. Use [`drain()`](#event-drain) when you need to know it
+landed. On a [durable](#durability) event it returns a promise that resolves
+once the driver has answered that the record is staged.
+
+```ts
+app.post('/orders', async (req, res) => {
+  const order = await orders.create(req.body)
+  await orderPlaced.record({
+    orderId: order.id,
+    customerId: order.customerId,
+    totalCents: order.totalCents,
+  })
+  res.status(201).json(order)      // only once the audit row is kept
+})
+```
 
 **Throws immediately** on an unbound event, an unknown or ill typed field, a
 missing required field, a `json()` value JSON cannot hold, an `at` that is
 neither a `Date` nor finite epoch milliseconds, or a `sample` function returning
 something outside `[0, 1]`. A call that throws changes nothing: no record is
-staged and no derived counter moves.
+staged and no derived counter moves. A durable event rejects its promise for
+all of these instead of throwing, so a caller has one place to catch them.
 
 What happens inside one call, in order: defaults are filled in, fields are
 checked, `ts` is chosen, [`sample`](#sample) decides, and the stored copy is
 made. Only once all of that has passed does [`derive`](#derive) run and the
 record get staged with its `id` and `_ingested_at`. `derive` still runs for a
 record that sampling dropped.
+
+A durable record is staged first, and `derive` runs once the driver has
+answered. A write the driver refused therefore counts nothing, and a caller who
+retries it does not count it twice.
 
 The stored copy is taken at the call. A `json()` value is turned into its JSON
 text there and a `Date` is copied, so changing the object you passed afterwards
@@ -399,7 +513,8 @@ does not change what ships.
 ## event.recordMany()
 
 ```ts
-recordMany(fields: readonly InferShape<F>[], options?: { at?: Date | number }): void
+recordMany(fields: readonly InferShape<F>[], options?: { at?: Date | number }): void            // relaxed
+recordMany(fields: readonly InferShape<F>[], options?: { at?: Date | number }): Promise<void>   // durable
 ```
 
 Stages several records in one round trip to the driver.
@@ -414,7 +529,15 @@ checkoutAttempted.recordMany([
 Every record is checked before any of them is derived or staged. If one of them
 is wrong the call throws and nothing happens, the same as a single `record()`.
 Each record is sampled on its own, so a call that succeeds can still stage some
-records and drop others. `at` applies to all of them.
+records and drop others. `at` applies to all of them. On a durable event the
+promise covers the whole list in one append.
+
+`ioredis()` sends a list longer than 1,000 records as several writes, one per
+thousand. When the connection drops partway, the promise rejects although the
+writes sent before the drop are already staged, and derive has counted none of
+them. Keep a durable
+`recordMany` to 1,000 records or fewer when a caller retries the whole list on
+failure.
 
 ## event.pending()
 
@@ -499,7 +622,9 @@ drain(): Promise<void>
 
 Resolves once every `record()` issued so far has reached the driver. On a
 locally staged event it also ships whatever is buffered, because that buffer is
-the only place those records exist.
+the only place those records exist. It waits for a durable record the driver
+has not answered yet, and resolves even when that record's promise rejects,
+since the caller holding the promise has the error.
 
 ## event.rowShape()
 
@@ -524,6 +649,7 @@ checkoutAttempted.rowShape().columns.map((c) => c.name)
 | `storage` | `'staged'` | It keeps each record whole |
 | `fields` | `Shape` | The declared fields |
 | `stage` | `'driver'` or `'local'` | Where records wait |
+| `durability` | `'relaxed'` or `'durable'` | What `record()` waits for |
 | `flushMs` | `number` | `flush`, parsed, including one taken from the house |
 | `isBound` | `boolean` | `true` once a house has registered it |
 | `write` | `WriteFn` | The function it was declared with |
@@ -723,6 +849,84 @@ LIMIT 20;
 The counter answers "how many", exactly and cheaply. The event answers "which
 ones and why", on a slice of the traffic. Neither has to be kept in step by
 hand.
+
+### An order log a request waits for
+
+```ts
+// metrics/house.ts
+import { createHouse, event, int, oneOf, str } from 'metrichouse/core'
+import { ioredis } from 'metrichouse/ioredis'
+import Redis from 'ioredis'
+import { toPostgres } from './sinks.js'
+
+export const orderEvent = event('order_event', {
+  fields: {
+    // your own key for the fact, so a table can spot a record a retry staged twice
+    eventKey: str(),
+    orderId: str(),
+    action: oneOf(['placed', 'paid', 'refunded', 'cancelled']),
+    actor: str(),
+    totalCents: int(),
+  },
+  // the request waits until Redis has the row, and fails if it does not
+  durability: 'durable',
+  flush: '10s',
+  claimLimit: 5_000,
+  write: toPostgres('order_event'),
+})
+
+// The Redis behind this runs with appendonly yes and appendfsync always, so it
+// writes each record to disk before it answers, and record() resolves after that
+export const driver = ioredis(() => new Redis(process.env.REDIS_URL!))
+
+export const house = createHouse({
+  driver,
+  schema: [orderEvent],
+  onWarn: (message) => logger.warn({ message }, 'metrichouse'),
+  onError: (error, { metric }) => logger.error({ err: error, metric }),
+})
+```
+
+```ts
+// routes/refund.ts
+app.post('/orders/:id/refund', async (req, res) => {
+  const refund = await payments.refund(req.params.id)
+
+  try {
+    await orderEvent.record({
+      eventKey: `${refund.orderId}:refunded:${refund.id}`,
+      orderId: refund.orderId,
+      action: 'refunded',
+      actor: req.user.id,
+      totalCents: refund.amountCents,
+    })
+  } catch (error) {
+    // Redis did not take it. The refund happened, so say so, and let the client retry
+    // the audit through an endpoint that records it again
+    logger.error({ err: error, refundId: refund.id }, 'refund audit not recorded')
+    return res.status(503).json({ refundId: refund.id, audited: false })
+  }
+
+  res.json({ refundId: refund.id, audited: true })
+})
+```
+
+```sql
+CREATE TABLE order_event (
+  id            TEXT PRIMARY KEY,
+  ts            TIMESTAMPTZ NOT NULL,
+  "eventKey"    TEXT NOT NULL UNIQUE,   -- a retried record lands on this
+  "orderId"     TEXT NOT NULL,
+  action        TEXT NOT NULL,
+  actor         TEXT NOT NULL,
+  "totalCents"  BIGINT NOT NULL,
+  _ingested_at  TIMESTAMPTZ NOT NULL
+);
+```
+
+The sink inserts with `ON CONFLICT DO NOTHING`, which covers both kinds of
+repeat: a flush retry resends the same `id`, and a caller retry resends the same
+`eventKey` under a new one.
 
 ## Playground
 

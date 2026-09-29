@@ -154,10 +154,13 @@ await house.drain()
 
 A write that failed does not end the wait early and does not make `drain()`
 reject. It goes to `onError`, or becomes an unhandled rejection when there is
-none, and `drain()` still waits for every other write.
+none, and `drain()` still waits for every other write. A
+[durable](/primitives/event#durability) record's failure rejects the promise
+its caller holds instead.
 
 `add()`, `set()`, `record()` and the rest return before storage has confirmed
-anything. On a platform that freezes your process the moment a response is
+anything, apart from `record()` and `recordMany()` on a durable event, which
+return a promise that settles once the driver has answered. On a platform that freezes your process the moment a response is
 returned, this is the only guarantee that a write actually landed.
 
 ### snapshot

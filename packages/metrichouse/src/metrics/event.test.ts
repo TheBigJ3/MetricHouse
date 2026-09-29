@@ -4,7 +4,7 @@ import type { Driver } from '../drivers/types.js'
 import { createHouse, type House } from '../runtime/house.js'
 import { int, json, str, ts } from '../schema/types.js'
 import { counter } from './counter.js'
-import { type Event, event } from './event.js'
+import { type Event, type EventConfig, event } from './event.js'
 import type { Row, WriteContext, WriteFn } from './types.js'
 
 /** A sink that keeps nothing, for declaration tests that never ship. */
@@ -1299,5 +1299,250 @@ describe('large local batches', () => {
     const report = await views.flush({ force: true })
     expect(report.error).toBeInstanceOf(Error)
     expect(await views.pending()).toBe(150_000)
+  })
+})
+
+describe('durability', () => {
+  const DURABLE = { durable: true, shared: true, atomicMerge: true }
+
+  /** A durable driver whose append can be made to fail or wait. */
+  function durableDriver(overrides: Partial<Driver> = {}): { driver: Driver; calls: string[] } {
+    const base = memory()
+    const calls: string[] = []
+    const driver: Driver = {
+      ...base,
+      capabilities: DURABLE,
+      append: async (ops) => {
+        calls.push(`append ${ops.length}`)
+        await (overrides.append ?? base.append)(ops)
+      },
+    }
+    return { driver, calls }
+  }
+
+  function audit(driver: Driver, write: WriteFn = discard, delivery?: 'immediate') {
+    const errors: unknown[] = []
+    const orders = counter('orders', { dims: { plan: str() }, resolution: '1m', write: discard })
+    const log = event('order_audit', {
+      fields: { orderId: str(), plan: str() },
+      durability: 'durable',
+      derive: { orders: (fields) => ({ dims: { plan: fields.plan } }) },
+      write,
+    })
+    const house = createHouse({
+      driver,
+      schema: [orders, log],
+      now,
+      defaults: { flush: '1m' },
+      ...(delivery && { delivery }),
+      onError: (error) => errors.push(error),
+    })
+    return { log, orders, house, errors }
+  }
+
+  const ORDER = { orderId: 'o_1', plan: 'pro' }
+
+  const declare = (config: Partial<EventConfig<Fields, 'durable'>>) =>
+    event('walk_started', { fields: makeFields(), write: discard, ...config })
+
+  it('refuses a value that is neither relaxed nor durable', () => {
+    expect(() => declare({ durability: 'always' as unknown as 'durable' })).toThrow(
+      `walk_started: durability must be 'relaxed' or 'durable', got "always"`,
+    )
+  })
+
+  it('refuses a null durability rather than reading it as relaxed', () => {
+    expect(() => declare({ durability: null as unknown as 'durable' })).toThrow(
+      `walk_started: durability must be 'relaxed' or 'durable', got null`,
+    )
+  })
+
+  it('names a relaxed and a durable event with one Event type', () => {
+    const relaxed = make()
+    const durable = declare({ durability: 'durable' })
+    // a compile error, not a runtime one, when Event<F> defaults to relaxed
+    const both: Event<Fields>[] = [relaxed, durable]
+    expect(both.map((one) => one.durability)).toEqual(['relaxed', 'durable'])
+  })
+
+  it('refuses durable with local staging', () => {
+    expect(() => declare({ durability: 'durable', stage: 'local' })).toThrow(
+      "walk_started: durability 'durable' needs stage 'driver', because a record staged in " +
+        'this process dies with it',
+    )
+  })
+
+  it('refuses durable with sampling, even at a rate of one', () => {
+    expect(() => declare({ durability: 'durable', sample: 1 })).toThrow(
+      "walk_started: durability 'durable' cannot sample, because a record sampling drops is " +
+        'lost on purpose',
+    )
+  })
+
+  it('reports relaxed by default, and a relaxed record() returns nothing', () => {
+    const walks = bound()
+    expect(walks.durability).toBe('relaxed')
+    expect(walks.record(WALK)).toBeUndefined()
+  })
+
+  it('resolves once the driver has staged the record, without drain()', async () => {
+    const { driver, calls } = durableDriver()
+    const { log, orders } = audit(driver)
+
+    await log.record(ORDER)
+    expect(calls).toEqual(['append 1'])
+    expect((await log.peek()).map((row) => row.orderId)).toEqual(['o_1'])
+    expect(await orders.current({ plan: 'pro' })).toBe(1)
+  })
+
+  it('rejects rather than throws a record that fails validation, and stages nothing', async () => {
+    const { driver, calls } = durableDriver()
+    const { log, orders } = audit(driver)
+
+    const result = log.record({ orderId: 'o_1' } as typeof ORDER)
+    await expect(result).rejects.toThrow('missing required field "plan"')
+    expect(calls).toEqual([])
+    expect(await log.pending()).toBe(0)
+    expect(await orders.current({ plan: 'pro' })).toBe(0)
+  })
+
+  it('rejects on an unbound event', async () => {
+    const log = event('order_audit', {
+      fields: { orderId: str() },
+      durability: 'durable',
+      write: discard,
+    })
+    await expect(log.record({ orderId: 'o_1' })).rejects.toThrow(
+      'order_audit: not bound to a house. Pass it to createHouse({ schema }) before writing',
+    )
+  })
+
+  it('rejects with the driver error when the append fails, and derives nothing', async () => {
+    const { driver } = durableDriver({
+      append: async () => {
+        throw new Error('redis down')
+      },
+    })
+    const { log, orders, errors } = audit(driver)
+
+    await expect(log.record(ORDER)).rejects.toThrow(
+      'order_audit: the driver did not confirm the record, which may still be staged and ship. ' +
+        'redis down',
+    )
+    expect(await orders.current({ plan: 'pro' })).toBe(0)
+    // the caller holds the failure, so onError is not told twice
+    expect(errors).toEqual([])
+  })
+
+  it('leaves a record nobody awaits to surface as an unhandled rejection', async () => {
+    const { driver } = durableDriver({
+      append: async () => {
+        throw new Error('redis down')
+      },
+    })
+    const { log, house, errors } = audit(driver)
+
+    // vitest's own listener would fail the run, so it steps aside for this one
+    const theirs = process.listeners('unhandledRejection')
+    process.removeAllListeners('unhandledRejection')
+    const unhandled: unknown[] = []
+    const mine = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', mine)
+    try {
+      log.record(ORDER)
+      await house.drain()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    } finally {
+      process.off('unhandledRejection', mine)
+      for (const listener of theirs) process.on('unhandledRejection', listener)
+    }
+
+    expect(unhandled.map((reason) => (reason as Error).message)).toEqual([
+      'order_audit: the driver did not confirm the record, which may still be staged and ' +
+        'ship. redis down',
+    ])
+    expect(errors).toEqual([])
+  })
+
+  it('derives only once the driver has answered the append', async () => {
+    let answer = () => {}
+    const { driver } = durableDriver({
+      append: (ops) =>
+        new Promise<void>((resolve) => {
+          answer = () => resolve(memory().append(ops))
+        }),
+    })
+    const { log, orders } = audit(driver)
+
+    const recorded = log.record(ORDER)
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    expect(await orders.current({ plan: 'pro' })).toBe(0)
+
+    answer()
+    await recorded
+    expect(await orders.current({ plan: 'pro' })).toBe(1)
+  })
+
+  it('stages a recordMany in one append, and stages none of it when one record is bad', async () => {
+    const { driver, calls } = durableDriver()
+    const { log } = audit(driver)
+
+    await log.recordMany([ORDER, { orderId: 'o_2', plan: 'team' }])
+    await expect(
+      log.recordMany([{ orderId: 'o_3', plan: 'pro' }, { orderId: 'o_4' } as typeof ORDER]),
+    ).rejects.toThrow('missing required field "plan"')
+
+    expect(calls).toEqual(['append 2'])
+    expect((await log.peek()).map((row) => row.orderId)).toEqual(['o_1', 'o_2'])
+  })
+
+  it('resolves an empty recordMany without touching the driver', async () => {
+    const { driver, calls } = durableDriver()
+    const { log } = audit(driver)
+    await expect(log.recordMany([])).resolves.toBeUndefined()
+    expect(calls).toEqual([])
+  })
+
+  it('makes drain() wait for a durable record, and resolve even when that record failed', async () => {
+    let fail = (_: Error) => {}
+    const { driver, calls } = durableDriver({
+      append: () =>
+        new Promise<void>((_, reject) => {
+          fail = reject
+        }),
+    })
+    const { log, house } = audit(driver)
+
+    const recorded = log.record(ORDER).catch((error: Error) => error.message)
+    let drained = false
+    const draining = house.drain().then(() => {
+      drained = true
+    })
+    await vi.waitFor(() => expect(calls).toEqual(['append 1']))
+    expect(drained).toBe(false)
+
+    fail(new Error('redis down'))
+    await draining
+    expect(await recorded).toBe(
+      'order_audit: the driver did not confirm the record, which may still be staged and ship. ' +
+        'redis down',
+    )
+  })
+
+  it('ships at once under immediate delivery', async () => {
+    const shipped: Row[] = []
+    const { driver } = durableDriver()
+    const { log, house } = audit(
+      driver,
+      (rows) => {
+        shipped.push(...rows)
+      },
+      'immediate',
+    )
+
+    await log.record(ORDER)
+    await house.drain()
+    expect(shipped.map((row) => row.orderId)).toEqual(['o_1'])
+    expect(await log.pending()).toBe(0)
   })
 })

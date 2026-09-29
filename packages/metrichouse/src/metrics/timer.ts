@@ -220,9 +220,12 @@ interface OpenTiming {
   end(values?: Record<string, unknown>): number
 }
 
-/** The one piece of an event a timer needs. */
+/**
+ * The one piece of an event a timer needs. A durable event answers with a
+ * promise, a relaxed one with nothing.
+ */
 interface RecordTarget {
-  record(fields: Record<string, unknown>): void
+  record(fields: Record<string, unknown>): Promise<void> | void
 }
 
 /**
@@ -401,7 +404,12 @@ export function timer<D extends Shape = Record<never, never>>(
 
     if (config.record === undefined) return
     try {
-      resolveRecordTarget(config.record).record({ ...values, [DURATION_FIELD]: ms })
+      const recorded = resolveRecordTarget(config.record).record({
+        ...values,
+        [DURATION_FIELD]: ms,
+      })
+      // a durable event answers with a promise, and nobody else holds it
+      if (recorded instanceof Promise) recorded.catch(reportDetached)
     } catch (error) {
       reportDetached(error)
     }

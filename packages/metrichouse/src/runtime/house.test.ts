@@ -118,6 +118,34 @@ describe('createHouse', () => {
     createHouse({ driver: durable, schema: [makeCounter()], onWarn })
     expect(onWarn).not.toHaveBeenCalled()
   })
+
+  const audit = () =>
+    event('order_audit', { fields: { orderId: str() }, durability: 'durable', write: discard })
+  const DURABLE = { durable: true, shared: true, atomicMerge: true }
+
+  it('warns when a durable event is bound to a driver that cannot survive a restart', () => {
+    const onWarn = vi.fn()
+    createHouse({ driver: memory(), schema: [audit()], onWarn })
+    expect(onWarn.mock.calls[1]).toEqual([
+      "order_audit: durability is 'durable', but the driver cannot survive a restart, so " +
+        'record() resolves once the record is staged and a crash still loses it',
+      { metric: 'order_audit' },
+    ])
+  })
+
+  it('warns about a durable event registered after the house was created', () => {
+    const onWarn = vi.fn()
+    const house = createHouse({ driver: memory(), onWarn })
+    house.register(audit())
+    expect(onWarn).toHaveBeenCalledTimes(2)
+    expect(onWarn.mock.calls[1]?.[1]).toEqual({ metric: 'order_audit' })
+  })
+
+  it('does not warn about a durable event on a durable driver', () => {
+    const onWarn = vi.fn()
+    createHouse({ driver: { ...memory(), capabilities: DURABLE }, schema: [audit()], onWarn })
+    expect(onWarn).not.toHaveBeenCalled()
+  })
 })
 
 describe('house config', () => {

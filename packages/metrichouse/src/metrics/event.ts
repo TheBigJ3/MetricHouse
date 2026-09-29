@@ -59,9 +59,10 @@ import { assertMetricName, assertSink, isCounter, pendingWrites, reportError } f
  * Where records wait between `record()` and your `write()`.
  *
  * - `'driver'` records are appended to the bound driver and claimed on flush. Durable and
- *   shared exactly as far as that driver is: on Redis this is an audit log
- *   that survives a crash, on the memory driver it is the same code path with
- *   `capabilities.durable: false`.
+ *   shared exactly as far as that driver is: on Redis a staged record survives
+ *   a crash of this process, on the memory driver it is the same code path
+ *   with `capabilities.durable: false`. `record()` returns before the driver
+ *   has the record, which is what {@link EventDurability} changes.
  * - `'local'` records are held in an array inside this process and shipped on
  *   `batch.maxSize`, on `batch.maxAge`, on `flush()`, or on `drain()`. Costs
  *   nothing per event and loses everything on a crash. Use it for pageviews,
@@ -74,6 +75,23 @@ import { assertMetricName, assertSink, isCounter, pendingWrites, reportError } f
  * things.
  */
 export type EventStage = 'driver' | 'local'
+
+/**
+ * What `record()` waits for before it returns.
+ *
+ * - `'relaxed'` returns at once and stages the record in the background. A
+ *   write the driver refuses goes to `onError`, and the record is gone.
+ * - `'durable'` returns a promise that resolves once the driver has answered
+ *   that the record is staged, and rejects when it has not. For order logs,
+ *   ticket audits and anything else a caller must not report as done until it
+ *   is kept. Whether staged also means on disk is the storage's own setting:
+ *   on Redis, `appendfsync always` syncs before it answers.
+ */
+export type EventDurability = 'relaxed' | 'durable'
+
+/** What `record()` returns: nothing when relaxed, a promise to await when durable. */
+// biome-ignore lint/suspicious/noConfusingVoidType: void is what a call made for its effect returns
+export type RecordResult<D extends EventDurability> = D extends 'durable' ? Promise<void> : void
 
 export interface EventBatchConfig {
   /** Ship once this many records are buffered. Default `500`. */
@@ -126,11 +144,16 @@ export type EventRow<F extends Shape> = Simplify<
  */
 export type EventLiveRow<F extends Shape> = Simplify<EventRow<F> & LiveFields>
 
-export interface EventConfig<F extends Shape> {
+export interface EventConfig<F extends Shape, D extends EventDurability = EventDurability> {
   /** The payload schema. Unlike dims, `json()` is legal here. */
   readonly fields: F
   /** Default `'driver'`. See {@link EventStage}. */
   readonly stage?: EventStage
+  /**
+   * Default `'relaxed'`. See {@link EventDurability}. `'durable'` needs
+   * `stage: 'driver'` and no `sample`, since both of those let a record go.
+   */
+  readonly durability?: D
   /** Local staging only, ignored when `stage: 'driver'`. */
   readonly batch?: EventBatchConfig
   /**
@@ -188,11 +211,21 @@ export interface EventConfig<F extends Shape> {
  * too, and a log is stored as an event and must still say `'log'` in a
  * {@link WriteContext}.
  */
-export interface Event<F extends Shape, K extends MetricKind = 'event'> extends AnyMetric {
+/**
+ * `D` defaults to either durability, so `Event<F>` names any event with those
+ * fields. `event()` infers the exact one, and it is that which decides what
+ * `record()` returns.
+ */
+export interface Event<
+  F extends Shape,
+  K extends MetricKind = 'event',
+  D extends EventDurability = EventDurability,
+> extends AnyMetric {
   readonly name: string
   readonly kind: K
   readonly fields: F
   readonly stage: EventStage
+  readonly durability: D
   readonly flushMs: number
   /** The sink this event was declared with. A method, as on the counter. */
   write(rows: EventRow<F>[], context: WriteContext): Promise<void> | void
@@ -200,11 +233,15 @@ export interface Event<F extends Shape, K extends MetricKind = 'event'> extends 
 
   bind(binding: MetricBinding): void
 
-  /** Stage one event. Fire-and-forget: `drain()` is what confirms it landed. */
-  record(fields: InferShape<F>, options?: { at?: Date | number }): void
+  /**
+   * Stage one event. Relaxed, it returns at once and `drain()` is what
+   * confirms it landed. Durable, it returns a promise that settles when the
+   * driver has answered.
+   */
+  record(fields: InferShape<F>, options?: { at?: Date | number }): RecordResult<D>
 
   /** Stage many in one round trip. */
-  recordMany(fields: readonly InferShape<F>[], options?: { at?: Date | number }): void
+  recordMany(fields: readonly InferShape<F>[], options?: { at?: Date | number }): RecordResult<D>
 
   /**
    * How many records have not shipped yet: those waiting to be claimed, plus
@@ -260,7 +297,10 @@ const DEFAULT_FLUSH_MS = 30_000
  * `timestamp` field, a field taking a reserved column name, a `sample` rate
  * outside `[0, 1]`, or an empty name.
  */
-export function event<F extends Shape>(name: string, config: EventConfig<F>): Event<F> {
+export function event<F extends Shape, D extends EventDurability = 'relaxed'>(
+  name: string,
+  config: EventConfig<F, D>,
+): Event<F, 'event', D> {
   return stagedMetric(name, config, 'event')
 }
 
@@ -280,11 +320,11 @@ export function event<F extends Shape>(name: string, config: EventConfig<F>): Ev
  *
  * @throws see {@link event}.
  */
-export function stagedMetric<F extends Shape, K extends MetricKind>(
-  name: string,
-  config: EventConfig<F>,
-  kind: K,
-): Event<F, K> {
+export function stagedMetric<
+  F extends Shape,
+  K extends MetricKind,
+  D extends EventDurability = 'relaxed',
+>(name: string, config: EventConfig<F, D>, kind: K): Event<F, K, D> {
   assertMetricName(name, kind)
   assertSink(config.write, name)
 
@@ -296,6 +336,27 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   // gets past TypeScript, and an unknown one would behave as `'driver'`
   if (stage !== 'driver' && stage !== 'local') {
     throw new Error(`${name}: stage must be 'driver' or 'local', got ${JSON.stringify(stage)}`)
+  }
+  // `=== undefined` and not `??`, so a null from a config file is refused
+  // rather than read as relaxed
+  const durability = (config.durability === undefined ? 'relaxed' : config.durability) as D
+  if (durability !== 'relaxed' && durability !== 'durable') {
+    throw new Error(
+      `${name}: durability must be 'relaxed' or 'durable', got ${JSON.stringify(durability)}`,
+    )
+  }
+  const durable = durability === 'durable'
+  if (durable && stage === 'local') {
+    throw new Error(
+      `${name}: durability 'durable' needs stage 'driver', because a record staged in this ` +
+        'process dies with it',
+    )
+  }
+  if (durable && config.sample !== undefined) {
+    throw new Error(
+      `${name}: durability 'durable' cannot sample, because a record sampling drops is lost ` +
+        'on purpose',
+    )
   }
   const ownFlushMs =
     config.flush === undefined ? undefined : parseInterval(config.flush, `${name}: flush`)
@@ -654,6 +715,62 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
   }
 
   /**
+   * `record()` for a durable event: stage the records, wait for the driver to
+   * answer, then derive.
+   *
+   * Everything that throws at the caller of a relaxed `record()` rejects here
+   * instead, so a caller has one place to look, and `onError` hears nothing
+   * the caller already has. A caller who never awaits the promise gets an
+   * unhandled rejection, as a relaxed record's failure without an `onError`
+   * does. Derive runs once the driver has answered and not before, so a
+   * caller who retries a write the driver refused does not count it twice.
+   */
+  function recordDurably(build: () => Prepared<F>[]): Promise<void> {
+    // drain() waits on this rather than on the promise the caller gets. A
+    // handler attached to that one would mark it handled, and a caller who
+    // forgot to await it would never hear that the record was not kept
+    let settled = (): void => {}
+    writes.track(
+      new Promise<void>((resolve) => {
+        settled = resolve
+      }),
+      () => undefined,
+    )
+
+    return (async (): Promise<void> => {
+      try {
+        await stageDurably(build)
+      } finally {
+        settled()
+      }
+    })()
+  }
+
+  /** The body of {@link recordDurably}. */
+  async function stageDurably(build: () => Prepared<F>[]): Promise<void> {
+    activeBinding()
+    const prepared = build()
+    // sampling is refused at declaration, so every prepared record is kept
+    const records = prepared.flatMap((one) => (one.record ? [one.record] : []))
+    if (records.length === 0) return
+
+    try {
+      await activeDriver().append(records.map((record) => ({ metric: name, ...record })))
+    } catch (error) {
+      // "may": a client that timed out or lost its connection after sending
+      // cannot know whether Redis applied the write, and often it had
+      const reason = error instanceof Error ? error.message : String(error)
+      throw new Error(
+        `${name}: the driver did not confirm the record, which may still be staged and ship. ` +
+          reason,
+        { cause: error },
+      )
+    }
+    for (const one of prepared) runDerive(one.values)
+    if (isImmediate()) track(shipStaged())
+  }
+
+  /**
    * Claim and ship whatever is staged, right now.
    *
    * Exactly what `flush()` does for this metric, minus the cadence
@@ -795,7 +912,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     return row
   }
 
-  const self: Event<F, K> = {
+  const self: Event<F, K, D> = {
     ...metricFlush({
       name,
       flushMs: effectiveFlushMs,
@@ -812,6 +929,7 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
     storage: 'staged',
     fields,
     stage,
+    durability,
     // an event has fields, not dims: they are unkeyed, `json()` is legal among
     // them, and no series is built from them
     dims: {},
@@ -841,16 +959,26 @@ export function stagedMetric<F extends Shape, K extends MetricKind>(
       binding = undefined
     },
 
-    record(values: InferShape<F>, options?: { at?: Date | number }): void {
+    record(values: InferShape<F>, options?: { at?: Date | number }): RecordResult<D> {
+      if (durable) {
+        return recordDurably(() => [prepare(values, options?.at)]) as RecordResult<D>
+      }
       activeBinding()
       commit([prepare(values, options?.at)])
+      return undefined as RecordResult<D>
     },
 
-    recordMany(many: readonly InferShape<F>[], options?: { at?: Date | number }): void {
-      activeBinding()
+    recordMany(many: readonly InferShape<F>[], options?: { at?: Date | number }): RecordResult<D> {
       // every record is prepared before any of them is committed, so one bad
       // record in the list throws with nothing derived and nothing staged
+      if (durable) {
+        return recordDurably(() =>
+          many.map((values) => prepare(values, options?.at)),
+        ) as RecordResult<D>
+      }
+      activeBinding()
       commit(many.map((values) => prepare(values, options?.at)))
+      return undefined as RecordResult<D>
     },
 
     async pending(): Promise<number> {

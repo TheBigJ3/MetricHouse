@@ -1919,9 +1919,11 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
     async close(): Promise<void> {
       if (!ownsClient || connection === undefined) return
-      const client = await connection
+      // taken and cleared before the await, so a second close() running
+      // alongside finds nothing left to quit
+      const closing = connection
       connection = undefined
-      await client.quit?.()
+      await (await closing).quit?.()
     },
 
     async scanSeries(metric: string): Promise<string[]> {

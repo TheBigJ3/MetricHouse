@@ -202,6 +202,11 @@ building in TypeScript or JavaScript and:
 - **A failed write never loses a row.** Data is claimed, handed to your function,
   and only deleted once that function returns. If it throws, the same rows come
   back on the next attempt.
+- **A record can be awaited.** An event declared \`durability: 'durable'\` makes
+  \`record()\` return a promise that resolves once the driver has the record and
+  rejects otherwise, so an order log or an audit trail is never reported as kept
+  when it was not. On Redis with \`appendonly yes\` and \`appendfsync always\`,
+  that answer comes after the record is on disk.
 - **A retry is recognisable.** Every aggregate row carries an id derived from the
   metric name, the window and the dimension values, so the same window shipped
   twice produces the same id with no stored state. A table that treats \`id\` as

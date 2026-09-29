@@ -52,7 +52,8 @@ the metric, which is a much better failure. Leave them on.
 The memory driver's claim holds data in a map rather than moving it somewhere
 durable, so `capabilities.durable` is `false`. A failed *write* recovers
 perfectly. A failed *process* loses the window in flight. The house warns about
-this once at startup through `onWarn`.
+this once at startup through `onWarn`, and once more for each event declared
+`durability: 'durable'`.
 :::
 
 ## ioredis
@@ -166,6 +167,42 @@ acknowledgement. Higher and a crashed window waits longer to ship. Nothing is
 lost either way. A claim's age is measured by Redis's clock, not the clock of
 the host that claimed it or the host checking it, so hosts whose clocks disagree
 do not take each other's claims early.
+
+### Durable events on Redis
+
+An event declared [`durability: 'durable'`](/primitives/event#durability) needs
+nothing from the driver beyond the append it already makes: `record()` waits for
+Redis to answer it. What that answer means is up to how Redis is run.
+
+| Redis setting | Why |
+| --- | --- |
+| `appendonly yes` | without it Redis keeps records only in memory and in snapshots, and a crash loses everything since the last snapshot |
+| `appendfsync always` | Redis writes the batch of commands it has just run to disk, and only then answers them. Under the default, `everysec`, it answers first and writes within the second |
+| `maxmemory-policy` of `noeviction` or a `volatile-*` policy | an `allkeys-*` policy can evict any key when memory runs short, staged records included. Records carry no expiry, so `volatile-*` leaves them alone |
+
+The driver checks none of these, because many hosted Redis services refuse the
+`CONFIG` command that would read them.
+
+`appendfsync` is the same choice Postgres makes with `synchronous_commit`, and it
+costs the same. Under `always`, every write to that Redis waits for one disk
+sync, and Redis gives one sync to every command that arrived together, so a burst
+of records shares it. Under `everysec`, a durable record costs one round trip,
+and a Redis crash can lose the last second of records that `record()` had
+already resolved.
+
+Replication is asynchronous, so a failover to a replica can lose records the
+primary had answered, whatever `appendfsync` says. MetricHouse does not wait for
+replicas.
+
+When Redis is down, a durable record rejects, and the request waiting on it
+fails. That makes Redis a dependency of every request that records one. How
+long the rejection takes is up to the ioredis client: its `maxRetriesPerRequest`,
+which retries twenty times by default, and `commandTimeout`. The same settings
+decide how long `house.stop()` waits for durable records still in flight while
+Redis is not answering. A client that retries without limit keeps a durable
+record waiting until Redis answers, and a `commandTimeout` rejects records that
+Redis usually applied anyway, as
+[a rejected promise](/primitives/event#durability) describes.
 
 ### Looking at a running system
 

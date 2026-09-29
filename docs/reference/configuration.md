@@ -114,13 +114,14 @@ A dimension may not be named `duration_ms`.
 The page: [event](/primitives/event).
 
 ```ts
-event(name, { fields, stage, batch, flush, timestamp, sample, derive, claimLimit, write })
+event(name, { fields, stage, durability, batch, flush, timestamp, sample, derive, claimLimit, write })
 ```
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `fields` | shape | required | The record schema. `json()` is allowed |
 | `stage` | `'driver'` or `'local'` | `'driver'` | Where records wait |
+| `durability` | `'relaxed'` or `'durable'` | `'relaxed'` | Whether `record()` returns at once or a promise that resolves once the driver has the record. `'durable'` needs `stage: 'driver'` and no `sample` |
 | `batch.maxSize` | number | `500` | Local staging: ship at this many |
 | `batch.maxAge` | duration | `'10s'` | Local staging: ship this long after the first |
 | `flush` | duration | the house default, then `'30s'` | The fastest this may ship |
@@ -267,6 +268,9 @@ These all throw when the module is first imported, not at the first write.
 | A dim or field named like a whole number | `a dim cannot be named "2024"` |
 | A dim or field named `bucket_open` or `bucket_elapsed_ms` | `a dim cannot be named "bucket_open"` |
 | An unknown event `stage` | `stage must be 'driver' or 'local', got "memory"` |
+| An unknown event `durability` | `durability must be 'relaxed' or 'durable', got "always"` |
+| `durability: 'durable'` with `stage: 'local'` | `durability 'durable' needs stage 'driver'` |
+| `durability: 'durable'` with `sample` | `durability 'durable' cannot sample` |
 | A `sample` that is neither a number nor a function | `sample must be a rate between 0 and 1 or a function returning one` |
 | Reserved event field name | `field "ts" is a reserved column` |
 | Duplicate level | `level "info" is declared twice` |

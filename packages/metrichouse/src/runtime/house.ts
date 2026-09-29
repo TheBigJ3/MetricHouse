@@ -220,6 +220,23 @@ export function createHouse(config: HouseConfig): House {
   }
 
   /**
+   * Say at boot when a durable event cannot get the promise it asks for.
+   *
+   * Warned rather than refused, so the same schema runs in a test against
+   * `memory()`. A record then resolves once it is in this process's memory,
+   * which a crash takes with it.
+   */
+  function warnIfDurableIsNot(metric: AnyMetric): void {
+    if (!('durability' in metric) || metric.durability !== 'durable') return
+    if (config.driver.capabilities.durable) return
+    config.onWarn?.(
+      `${metric.name}: durability is 'durable', but the driver cannot survive a restart, so ` +
+        'record() resolves once the record is staged and a crash still loses it',
+      { metric: metric.name },
+    )
+  }
+
+  /**
    * Bind every metric, or none of them.
    *
    * All or nothing because a bound metric cannot be bound again: if the
@@ -267,6 +284,7 @@ export function createHouse(config: HouseConfig): House {
     }
 
     for (const metric of incoming) {
+      warnIfDurableIsNot(metric)
       registry.set(metric.name, metric)
       // a metric added while the scheduler is running gets its interval now,
       // rather than at the next start() that may never come

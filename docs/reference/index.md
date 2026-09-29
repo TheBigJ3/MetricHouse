@@ -133,6 +133,7 @@ Some types add properties of their own.
 | `record` | timer | The name of the event it also records each timing to, or `undefined` |
 | `fields` | event, log | The declared record fields |
 | `stage` | event, log | Where records wait, `'driver'` or `'local'` |
+| `durability` | event | What `record()` waits for, `'relaxed'` or `'durable'` |
 | `levels` | log | The declared levels, lowest severity first |
 | `minLevel` | log | The lowest level it keeps |
 
@@ -149,8 +150,8 @@ Some types add properties of their own.
 | `handle.end(dims?)` | Stops the timing, records it, and returns the milliseconds. A second call records nothing |
 | `handle.elapsed()` | Milliseconds so far, without stopping |
 | `timer.observe(ms, dims?)` | Records a duration measured somewhere else |
-| `event.record(fields, options?)` | Stages one record. `options.at` sets its timestamp |
-| `event.recordMany(records, options?)` | Stages several records in one round trip |
+| `event.record(fields, options?)` | Stages one record. `options.at` sets its timestamp. Returns a promise on a durable event |
+| `event.recordMany(records, options?)` | Stages several records in one round trip. Returns a promise on a durable event |
 | `log.info(message, fields?)` | One method per declared level, so `log.info()` exists only when `info` is declared. The default levels are `debug`, `info`, `warn` and `error` |
 | `log.at(level, message, fields?)` | Writes at a level chosen while the program runs. Throws if the level was not declared |
 | `log.child(fields)` | A logger that adds `fields` to every line it writes |
@@ -161,10 +162,12 @@ string or an `Error`, and an `Error` fills the `error_stack` column. A child
 logger has the same level methods, `at()` and `child()`, plus `bound`, the
 fields it adds to every line.
 
-Every write method returns before storage has confirmed anything. Call `drain()`
-on the metric or the house when you need to know a write landed. Each method,
-with its parameters and what it throws, is on the page for its type:
-[counter](/primitives/counter), [gauge](/primitives/gauge),
+Every write method returns before storage has confirmed anything, apart from
+`record()` and `recordMany()` on an event declared `durability: 'durable'`,
+which return a promise that settles once the driver has answered. Call
+`drain()` on the metric or the house when you need to know any other write
+landed. Each method, with its parameters and what it throws, is on the page for
+its type: [counter](/primitives/counter), [gauge](/primitives/gauge),
 [level](/primitives/level), [timer](/primitives/timer),
 [event](/primitives/event) and [log](/primitives/log).
 
@@ -252,7 +255,8 @@ All of these are exported as types from `metrichouse/core`.
 `Counter`, `CounterConfig`, `CounterRow`, `CounterLiveRow`,
 `Gauge`, `GaugeConfig`, `GaugeRow`, `GaugeLiveRow`, `GaugeAggregate`, `GaugeTotals`,
 `Level`, `LevelConfig`, `LevelRow`, `LevelLiveRow`,
-`Event`, `EventConfig`, `EventRow`, `EventLiveRow`, `EventStage`, `EventBatchConfig`,
+`Event`, `EventConfig`, `EventRow`, `EventLiveRow`, `EventStage`, `EventDurability`,
+`RecordResult`, `EventBatchConfig`,
 `DeriveFn`, `DeriveTarget`,
 `Log`, `LogConfig`, `LogRow`, `LogLiveRow`, `LogWriters`, `ChildLog`, `LogFieldsArgs`, `DefaultLogLevels`,
 `Timer`, `TimerConfig`, `TimerHandle`, `TimeArgs`
