@@ -75,12 +75,16 @@ describe('house delivery resolution', () => {
     expect(house.delivery).toBe('staged')
   })
 
-  it('warns once about last-write-wins when immediate', () => {
+  it('warns once that the sink must upsert on id and keep the flush row when immediate', () => {
     const onWarn = vi.fn()
     createHouse({ driver, delivery: 'immediate', onWarn })
-    expect(onWarn.mock.calls.some(([message]) => /newest row per id/.test(message as string))).toBe(
-      true,
-    )
+    const messages = onWarn.mock.calls.map(([message]) => message as string)
+    expect(messages.filter((message) => message.startsWith("delivery is 'immediate'"))).toEqual([
+      "delivery is 'immediate', so bucketed rows are resent as their bucket fills. The sink " +
+        'must upsert on id rather than fold duplicates together, and must keep the flush row ' +
+        'over an immediate one. Staged kinds ship without flush(); bucketed kinds still ' +
+        'need it to retire closed buckets',
+    ])
   })
 })
 
@@ -176,7 +180,7 @@ describe('immediate delivery of bucketed kinds', () => {
     expect(report.metrics.dog_poops?.rows).toBe(1)
     expect(sent).toHaveLength(1)
     // same id as every immediate send, carrying the complete fold, so a store
-    // keeping the newest row per id lands on the right number
+    // that lets the flush row win lands on the right number
     expect(sent[0]?.rows[0]).toMatchObject({
       id: rowId('dog_poops', clock - 60_000, encodeDimKey(DIMS, RIVERSIDE)),
       value: 4,

@@ -169,18 +169,18 @@ row was written, so a dimension you did not declare was never captured. Adding
 one later affects new rows only, and reordering the ones you have is a breaking
 change. [dims](/reference/dims#reordering-is-a-breaking-change) covers both.
 
-**Changing resolution splits your history.** Old rows keep their old boundaries,
-and windows still in the driver when you deploy are the ones at risk of landing
-off the new grid. Flush them first, as
+**Changing resolution splits your history.** Rows already shipped keep their old
+boundaries, and so do windows still in the driver when you deploy: they ship
+with the boundaries they were written with. Every write made after the deploy
+lands on the new grid. A chart that reads raw `bucket_ts` values will see the
+granularity change at the point you made the switch, while any query that groups
+to something coarser than both resolutions reads old and new rows alike, which
+is almost every query. Flushing before you deploy, as
 [Changing a schema with data in storage](/guide/production#changing-a-schema-with-data-in-storage)
-describes. Old rows are fine for any query that groups to something coarser than both, which is
-almost every query, but a chart that reads raw `bucket_ts` values will see the
-granularity change at the point you made the switch. Windows still in storage
-when you switch ship with their old boundaries too. A write for a window the old
-resolution already shipped is moved to the first window of the new resolution
-past that point, so every row the metric ships from then on sits on the new
-grid. Going from one minute to five, a write for `12:05` after `12:07` has
-shipped lands in `12:10`
+describes, keeps the switch to a single point in time. A write for a window the
+old resolution already shipped is moved to the first window of the new
+resolution at or past that point. Going from one minute to five, a write for
+`12:05` after `12:07` has shipped lands in `12:10`
 ([A write that misses its window](#a-write-that-misses-its-window)).
 
 ## Where the boundaries are
@@ -392,8 +392,8 @@ const slowJobs = counter('slow_jobs', {
 
 Sometimes a write arrives after its window has already been claimed by a flush:
 grace was too short, or the server that made it has a clock running behind. That
-write is moved forward into the oldest window that has not shipped yet, and it
-ships with that window.
+write is moved forward into the first window of its own resolution at or past
+the watermark, and it ships with that window.
 
 The driver keeps track of this with a **watermark** per metric: every window
 below it has been claimed at least once. A write aimed below the watermark lands

@@ -185,10 +185,12 @@ await house.snapshot({ only: ['http_requests'], rollup: 'sum' })
 Metrics are read in parallel. Options that only make sense for a folded metric
 are ignored by events and logs rather than rejected, so `dims`, `complete`,
 `rollup` and `groupBy` work across a mixed schema. Events and logs honour
-`from`, `to`, `orderBy`, `direction` and `limit`. `dims`, `groupBy` and
-`orderBy` name columns, and every metric that reads them has to have those
-columns: `orderBy: 'value'` on a house that also holds a gauge throws, because a
-gauge row has `min` and `max` rather than `value`. One metric that throws
+`from`, `to`, `orderBy`, `direction` and `limit`. `orderBy` names a column,
+and every metric that reads it has to have that column: `orderBy: 'value'` on a
+house that also holds a gauge throws, because a gauge row has `min` and `max`
+rather than `value`. `dims` and `groupBy` name dimensions, and only the folded
+metrics read them, so an event or a log never objects to one. Each folded
+metric does: it throws when it does not declare a dim you named. One metric that throws
 rejects the whole call, so narrow it with `only` when the options fit some
 metrics and not others.
 

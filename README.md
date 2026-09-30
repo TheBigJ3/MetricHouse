@@ -123,7 +123,8 @@ await dogPoops.current({ dogName: 'Willow', park: 'riverside', kind: 'solid' })
 ### Getting it out
 
 A metric is a complete unit, covering what it measures, how often it ships, and where
-it ships to, so flushing one needs no house at all:
+it ships to, so flushing one needs no scheduler and no call to `house.flush()`. It does
+have to be bound, by passing it to `createHouse({ schema })`:
 
 ```ts
 await dogPoops.flush()
@@ -136,7 +137,7 @@ each metric its own interval at its own cadence, and nothing else has to pump:
 ```ts
 house.start()                     // dog_poops ships every 5m, on its own timer
 process.on('SIGTERM', async () => {
-  await house.stop()              // clear timers, drain, force a final flush
+  await house.stop()              // clear timers, drain, make a final flush
 })
 ```
 

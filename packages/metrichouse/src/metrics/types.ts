@@ -99,8 +99,8 @@ export interface WriteContext {
    * which happens without anyone calling flush.
    *
    * `'immediate'` is `delivery: 'immediate'`. An immediate bucketed row is a
-   * running total that a later send supersedes, so a sink must keep the
-   * newest row per `id` rather than fold them together, which double counts.
+   * running total that a later send supersedes, so a sink must
+   * upsert on `id` rather than fold them together, which double counts.
    *
    * A `'flush'` row of a bucketed kind carries the same `id` as the immediate
    * rows of its window, with the final total, so under immediate delivery it

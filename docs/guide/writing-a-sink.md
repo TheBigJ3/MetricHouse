@@ -233,7 +233,7 @@ write: async (rows, context) => {
 | --- | --- |
 | `'flush'` | A normal flush, from a timer, a cron or a direct call. Under immediate delivery it holds a window's final value and must win over an `'immediate'` row with the same `id`, whichever arrives last. See [Delivery modes](/guide/delivery#telling-the-two-apart-in-your-sink) |
 | `'batch'` | A locally staged event filled up and shipped itself |
-| `'immediate'` | Immediate delivery. Treat as last write wins on `id`, unless the row held came from a flush |
+| `'immediate'` | Immediate delivery. Upsert on `id`, unless the row held came from a flush |
 
 ## Row ids and duplicates
 
@@ -292,7 +292,10 @@ Use `DO UPDATE` rather than `DO NOTHING`. With the default delivery a resent row
 carries exactly the value it carried the first time, so either would do. Under
 [immediate delivery](/guide/delivery) a row is sent again as its window fills,
 with the same id and a larger value, and you want the newer number. `DO UPDATE`
-is right in both cases.
+is right in both cases. Under immediate delivery the flush row holds the window's
+complete value, so a real sink also stops a later immediate row from replacing
+it, as [Delivery modes](/guide/delivery#telling-the-two-apart-in-your-sink)
+shows.
 
 There is also a helper that names the columns your table should treat as unique:
 
