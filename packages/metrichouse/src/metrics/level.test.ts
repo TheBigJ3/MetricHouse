@@ -1074,3 +1074,45 @@ for (const { name: driverName, make: makeDriver } of drivers) {
     })
   })
 }
+
+describe('a change of resolution', () => {
+  it('carries a late set that landed on the first window of the coarser grid', async () => {
+    // on a five minute boundary
+    const base = 1_788_616_800_000
+    const minute = 60_000
+    const before = level('queue_depth', {
+      dims: { queue: str() },
+      resolution: '1m',
+      flush: '1m',
+      write: discard,
+    })
+    before.bind({ driver, now })
+    clock = base + 7 * minute + 10_000
+    before.set(4, EMAIL)
+    clock = base + 8 * minute + 1000
+    before.set(4, EMAIL)
+    await before.drain()
+    clock = base + 8 * minute + 3000
+    await before.flush()
+
+    const sink = collector()
+    const after = level('queue_depth', {
+      dims: { queue: str() },
+      resolution: '5m',
+      flush: '5m',
+      write: sink.write,
+    })
+    after.bind({ driver, now })
+    clock = base + 8 * minute + 10_000
+    after.set(9, EMAIL)
+    await after.drain()
+
+    clock = base + 20 * minute + 3000
+    await after.flush()
+    expect(sink.shape.map(([ts, value]) => [ts - base, value])).toEqual([
+      [8 * minute, 4],
+      [10 * minute, 9],
+      [15 * minute, 9],
+    ])
+  })
+})

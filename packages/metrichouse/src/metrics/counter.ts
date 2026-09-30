@@ -17,7 +17,7 @@ import { assertDimsLegal, dimKeyDecoder, dimKeyEncoder } from '../schema/dims.js
 import type { FieldType, InferRow, InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketStart } from '../time/buckets.js'
 import type { DurationInput } from '../time/duration.js'
-import { bucketedBinding, bucketedLifecycle, bucketedReader } from './bucketed.js'
+import { bucketedBinding, bucketedLifecycle, bucketedReader, openWindow } from './bucketed.js'
 import type {
   AnyMetric,
   DimsArgs,
@@ -384,14 +384,26 @@ export function counter<D extends Shape = Record<never, never>>(
       const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
 
       const write = active.driver.increment([
-        { metric: name, bucketTs, dimKey, delta, ...(!isFloat && { integer: true }) },
+        {
+          metric: name,
+          bucketTs,
+          resolutionMs,
+          dimKey,
+          delta,
+          ...(!isFloat && { integer: true }),
+        },
       ])
       writes.track(slot.deliver(write, bucketTs, dimKey), () => active.onError)
     },
 
     async current(values?: InferShape<D>): Promise<number> {
       const active = slot.active()
-      const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
+      const bucketTs = await openWindow(
+        active.driver,
+        name,
+        bucketStart((active.now ?? Date.now)(), resolutionMs),
+        resolutionMs,
+      )
 
       // the whole metric's total, added up in storage rather than by reading
       // every series. Only for whole numbers, and only when the driver says

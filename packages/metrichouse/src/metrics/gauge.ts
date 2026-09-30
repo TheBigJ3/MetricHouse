@@ -21,7 +21,13 @@ import { assertDimsLegal, dimKeyDecoder, dimKeyEncoder } from '../schema/dims.js
 import type { InferRow, InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketStart } from '../time/buckets.js'
 import type { DurationInput } from '../time/duration.js'
-import { bucketedBinding, bucketedLifecycle, bucketedReader, seriesKey } from './bucketed.js'
+import {
+  bucketedBinding,
+  bucketedLifecycle,
+  bucketedReader,
+  openWindow,
+  seriesKey,
+} from './bucketed.js'
 import type {
   AnyMetric,
   DimsArgs,
@@ -415,13 +421,18 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       const dimKey = keyFor(args[0])
       const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
 
-      const write = active.driver.observe([{ metric: name, bucketTs, dimKey, value }])
+      const write = active.driver.observe([{ metric: name, bucketTs, resolutionMs, dimKey, value }])
       writes.track(slot.deliver(write, bucketTs, dimKey), () => active.onError)
     },
 
     async openFolds(values?: InferShape<D>): Promise<GaugeCell[]> {
       const active = slot.active()
-      const bucketTs = bucketStart((active.now ?? Date.now)(), resolutionMs)
+      const bucketTs = await openWindow(
+        active.driver,
+        name,
+        bucketStart((active.now ?? Date.now)(), resolutionMs),
+        resolutionMs,
+      )
 
       const rows = await active.driver.readBuckets({
         metric: name,

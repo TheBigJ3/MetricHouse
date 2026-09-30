@@ -641,7 +641,8 @@ export function delegateBatch(inner: AnyMetric): BatchMethods {
 /** What a flush tells a metric about the claim it is asking for. */
 export interface ClaimOptions {
   /**
-   * Take windows that have ended even if they are still inside grace. Set by
+   * Take windows that have ended even if they are still inside grace, and on
+   * a driver that is not durable, every window ahead of the clock too. Set by
    * a `final` flush; a staged kind has no grace and ignores it.
    */
   readonly final?: boolean

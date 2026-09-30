@@ -32,7 +32,7 @@ import {
 import { shipOpenSeries } from '../runtime/ship.js'
 import { dimKeyDecoder } from '../schema/dims.js'
 import type { Shape } from '../schema/types.js'
-import { assertResolution, closedUpTo } from '../time/buckets.js'
+import { assertResolution, bucketStart, closedUpTo } from '../time/buckets.js'
 import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
 import type {
   AnyMetric,
@@ -65,6 +65,23 @@ export function claimWatermark(
   options: ClaimOptions = {},
 ): number {
   return closedUpTo(resolutionMs, nowMs, options.final ? 0 : graceMs())
+}
+
+/**
+ * The window a write made now lands in, which is the one a live read of the
+ * open window has to look at.
+ *
+ * Usually `aimed`, the window the clock is in. After the clock steps back
+ * behind the driver's watermark, writes land on the first window past it
+ * instead, and reading `aimed` would leave them out of `current()`.
+ */
+export async function openWindow(
+  driver: Driver,
+  metric: string,
+  aimed: number,
+  resolutionMs: number,
+): Promise<number> {
+  return driver.landing ? driver.landing(metric, aimed, resolutionMs) : aimed
 }
 
 /**
@@ -422,10 +439,17 @@ export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
     },
 
     async claimBatch(nowMs: number, claimOptions: ClaimOptions = {}): Promise<Claim> {
-      const claim = await driver().claim(
-        name,
-        claimWatermark(resolutionMs, nowMs, graceMs, claimOptions),
-      )
+      const storage = driver()
+      const upTo = claimWatermark(resolutionMs, nowMs, graceMs, claimOptions)
+      // the last flush of a process whose storage dies with it also takes
+      // the windows ahead of its clock: a write the watermark moved there, or
+      // one made before the clock stepped back. Nothing else will ship them.
+      // Storage that outlives the process keeps them for a later flush, and
+      // leaves the open windows of other processes alone
+      const claim =
+        claimOptions.final && !storage.capabilities.durable
+          ? await storage.claim(name, upTo, bucketStart(nowMs, resolutionMs) + resolutionMs)
+          : await storage.claim(name, upTo)
       if (sendsSoFar !== undefined && !isEmptyClaim(claim)) await sendsSoFar()
       return claim
     },

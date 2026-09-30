@@ -161,7 +161,12 @@ The cadence is measured from the last flush that shipped rows. Before the first
 one there is nothing to measure from, so the first flush always goes ahead,
 whatever the clock reads. If the clock steps backwards, say an NTP correction of
 an hour, the next flush goes ahead too, instead of waiting for the clock to catch
-back up.
+back up. It ships only the windows the stepped back clock says have closed. A
+write made after the step can land in a window ahead of the clock. It waits
+there until the clock passes that window again, unless a final flush on a driver
+such as `memory()` takes it first.
+[A write that misses its window](/guide/buckets-and-time#a-write-that-misses-its-window)
+explains why, and where the write lands.
 
 ### Several processes on one driver
 

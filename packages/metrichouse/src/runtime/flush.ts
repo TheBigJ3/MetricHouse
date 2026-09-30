@@ -44,6 +44,10 @@ export interface FlushOptions {
    * keeping back is the one still open. A write from another instance that
    * arrives after this is moved into the oldest window that has not shipped,
    * so nothing is lost by not waiting.
+   *
+   * On a driver that is not durable it also ships every window ahead of the
+   * clock. Data lands there when the clock steps back, and nothing will be
+   * left to ship it once the process ends.
    */
   readonly final?: boolean
 }

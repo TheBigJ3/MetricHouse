@@ -282,6 +282,7 @@ export function level<D extends Shape = Record<never, never>>(
     const op: LevelOp = {
       metric: name,
       bucketTs,
+      resolutionMs,
       dimKey,
       value: amount,
       mode,
@@ -524,7 +525,9 @@ export function level<D extends Shape = Record<never, never>>(
       const until = Math.min(watermark, holdUntil(one) ?? watermark)
       if (carries(one) && one.heldThrough + resolutionMs < until) {
         carrying.push({ series: one, until })
-        earliest = Math.min(earliest, one.heldThrough + resolutionMs)
+        // floored, as the walk floors it: a pointer left by an older
+        // resolution sits between two windows of this one
+        earliest = Math.min(earliest, bucketStart(one.heldThrough + resolutionMs, resolutionMs))
       }
 
       // a series past its hold stops reporting. Dropped rather than left
@@ -564,6 +567,7 @@ export function level<D extends Shape = Record<never, never>>(
         ops.push({
           metric: name,
           bucketTs: window.bucketTs,
+          resolutionMs,
           dimKey: one.dimKey,
           value: window.value,
           mode: 'hold',

@@ -44,7 +44,7 @@ describe('memory · options', () => {
       maxStaged: Number.POSITIVE_INFINITY,
     })
     await expect(
-      open.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }]),
+      open.increment([{ metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 }]),
     ).resolves.toBeUndefined()
   })
 })
@@ -95,71 +95,91 @@ describe('memory · maxStaged', () => {
 describe('memory · maxSeries', () => {
   it('refuses a new series past the cap, naming the metric', async () => {
     const capped = memory({ maxSeries: 2 })
-    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
-    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'b', delta: 1 }])
+    await capped.increment([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+    ])
+    await capped.increment([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'b', delta: 1 },
+    ])
 
     await expect(
-      capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'c', delta: 1 }]),
+      capped.increment([{ metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'c', delta: 1 }]),
     ).rejects.toThrow(new RegExp(`${M}.*maxSeries`))
   })
 
   it('does not count the same series twice across buckets', async () => {
     const capped = memory({ maxSeries: 1 })
-    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
+    await capped.increment([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+    ])
     await expect(
-      capped.increment([{ metric: M, bucketTs: 2000, dimKey: 'a', delta: 1 }]),
+      capped.increment([{ metric: M, bucketTs: 2000, resolutionMs: 1000, dimKey: 'a', delta: 1 }]),
     ).resolves.toBeUndefined()
   })
 
   it('caps each metric independently', async () => {
     const capped = memory({ maxSeries: 1 })
-    await capped.increment([{ metric: 'a', bucketTs: 1000, dimKey: 'x', delta: 1 }])
+    await capped.increment([
+      { metric: 'a', bucketTs: 1000, resolutionMs: 1000, dimKey: 'x', delta: 1 },
+    ])
     await expect(
-      capped.increment([{ metric: 'b', bucketTs: 1000, dimKey: 'y', delta: 1 }]),
+      capped.increment([
+        { metric: 'b', bucketTs: 1000, resolutionMs: 1000, dimKey: 'y', delta: 1 },
+      ]),
     ).resolves.toBeUndefined()
   })
 
   it('frees capacity once a claim is acked', async () => {
     const capped = memory({ maxSeries: 1 })
-    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
+    await capped.increment([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+    ])
     await capped.ack(await capped.claim(M, 2000))
 
     await expect(
-      capped.increment([{ metric: M, bucketTs: 3000, dimKey: 'b', delta: 1 }]),
+      capped.increment([{ metric: M, bucketTs: 3000, resolutionMs: 1000, dimKey: 'b', delta: 1 }]),
     ).resolves.toBeUndefined()
   })
 
   it('still counts data that is claimed but not yet acked', async () => {
     // it is held in memory either way, which is what the cap protects
     const capped = memory({ maxSeries: 1 })
-    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
+    await capped.increment([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+    ])
     await capped.claim(M, 2000)
 
     await expect(
-      capped.increment([{ metric: M, bucketTs: 3000, dimKey: 'b', delta: 1 }]),
+      capped.increment([{ metric: M, bucketTs: 3000, resolutionMs: 1000, dimKey: 'b', delta: 1 }]),
     ).rejects.toThrow(/maxSeries/)
   })
 
   it('does not leak capacity when a late write lands beside a released window', async () => {
     const capped = memory({ maxSeries: 1 })
-    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
+    await capped.increment([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+    ])
     const claim = await capped.claim(M, 2000)
     // moved forward to 2000: the same series, in a second window
-    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
+    await capped.increment([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+    ])
     await capped.release(claim)
 
     // one series in two windows, and acking both must free the slot completely
     await capped.ack(await capped.claim(M, 3000))
     await expect(
-      capped.increment([{ metric: M, bucketTs: 3000, dimKey: 'b', delta: 1 }]),
+      capped.increment([{ metric: M, bucketTs: 3000, resolutionMs: 1000, dimKey: 'b', delta: 1 }]),
     ).resolves.toBeUndefined()
   })
 
   it('leaves no partial state behind when a write is refused', async () => {
     const capped = memory({ maxSeries: 1 })
-    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
+    await capped.increment([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+    ])
     await expect(
-      capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'b', delta: 1 }]),
+      capped.increment([{ metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'b', delta: 1 }]),
     ).rejects.toThrow(
       new Error(
         `memory driver: ${M} exceeded maxSeries (1), which a dim with unbounded values will ` +
@@ -175,9 +195,11 @@ describe('memory · maxSeries', () => {
   it('leaves no empty window behind when a write to a new window is refused', async () => {
     // an empty window would still be claimed, and ship as a batch of no rows
     const capped = memory({ maxSeries: 1 })
-    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
+    await capped.increment([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+    ])
     await expect(
-      capped.increment([{ metric: M, bucketTs: 2000, dimKey: 'b', delta: 1 }]),
+      capped.increment([{ metric: M, bucketTs: 2000, resolutionMs: 1000, dimKey: 'b', delta: 1 }]),
     ).rejects.toThrow(/maxSeries/)
 
     const claim = await capped.claim(M, 3000)
@@ -186,12 +208,14 @@ describe('memory · maxSeries', () => {
 
   it('refuses a batch that would pass the cap without keeping any of it', async () => {
     const capped = memory({ maxSeries: 2 })
-    await capped.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
+    await capped.increment([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+    ])
     await expect(
       capped.increment([
-        { metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 },
-        { metric: M, bucketTs: 1000, dimKey: 'b', delta: 1 },
-        { metric: M, bucketTs: 1000, dimKey: 'c', delta: 1 },
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'b', delta: 1 },
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'c', delta: 1 },
       ]),
     ).rejects.toThrow(/maxSeries/)
 
@@ -221,6 +245,7 @@ describe('memory · large batches', () => {
       Array.from({ length: 100_000 }, (_, i) => ({
         metric: M,
         bucketTs: 1000,
+        resolutionMs: 1000,
         dimKey: `s${i}`,
         delta: 1,
       })),
@@ -239,8 +264,12 @@ describe('memory · large batches', () => {
 describe('memory · reads', () => {
   it('hands out copies of folds and level cells, so editing one changes nothing stored', async () => {
     const driver = memory()
-    await driver.observe([{ metric: M, bucketTs: 1000, dimKey: 'a', value: 4.6 }])
-    await driver.setLevel([{ metric: 'lvl', bucketTs: 1000, dimKey: 'a', value: 3, mode: 'set' }])
+    await driver.observe([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', value: 4.6 },
+    ])
+    await driver.setLevel([
+      { metric: 'lvl', bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', value: 3, mode: 'set' },
+    ])
 
     const [fold] = await driver.readBuckets({ metric: M })
     const [held] = await driver.readBuckets({ metric: 'lvl', dimKey: 'a' })

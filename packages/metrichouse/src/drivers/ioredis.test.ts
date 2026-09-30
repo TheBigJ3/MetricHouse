@@ -186,7 +186,7 @@ function scriptedClient(trips: [error: Error | null, result: unknown][][]) {
 
 // no server needed: the replies are scripted
 describe('ioredis · writes Redis never answered', () => {
-  const op = { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }
+  const op = { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 }
   /** The floor each write was sent with, the second to last argument. */
   const floors = (sent: (string | number)[][]) => sent.map((args) => args.at(-2))
 
@@ -237,7 +237,13 @@ describe('ioredis · writes Redis never answered', () => {
 
 // no server needed: the replies are scripted
 describe('ioredis · round trips of one call', () => {
-  const op = (bucketTs: number) => ({ metric: M, bucketTs, dimKey: WILLOW, delta: 1 })
+  const op = (bucketTs: number) => ({
+    metric: M,
+    bucketTs,
+    resolutionMs: 1000,
+    dimKey: WILLOW,
+    delta: 1,
+  })
   /** The window each script was aimed at, after its three keys and the key prefix. */
   const windows = (sent: (string | number)[][]) => sent.map((args) => args[4])
 
@@ -301,6 +307,7 @@ describe('ioredis · options and connection', () => {
         Array.from({ length: 300_000 }, (_, i) => ({
           metric: M,
           bucketTs: i * 1000,
+          resolutionMs: 1000,
           dimKey: WILLOW,
           delta: 1,
         })),
@@ -317,7 +324,9 @@ describe('ioredis · options and connection', () => {
       },
     } as unknown as IoredisClient
     const driver = ioredis(() => made)
-    await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+    await driver.increment([
+      { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+    ])
 
     await Promise.all([driver.close(), driver.close()])
     expect(quits).toBe(1)
@@ -333,7 +342,7 @@ describe('ioredis · options and connection', () => {
       },
       { namespace: 'stub' },
     )
-    const op = { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }
+    const op = { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 }
 
     const raced = await Promise.allSettled([driver.increment([op]), driver.increment([op])])
     expect(raced.map((one) => (one.status === 'rejected' ? String(one.reason) : 'ok'))).toEqual([
@@ -398,7 +407,9 @@ if (!client) {
     it('puts a counter where keyFor says it is, as a plain hash', async () => {
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns })
-      await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 2 }])
+      await driver.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 2 },
+      ])
 
       expect(driver.keyFor(M, 1000)).toBe(`${ns}:b:${M}:1000`)
       // the promise the docs make: you can go and look at it in redis-cli
@@ -411,8 +422,8 @@ if (!client) {
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns })
       await driver.observe([
-        { metric: G, bucketTs: 1000, dimKey: WILLOW, value: 5 },
-        { metric: G, bucketTs: 1000, dimKey: WILLOW, value: 9 },
+        { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: 5 },
+        { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: 9 },
       ])
 
       expect(await live.hget(`${ns}:b:${G}:1000`, WILLOW)).toBe('9|5|9|14|2')
@@ -424,8 +435,8 @@ if (!client) {
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns })
       await driver.increment([
-        { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 },
-        { metric: M, bucketTs: 2000, dimKey: WILLOW, delta: 1 },
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+        { metric: M, bucketTs: 2000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
       ])
 
       expect(await live.zrange(`${ns}:idx:${M}`, '0', '-1')).toEqual(['1000', '2000'])
@@ -438,7 +449,9 @@ if (!client) {
     it('leaves nothing behind once a claim is acked', async () => {
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns })
-      await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await driver.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       await driver.append([{ metric: M, id: 'a', ts: 1000, fields: {} }])
 
       await driver.ack(await driver.claim(M, 2000))
@@ -457,7 +470,9 @@ if (!client) {
     it('fails on a bound Redis refuses with the words the plain command uses', async () => {
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns })
-      await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await driver.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       for (const bound of [{ from: Number.NaN }, { to: Number.NaN }]) {
         await expect(driver.readBuckets({ metric: M, ...bound })).rejects.toThrow(
           'ERR min or max is not a float',
@@ -495,10 +510,10 @@ if (!client) {
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns })
       await driver.increment([
-        { metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 },
-        { metric: M, bucketTs: 2000, dimKey: 'b', delta: 1 },
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+        { metric: M, bucketTs: 2000, resolutionMs: 1000, dimKey: 'b', delta: 1 },
         // the same series in a second bucket is still one series
-        { metric: M, bucketTs: 2000, dimKey: 'a', delta: 1 },
+        { metric: M, bucketTs: 2000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
       ])
 
       expect(await driver.scanSeries(M)).toEqual(['a', 'b'])
@@ -509,7 +524,9 @@ if (!client) {
     it('stops counting a series once its bucket is claimed', async () => {
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns })
-      await driver.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }])
+      await driver.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+      ])
       await driver.claim(M, 2000)
 
       expect(await driver.scanSeries(M)).toEqual([])
@@ -525,7 +542,9 @@ if (!client) {
       // in Redis, and whoever comes back can still settle it.
       const ns = fresh()
       const crashed = ioredis(live, { namespace: ns })
-      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 4 }])
+      await crashed.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 4 },
+      ])
       const claim = await crashed.claim(M, 2000)
 
       const restarted = ioredis(live, { namespace: ns })
@@ -538,7 +557,9 @@ if (!client) {
     it('lets a restarted driver release a window the old one had claimed', async () => {
       const ns = fresh()
       const crashed = ioredis(live, { namespace: ns })
-      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 4 }])
+      await crashed.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 4 },
+      ])
       const claim = await crashed.claim(M, 2000)
 
       const restarted = ioredis(live, { namespace: ns })
@@ -569,8 +590,8 @@ if (!client) {
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns })
       await driver.increment([
-        { metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 },
-        { metric: M, bucketTs: 1000, dimKey: 'b', delta: 2 },
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', delta: 1 },
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: 'b', delta: 2 },
       ])
       const claim = await driver.claim(M, 2000)
       // a gauge fold an older driver left in the claimed window
@@ -598,7 +619,9 @@ if (!client) {
     it('puts back a window the flusher died holding, and the next claim gets it', async () => {
       const ns = fresh()
       const crashed = ioredis(live, { namespace: ns })
-      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 4 }])
+      await crashed.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 4 },
+      ])
       await crashed.claim(M, 2000)
       // the crash: nothing acks, nothing releases, the process is gone
 
@@ -630,11 +653,15 @@ if (!client) {
       // shipping it again gives a sink the same row it may already have
       const ns = fresh()
       const crashed = ioredis(live, { namespace: ns })
-      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 5 }])
+      await crashed.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 5 },
+      ])
       await crashed.claim(M, 2000)
 
       const survivor = sweeper(ns)
-      await survivor.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 2 }])
+      await survivor.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 2 },
+      ])
       await survivor.recover(M)
 
       expect(await survivor.readBuckets({ metric: M })).toEqual([
@@ -651,8 +678,8 @@ if (!client) {
       const ns = fresh()
       const crashed = ioredis(live, { namespace: ns })
       await crashed.observe([
-        { metric: G, bucketTs: 1000, dimKey: WILLOW, value: 5 },
-        { metric: G, bucketTs: 1000, dimKey: WILLOW, value: 2 },
+        { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: 5 },
+        { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: 2 },
       ])
       await crashed.claim(G, 2000)
       await live.hset(crashed.keyFor(G, 1000), WILLOW, '9|9|9|9|1')
@@ -707,7 +734,9 @@ if (!client) {
     it('leaves a claim younger than recoverAfter alone', async () => {
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns, recoverAfter: '5m' })
-      await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await driver.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       const claim = await driver.claim(M, 2000)
 
       expect((await driver.recover(M)).claims).toBe(0)
@@ -720,10 +749,14 @@ if (!client) {
     it('reports when the oldest recovered claim was taken', async () => {
       const ns = fresh()
       const crashed = ioredis(live, { namespace: ns })
-      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await crashed.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       const before = Date.now()
       const first = await crashed.claim(M, 2000)
-      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await crashed.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       await crashed.claim(M, 2000)
 
       const report = await sweeper(ns).recover(M)
@@ -740,7 +773,9 @@ if (!client) {
       // that is now back in the live set
       const ns = fresh()
       const crashed = ioredis(live, { namespace: ns })
-      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await crashed.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       const claim = await crashed.claim(M, 2000)
 
       await sweeper(ns).recover(M)
@@ -752,7 +787,9 @@ if (!client) {
     it('lets only one of two racing sweepers take a claim', async () => {
       const ns = fresh()
       const crashed = ioredis(live, { namespace: ns })
-      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 6 }])
+      await crashed.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 6 },
+      ])
       await crashed.claim(M, 2000)
 
       const [a, b] = await Promise.all([sweeper(ns).recover(M), sweeper(ns).recover(M)])
@@ -768,7 +805,9 @@ if (!client) {
     it('leaves nothing behind once the recovered window has been acked', async () => {
       const ns = fresh()
       const crashed = ioredis(live, { namespace: ns })
-      await crashed.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await crashed.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       await crashed.claim(M, 2000)
 
       const survivor = sweeper(ns)
@@ -815,7 +854,9 @@ if (!client) {
       const instances = [0, 1, 2].map(() => ioredis(live, { namespace: ns }))
       await Promise.all(
         instances.map((driver) =>
-          driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }]),
+          driver.increment([
+            { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+          ]),
         ),
       )
 
@@ -833,7 +874,9 @@ if (!client) {
       const instances = Array.from({ length: 20 }, () => ioredis(live, { namespace: ns }))
       await Promise.all(
         instances.map((driver, i) =>
-          driver.observe([{ metric: G, bucketTs: 1000, dimKey: WILLOW, value: i }]),
+          driver.observe([
+            { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: i },
+          ]),
         ),
       )
 
@@ -851,7 +894,9 @@ if (!client) {
       const ns = fresh()
       const a = ioredis(live, { namespace: ns })
       const b = ioredis(live, { namespace: ns })
-      await a.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await a.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
 
       // both flushers run; only one can carry the window, and they must not
       // collide on the key their claim lives at
@@ -865,14 +910,18 @@ if (!client) {
     it('gives a claim an id no earlier claim had after Redis loses recent writes', async () => {
       const ns = fresh()
       const one = ioredis(live, { namespace: ns })
-      await one.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await one.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       const first = await one.claim(M, 2000)
       // what a restart that lost its last second of writes can leave behind:
       // every counter Redis kept rolled back, and the claim still in flight
       for (const key of await live.keys(`${ns}:seq*`)) await live.del(key)
 
       const other = ioredis(live, { namespace: ns })
-      await other.increment([{ metric: M, bucketTs: 2000, dimKey: WILLOW, delta: 2 }])
+      await other.increment([
+        { metric: M, bucketTs: 2000, resolutionMs: 1000, dimKey: WILLOW, delta: 2 },
+      ])
       const second = await other.claim(M, 3000)
       expect(second.id).not.toBe(first.id)
 
@@ -890,12 +939,16 @@ if (!client) {
       // once. The driver must notice and reload rather than fail the write.
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns })
-      await driver.observe([{ metric: G, bucketTs: 1000, dimKey: WILLOW, value: 5 }])
+      await driver.observe([
+        { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: 5 },
+      ])
 
       await live.script('FLUSH')
 
       await expect(
-        driver.observe([{ metric: G, bucketTs: 1000, dimKey: WILLOW, value: 7 }]),
+        driver.observe([
+          { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: 7 },
+        ]),
       ).resolves.toBeUndefined()
       expect(await live.hget(`${ns}:b:${G}:1000`, WILLOW)).toBe('7|5|7|12|2')
 
@@ -919,8 +972,12 @@ if (!client) {
       // imported by build steps and tests that never write anything
       expect(calls).toBe(0)
 
-      await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
-      await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await driver.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
+      await driver.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       expect(calls).toBe(1)
 
       await wipe(ns)
@@ -956,6 +1013,7 @@ if (!client) {
         Array.from({ length: 50 }, () => ({
           metric: M,
           bucketTs: 1000,
+          resolutionMs: 1000,
           dimKey: WILLOW,
           delta: 1,
         })),
@@ -988,10 +1046,21 @@ if (!client) {
       })
       const driver = ioredis(twice, { namespace: ns })
 
-      await driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 5 }])
-      await driver.observe([{ metric: G, bucketTs: 1000, dimKey: WILLOW, value: 3 }])
+      await driver.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 5 },
+      ])
+      await driver.observe([
+        { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: 3 },
+      ])
       await driver.setLevel([
-        { metric: 'lvl', bucketTs: 1000, dimKey: WILLOW, value: 2, mode: 'add' },
+        {
+          metric: 'lvl',
+          bucketTs: 1000,
+          resolutionMs: 1000,
+          dimKey: WILLOW,
+          value: 2,
+          mode: 'add',
+        },
       ])
       await driver.append([{ metric: 'ev', id: 'a', ts: 1000, fields: {} }])
 
@@ -1031,7 +1100,9 @@ if (!client) {
     it('acks a claim whose reply was lost and resent', async () => {
       const ns = fresh()
       const plain = ioredis(live, { namespace: ns })
-      await plain.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await plain.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       const claim = await plain.claim(M, 2000)
 
       await expect(ioredis(lostReply(), { namespace: ns }).ack(claim)).resolves.toBeUndefined()
@@ -1042,7 +1113,9 @@ if (!client) {
     it('releases a claim whose reply was lost and resent, once', async () => {
       const ns = fresh()
       const plain = ioredis(live, { namespace: ns })
-      await plain.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await plain.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       const claim = await plain.claim(M, 2000)
 
       await expect(ioredis(lostReply(), { namespace: ns }).release(claim)).resolves.toBeUndefined()
@@ -1055,7 +1128,9 @@ if (!client) {
     it('reports what a recovery put back when its reply was lost and resent', async () => {
       const ns = fresh()
       const plain = ioredis(live, { namespace: ns })
-      await plain.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await plain.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       await plain.claim(M, 2000)
 
       const resent = ioredis(lostReply(), { namespace: ns, recoverAfter: 0 })
@@ -1124,9 +1199,23 @@ if (!client) {
       const driver = ioredis(twice, { namespace: ns })
       await expect(
         driver.setLevel([
-          { metric: 'lvl', bucketTs: 1000, dimKey: 'a', value: 5, mode: 'add' },
-          { metric: 'lvl', bucketTs: 1000, dimKey: 'b', value: Number.MAX_VALUE, mode: 'add' },
-          { metric: 'lvl', bucketTs: 1000, dimKey: 'b', value: Number.MAX_VALUE, mode: 'add' },
+          { metric: 'lvl', bucketTs: 1000, resolutionMs: 1000, dimKey: 'a', value: 5, mode: 'add' },
+          {
+            metric: 'lvl',
+            bucketTs: 1000,
+            resolutionMs: 1000,
+            dimKey: 'b',
+            value: Number.MAX_VALUE,
+            mode: 'add',
+          },
+          {
+            metric: 'lvl',
+            bucketTs: 1000,
+            resolutionMs: 1000,
+            dimKey: 'b',
+            value: Number.MAX_VALUE,
+            mode: 'add',
+          },
         ]),
       ).rejects.toThrow(/largest number/)
       expect(await driver.readLevels('lvl')).toEqual([])
@@ -1218,7 +1307,9 @@ if (!client) {
       })
       const driver = ioredis(slowLoad, { namespace: ns })
       const set = (value: number) =>
-        driver.setLevel([{ metric: 'lvl', bucketTs: 1000, dimKey: WILLOW, value, mode: 'set' }])
+        driver.setLevel([
+          { metric: 'lvl', bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value, mode: 'set' },
+        ])
 
       const first = set(1)
       await new Promise((resolve) => setTimeout(resolve, 10))
@@ -1231,7 +1322,9 @@ if (!client) {
     it('ages a claim by Redis time, whatever the recovering host believes', async () => {
       const ns = fresh()
       const claimer = ioredis(live, { namespace: ns })
-      await claimer.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      await claimer.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
       await claimer.claim(M, 2000)
 
       // a host whose clock runs two minutes fast
@@ -1257,7 +1350,11 @@ if (!client) {
       const driver = ioredis(live, { namespace: ns })
       const writes: Promise<void>[] = []
       for (let i = 0; i < 150_000; i++) {
-        writes.push(driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }]))
+        writes.push(
+          driver.increment([
+            { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+          ]),
+        )
       }
       await Promise.all(writes)
 
@@ -1294,7 +1391,9 @@ if (!client) {
       })
       const driver = ioredis(counting, { namespace: ns })
       for (let s = 0; s < 50; s++) {
-        await driver.setLevel([{ metric: M, bucketTs: 0, dimKey: `s${s}`, value: s, mode: 'set' }])
+        await driver.setLevel([
+          { metric: M, bucketTs: 0, resolutionMs: 1000, dimKey: `s${s}`, value: s, mode: 'set' },
+        ])
       }
       scripts = 0
 
@@ -1305,6 +1404,7 @@ if (!client) {
           holds.push({
             metric: M,
             bucketTs: w * 1000,
+            resolutionMs: 1000,
             dimKey: `s${s}`,
             value: s,
             mode: 'hold' as const,
@@ -1336,13 +1436,16 @@ if (!client) {
         },
       })
       const driver = ioredis(counting, { namespace: ns, maxPipelineSize: 10 })
-      await driver.setLevel([{ metric: M, bucketTs: 0, dimKey: WILLOW, value: 1, mode: 'set' }])
+      await driver.setLevel([
+        { metric: M, bucketTs: 0, resolutionMs: 1000, dimKey: WILLOW, value: 1, mode: 'set' },
+      ])
       sizes.length = 0
 
       await driver.setLevel(
         Array.from({ length: 45 }, (_, i) => ({
           metric: M,
           bucketTs: (i + 1) * 1000,
+          resolutionMs: 1000,
           dimKey: WILLOW,
           value: 1,
           mode: 'hold' as const,

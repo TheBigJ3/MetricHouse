@@ -228,11 +228,17 @@ end
 
 -- the window a write aimed at bucketTs actually lands in. Every window below
 -- the watermark has been claimed already, so a write for one of them goes to
--- the watermark instead, the oldest window that has not shipped
-local function mh_landing(wmKey, bucketTs)
+-- the first window of its own resolution at or past the watermark instead,
+-- the oldest window of that grid that has not shipped. fmod, because it is
+-- exact for a whole number of milliseconds where Lua's % divides first
+local function mh_landing(wmKey, bucketTs, res)
   local wm = redis.call('GET', wmKey)
-  if wm ~= false and tonumber(bucketTs) < tonumber(wm) then return wm end
-  return bucketTs
+  if wm == false or tonumber(bucketTs) >= tonumber(wm) then return bucketTs end
+  local floor = tonumber(wm)
+  local step = tonumber(res)
+  local past = math.fmod(floor, step)
+  if past == 0 then return wm end
+  return string.format('%.0f', floor - past + step)
 end
 
 local MH_RANGE = 'MHRANGE would pass the largest number a metric can store, so the write was refused'
@@ -330,19 +336,19 @@ end
  * does not roll a script back, so a refusal halfway through would otherwise
  * leave half a batch applied.
  *
- * KEYS: bucket index, watermark. ARGV: bucket key prefix, bucketTs, `1` when
- * every total must stay a whole number a double holds exactly, then
- * dimKey/delta pairs.
+ * KEYS: bucket index, watermark. ARGV: bucket key prefix, bucketTs,
+ * resolutionMs, `1` when every total must stay a whole number a double holds
+ * exactly, then dimKey/delta pairs.
  */
 const INCREMENT = `${LUA_HELPERS}${LUA_ONCE}
 if mh_seen() then return 0 end
-local target = mh_landing(KEYS[2], ARGV[2])
+local target = mh_landing(KEYS[2], ARGV[2], ARGV[3])
 local key = ARGV[1] .. target
-local integer = ARGV[3] == '1'
+local integer = ARGV[4] == '1'
 local totals = {}
 local order = {}
 
-for i = 4, MH_N, 2 do
+for i = 5, MH_N, 2 do
   local field = ARGV[i]
   local total = totals[field]
   if total == nil then
@@ -380,17 +386,17 @@ return 1
  * from the client would lose observations. Checked in full before anything
  * is written, as {@link INCREMENT} is.
  *
- * KEYS: bucket index, watermark. ARGV: bucket key prefix, bucketTs, then
- * dimKey/value pairs.
+ * KEYS: bucket index, watermark. ARGV: bucket key prefix, bucketTs,
+ * resolutionMs, then dimKey/value pairs.
  */
 const MERGE_GAUGE = `${LUA_HELPERS}${LUA_ONCE}
 if mh_seen() then return 0 end
-local target = mh_landing(KEYS[2], ARGV[2])
+local target = mh_landing(KEYS[2], ARGV[2], ARGV[3])
 local key = ARGV[1] .. target
 local folds = {}
 local order = {}
 
-for i = 3, MH_N, 2 do
+for i = 4, MH_N, 2 do
   local field = ARGV[i]
   local v = tonumber(ARGV[i + 1])
   local cur = folds[field]
@@ -465,16 +471,16 @@ end
  * names, because that window now ends at this value.
  *
  * KEYS: bucket index, watermark, level hash. ARGV: bucket key prefix,
- * bucketTs, mode, `1` when every level must stay a whole number a double holds
- * exactly, then dimKey/value pairs.
+ * bucketTs, resolutionMs, mode, `1` when every level must stay a whole number
+ * a double holds exactly, then dimKey/value pairs.
  */
 const SET_LEVEL = `${LUA_HELPERS}${LUA_LEVEL_STATE}${LUA_ONCE}
 if mh_seen() then return 0 end
-local target = mh_landing(KEYS[2], ARGV[2])
+local target = mh_landing(KEYS[2], ARGV[2], ARGV[3])
 local bucketTs = tonumber(target)
 local prefix = ARGV[1]
-local add = ARGV[3] == 'add'
-local integer = ARGV[4] == '1'
+local add = ARGV[4] == 'add'
+local integer = ARGV[5] == '1'
 
 -- nothing is written until every op in the call has been worked out and
 -- checked, so a refusal changes nothing, and a resend of a refused call is
@@ -499,7 +505,7 @@ local function level_at(at, field)
   return tonumber(string.sub(cur, 2))
 end
 
-for i = 5, MH_N, 2 do
+for i = 6, MH_N, 2 do
   local field = ARGV[i]
   local v = tonumber(ARGV[i + 1])
   local state = statePlan[field]
@@ -677,7 +683,8 @@ return dropped
 `
 
 /**
- * Move every bucket strictly below a watermark into one in-flight key.
+ * Move every bucket strictly below a watermark, and every bucket at or past
+ * `aheadFrom` when one is given, into one in-flight key.
  *
  * Atomic, so a second flusher racing this one sees an index with those buckets
  * already gone rather than a half-moved window. The claim is registered in the
@@ -685,19 +692,36 @@ return dropped
  * claim that has to be settled exactly once.
  *
  * Raises the stored watermark in the same step, so no write can land below it
- * between the move and the raise.
+ * between the move and the raise. It rises no higher than one past the newest
+ * live window, unless the claim took a window past that bound. The memory
+ * driver's claim says why.
  *
  * KEYS: index, in-flight hash, claims, watermark. ARGV: watermark, claimId,
- * bucket key prefix. Returns Redis's time and the claimed cells.
+ * bucket key prefix, aheadFrom or an empty string. Returns Redis's time and
+ * the claimed cells.
  */
 const CLAIM_BUCKETS = `${LUA_NOW}
 local claimedAt = mh_now()
-local wm = redis.call('GET', KEYS[4])
-if wm == false or tonumber(ARGV[1]) > tonumber(wm) then
-  redis.call('SET', KEYS[4], ARGV[1])
-end
+local upTo = tonumber(ARGV[1])
+local newest = redis.call('ZREVRANGE', KEYS[1], 0, 0)
 
 local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', '(' .. ARGV[1])
+if ARGV[4] ~= '' then
+  local from = string.format('%.0f', math.max(tonumber(ARGV[4]), upTo))
+  for _, id in ipairs(redis.call('ZRANGEBYSCORE', KEYS[1], from, '+inf')) do
+    ids[#ids + 1] = id
+  end
+end
+
+if #newest > 0 then
+  local raised = math.min(upTo, tonumber(newest[1]) + 1)
+  if #ids > 0 then raised = math.max(raised, tonumber(ids[#ids]) + 1) end
+  local wm = redis.call('GET', KEYS[4])
+  if wm == false or raised > tonumber(wm) then
+    redis.call('SET', KEYS[4], string.format('%.0f', raised))
+  end
+end
+
 for i = 1, #ids do
   local bucketTs = ids[i]
   local data = redis.call('HGETALL', ARGV[3] .. bucketTs)
@@ -1239,6 +1263,17 @@ for i = 1, #buckets do
   end
 end
 return out
+`
+
+/**
+ * The window a write aimed at a bucket would land in now, by the same
+ * `mh_landing` every write script calls, so a read and a write cannot
+ * disagree about it. Reads only.
+ *
+ * KEYS: watermark. ARGV: bucketTs, resolutionMs.
+ */
+const LANDING = `${LUA_HELPERS}
+return mh_landing(KEYS[1], ARGV[1], ARGV[2])
 `
 
 /**
@@ -1949,6 +1984,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     readonly first: Op
     readonly metric: string
     readonly bucketTs: number
+    readonly resolutionMs: number
     readonly integer: boolean
     readonly args: (string | number)[]
   }
@@ -1966,7 +2002,9 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
    * `apart` names anything else that keeps an op out of the group before it,
    * given the op that opened that group.
    */
-  function grouped<Op extends { metric: string; bucketTs: number; integer?: boolean }>(
+  function grouped<
+    Op extends { metric: string; bucketTs: number; resolutionMs: number; integer?: boolean },
+  >(
     ops: readonly Op[],
     pair: (op: Op) => [string, number],
     apart: (op: Op, first: Op) => boolean = () => false,
@@ -1978,6 +2016,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         !group ||
         group.metric !== op.metric ||
         group.bucketTs !== op.bucketTs ||
+        group.resolutionMs !== op.resolutionMs ||
         group.integer !== (op.integer === true) ||
         group.args.length >= MAX_PAIRS_PER_SCRIPT * 2 ||
         apart(op, group.first)
@@ -1986,6 +2025,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           first: op,
           metric: op.metric,
           bucketTs: op.bucketTs,
+          resolutionMs: op.resolutionMs,
           integer: op.integer === true,
           args: [],
         }
@@ -2065,6 +2105,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
             args: [
               key.bucketPrefix(group.metric),
               group.bucketTs,
+              group.resolutionMs,
               group.integer ? 1 : 0,
               ...group.args,
             ],
@@ -2088,7 +2129,12 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
             script: MERGE_GAUGE,
             once: true,
             keys: [key.idx(group.metric), key.watermark(group.metric)],
-            args: [key.bucketPrefix(group.metric), group.bucketTs, ...group.args],
+            args: [
+              key.bucketPrefix(group.metric),
+              group.bucketTs,
+              group.resolutionMs,
+              ...group.args,
+            ],
           })),
           'observe',
         )
@@ -2121,7 +2167,9 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
             args: [
               key.bucketPrefix(group.metric),
               group.bucketTs,
-              ...(group.first.mode === 'hold' ? [] : [group.first.mode, group.integer ? 1 : 0]),
+              ...(group.first.mode === 'hold'
+                ? []
+                : [group.resolutionMs, group.first.mode, group.integer ? 1 : 0]),
               ...group.args,
             ],
           })),
@@ -2337,7 +2385,15 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       return Number(count ?? 0)
     },
 
-    async claim(metric: string, upToBucketTs: number): Promise<BucketClaim> {
+    async landing(metric: string, bucketTs: number, resolutionMs: number): Promise<number> {
+      const reply = await runScript(
+        { script: LANDING, keys: [key.watermark(metric)], args: [bucketTs, resolutionMs] },
+        'landing',
+      )
+      return Number(reply)
+    },
+
+    async claim(metric: string, upToBucketTs: number, aheadFrom?: number): Promise<BucketClaim> {
       // refused before the script, which would store it as the watermark: a
       // watermark of NaN compares false against every window, and no late
       // write would move forward past a claimed one again
@@ -2357,7 +2413,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           {
             script: CLAIM_BUCKETS,
             keys: [key.idx(metric), key.inflight(id), key.claims(metric), key.watermark(metric)],
-            args: [upToBucketTs, id, key.bucketPrefix(metric)],
+            args: [upToBucketTs, id, key.bucketPrefix(metric), aheadFrom ?? ''],
           },
           'claim',
         ),
