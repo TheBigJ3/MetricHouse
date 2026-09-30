@@ -284,6 +284,43 @@ forward to the watermark is `@7 `. Lua's `tonumber` and JavaScript's `Number`
 both skip the space, so 0.7.0 reads all three as `7`, and a claim moves the
 mark along with the number.
 
+### How the watermark is stored
+
+A metric's [watermark](/guide/buckets-and-time#a-write-that-misses-its-window)
+is kept in two keys. `mh:wm:<metric>` is the one 0.7.0 reads: every claim
+raises it to the boundary it claimed up to, so it always sits on the metric's
+grid. The hash `mh:wmown:<metric>` holds, in its `watermark` field, the
+watermark this version lands late writes by, next to the value `mh:wm` had
+when a claim of this version last wrote it:
+
+```
+watermark   1789000240001|1789000270000
+```
+
+The first part is lower than the second when the newest window that held data
+is older than the boundary claimed. Here the claim went up to `1789000270000`,
+and the newest window with data was `1789000240000`, so the watermark this
+version uses is one past it. A late write aimed at `1789000250000`, which was
+empty when the claim ran, keeps its own window on this version, while 0.7.0
+moves it to `1789000270000`. The first part is empty until a claim of this
+version finds data.
+
+The windows between the two parts are the gap. A 0.7.0 claim at that same
+boundary leaves `mh:wm` as it was and still takes every window below it,
+including one a write of this version has since started in the gap. So each
+window a write or a carry of this version starts in the gap gets a field of
+its own in the same hash, `1789000250000 1`. A recorded window that is no longer
+live has been claimed, and a write aimed at it moves on to the next window of
+its resolution, as it would past a watermark. A claim of this version removes
+the fields its own watermark has passed, so the hash stays at one field most of
+the time.
+
+A 0.7.0 claim that raises `mh:wm` leaves the second part naming an older value.
+This version then lands writes by the higher of the two watermarks, and there is
+no gap. With no `mh:wmown` key at all, `mh:wm` is the whole watermark, as 0.7.0
+left it, or as a build between 0.7.0 and this one left it between two
+boundaries. The next claim of this version writes both keys.
+
 ### Looking at a running system
 
 The driver exposes two extras beyond the standard contract:
@@ -381,13 +418,34 @@ export const house = createHouse({ driver, schema })
 - **0.7.0 reads the levels this version keeps.** Each series is stored in the
   four fields 0.7.0 reads, and its cells as numbers 0.7.0 reads, as
   [How a level is stored](#how-a-level-is-stored) describes. Processes of both
-  versions on one namespace ship the same rows one process alone would, a
-  failed flush included. A series that a build between 0.7.0 and this one
-  stored with a fifth field is rewritten in four the next time this version
-  writes or carries it, and a cell such a build marked `@c` ships once its
-  window is claimed. Until then 0.7.0 treats that series as absent and ships
-  such a cell as `NaN`, so run this version through one flush before rolling
-  back to 0.7.0.
+  versions on one namespace share every series and every window, a failed
+  flush included. Each process applies the level rules of its own version to
+  what it writes and carries, so each window ships by the rules of the version
+  that wrote or carried it. The two differ in two places. This version stops
+  carrying a series once `holdFor` has passed since the newest write before
+  the window, where 0.7.0 counts from the newest write of all. So when writes
+  pause for longer than `holdFor` and then resume, 0.7.0 carries the windows of
+  the pause and this version skips them. An
+  `add` that arrives late for a window where the series had already expired
+  starts from zero on this version, and from the expired value on 0.7.0.
+- **0.7.0 reads the levels a build between it and this one left, after one
+  flush.** Such a build stored some series with a fifth field and marked some
+  carried cells `@c`, and 0.7.0 treats that series as absent and ships such a
+  cell as `NaN`. A process of this version rewrites every series of a level in
+  four fields each time it reads them, which every flush does, whether or not
+  it carries anything. It rewrites a `@c` cell as `@ ` when one of its claims
+  takes that cell or puts it back. So run this version through one flush of
+  every level before rolling back to 0.7.0.
+- **0.7.0 reads the watermark this version keeps.** `mh:wm:<metric>` stays on
+  the metric's grid, and this version keeps its own watermark beside it, as
+  [How the watermark is stored](#how-the-watermark-is-stored) describes. A
+  late write for a window that was empty when a claim of this version last
+  ran keeps that window on a process of this version, and moves to the
+  boundary that claim reached on 0.7.0, so it ships in the window the version
+  that wrote it chose. A watermark that a build between 0.7.0 and this one
+  stored between two boundaries stays until a claim of this version reaches a
+  boundary past it, and until then 0.7.0 moves a late write into a window no
+  row of the metric can name.
 - Between later versions, follow
   [Changing a schema with data in storage](/guide/production#changing-a-schema-with-data-in-storage)
   for a schema change, and the changelog for anything else.

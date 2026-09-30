@@ -180,6 +180,96 @@ const DEFAULT_MAX_PIPELINE = 1000
 const DEFAULT_RECOVER_AFTER = 300_000
 
 /**
+ * The watermark a write is landed by, from the two keys a claim keeps.
+ *
+ * `mh:wm:<metric>` is the one 0.7.0 reads and raises: the highest window
+ * boundary any claim has been handed, which a 0.7 process moves a late write
+ * onto as it is. This version keeps its own in the hash `mh:wmown:<metric>`,
+ * under `watermark`, as `watermark|mh:wm as it stood`. It is lower while the
+ * newest window that held data is older than the boundary claimed, and empty
+ * until a claim of this version finds data.
+ *
+ * The stretch between the two is the gap: windows that were empty when this
+ * version last claimed, which a write of this version may still start. A 0.7
+ * claim at that same boundary takes such a window without raising `mh:wm`,
+ * so every window a write of this version starts in the gap is recorded as a
+ * field of the same hash. One recorded and no longer live has been claimed,
+ * and a write aimed there moves on, as it would past a watermark. A claim of
+ * this version forgets the fields its own watermark has passed.
+ *
+ * A 0.7 claim that raises `mh:wm` leaves the entry naming an older value,
+ * and then the higher of the two counts and there is no gap. With no entry,
+ * `mh:wm` is the whole of it, as 0.7.0 or a build between it and this one
+ * stored it, on the grid or not.
+ */
+const LUA_WATERMARK = `
+-- this version's watermark or nil, and where the gap ends or nil
+local function mh_watermark(wmKey, ownKey)
+  local wm = redis.call('GET', wmKey)
+  local own = redis.call('HGET', ownKey, 'watermark')
+  if own ~= false then
+    local mine, beside = string.match(own, '^([^|]*)|(.*)$')
+    if mine ~= nil then
+      mine = tonumber(mine)
+      if wm == false then return mine, nil end
+      wm = tonumber(wm)
+      if tonumber(beside) == wm then
+        if mine == nil or mine < wm then return mine, wm end
+        return mine, nil
+      end
+      if mine ~= nil and mine > wm then return mine, nil end
+      return wm, nil
+    end
+  end
+  if wm == false then return nil, nil end
+  return tonumber(wm), nil
+end
+
+-- true for a window in the gap a write of this version started and a claim
+-- has taken since
+local function mh_taken(ownKey, idxKey, window)
+  return redis.call('HEXISTS', ownKey, window) == 1 and redis.call('ZSCORE', idxKey, window) == false
+end
+
+-- the first boundary of a grid of step res at or past floor. fmod, because it
+-- is exact for a whole number of milliseconds where Lua's % divides first
+local function mh_boundary(floor, res)
+  local step = tonumber(res)
+  local past = math.fmod(floor, step)
+  if past == 0 then return string.format('%.0f', floor) end
+  return string.format('%.0f', floor - past + step)
+end
+
+-- the window a write aimed at bucketTs actually lands in, and true when that
+-- window is in the gap and has to be recorded once the write is made. Every
+-- window below the watermark has been claimed already, so a write for one of
+-- them goes to the first window of its own resolution at or past the
+-- watermark instead, the oldest window of that grid that has not shipped
+local function mh_landing(wmKey, ownKey, idxKey, bucketTs, res)
+  local floor, gapEnd = mh_watermark(wmKey, ownKey)
+  local target = bucketTs
+  if floor ~= nil and tonumber(bucketTs) < floor then target = mh_boundary(floor, res) end
+  while gapEnd ~= nil and tonumber(target) < gapEnd do
+    if not mh_taken(ownKey, idxKey, target) then return target, true end
+    target = mh_boundary(tonumber(target) + 1, res)
+  end
+  return target, false
+end
+
+-- true when a claim has taken the window already, and true second when a
+-- cell written there has to be recorded as one started in the gap
+local function mh_claimed(wmKey, ownKey, idxKey, window)
+  local floor, gapEnd = mh_watermark(wmKey, ownKey)
+  if floor ~= nil and tonumber(window) < floor then return true, false end
+  if gapEnd ~= nil and tonumber(window) < gapEnd then
+    if mh_taken(ownKey, idxKey, window) then return true, false end
+    return false, true
+  end
+  return false, false
+end
+`
+
+/**
  * A gauge fold, packed into one hash field as `last|min|max|sum|count`.
  *
  * `%.17g` and not `%.14g`. Lua's default `tostring` is the latter, and a fold
@@ -187,7 +277,7 @@ const DEFAULT_RECOVER_AFTER = 300_000
  * observation. Seventeen significant digits is what an f64 needs to survive
  * the trip unchanged.
  */
-const LUA_HELPERS = `
+const LUA_HELPERS = `${LUA_WATERMARK}
 -- nil when the field is empty, a five-number table for a gauge fold, the
 -- string 'level' for a level cell, and false for a counter's bare scalar
 local function mh_parse(v)
@@ -231,21 +321,6 @@ end
 -- would come back as the text 'inf', which JavaScript reads as NaN
 local function mh_finite(x)
   return x == x and x ~= math.huge and x ~= -math.huge
-end
-
--- the window a write aimed at bucketTs actually lands in. Every window below
--- the watermark has been claimed already, so a write for one of them goes to
--- the first window of its own resolution at or past the watermark instead,
--- the oldest window of that grid that has not shipped. fmod, because it is
--- exact for a whole number of milliseconds where Lua's % divides first
-local function mh_landing(wmKey, bucketTs, res)
-  local wm = redis.call('GET', wmKey)
-  if wm == false or tonumber(bucketTs) >= tonumber(wm) then return bucketTs end
-  local floor = tonumber(wm)
-  local step = tonumber(res)
-  local past = math.fmod(floor, step)
-  if past == 0 then return wm end
-  return string.format('%.0f', floor - past + step)
 end
 
 local MH_RANGE = 'MHRANGE would pass the largest number a metric can store, so the write was refused'
@@ -343,13 +418,13 @@ end
  * does not roll a script back, so a refusal halfway through would otherwise
  * leave half a batch applied.
  *
- * KEYS: bucket index, watermark. ARGV: bucket key prefix, bucketTs,
- * resolutionMs, `1` when every total must stay a whole number a double holds
- * exactly, then dimKey/delta pairs.
+ * KEYS: bucket index, watermark, own watermark. ARGV: bucket key prefix,
+ * bucketTs, resolutionMs, `1` when every total must stay a whole number a
+ * double holds exactly, then dimKey/delta pairs.
  */
 const INCREMENT = `${LUA_HELPERS}${LUA_ONCE}
 if mh_seen() then return 0 end
-local target = mh_landing(KEYS[2], ARGV[2], ARGV[3])
+local target, gap = mh_landing(KEYS[2], KEYS[3], KEYS[1], ARGV[2], ARGV[3])
 local key = ARGV[1] .. target
 local integer = ARGV[4] == '1'
 local totals = {}
@@ -381,6 +456,7 @@ for _, field in ipairs(order) do
   redis.call('HSET', key, field, mh_num(totals[field]))
 end
 redis.call('ZADD', KEYS[1], target, target)
+if gap then redis.call('HSET', KEYS[3], target, 1) end
 mh_mark()
 return 1
 `
@@ -393,12 +469,12 @@ return 1
  * from the client would lose observations. Checked in full before anything
  * is written, as {@link INCREMENT} is.
  *
- * KEYS: bucket index, watermark. ARGV: bucket key prefix, bucketTs,
- * resolutionMs, then dimKey/value pairs.
+ * KEYS: bucket index, watermark, own watermark. ARGV: bucket key prefix,
+ * bucketTs, resolutionMs, then dimKey/value pairs.
  */
 const MERGE_GAUGE = `${LUA_HELPERS}${LUA_ONCE}
 if mh_seen() then return 0 end
-local target = mh_landing(KEYS[2], ARGV[2], ARGV[3])
+local target, gap = mh_landing(KEYS[2], KEYS[3], KEYS[1], ARGV[2], ARGV[3])
 local key = ARGV[1] .. target
 local folds = {}
 local order = {}
@@ -434,6 +510,7 @@ for _, field in ipairs(order) do
   redis.call('HSET', key, field, mh_pack(f[1], f[2], f[3], f[4], f[5]))
 end
 redis.call('ZADD', KEYS[1], target, target)
+if gap then redis.call('HSET', KEYS[3], target, 1) end
 mh_mark()
 return 1
 `
@@ -548,14 +625,14 @@ end
  * those between a pointer and it, are read once for the call rather than
  * once per op. A write only ever adds the window it lands in.
  *
- * KEYS: bucket index, watermark, level hash, carriedFrom hash. ARGV: bucket
- * key prefix, bucketTs, resolutionMs, mode, `1` when every level must stay a
- * whole number a double holds exactly, the level's holdFor or an empty
- * string, then dimKey/value pairs.
+ * KEYS: bucket index, watermark, level hash, carriedFrom hash, own watermark.
+ * ARGV: bucket key prefix, bucketTs, resolutionMs, mode, `1` when every level
+ * must stay a whole number a double holds exactly, the level's holdFor or an
+ * empty string, then dimKey/value pairs.
  */
 const SET_LEVEL = `${LUA_HELPERS}${LUA_LEVEL_STATE}${LUA_ONCE}
 if mh_seen() then return 0 end
-local target = mh_landing(KEYS[2], ARGV[2], ARGV[3])
+local target, gap = mh_landing(KEYS[2], KEYS[5], KEYS[1], ARGV[2], ARGV[3])
 local bucketTs = tonumber(target)
 local moved = bucketTs ~= tonumber(ARGV[2])
 local prefix = ARGV[1]
@@ -771,6 +848,10 @@ for _, c in ipairs(cellOrder) do
   local mark = cellMark[c[3]]
   redis.call('HSET', prefix .. c[1], c[2], mh_pack_level(cellValue[c[3]], mark == 1, mark == 2))
   redis.call('ZADD', KEYS[1], c[1], c[1])
+  if gap and c[1] == target then
+    redis.call('HSET', KEYS[5], target, 1)
+    gap = false
+  end
 end
 for _, field in ipairs(stateOrder) do
   mh_write_state(KEYS[3], KEYS[4], field, statePlan[field])
@@ -807,14 +888,13 @@ return 1
  * rather than once per series. A flush holds every series from the same
  * pointer, and there are nearly always none.
  *
- * KEYS: bucket index, watermark, level hash, carriedFrom hash. ARGV: bucket
- * key prefix, bucketTs, then dimKey/value pairs.
+ * KEYS: bucket index, watermark, level hash, carriedFrom hash, own watermark.
+ * ARGV: bucket key prefix, bucketTs, then dimKey/value pairs.
  */
 const HOLD_LEVEL = `${LUA_HELPERS}${LUA_LEVEL_STATE}
 local bucketTs = tonumber(ARGV[2])
 local key = ARGV[1] .. ARGV[2]
-local wm = redis.call('GET', KEYS[2])
-local claimed = wm ~= false and bucketTs < tonumber(wm)
+local claimed, gap = mh_claimed(KEYS[2], KEYS[5], KEYS[1], ARGV[2])
 local written = 0
 
 -- the level cell one window holds for a series and its mark, or nil when it
@@ -906,8 +986,36 @@ for i = 3, #ARGV, 2 do
   end
 end
 
-if written > 0 then redis.call('ZADD', KEYS[1], ARGV[2], ARGV[2]) end
+if written > 0 then
+  redis.call('ZADD', KEYS[1], ARGV[2], ARGV[2])
+  if gap then redis.call('HSET', KEYS[5], ARGV[2], 1) end
+end
 return written
+`
+
+/**
+ * Rewrite level series a build between 0.7.0 and this one stored with
+ * `carriedFrom` as a fifth field into the four fields 0.7.0 reads, with the
+ * entry beside them when the four cannot say it.
+ *
+ * A series is rewritten only while it still holds the text the caller read,
+ * so one a 0.7 process wrote since is left as that process stored it.
+ *
+ * KEYS: level hash, carriedFrom hash. ARGV: dimKey and stored text pairs.
+ */
+const REWRITE_LEVELS = `${LUA_LEVEL_STATE}
+for i = 1, #ARGV, 2 do
+  local field = ARGV[i]
+  if redis.call('HGET', KEYS[1], field) == ARGV[i + 1] then
+    local state = mh_read_state(KEYS[1], field)
+    if state ~= nil then
+      -- an entry beside it can only be left over from before, and goes
+      state[6] = true
+      mh_write_state(KEYS[1], KEYS[2], field, state)
+    end
+  end
+end
+return 1
 `
 
 /**
@@ -945,16 +1053,24 @@ return dropped
  * claims ZSET even when it carries nothing, because an empty claim is still a
  * claim that has to be settled exactly once.
  *
- * Raises the stored watermark in the same step, so no write can land below it
- * between the move and the raise. It rises no higher than one past the newest
- * live window, unless the claim took a window past that bound. The memory
- * driver's claim says why.
+ * Raises both watermarks in the same step, so no write can land below them
+ * between the move and the raise. The one 0.7.0 reads rises to the watermark
+ * handed in, as a 0.7 claim raises it, so it stays on the metric's grid and
+ * a 0.7 process moves a late write onto a window a row can name. This
+ * version's own rises no higher than one past the newest live window, unless
+ * the claim took a window past that bound, and a claim that finds no live
+ * window leaves it where it was. The memory driver's claim says why. See
+ * `mh_watermark` for how the two are stored.
  *
- * KEYS: index, in-flight hash, claims, watermark. ARGV: watermark, claimId,
- * bucket key prefix, aheadFrom or an empty string. Returns Redis's time and
- * the claimed cells.
+ * A level cell a build between 0.7.0 and this one marked carried with a `c`
+ * moves as `@ ` and its number, the mark 0.7.0 reads past, so a 0.7 process
+ * that recovers the claim ships the number.
+ *
+ * KEYS: index, in-flight hash, claims, watermark, own watermark. ARGV:
+ * watermark, claimId, bucket key prefix, aheadFrom or an empty string.
+ * Returns Redis's time and the claimed cells.
  */
-const CLAIM_BUCKETS = `${LUA_NOW}
+const CLAIM_BUCKETS = `${LUA_NOW}${LUA_WATERMARK}
 local claimedAt = mh_now()
 local upTo = tonumber(ARGV[1])
 local newest = redis.call('ZREVRANGE', KEYS[1], 0, 0)
@@ -967,12 +1083,28 @@ if ARGV[4] ~= '' then
   end
 end
 
+local own = mh_watermark(KEYS[4], KEYS[5])
 if #newest > 0 then
   local raised = math.min(upTo, tonumber(newest[1]) + 1)
   if #ids > 0 then raised = math.max(raised, tonumber(ids[#ids]) + 1) end
-  local wm = redis.call('GET', KEYS[4])
-  if wm == false or raised > tonumber(wm) then
-    redis.call('SET', KEYS[4], string.format('%.0f', raised))
+  if own == nil or raised > own then own = raised end
+end
+local wm = redis.call('GET', KEYS[4])
+if wm == false or upTo > tonumber(wm) then
+  wm = string.format('%.0f', upTo)
+  redis.call('SET', KEYS[4], wm)
+end
+local ownText = ''
+if own ~= nil then ownText = string.format('%.0f', own) end
+redis.call('HSET', KEYS[5], 'watermark', ownText .. '|' .. wm)
+-- the windows recorded in the gap that the gap no longer holds
+if redis.call('HLEN', KEYS[5]) > 1 then
+  local gapEnd = tonumber(wm)
+  for _, field in ipairs(redis.call('HKEYS', KEYS[5])) do
+    local at = tonumber(field)
+    if at ~= nil and ((own ~= nil and at < own) or at >= gapEnd) then
+      redis.call('HDEL', KEYS[5], field)
+    end
   end
 end
 
@@ -981,8 +1113,11 @@ for i = 1, #ids do
   local data = redis.call('HGETALL', ARGV[3] .. bucketTs)
   local flat = {}
   for j = 1, #data, 2 do
+    local v = data[j + 1]
+    -- '@c', a 64 and a 99
+    if string.byte(v, 2) == 99 and string.byte(v, 1) == 64 then v = '@ ' .. string.sub(v, 3) end
     flat[#flat + 1] = bucketTs .. ':' .. data[j]
-    flat[#flat + 1] = data[j + 1]
+    flat[#flat + 1] = v
   end
   -- chunked: unpack() past a few thousand arguments overflows the Lua stack
   for j = 1, #flat, 1000 do
@@ -1050,6 +1185,12 @@ local function mh_restore_buckets(inflight, prefix, idx)
     if seen[bucketTs] == nil then
       seen[bucketTs] = true
       buckets = buckets + 1
+    end
+
+    -- a level cell a build between 0.7.0 and this one marked '@c' goes back
+    -- with the mark 0.7.0 reads past, as a claim moves it
+    if string.byte(held, 2) == 99 and string.byte(held, 1) == 64 then
+      held = '@ ' .. string.sub(held, 3)
     end
 
     local cur = redis.call('HGET', key, field)
@@ -1561,10 +1702,10 @@ return out
  * `mh_landing` every write script calls, so a read and a write cannot
  * disagree about it. Reads only.
  *
- * KEYS: watermark. ARGV: bucketTs, resolutionMs.
+ * KEYS: watermark, own watermark, bucket index. ARGV: bucketTs, resolutionMs.
  */
 const LANDING = `${LUA_HELPERS}
-return mh_landing(KEYS[1], ARGV[1], ARGV[2])
+return mh_landing(KEYS[1], KEYS[2], KEYS[3], ARGV[1], ARGV[2])
 `
 
 /**
@@ -1761,7 +1902,15 @@ function levelSeriesFrom(
   packed: string,
   beside: string | undefined,
 ): LevelSeries | undefined {
-  const parts = packed.split('|')
+  return levelSeriesOf(dimKey, packed.split('|'), beside)
+}
+
+/** {@link levelSeriesFrom}, from the field already split at each `|`. */
+function levelSeriesOf(
+  dimKey: string,
+  parts: readonly string[],
+  beside: string | undefined,
+): LevelSeries | undefined {
   if (parts.length !== 4 && parts.length !== 5) return undefined
   const writtenAt = Number(parts[2])
   const heldThrough = Number(parts[3])
@@ -1925,6 +2074,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     inflight: (claimId: string) => `${ns}:inflight:${claimId}`,
     claims: (metric: string) => `${ns}:claims:${metric}`,
     watermark: (metric: string) => `${ns}:wm:${metric}`,
+    ownWatermark: (metric: string) => `${ns}:wmown:${metric}`,
     turn: (metric: string) => `${ns}:turn:${metric}`,
     turnToken: (metric: string) => `${ns}:turntok:${metric}`,
   }
@@ -2585,7 +2735,11 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           groups.map((group) => ({
             script: INCREMENT,
             once: true,
-            keys: [key.idx(group.metric), key.watermark(group.metric)],
+            keys: [
+              key.idx(group.metric),
+              key.watermark(group.metric),
+              key.ownWatermark(group.metric),
+            ],
             args: [
               key.bucketPrefix(group.metric),
               group.bucketTs,
@@ -2612,7 +2766,11 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           groups.map((group) => ({
             script: MERGE_GAUGE,
             once: true,
-            keys: [key.idx(group.metric), key.watermark(group.metric)],
+            keys: [
+              key.idx(group.metric),
+              key.watermark(group.metric),
+              key.ownWatermark(group.metric),
+            ],
             args: [
               key.bucketPrefix(group.metric),
               group.bucketTs,
@@ -2653,6 +2811,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
               key.watermark(group.metric),
               key.levels(group.metric),
               key.levelsFrom(group.metric),
+              key.ownWatermark(group.metric),
             ],
             args: [
               key.bucketPrefix(group.metric),
@@ -2682,9 +2841,25 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       )
 
       const series: LevelSeries[] = []
+      // series a build between 0.7.0 and this one stored in five fields,
+      // which 0.7.0 reads as absent. Every flush reads the series, so the
+      // first flush after an upgrade leaves every one in four
+      const fiveFields: string[] = []
       for (const [dimKey, packed] of Object.entries(flat)) {
-        const one = levelSeriesFrom(dimKey, packed, beside[dimKey])
+        const parts = packed.split('|')
+        const one = levelSeriesOf(dimKey, parts, beside[dimKey])
         if (one !== undefined) series.push(one)
+        if (parts.length === 5) fiveFields.push(dimKey, packed)
+      }
+      if (fiveFields.length > 0) {
+        await runScripts(
+          chunks(fiveFields, 2 * MAX_PAIRS_PER_SCRIPT).map((some) => ({
+            script: REWRITE_LEVELS,
+            keys: [key.levels(metric), key.levelsFrom(metric)],
+            args: some,
+          })),
+          'readLevels',
+        )
       }
 
       return series.sort((a, b) => (a.dimKey < b.dimKey ? -1 : 1))
@@ -2889,7 +3064,11 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
     async landing(metric: string, bucketTs: number, resolutionMs: number): Promise<number> {
       const reply = await runScript(
-        { script: LANDING, keys: [key.watermark(metric)], args: [bucketTs, resolutionMs] },
+        {
+          script: LANDING,
+          keys: [key.watermark(metric), key.ownWatermark(metric), key.idx(metric)],
+          args: [bucketTs, resolutionMs],
+        },
         'landing',
       )
       return Number(reply)
@@ -2914,7 +3093,13 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         await runScript(
           {
             script: CLAIM_BUCKETS,
-            keys: [key.idx(metric), key.inflight(id), key.claims(metric), key.watermark(metric)],
+            keys: [
+              key.idx(metric),
+              key.inflight(id),
+              key.claims(metric),
+              key.watermark(metric),
+              key.ownWatermark(metric),
+            ],
             args: [upToBucketTs, id, key.bucketPrefix(metric), aheadFrom ?? ''],
           },
           'claim',

@@ -633,6 +633,16 @@ may keep its own window. Without that limit, one claim on a clock two days
 ahead would move every write of the next two days into a single window that no
 claim could take until the clock caught up.
 
+The Redis driver keeps this watermark in the hash `mh:wmown:<metric>`, beside
+the one 0.7.0 reads in `mh:wm:<metric>`. A claim raises `mh:wm` to
+`upToBucketTs` in the same script, as a 0.7.0 claim does, so it always names a
+window boundary. 0.7.0 moves a late write onto that value as it is, and a value
+between two boundaries would give it a window no row can name. The hash also
+records the windows this version's writes start between the two watermarks,
+so a write moves past one that a 0.7.0 claim has taken since.
+[How the watermark is stored](/guide/drivers#how-the-watermark-is-stored) has
+the layout.
+
 ### claimRecords
 
 ```ts
