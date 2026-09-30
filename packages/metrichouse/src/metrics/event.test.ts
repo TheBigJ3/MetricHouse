@@ -2060,6 +2060,30 @@ describe('records staged under an earlier declaration', () => {
     expect(errors).toHaveLength(1)
   })
 
+  it('reports past 10,000 unreadable records once, and not again on the next read', async () => {
+    await stagedBefore(
+      { n: str() },
+      Array.from({ length: 10_001 }, () => ({ n: 'abc' })),
+    )
+    const errors: string[] = []
+    const views = event('views', { fields: { n: int() }, write: discard })
+    createHouse({
+      driver,
+      schema: [views],
+      now,
+      onError: (error) => errors.push((error as Error).message),
+    })
+
+    await views.peek()
+    expect(errors).toHaveLength(10_001)
+    expect(errors.at(-1)).toBe(
+      'views: more than 10,000 staged records do not fit the fields as declared now. Each ' +
+        'ships as stored, and no more are reported until some of them have shipped',
+    )
+    await views.peek()
+    expect(errors).toHaveLength(10_001)
+  })
+
   it('ships text stored under str() as JSON text once the field is json()', async () => {
     await stagedBefore({ note: str() }, [{ note: 'hello' }])
     const views = event('views', { fields: { note: json() }, write: discard })
@@ -2106,7 +2130,7 @@ describe('a locally staged event and the driver', () => {
     })
   }
 
-  it('ships the local buffer when the driver fails, and reports the failure once', async () => {
+  it('ships the local buffer when the driver fails, and returns the failure as recoveryError', async () => {
     const down = () => Promise.reject(new Error('redis down'))
     const { driver: failing } = watched(driver, { countPending: down, recover: down })
     const sent: string[][] = []
@@ -2122,13 +2146,46 @@ describe('a locally staged event and the driver', () => {
 
     const report = await house.flush({ force: true })
     expect(report.ok).toBe(true)
-    expect(report.metrics.views).toEqual({ buckets: 0, rows: 1, skipped: false })
-    expect(sent).toEqual([['/1']])
-    expect(await views.pending()).toBe(0)
-    expect(errors.map((error) => (error as Error).message)).toEqual([
+    const { recoveryError, ...rest } = report.metrics.views ?? {}
+    expect(rest).toEqual({ buckets: 0, rows: 1, skipped: false })
+    expect((recoveryError as Error).message).toBe(
       "views: could not ask the driver for records an earlier stage: 'driver' declaration " +
         'left there, so this process looks again in 30000ms. redis down',
-    ])
+    )
+    expect(sent).toEqual([['/1']])
+    expect(await views.pending()).toBe(0)
+    // the caller holds the report, so onError is not told as well
+    expect(errors).toEqual([])
+  })
+
+  it('hands a failed driver check on a scheduled flush to onError once', async () => {
+    vi.useFakeTimers()
+    try {
+      const down = () => Promise.reject(new Error('redis down'))
+      const { driver: failing } = watched(driver, { countPending: down, recover: down })
+      const sent: string[][] = []
+      const errors: unknown[] = []
+      const views = localViews(sent)
+      const house = createHouse({
+        driver: failing,
+        schema: [views],
+        now,
+        onError: (error) => errors.push(error),
+      })
+      views.record({ path: '/1' })
+      house.start()
+      clock += 30_000
+      await vi.advanceTimersByTimeAsync(30_000)
+      await house.stop()
+
+      expect(sent).toEqual([['/1']])
+      expect(errors.map((error) => (error as Error).message)).toEqual([
+        "views: could not ask the driver for records an earlier stage: 'driver' declaration " +
+          'left there, so this process looks again in 30000ms. redis down',
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('does not wait longer than the bound on a driver that never answers', async () => {
@@ -2247,6 +2304,134 @@ describe('a locally staged event and the driver', () => {
     expect(calls).toEqual(['countPending', 'countPending'])
     await house.flush({ force: true })
     expect(sent).toEqual([['/old']])
+  })
+})
+
+describe('an event in a house with no onError', () => {
+  /**
+   * What `work` raised as unhandled rejections. Vitest's own listener would
+   * fail the run, so it steps aside meanwhile. Real timers only: it waits a
+   * real moment for the rejections to surface.
+   */
+  async function raisedDuring(work: () => Promise<void>): Promise<unknown[]> {
+    const theirs = process.listeners('unhandledRejection')
+    process.removeAllListeners('unhandledRejection')
+    const raised: unknown[] = []
+    const mine = (reason: unknown) => raised.push(reason)
+    process.on('unhandledRejection', mine)
+    try {
+      await work()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    } finally {
+      process.off('unhandledRejection', mine)
+      for (const listener of theirs) process.on('unhandledRejection', listener)
+    }
+    return raised
+  }
+
+  const DRIVER_DOWN =
+    "views: could not ask the driver for records an earlier stage: 'driver' declaration left " +
+    'there, so this process looks again in 30000ms. redis down'
+
+  /** `base` with the two calls a locally staged event checks the driver with failing. */
+  function checksFail(base: Driver): Driver {
+    const down = () => Promise.reject(new Error('redis down'))
+    return new Proxy(base, {
+      get(target, key, receiver) {
+        if (key === 'countPending' || key === 'recover') return down
+        return Reflect.get(target, key, receiver)
+      },
+    })
+  }
+
+  function localViews(sent: string[][]): Event<{ path: ReturnType<typeof str> }> {
+    return event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      flush: '30s',
+      write: (rows) => {
+        sent.push(rows.map((row) => row.path))
+      },
+    })
+  }
+
+  it('returns a failed driver check from flush() as recoveryError and raises nothing', async () => {
+    const sent: string[][] = []
+    const views = localViews(sent)
+    const house = createHouse({ driver: checksFail(driver), schema: [views], now })
+    views.record({ path: '/1' })
+
+    let recoveryError: unknown
+    const raised = await raisedDuring(async () => {
+      recoveryError = (await house.flush({ force: true })).metrics.views?.recoveryError
+    })
+
+    expect(raised).toEqual([])
+    expect((recoveryError as Error).message).toBe(DRIVER_DOWN)
+    expect(sent).toEqual([['/1']])
+  })
+
+  it('raises nothing when pending() cannot ask the driver', async () => {
+    const views = localViews([])
+    createHouse({ driver: checksFail(driver), schema: [views], now })
+    views.record({ path: '/1' })
+
+    let pending: number | undefined
+    const raised = await raisedDuring(async () => {
+      pending = await views.pending()
+    })
+
+    expect(raised).toEqual([])
+    expect(pending).toBe(1)
+  })
+
+  it('raises nothing when a scheduled flush cannot ask the driver', async () => {
+    const sent: string[][] = []
+    const views = localViews(sent)
+    const house = createHouse({ driver: checksFail(driver), schema: [views], now })
+    views.record({ path: '/1' })
+
+    const raised = await raisedDuring(async () => {
+      vi.useFakeTimers()
+      try {
+        house.start()
+        clock += 30_000
+        await vi.advanceTimersByTimeAsync(30_000)
+        await house.stop()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    expect(raised).toEqual([])
+    expect(sent).toEqual([['/1']])
+  })
+
+  it('returns a staged record the fields cannot read as stored and raises nothing', async () => {
+    const old = event('views', { fields: { n: str() }, write: discard })
+    createHouse({ driver, schema: [old], now })
+    old.record({ n: 'abc' })
+    await old.drain()
+    const rows: Row[] = []
+    const views = event('views', {
+      fields: { n: int() },
+      write: (batch) => {
+        rows.push(...batch)
+      },
+    })
+    const house = createHouse({ driver, schema: [views], now })
+
+    let peeked: unknown[] = []
+    let report: Awaited<ReturnType<typeof house.flush>> | undefined
+    const raised = await raisedDuring(async () => {
+      peeked = (await views.peek()).map((row) => row.n)
+      report = await house.flush({ force: true })
+    })
+
+    expect(raised).toEqual([])
+    expect(peeked).toEqual(['abc'])
+    expect(report?.ok).toBe(true)
+    expect(rows.map((row) => row.n)).toEqual(['abc'])
   })
 })
 

@@ -147,14 +147,27 @@ that way, and stops once `countPending` answers `0`. From then on a flush and a
 passed and the next one asks again, which finds records a process still on the
 old declaration staged during a rolling deploy. A driver call that fails, or
 takes longer than 5 seconds or the flush interval, whichever is shorter, counts
-as `0` and goes to `onError`, so a Redis that is down never fails, or holds up,
-the flush of records only this process holds, and never keeps `house.stop()`
-from returning. A claim the driver hands over after that wait has given up goes
-straight back to the driver.
+as `0`, so a Redis that is down never fails, or holds up, the flush of records
+only this process holds, and never keeps `house.stop()` from returning. A claim
+the driver hands over after that wait has given up goes straight back to the
+driver.
 
 ```
 page_viewed: could not ask the driver for records an earlier stage: 'driver' declaration left there, so this process looks again in 30000ms. the driver did not answer within 5000ms
 ```
+
+Where that failure goes depends on which call asked:
+
+| The call | With `onError` | Without `onError` |
+| --- | --- | --- |
+| A `flush()` you call, or the final flush `house.stop()` returns, whose recovery pass asks first | returned as the report's `recoveryError` | returned as the report's `recoveryError` |
+| A flush on a [scheduler](/guide/flushing) tick | goes to `onError` | dropped |
+| `pending()`, or a flush whose claim asks after its recovery pass answered | goes to `onError` | dropped |
+
+Nothing that goes unreported here lost a record: the local buffer shipped, and
+the driver is asked again one flush interval later. Raising it as an unhandled
+rejection instead would end a Node process that set no `onError`, over a
+check the event already copes with.
 
 [`peek()`](#event-peek) and [`snapshot()`](#event-snapshot) read the local
 buffer only.
@@ -804,8 +817,17 @@ changes it, and the question never comes up.
 `peek()` and `snapshot()` return such a record as stored too. A process reports
 each record at most once, however many times a flush, `peek()` or `snapshot()`
 reads it, so a dashboard polling `house.snapshot()` does not flood `onError`. It
-remembers the last 10,000 records it reported, and forgets a record once it has
-shipped.
+remembers up to 10,000 reported records per event, and forgets a record once it
+has shipped. The first unreadable record past 10,000 is reported once more, for
+all of them, and no record after it is reported until records it remembers have
+shipped and brought it below 10,000 again:
+
+```
+views: more than 10,000 staged records do not fit the fields as declared now. Each ships as stored, and no more are reported until some of them have shipped
+```
+
+The report is made only when the house has an `onError`. Without one, nothing
+is raised, and the record ships as stored all the same.
 
 ### Table schema
 

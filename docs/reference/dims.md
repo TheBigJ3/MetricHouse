@@ -341,8 +341,22 @@ it, and its row is built from what is stored:
 - A value past the last declared dim has no dim to belong to, so it is left
   off the row.
 
+The row your `write` function receives can therefore break the types the
+metric's row promises, such as a string in a column declared `int()`. A sink
+that inserts into a typed table may reject that batch. The claim then fails and
+is retried like any other sink failure, and since the key is still stored the
+same way, it fails again on every flush and holds up every series shipped with
+it. Change a dim in a way that accepts what is already stored, or let every
+window written under the old declaration ship before the deploy that changes
+it, and the question never comes up.
+
 [`snapshot()`](/reference/snapshot-options) returns the same rows a flush
-ships.
+ships. A snapshot that merges series, with `groupBy` or a `rollup`, tells such
+a series apart from others by its stored key rather than by its values. Its
+values can read the same as those of a series written since, when the value it
+has past the last dim is left off, and it is still a series of its own: a
+[level](/primitives/level) adds the latest value of each, and a
+[gauge](/primitives/gauge) leaves `last` off a window both of them hold.
 
 Each such key is reported to `onError` once per process, however often it is
 flushed or read, so a snapshot polled every second does not repeat it. The
@@ -354,8 +368,18 @@ orders: stored series key "abc" cannot be read under the current dims: dim "coun
 
 A key with more values than dims reports `expected at most 2 segments for
 [route, status], got 3`, and one stored as absent for a dim that is required
-now reports `dim "status" is required now`. The report is made only when the
-house has an `onError`.
+now reports `dim "status" is required now`.
+
+A process remembers 10,000 reported keys per metric. The first unreadable key
+past that is reported once more, for all of them, and no key after it is
+reported by that process:
+
+```
+orders: more than 10,000 stored series keys cannot be read under the current dims. Each ships with the stored text as each unreadable dim's value, and no more are reported
+```
+
+The report is made only when the house has an `onError`. Without one, nothing
+is raised, and the series ships as stored all the same.
 
 A [level](/primitives/level) does not carry or total such a series. It ships
 the windows the series was written in as stored, and stops there. `totals()`
