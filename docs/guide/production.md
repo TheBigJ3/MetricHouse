@@ -229,16 +229,28 @@ cannot disagree with the new declaration.
 still hold the old declaration and share a Redis with processes on the new one.
 Each process does what its own declaration says, so:
 
-- **A dim added at the end reaches old processes as a key they cannot read.** A
-  process on the old declaration that flushes a series written by a new one
-  finds one segment more than it declares, and its flush throws
-  `decodeDimKey`. Deploy a dim change as a full stop and restart, not a rolling deploy.
+- **A dim added at the end reaches old processes as a key they cannot decode.**
+  A process on the old declaration that flushes or reads a series written by a
+  new one finds one segment more than it declares. It reports the key to
+  `onError` once and ships the series as stored, with the stored text in place
+  of any dim it cannot read and the extra value left off the row. Its flush
+  carries on and the other series ship as usual. The rows it ships for that
+  series differ from the ones a new process ships for the same window, so
+  deploy a dim change as a full stop and restart to keep them the same.
+- **Adding a `oneOf` member or a `.default()` to an optional dim also reaches
+  processes as keys they cannot decode.** A new process writes a member the old
+  `oneOf` does not list, which an old process cannot decode. A dim that gains a
+  `.default()` is stored as absent by an old process, which a new process
+  cannot decode, because the dim now always has a value. Each process reports
+  such a key to `onError` once and ships the series as stored.
 - **A changed `holdFor` is not in effect until the last old process is gone.**
   A level series keeps carrying for the `holdFor` of whichever process flushes
   it, so during the roll the old value still applies.
-- **A changed dim type now fails loudly.** A stored key that the new type cannot
-  decode makes the metric's flush or read throw. It is not read back as a wrong
-  value.
+- **A changed dim type reports the stored keys it cannot decode.** A stored key
+  that the new type cannot decode is reported to `onError` once and ships as
+  stored, with its text in place of the dim's value. The flush and every other
+  series are unaffected. See
+  [Keys the declaration cannot read](/reference/dims#keys-the-declaration-cannot-read).
 
 **A metric name is the key everything is stored under.**
 

@@ -250,10 +250,10 @@ missing throws at `end()`, where it is the last chance to supply one.
 
 ```ts
 httpLatency.start({ rout: '/checkout' })
-// Error: unknown dim "rout". The declared dims are [route, status]
+// Error: http_latency: unknown dim "rout". The declared dims are [route, status]
 
 httpLatency.start({}).end({})
-// Error: missing required dim "route"
+// Error: http_latency: missing required dim "route"
 ```
 
 ## The series key
@@ -292,9 +292,11 @@ groups across the change sees two populations.
 
 Treat a reorder the way you would treat a column rename in a database. Adding a
 dim at the end leaves the rows already stored readable by a process on the new
-declaration, and they carry no value for it. It is not safe during a rolling
-deploy: a process still on the old declaration throws `decodeDimKey` when it
-flushes a series written with the extra dim. Read
+declaration, and they carry no value for it. During a rolling deploy, a
+process still on the old declaration finds keys with an extra value that it
+cannot decode. It reports each to `onError` and ships it as stored, as
+[Keys the declaration cannot read](#keys-the-declaration-cannot-read) describes.
+Read
 [Changing a schema with data in storage](/guide/production#changing-a-schema-with-data-in-storage)
 before deploying it.
 
@@ -313,29 +315,51 @@ to that same empty key, and the two cannot be told apart. That series then
 reads back with the dim set to `''`. With two dims or more, or one dim of any
 other type, it reads back with every dim left off.
 
-Removing a dim leaves stored keys holding more values than the declaration
-names. A flush or a snapshot of that metric throws until those windows are
-deleted from the driver. A level keeps adding such windows while it carries
-the series, which lasts until its [`holdFor`](/primitives/level#holdfor) runs
-out, or until the series is deleted when it has no `holdFor`:
+### Keys the declaration cannot read
+
+A stored key outlives the declaration that wrote it. The current declaration
+cannot decode a key when:
+
+- a dim was removed, so the key holds more values than the declaration names
+- a dim changed type, such as a `str()` turned into an `int()` that holds
+  `"abc"`
+- a `oneOf` member was removed, so a stored value is no longer one of the
+  members
+- a dim that is now required or has a default was stored as absent
+
+A number or a timestamp is decoded only from the text MetricHouse writes for
+it. `7` reads back as 7, and `007`, `+7`, `0x7`, `7.0` and `1e1` do not.
+
+Such a key never stops a flush or a snapshot. The series ships in the same
+batch as every other series of the metric, under the id its key already gave
+it, and its row is built from what is stored:
+
+- A dim the declaration can read comes back as its declared type.
+- A dim it cannot read holds the stored text of that value, with its escapes
+  undone. A dim declared as `int()` then holds a string in that row.
+- A dim stored as absent is left off the row.
+- A value past the last declared dim has no dim to belong to, so it is left
+  off the row.
+
+[`snapshot()`](/reference/snapshot-options) returns the same rows a flush
+ships.
+
+Each such key is reported to `onError` once per process, however often it is
+flushed or read, so a snapshot polled every second does not repeat it. The
+error names the metric, the dim, the stored text and the reason:
 
 ```
-decodeDimKey: expected at most 2 segments for [route, status], got 3
+orders: stored series key "abc" cannot be read under the current dims: dim "count" is declared as int(), but the stored value "abc" is not a safe integer. The stored series was written under an earlier declaration. It ships with the stored text as each unreadable dim's value
 ```
 
-Changing the type of a dim, or removing a `oneOf` member, leaves stored keys
-the new declaration cannot read. A key is read back with the current type, so
-a `str()` turned into an `int()` that holds `"abc"`, or a stored value that is
-no longer one of the members, throws when a row is built for it, naming the
-dim. So does a key with no value for a dim that is now required or has a
-default:
+A key with more values than dims reports `expected at most 2 segments for
+[route, status], got 3`, and one stored as absent for a dim that is required
+now reports `dim "status" is required now`. The report is made only when the
+house has an `onError`.
 
-```
-decodeDimKey: dim "count" is declared as int(), but the stored value "abc" is not a safe integer. The stored series was written under an earlier declaration
-```
-
-A [level](/primitives/level) stops carrying and totalling such a series, and
-the windows it wrote stay stored until they are deleted from the driver.
+A [level](/primitives/level) does not carry or total such a series. It ships
+the windows the series was written in as stored, and stops there. `totals()`
+leaves it out. The windows stay stored until they are deleted from the driver.
 
 ### Every combination is a running total
 
@@ -478,11 +502,11 @@ half finished state behind.
 | `a dim cannot be named "__proto__"` | JavaScript treats that key as an object's prototype, so no row could carry it. At declaration |
 | `a dim cannot be named "2024"` | A name that reads as a whole number, which JavaScript moves ahead of every other key. At declaration |
 | `a dim cannot be named "bucket_open"` | A name every snapshot row already uses, and the same for `bucket_elapsed_ms`. At declaration |
-| `missing required dim "status"` | A declared dim with no value and no default |
-| `unknown dim "pakr". The declared dims are [route, status]` | A key that is not declared |
-| `route: expected a string, got 42` | A value of the wrong type |
-| `status: "200" is not one of ["2xx", "3xx", "4xx", "5xx"]` | A value outside a `oneOf` set |
-| `occurredAt: expected a valid Date, got "2026-09-17"` | A `ts()` dim given something that is not a `Date` |
+| `http_requests: missing required dim "status"` | A declared dim with no value and no default |
+| `http_requests: unknown dim "pakr". The declared dims are [route, status]` | A key that is not declared |
+| `http_requests: route: expected a string, got 42` | A value of the wrong type |
+| `http_requests: status: "200" is not one of ["2xx", "3xx", "4xx", "5xx"]` | A value outside a `oneOf` set |
+| `http_requests: occurredAt: expected a valid Date, got "2026-09-17"` | A `ts()` dim given something that is not a `Date` |
 | `http_requests: dims names "pakr", which is not a declared dim` | A snapshot filter or `groupBy` naming an undeclared dim |
 | `dim value "a\ud800" holds half of a surrogate pair` | A string cut in the middle of an emoji, which storage kept as UTF-8 could not tell apart from another |
 | `memory driver: http_requests exceeded maxSeries (100000)` | A dim with unbounded values, on `memory()` |

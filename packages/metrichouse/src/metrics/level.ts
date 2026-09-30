@@ -30,17 +30,17 @@ import {
   type SnapshotOptions,
   snapshotRange,
 } from '../runtime/live.js'
-import {
-  assertDimsLegal,
-  dimKeyDecoder,
-  dimKeyEncoder,
-  isDecodableDimKey,
-  isShorterDimKey,
-} from '../schema/dims.js'
+import { assertDimsLegal, dimKeyCurrent, dimKeyEncoder } from '../schema/dims.js'
 import type { FieldType, InferRow, InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketRange, bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
-import { bucketedBinding, bucketedLifecycle, claimWatermark, seriesKey } from './bucketed.js'
+import {
+  bucketedBinding,
+  bucketedLifecycle,
+  claimWatermark,
+  seriesKey,
+  storedKeyReader,
+} from './bucketed.js'
 import type {
   AnyMetric,
   ClaimOptions,
@@ -268,7 +268,9 @@ export function level<D extends Shape = Record<never, never>>(
   // built once, here: every write encodes a key and every row a flush or a
   // snapshot builds decodes one, against a declaration that never changes
   const encodeKey = dimKeyEncoder(dims, name)
-  const decodeKey = dimKeyDecoder(dims)
+  const decodeKey = storedKeyReader(dims, name, slot)
+  // built once: `carries` asks it of every series on every read and flush
+  const isCurrentKey = dimKeyCurrent(dims)
 
   function keyFor(values: InferShape<D> | undefined): string {
     return encodeKey((values ?? {}) as Record<string, unknown>)
@@ -425,11 +427,13 @@ export function level<D extends Shape = Record<never, never>>(
    * again. Carrying it would ship it in every later window beside the series
    * that replaced it, and add it into every total, for as long as it is held.
    * So it ships the windows it was written in and nothing after them. Its
-   * stored data is left alone. The flush, a snapshot, `current()` and
-   * `totals()` all ask this one function, so they agree about it.
+   * stored data is left alone. A series whose key the dims cannot read any
+   * more is held back the same way, and reported to `onError` once if one of
+   * its windows is shipped. The flush, a snapshot, `current()` and `totals()`
+   * all ask this one function, so they agree about it.
    */
   function carries(one: LevelSeries): boolean {
-    return !isShorterDimKey(dims, one.dimKey) && isDecodableDimKey(dims, one.dimKey)
+    return isCurrentKey(one.dimKey)
   }
 
   /**

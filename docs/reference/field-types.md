@@ -263,15 +263,24 @@ requests.rowShape()
 
 ## Error messages
 
-Every failure names the offending key, so you do not have to guess.
+Every failure names the offending key, so you do not have to guess. A dim of a
+metric starts with the metric name:
 
 ```
-route: expected a string, got 42
+http_requests: route: expected a string, got 42
+http_requests: status: "200" is not one of ["2xx", "3xx", "4xx", "5xx"]
+http_requests: missing required dim "status"
+http_requests: unknown dim "pakr". The declared dims are [route, status]
+http_requests: occurredAt: expected a valid Date, got "2026-09-17"
+```
+
+A field of an event or a log carries no metric name in front of it:
+
+```
 amountCents: expected a safe integer, got 49.99
-status: "200" is not one of ["2xx", "3xx", "4xx", "5xx"]
-missing required dim "status"
-unknown dim "pakr". The declared dims are [route, status]
-occurredAt: expected a valid Date, got "2026-09-17"
+status: "c" is not one of ["a", "b"]
+missing required field "route"
+unknown field "pakr". The declared fields are [amountCents, status, route]
 ```
 
 ## Declaration order matters

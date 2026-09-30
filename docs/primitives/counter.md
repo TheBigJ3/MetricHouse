@@ -271,8 +271,8 @@ jobsProcessed.add(5)
 | `the first argument must be a number or a plain dims object, got a Date` | A `Date`, an array or a boxed `Number` where a delta goes, which TypeScript also allows there |
 | `declares an integer counter, so 1.5 is not a legal delta` | A fraction without `value: float()` |
 | `9007199254740992 is past 9007199254740991` | A whole delta too large for a double to hold exactly, on an integer counter |
-| `missing required dim "status"` | A declared dim with no value and no default |
-| `unknown dim "pakr"` | A key that is not declared |
+| `http_requests: missing required dim "status"` | A declared dim with no value and no default |
+| `http_requests: unknown dim "pakr"` | A key that is not declared |
 
 A failure on the way to storage cannot be thrown at a caller that has already
 returned, so it goes to the house's `onError` handler instead.
