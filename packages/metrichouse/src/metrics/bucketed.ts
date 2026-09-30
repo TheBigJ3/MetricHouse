@@ -15,7 +15,6 @@ import {
   type Claim,
   type Driver,
   isBucketClaim,
-  isEmptyClaim,
   type RecoveryReport,
 } from '../drivers/types.js'
 import { type Attempts, createAttempts } from '../runtime/flush.js'
@@ -66,23 +65,6 @@ export function claimWatermark(
   options: ClaimOptions = {},
 ): number {
   return closedUpTo(resolutionMs, nowMs, options.final ? 0 : graceMs())
-}
-
-/**
- * The window a write made now lands in, which is the one a live read of the
- * open window has to look at.
- *
- * Usually `aimed`, the window the clock is in. After the clock steps back
- * behind the driver's watermark, writes land on the first window past it
- * instead, and reading `aimed` would leave them out of `current()`.
- */
-export async function openWindow(
-  driver: Driver,
-  metric: string,
-  aimed: number,
-  resolutionMs: number,
-): Promise<number> {
-  return driver.landing ? driver.landing(metric, aimed, resolutionMs) : aimed
 }
 
 /**
@@ -157,10 +139,12 @@ export interface BucketedBinding {
    */
   deliver(write: Promise<void>, bucketTs: number, dimKey: string): Promise<void>
   /**
-   * Resolve once every immediate send under way when it was called has
-   * finished, however it ended. Sends started afterwards are not waited for.
+   * Resolve once every immediate send under way when it was called, and aimed
+   * at a window at or before `newest`, has finished, however it ended, or
+   * once one flush interval has passed, whichever comes first. Sends started
+   * afterwards, and sends aimed past `newest`, are not waited for.
    */
-  sendsSoFar(): Promise<void>
+  sendsSoFar(newest: number): Promise<void>
 }
 
 /**
@@ -190,8 +174,11 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
 
   const attempts = createAttempts()
   let binding: MetricBinding | undefined
-  /** Immediate sends that have not finished, each with the write before it. */
-  const sends = new Set<Promise<void>>()
+  /**
+   * Immediate sends that have not finished, each with the write before it,
+   * and the window the write was aimed at.
+   */
+  const sends = new Map<Promise<void>, number>()
 
   function active(): MetricBinding {
     if (!binding) {
@@ -281,12 +268,28 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
           sends.delete(settled)
         },
       )
-      sends.add(settled)
+      sends.set(settled, bucketTs)
       return sent
     },
 
-    async sendsSoFar(): Promise<void> {
-      await Promise.all([...sends])
+    async sendsSoFar(newest: number): Promise<void> {
+      // a send reads the window it aimed at and the ones after it, so one
+      // aimed past the newest claimed window cannot hold a claimed total
+      const reading: Promise<void>[] = []
+      for (const [send, aimed] of sends) if (aimed <= newest) reading.push(send)
+      if (reading.length === 0) return
+
+      // bounded, so a sink that never answers an immediate send holds up one
+      // flush by an interval rather than every flush of the metric for ever
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const bound = new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, flushMs())
+      })
+      try {
+        await Promise.race([Promise.all(reading), bound])
+      } finally {
+        clearTimeout(timer)
+      }
     },
   }
 }
@@ -427,15 +430,16 @@ export interface BucketedOptions {
   readonly totalOf: (rows: readonly Row[]) => number
   /**
    * {@link BucketedBinding.sendsSoFar}, waited for between a claim and its
-   * rows reaching the sink.
+   * rows reaching the sink, with the newest window the claim took.
    *
    * An immediate send reads a running total and then calls the sink. One
    * that read before the claim and is still on its way would otherwise reach
    * the sink after the flush row, under the same id, and a table keeping the
    * newest row would keep its older total. Sends that start after the claim
-   * cannot read the claimed window, so they are not waited for.
+   * cannot read the claimed window, so they are not waited for, and nor are
+   * sends aimed past every window the claim took.
    */
-  readonly sendsSoFar?: () => Promise<void>
+  readonly sendsSoFar?: (newest: number) => Promise<void>
 }
 
 export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
@@ -469,7 +473,11 @@ export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
         claimOptions.final && !storage.capabilities.durable
           ? await storage.claim(name, upTo, bucketStart(nowMs, resolutionMs) + resolutionMs)
           : await storage.claim(name, upTo)
-      if (sendsSoFar !== undefined && !isEmptyClaim(claim)) await sendsSoFar()
+      if (sendsSoFar !== undefined && claim.buckets.length > 0) {
+        let newest = Number.NEGATIVE_INFINITY
+        for (const bucket of claim.buckets) newest = Math.max(newest, bucket.bucketTs)
+        await sendsSoFar(newest)
+      }
       return claim
     },
 

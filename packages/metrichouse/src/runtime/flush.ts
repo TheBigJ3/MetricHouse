@@ -155,16 +155,32 @@ interface FlushState {
    */
   lastFlushMs: number | undefined
   /**
-   * When each flush the cadence has let through, and that has not finished
-   * yet, was let through.
-   *
-   * The cadence counts from the newest of these as well as from
-   * `lastFlushMs`. A flush still inside its sink has not set `lastFlushMs`
-   * yet, and a second flush that looked only at that would ship beside it in
-   * the same interval. One that finishes having shipped nothing leaves this
-   * set and moves nothing, so the flush after it goes ahead.
+   * Which flush set `lastFlushMs`, counted in the order the cadence let them
+   * through. A flush that finishes after one let through later leaves
+   * `lastFlushMs` alone, since the later one shipped more recently.
    */
-  readonly inFlight: Set<{ readonly at: number }>
+  lastFlushSeq: number
+  /** How many flushes the cadence has let through, the last one's number. */
+  admitted: number
+  /**
+   * When each flush the cadence has let through, and that has not finished
+   * yet, was let through, and its number in that order.
+   *
+   * The cadence counts from whichever was let through last, of these and of
+   * the flush that set `lastFlushMs`. A flush still inside its sink has not
+   * set `lastFlushMs` yet, and a second flush that looked only at that would
+   * ship beside it in the same interval. One that finishes having shipped
+   * nothing leaves this set and moves nothing, so the flush after it goes
+   * ahead. Compared by order rather than by time, because a clock that
+   * stepped back makes a newer flush's time the smaller one.
+   */
+  readonly inFlight: Set<Admitted>
+}
+
+/** A flush the cadence let through: its `now`, and its number in that order. */
+interface Admitted {
+  readonly at: number
+  readonly seq: number
 }
 
 /**
@@ -261,7 +277,12 @@ export interface MetricFlushOptions {
 export function metricFlush(
   options: MetricFlushOptions,
 ): Required<Pick<AnyMetric, 'flush' | typeof SETTLE>> {
-  const state: FlushState = { lastFlushMs: undefined, inFlight: new Set() }
+  const state: FlushState = {
+    lastFlushMs: undefined,
+    lastFlushSeq: 0,
+    admitted: 0,
+    inFlight: new Set(),
+  }
   const attempts = options.attempts ?? createAttempts()
   /**
    * Flushes of this metric that have not returned yet, however they were
@@ -340,27 +361,42 @@ export function metricFlush(
 
     // added before the first `await`, so a flush called while this one waits
     // for its turn already sees it
-    const entry = { at: now }
+    const entry = { at: now, seq: ++state.admitted }
     state.inFlight.add(entry)
     try {
-      return await shipWithTurn(metric, now, final, flushMs, gapMs, flushOptions)
+      return await shipWithTurn(metric, entry, final, flushMs, gapMs, flushOptions)
     } finally {
       state.inFlight.delete(entry)
     }
   }
 
-  /** The newest of the last shipment and the flushes still running, if any. */
+  /**
+   * When the flush let through last was let through, of the one that set
+   * `lastFlushMs` and the ones still running, if there is any.
+   */
   function latestShipment(): number | undefined {
     let latest = state.lastFlushMs
-    // insertion order, so the last one seen is the flush let through last
-    for (const running of state.inFlight) latest = running.at
+    let seq = state.lastFlushSeq
+    for (const running of state.inFlight) {
+      if (running.seq > seq) {
+        latest = running.at
+        seq = running.seq
+      }
+    }
     return latest
+  }
+
+  /** Record a flush that shipped, unless one let through after it already has. */
+  function shipped(entry: Admitted): void {
+    if (entry.seq < state.lastFlushSeq) return
+    state.lastFlushMs = entry.at
+    state.lastFlushSeq = entry.seq
   }
 
   /** Step 1's second half, the turn, then steps 2 to 5. */
   async function shipWithTurn(
     metric: AnyMetric,
-    now: number,
+    entry: Admitted,
     final: boolean,
     flushMs: number,
     gapMs: number,
@@ -372,6 +408,7 @@ export function metricFlush(
     //    shipped. `final` waits for it like any flush when storage outlives
     //    this process, since whoever takes the next turn ships what it
     //    leaves, and takes it with no gap when storage does not.
+    const now = entry.at
     const driver = options.sharedDriver?.()
     let turn: { readonly driver: Driver; readonly taken: ShipTurn & { granted: true } } | undefined
     if (driver?.capabilities.shared === true && driver.takeTurn !== undefined) {
@@ -394,7 +431,7 @@ export function metricFlush(
       turn = { driver, taken }
     }
 
-    const { report, wrote } = await ship(metric, now, final)
+    const { report, wrote } = await ship(metric, entry, final)
 
     // a turn that wrote nothing, because nothing was closed or because the
     // sink failed, was not a shipment, for the same reason those leave
@@ -418,9 +455,10 @@ export function metricFlush(
    */
   async function ship(
     metric: AnyMetric,
-    now: number,
+    entry: Admitted,
     final: boolean,
   ): Promise<{ report: MetricFlushReport; wrote: boolean }> {
+    const now = entry.at
     // 2. recover. A batch claimed by a flusher that then died is already
     //    out of the live set, so `claimBatch` cannot reach it however long
     //    it waits. Putting it back first is what lets this flush ship it.
@@ -467,7 +505,7 @@ export function metricFlush(
      * claims before it wrote and every ack that failed after them.
      */
     const failed = (error: unknown, releaseError?: unknown) => {
-      if (written.rows > 0) state.lastFlushMs = now
+      if (written.rows > 0) shipped(entry)
       const report = {
         buckets,
         rows,
@@ -515,7 +553,7 @@ export function metricFlush(
       return { report: { buckets: 0, rows: 0, skipped: false, ...settled }, wrote }
     }
 
-    state.lastFlushMs = now
+    shipped(entry)
 
     return { report: { buckets, rows, skipped: false, ...settled }, wrote }
   }

@@ -1250,12 +1250,18 @@ return { claims, buckets, records, oldest }
  * would otherwise find the one it had just taken in its way and be refused,
  * and the flush would skip while holding a turn nobody gives back.
  *
- * A turn is stored as `at|token`. One stored before turns carried a token is
- * the time alone, and reads as a turn with an empty token.
+ * The turn key holds the time alone, the layout 0.7.0 reads, so a process of
+ * that version on the same namespace can still take and give back turns. The
+ * token sits in a key beside it, written in the same step. A 0.7.0 process
+ * writes the time and leaves that key alone, so its turns read with whatever
+ * token was there before. One taken in the same millisecond as a newer
+ * process's is told apart by time alone, as 0.7.0 did. A turn stored as
+ * `at|token`, the layout of a build between 0.7.0 and this one, is read as
+ * that turn and rewritten into the two keys.
  *
- * KEYS: turn. ARGV: now, gapMs, the new turn's token. Returns `1` or `0` for
- * granted, and the turn recorded before this one, or an empty string when
- * there was none.
+ * KEYS: turn, token. ARGV: now, gapMs, the new turn's token. Returns `1` or
+ * `0` for granted, and the turn recorded before this one as `at|token`, or an
+ * empty string when there was none.
  */
 const TAKE_TURN = `${LUA_ONCE}
 local replayed = mh_seen()
@@ -1266,35 +1272,66 @@ end
 
 local now = tonumber(ARGV[1])
 local gap = tonumber(ARGV[2])
-local last = redis.call('GET', KEYS[1])
+local stored = redis.call('GET', KEYS[1])
+local last = ''
 local granted = 1
-if last then
-  local elapsed = now - tonumber(string.match(last, '^[^|]*'))
+if stored then
+  local at, token = string.match(stored, '^([^|]*)|(.*)$')
+  if at then
+    redis.call('SET', KEYS[1], at)
+    if token == '' then
+      redis.call('DEL', KEYS[2])
+    else
+      redis.call('SET', KEYS[2], token)
+    end
+  else
+    at = stored
+    token = redis.call('GET', KEYS[2]) or ''
+  end
+  last = at .. '|' .. token
+  local elapsed = now - tonumber(at)
   if elapsed < gap and -elapsed < gap then granted = 0 end
 end
-if granted == 1 then redis.call('SET', KEYS[1], ARGV[1] .. '|' .. ARGV[3]) end
+if granted == 1 then
+  redis.call('SET', KEYS[1], ARGV[1])
+  redis.call('SET', KEYS[2], ARGV[3])
+end
 
-last = last or ''
 mh_mark(granted .. ',' .. last)
 return { granted, last }
 `
 
 /**
  * Give back a turn that shipped nothing, while it is still the one recorded.
- * Compared with its token, so a turn taken later in the same millisecond is
- * left alone.
+ * Compared by time and token, so a turn taken later in the same millisecond is
+ * left alone. The recorded turn is read the way {@link TAKE_TURN} reads it, an
+ * `at|token` one included, and whatever is put back is written as the time and
+ * the token key.
  *
- * KEYS: turn. ARGV: the turn being given back, the one to restore or an empty
- * string to clear it, each as `at|token`.
+ * KEYS: turn, token. ARGV: the time and token of the turn being given back,
+ * then the time and token of the one to restore, the time empty to clear it.
  */
 const RETURN_TURN = `${LUA_ONCE}
 if mh_seen() then return 1 end
 
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  if ARGV[2] == '' then
-    redis.call('DEL', KEYS[1])
-  else
-    redis.call('SET', KEYS[1], ARGV[2])
+local stored = redis.call('GET', KEYS[1])
+if stored then
+  local at, token = string.match(stored, '^([^|]*)|(.*)$')
+  if not at then
+    at = stored
+    token = redis.call('GET', KEYS[2]) or ''
+  end
+  if at == ARGV[1] and token == ARGV[2] then
+    if ARGV[3] == '' then
+      redis.call('DEL', KEYS[1], KEYS[2])
+    else
+      redis.call('SET', KEYS[1], ARGV[3])
+      if ARGV[4] == '' then
+        redis.call('DEL', KEYS[2])
+      else
+        redis.call('SET', KEYS[2], ARGV[4])
+      end
+    end
   end
 end
 mh_mark()
@@ -1629,14 +1666,9 @@ function decodeCell(raw: string): Cell {
   }
 }
 
-/** A turn as {@link TAKE_TURN} stores it, `at|token`. */
-function turnText(turn: Turn): string {
-  return `${turn.at}|${turn.token}`
-}
-
 /**
- * A stored turn, or `undefined` for none. One stored before turns carried a
- * token is the time alone, and comes back with an empty token.
+ * The turn {@link TAKE_TURN} answers with, `at|token`, or `undefined` for none.
+ * One 0.7.0 took, which has no token, comes back with an empty one.
  */
 function turnFrom(stored: string): Turn | undefined {
   if (stored === '') return undefined
@@ -1732,6 +1764,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     claims: (metric: string) => `${ns}:claims:${metric}`,
     watermark: (metric: string) => `${ns}:wm:${metric}`,
     turn: (metric: string) => `${ns}:turn:${metric}`,
+    turnToken: (metric: string) => `${ns}:turntok:${metric}`,
   }
 
   /**
@@ -1940,7 +1973,8 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     const tripOf: number[] = []
     const heard: boolean[] = []
 
-    type Results = [error: Error | null, result: unknown][] | null
+    type Entry = [error: Error | null, result: unknown]
+    type Results = Entry[] | null
 
     /** One round trip carrying the calls at `indexes`, issued now. */
     function issue(indexes: readonly number[], resolved: readonly string[], floor: number) {
@@ -2008,26 +2042,61 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     let failure: { error: unknown } | undefined
     try {
       const replies = await send(trips)
-      for (const [t, indexes] of trips.entries()) {
+      const answers: ({ results: Results } | { error: unknown })[] = []
+      for (const reply of replies) {
         try {
-          let results = await (replies[t] as Promise<Results>)
-          const missing = indexes.filter((_, n) => isNoScript(results?.[n]?.[0]))
-          if (results !== null && missing.length > 0) {
-            // only the calls Redis did not recognise go again. The others
-            // ran, and running them twice is the very thing LUA_ONCE guards
-            // against
-            shas.clear()
-            const [again] = await send([missing])
-            const retried = await (again as Promise<Results>)
-            const merged = [...results]
-            missing.forEach((i, n) => {
-              merged[i - (indexes[0] as number)] = retried?.[n] ?? [
-                new Error('ioredis driver: retry was discarded'),
-                null,
-              ]
-            })
-            results = merged
+          answers.push({ results: await reply })
+        } catch (error) {
+          answers.push({ error })
+        }
+      }
+
+      // only the calls Redis did not recognise go again. The others ran, and
+      // running them twice is the very thing LUA_ONCE guards against. Every
+      // round trip's are sent again in one queued step, once all of them are
+      // answered, so a call made after this one cannot land between them
+      const missing: number[] = []
+      trips.forEach((indexes, t) => {
+        const answer = answers[t]
+        if (answer === undefined || !('results' in answer)) return
+        indexes.forEach((i, n) => {
+          if (isNoScript(answer.results?.[n]?.[0])) missing.push(i)
+        })
+      })
+      const retried = new Map<number, Entry>()
+      if (missing.length > 0) {
+        shas.clear()
+        const again: number[][] = []
+        for (let start = 0; start < missing.length; start += maxPipeline) {
+          again.push(missing.slice(start, start + maxPipeline))
+        }
+        const resent = await send(again)
+        for (const [t, indexes] of again.entries()) {
+          let results: Results
+          try {
+            results = await (resent[t] as Promise<Results>)
+          } catch (error) {
+            for (const i of indexes) retried.set(i, [error as Error, null])
+            continue
           }
+          indexes.forEach((i, n) => {
+            retried.set(i, results?.[n] ?? [new Error('ioredis driver: retry was discarded'), null])
+          })
+        }
+      }
+
+      for (const [t, indexes] of trips.entries()) {
+        const answer = answers[t] as { results: Results } | { error: unknown }
+        if (!('results' in answer)) {
+          failure ??= { error: answer.error }
+          continue
+        }
+        let results = answer.results
+        if (results !== null && indexes.some((i) => retried.has(i))) {
+          const first = results
+          results = indexes.map((i, n) => retried.get(i) ?? (first[n] as Entry))
+        }
+        try {
           // one at a time: a spread passes every reply as an argument, and
           // a pipeline of a hundred thousand replies overflows the stack
           for (const reply of unwrap(results, what, indexes[0])) out.push(reply)
@@ -2657,7 +2726,12 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     async takeTurn(metric: string, now: number, gapMs: number): Promise<ShipTurn> {
       const token = uuidv7(Date.now())
       const reply = await runScript(
-        { script: TAKE_TURN, once: true, keys: [key.turn(metric)], args: [now, gapMs, token] },
+        {
+          script: TAKE_TURN,
+          once: true,
+          keys: [key.turn(metric), key.turnToken(metric)],
+          args: [now, gapMs, token],
+        },
         'takeTurn',
       )
       const [granted, last] = reply as [number, string]
@@ -2671,8 +2745,8 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         {
           script: RETURN_TURN,
           once: true,
-          keys: [key.turn(metric)],
-          args: [turnText(turn), previous === undefined ? '' : turnText(previous)],
+          keys: [key.turn(metric), key.turnToken(metric)],
+          args: [turn.at, turn.token, previous?.at ?? '', previous?.token ?? ''],
         },
         'returnTurn',
       )

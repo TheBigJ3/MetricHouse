@@ -133,6 +133,35 @@ async function settle(
   return shipped
 }
 
+/**
+ * Read the window a write aimed at `aimed` lands in now.
+ *
+ * Usually `aimed` itself. Once a flush has claimed it, or after the clock
+ * steps back behind the driver's watermark, a write lands on the first window
+ * past the watermark instead, and reading `aimed` would leave it out of
+ * `current()` and out of an immediate send. `read` is handed the window to
+ * read, `aimed` or the landing one.
+ *
+ * The driver is asked where a write lands and `aimed` is read at the same
+ * time, so on a shared driver the usual answer, `aimed` itself, costs one
+ * round trip rather than two. Only when the answer is another window is that
+ * one read as well.
+ */
+export async function readOpenWindow<T>(
+  driver: Driver,
+  metric: string,
+  aimed: number,
+  resolutionMs: number,
+  read: (bucketTs: number) => Promise<T>,
+): Promise<T> {
+  if (!driver.landing) return read(aimed)
+  const [landed, atAimed] = await Promise.all([
+    driver.landing(metric, aimed, resolutionMs),
+    read(aimed),
+  ])
+  return landed === aimed ? atAimed : read(landed)
+}
+
 /** What {@link shipOpenSeries} needs to turn one live series into a send. */
 export interface OpenSeriesShip {
   readonly metric: string
@@ -175,28 +204,34 @@ export interface OpenSeriesShip {
  * with writes, not with the cardinality of the metric.
  */
 export async function shipOpenSeries(ship: OpenSeriesShip): Promise<void> {
-  let live = await ship.driver.readBuckets({
-    metric: ship.metric,
-    dimKey: ship.dimKey,
-    from: ship.bucketTs,
-    to: ship.bucketTs + ship.resolutionMs,
-  })
-
-  // nothing where the write was aimed: a flush claimed that window before the
-  // write arrived, so the driver moved the write forward to a window that has
-  // not shipped. That is usually the earliest one still live from here on,
-  // but not always: a window a failed flush released sits in front of it. So
-  // every live window from here on is sent, and the landing one is among them
-  if (live.length === 0) {
-    live = await ship.driver.readBuckets({
+  const read = (from: number, to?: number) =>
+    ship.driver.readBuckets({
       metric: ship.metric,
       dimKey: ship.dimKey,
-      from: ship.bucketTs,
+      from,
+      ...(to !== undefined && { to }),
     })
-    // nothing at all: a flush claimed the landing window too, and it ships
-    // the same id with the same fold
-    if (live.length === 0) return
-  }
+
+  // a flush may have claimed the aimed window before the write arrived, so
+  // the driver moved the write forward to the first window past the
+  // watermark. Every live window from the aimed one through that one is
+  // sent: a window a failed flush released can sit in front of the landing
+  // one, the aimed window among them
+  let live = await readOpenWindow(
+    ship.driver,
+    ship.metric,
+    ship.bucketTs,
+    ship.resolutionMs,
+    (newest) => read(ship.bucketTs, newest + ship.resolutionMs),
+  )
+
+  // a driver that cannot say where the write landed: nothing where it was
+  // aimed means it was moved, so every live window from there on is sent
+  if (live.length === 0 && ship.driver.landing === undefined) live = await read(ship.bucketTs)
+
+  // nothing at all: a flush claimed the landing window too, and it ships the
+  // same id with the same fold
+  if (live.length === 0) return
 
   let bucketFrom = Number.POSITIVE_INFINITY
   let newest = Number.NEGATIVE_INFINITY

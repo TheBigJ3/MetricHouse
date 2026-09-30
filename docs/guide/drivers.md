@@ -82,9 +82,11 @@ took it. If a flusher dies holding one, a later flush finds it and merges it bac
 into the live set before claiming, so those rows ship rather than sitting in
 Redis for ever. See [Recovering a crashed flush](/guide/reliability#recovering-a-crashed-flush).
 
-The driver also keeps each metric's turn to ship, in one small key per metric,
-`mh:turn:<metric>`, holding when the turn was taken and a token unique to it. Every instance can run its own flush timers, and each
-metric still ships once per interval for the whole fleet. See
+The driver also keeps each metric's turn to ship, in two small keys per
+metric: `mh:turn:<metric>` holds when the turn was taken, and
+`mh:turntok:<metric>` a token unique to that turn. Every instance can run its
+own flush timers, and each metric still ships about once per interval for the
+whole fleet. See
 [Several processes on one driver](/guide/flushing#several-processes-on-one-driver).
 
 ### Passing a client lazily
@@ -328,6 +330,14 @@ export const house = createHouse({ driver, schema })
   `json()` field holding a string is stored without the marker newer versions
   use, so it ships as the bare string instead of parsed JSON. Flush every event
   and log to the end on 0.4.0 before upgrading.
+- **0.7.0 reads the turn this version keeps.** The turn key holds the time
+  alone, the layout 0.7.0 reads, and the token sits in a key of its own that
+  0.7.0 leaves alone. Processes of both versions on one namespace, in a rolling
+  deploy either way, take and give back each other's turns. A turn key that a
+  build between 0.7.0 and this one left as `at|token` is rewritten into the
+  two keys the first time a process of this version takes or gives back that
+  turn. Until then a 0.7.0 process fails every flush of that metric, so run
+  this version on at least one process before rolling back to 0.7.0.
 - Between later versions, follow
   [Changing a schema with data in storage](/guide/production#changing-a-schema-with-data-in-storage)
   for a schema change, and the changelog for anything else.

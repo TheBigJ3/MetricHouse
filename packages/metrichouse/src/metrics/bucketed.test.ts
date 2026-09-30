@@ -185,6 +185,69 @@ describe('bucketedLifecycle', () => {
     ])
   })
 
+  /**
+   * A one second counter under immediate delivery whose sink never answers
+   * the immediate send numbered `hang`, and what reached the sink.
+   */
+  function hanging(hang: number) {
+    const sent: [string, unknown][] = []
+    const stuck: unknown[] = []
+    let sends = 0
+    const visits = counter('visits', {
+      resolution: '1s',
+      flush: '1s',
+      write: (rows, context) => {
+        if (context.source === 'immediate' && ++sends === hang) {
+          stuck.push(rows[0]?.value)
+          return new Promise(() => {})
+        }
+        for (const row of rows) sent.push([context.source, row.value])
+      },
+    })
+    createHouse({ driver, schema: [visits], delivery: 'immediate', now })
+    return { visits, sent, stuck }
+  }
+
+  it('does not wait for an immediate send aimed past the windows it claimed', async () => {
+    const { visits, sent, stuck } = hanging(2)
+    visits.add()
+    await visits.drain()
+    clock += 3_000
+    // aimed at the open window, and its sink never answers
+    visits.add()
+    await vi.waitFor(() => expect(stuck).toEqual([1]))
+
+    const report = await visits.flush()
+    expect(report).toMatchObject({ rows: 1 })
+    expect(sent).toEqual([
+      ['immediate', 1],
+      ['flush', 1],
+    ])
+  })
+
+  it('stops waiting for a send aimed at a claimed window after one flush interval', async () => {
+    const { visits, sent, stuck } = hanging(1)
+    visits.add()
+    await vi.waitFor(() => expect(stuck).toEqual([1]))
+    clock += 3_000
+
+    vi.useFakeTimers()
+    try {
+      let done = false
+      const flushing = visits.flush().then((report) => {
+        done = true
+        return report
+      })
+      await vi.advanceTimersByTimeAsync(999)
+      expect(done).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(await flushing).toMatchObject({ rows: 1 })
+      expect(sent).toEqual([['flush', 1]])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   /** A one second counter that ships every second, and the values its sink received. */
   function perSecond(on: Driver = driver) {
     const shipped: number[] = []
