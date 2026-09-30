@@ -1458,6 +1458,42 @@ if (!client) {
       await wipe(ns)
     })
 
+    it('reads a level series stored before it carried carriedFrom', async () => {
+      // `value|carried|writtenAt|heldThrough`. The newest write is at or
+      // before the pointer unless it is past it, and then the pointer is the
+      // latest the write carried can be
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.hset(`${ns}:lvl:${M}`, WILLOW, '7|5|3000|1000', 'Rex', '4|4|1000|2000')
+
+      expect(await driver.readLevels(M)).toEqual([
+        {
+          dimKey: 'Rex',
+          value: 4,
+          carried: 4,
+          writtenAt: 1000,
+          heldThrough: 2000,
+          carriedFrom: 1000,
+        },
+        {
+          dimKey: WILLOW,
+          value: 7,
+          carried: 5,
+          writtenAt: 3000,
+          heldThrough: 1000,
+          carriedFrom: 1000,
+        },
+      ])
+
+      // a hold reads it the same way, and stores it in the new form
+      await driver.setLevel([
+        { metric: M, bucketTs: 2000, resolutionMs: 1000, dimKey: WILLOW, value: 5, mode: 'hold' },
+      ])
+      expect(await live.hget(`${ns}:lvl:${M}`, WILLOW)).toBe('7|5|3000|2000|1000')
+
+      await wipe(ns)
+    })
+
     it('reads a record staged before records carried a sequence stamp', async () => {
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns })

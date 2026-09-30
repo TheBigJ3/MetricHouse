@@ -441,6 +441,23 @@ it:
   flush leaves them in storage. The first flush whose clock has passed them
   ships them, from this process after a restart or from any other process.
 
+### A clock that steps backwards
+
+When the watermark is not ahead of it, a server whose clock is corrected
+backwards writes into windows older than the ones it wrote to a moment before.
+For a counter, a gauge or a timer, that only counts the writes after the step in
+an earlier window.
+
+A [level](/primitives/level) is different, because it keeps one current value
+and decides which reading is newest by the window each was written in. A
+`set()` made after the step lands in an earlier window than the one made
+before it, so as far as the level can tell it is the older reading. It fills
+its own window and the empty windows after it, and the reading from before the
+step stays current. `current()` keeps returning that reading, and every flush
+keeps carrying it, until something writes to its window or a later one. With
+the clock only corrected by a second or two, the next write after the clock
+has caught up puts it right.
+
 ## Flush is a minimum, not a schedule
 
 The `flush` setting says how fast a metric is allowed to ship. It does not make

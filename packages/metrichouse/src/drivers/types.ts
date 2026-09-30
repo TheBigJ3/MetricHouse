@@ -69,14 +69,16 @@ export interface GaugeOp {
  *
  * - `set` puts the series at `value`.
  * - `add` moves it by `value`, treating an untouched series as zero.
- * - `hold` writes `value` into `bucketTs` only if that window has no cell
- *   yet, and moves the pointer. This is the one a flush issues for windows
- *   nobody wrote to.
+ * - `hold` fills `bucketTs` only if that window has no cell yet, and moves
+ *   the pointer. This is the one a flush issues for windows nobody wrote to.
  *
- * A hold names its value rather than reading the held one because the window
- * it fills is in the past, and the series may have moved since. Filling the
- * three minutes before a write with the value that write introduced would
- * report a queue that changed earlier than it did.
+ * A hold fills its window with the value in effect just before it, read from
+ * storage when the hold lands rather than from the held value, because the
+ * window it fills is in the past and the series may have moved since. Filling
+ * the three minutes before a write with the value that write introduced would
+ * report a queue that changed earlier than it did. `value` on a hold is what
+ * the flush worked out, and only a window a claim has already taken, whose
+ * cells storage can no longer see, uses it.
  */
 export interface LevelOp {
   readonly metric: string
@@ -88,6 +90,14 @@ export interface LevelOp {
   readonly mode: 'set' | 'add' | 'hold'
   /** The level holds whole numbers, as {@link IncrOp.integer} says of a counter. */
   readonly integer?: boolean
+  /**
+   * The level's `holdFor`, in milliseconds, on a `set` or an `add`.
+   *
+   * A series whose `writtenAt` plus this is below the window the write lands
+   * in has stopped reporting, even if no flush has dropped it yet, and the
+   * write treats it as a series it has never seen: an `add` starts from zero.
+   */
+  readonly holdFor?: number
 }
 
 /**
@@ -110,7 +120,7 @@ export interface LevelSeries {
    */
   readonly carried: number
   /**
-   * The bucket the last `set` or `add` landed in.
+   * The bucket the newest `set` or `add` landed in.
    *
    * A bucket timestamp and not a wall clock reading, so the driver still has
    * no clock of its own: everything it stores about time was handed to it.
@@ -120,11 +130,23 @@ export interface LevelSeries {
   /**
    * The newest bucket this series has been carried through.
    *
-   * Moved only by a `hold`, never by a `set` or an `add`. A series that is
-   * written at noon and again at three is still owed a row for every window
-   * in between, and a pointer that jumped to the later write would skip them.
+   * Moved forward only by a `hold`, never by a `set` or an `add` after it. A
+   * series that is written at noon and again at three is still owed a row
+   * for every window in between, and a pointer that jumped to the later
+   * write would skip them. A write that lands before it, with no cell between
+   * the two, moves it back, so the windows between that write and the one
+   * that began the series are owed a row too.
    */
   readonly heldThrough: number
+  /**
+   * The bucket of the newest `set` or `add` at or before `heldThrough`, the
+   * write `carried` comes from.
+   *
+   * A carry measures a `holdFor` expiry from here until it reaches a newer
+   * write, so a series written again after it expired stops at its old last
+   * window, rather than carrying the old value through the gap.
+   */
+  readonly carriedFrom: number
 }
 
 /**
@@ -179,6 +201,14 @@ export interface GaugeCell {
  */
 export interface LevelCell {
   readonly level: number
+  /**
+   * Written by a `hold` rather than by a `set` or an `add`.
+   *
+   * A written cell is a reading, and a later `set` does not replace it. A
+   * carried cell only repeats the value before it, so a `set` that lands
+   * before it, after the carry, replaces it with the new value.
+   */
+  readonly carried?: true
 }
 
 /**

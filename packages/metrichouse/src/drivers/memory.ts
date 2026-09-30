@@ -59,8 +59,16 @@ function mergeCells(older: Cell, newer: Cell): Cell {
   }
 }
 
+/** One level cell of one series, and whether a `hold` wrote it. */
+interface LevelCellAt {
+  readonly at: number
+  readonly value: number
+  readonly carried: boolean
+}
+
 /**
- * What one level `set` or `add` does to its series and its cells.
+ * What one level `set` or `add` does to its series and its cells, or
+ * `undefined` when it changes nothing.
  *
  * The rule a shared driver has to follow as well, written once here in plain
  * code; the Redis driver's Lua mirrors it line for line.
@@ -70,55 +78,101 @@ function mergeCells(older: Cell, newer: Cell): Cell {
  *   held value, and `carried` when the pointer is at or past the landing
  *   window. That is what keeps an `inc` and a `dec` from two processes right
  *   whichever order they arrive in.
- * - `set` is a reading. It becomes the landing cell. It becomes the held value
- *   and `carried` only if nothing newer has been written: a later window that
- *   already has a cell was written after this reading was taken.
+ * - `set` is a reading. It becomes the landing cell, and every carried cell
+ *   after it up to the next written one, because those only repeated the
+ *   value before it. It becomes the held value and `carried` only if nothing
+ *   newer has been written: a later window with a written cell was written
+ *   after this reading was taken. A `set` moved forward to the watermark
+ *   that finds a written cell there is older than that cell, and changes
+ *   nothing.
+ * - A series past `holdFor` is treated as one never seen, so an `add` starts
+ *   from zero. Its pointer and `carried` stay, because the windows it owed
+ *   before it expired are still owed.
+ * - A write landing before the pointer, with no cell between the two, moves
+ *   the pointer back to it. Only the write that began the series can have
+ *   put the pointer there, so an `add` starts from zero. An `add` landing
+ *   before the pointer in an empty window between cells starts from zero
+ *   too: the flush skipped that window because the series had expired there.
  */
 function planLevelWrite(
   op: LevelOp,
   bucketTs: number,
   held: LevelSeries | undefined,
-  landingCell: number | undefined,
-  later: readonly number[],
-  valueBefore: () => number,
-  cellAt: (bucketTs: number) => number,
-): { cells: [number, number][]; series: LevelSeries } {
+  landingCell: LevelCellAt | undefined,
+  later: readonly LevelCellAt[],
+  valueBefore: (held: LevelSeries) => number,
+): { cells: LevelCellAt[]; series: LevelSeries } | undefined {
+  if (
+    op.mode === 'set' &&
+    bucketTs !== op.bucketTs &&
+    landingCell !== undefined &&
+    !landingCell.carried
+  ) {
+    return undefined
+  }
+
   const pointer = held?.heldThrough ?? bucketTs
-  const writtenAt = Math.max(held?.writtenAt ?? bucketTs, bucketTs)
+  const expired =
+    held !== undefined && op.holdFor !== undefined && held.writtenAt + op.holdFor < bucketTs
+  const back =
+    held !== undefined &&
+    bucketTs < pointer &&
+    landingCell === undefined &&
+    !later.some((cell) => cell.at < pointer)
+  const where = {
+    dimKey: op.dimKey,
+    writtenAt: Math.max(held?.writtenAt ?? bucketTs, bucketTs),
+    heldThrough: back ? bucketTs : pointer,
+    carriedFrom:
+      held === undefined || back
+        ? bucketTs
+        : bucketTs <= pointer
+          ? Math.max(held.carriedFrom, bucketTs)
+          : held.carriedFrom,
+  }
 
   if (op.mode === 'add') {
-    const base = landingCell ?? (held === undefined ? 0 : valueBefore())
-    const cells: [number, number][] = [[bucketTs, base + op.value]]
-    for (const at of later) cells.push([at, cellAt(at) + op.value])
-    const value = (held?.value ?? 0) + op.value
+    const base =
+      landingCell?.value ??
+      (held === undefined || expired || bucketTs < pointer ? 0 : valueBefore(held))
+    const cells: LevelCellAt[] = [{ at: bucketTs, value: base + op.value, carried: false }]
+    for (const cell of later) cells.push({ ...cell, value: cell.value + op.value })
+    const value = (held === undefined || expired ? 0 : held.value) + op.value
     return {
       cells,
       series: {
-        dimKey: op.dimKey,
+        ...where,
         value,
         carried:
-          held === undefined ? value : bucketTs <= pointer ? held.carried + op.value : held.carried,
-        writtenAt,
-        heldThrough: pointer,
+          held === undefined
+            ? value
+            : back
+              ? base + op.value
+              : bucketTs <= pointer
+                ? held.carried + op.value
+                : held.carried,
       },
     }
   }
 
-  const superseded = later.length > 0
-  const newerAtPointer = later.some((at) => at <= pointer)
+  const written = later.find((cell) => !cell.carried)
+  const cells: LevelCellAt[] = [{ at: bucketTs, value: op.value, carried: false }]
+  for (const cell of later) {
+    if (cell.carried && (written === undefined || cell.at < written.at)) {
+      cells.push({ ...cell, value: op.value })
+    }
+  }
   return {
-    cells: [[bucketTs, op.value]],
+    cells,
     series: {
-      dimKey: op.dimKey,
-      value: held !== undefined && superseded ? held.value : op.value,
+      ...where,
+      value: held !== undefined && written !== undefined ? held.value : op.value,
       carried:
-        held === undefined
+        held === undefined ||
+        back ||
+        (bucketTs <= pointer && (written === undefined || written.at > pointer))
           ? op.value
-          : bucketTs <= pointer && !newerAtPointer
-            ? op.value
-            : held.carried,
-      writtenAt,
-      heldThrough: pointer,
+          : held.carried,
     },
   }
 }
@@ -460,16 +514,32 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
   }
 
   /**
-   * metric -> the newest window a live bucket has ever been created for.
+   * metric -> its live bucket timestamps, ascending, once a level op has
+   * asked for them.
    *
-   * Only ever raised, so it is at or past every live bucket, and a level
-   * write landing at or past it knows no later window exists without looking
-   * at each one. Every place that puts a bucket into {@link live} goes through
-   * {@link addBucket} to keep that true.
+   * What lets a level op find one series' cells between two windows without
+   * looking at every window the metric holds. A flush sends a hold per
+   * window, and each looks between the pointer and its own window, which is
+   * nearly always empty. Built on first use and kept in step by
+   * {@link addBucket}, through which every new live bucket goes. A claim, which
+   * takes many buckets at once, and an undone level write drop it instead, to
+   * be built again when next asked for.
    */
-  const newestBucket = new Map<string, number>()
+  const bucketOrder = new Map<string, number[]>()
 
-  /** Put a bucket into a metric's live set, and remember how new it is. */
+  /** Where `bucketTs` goes in `sorted`: the index of the first entry above it. */
+  function firstAbove(sorted: readonly number[], bucketTs: number): number {
+    let lo = 0
+    let hi = sorted.length
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1
+      if ((sorted[mid] as number) <= bucketTs) lo = mid + 1
+      else hi = mid
+    }
+    return lo
+  }
+
+  /** Put a bucket into a metric's live set, and into its order. */
   function addBucket(
     metric: string,
     byBucket: Map<number, Map<string, Cell>>,
@@ -477,8 +547,47 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     bucket: Map<string, Cell>,
   ): void {
     byBucket.set(bucketTs, bucket)
-    const newest = newestBucket.get(metric)
-    if (newest === undefined || bucketTs > newest) newestBucket.set(metric, bucketTs)
+    const order = bucketOrder.get(metric)
+    if (order) order.splice(firstAbove(order, bucketTs), 0, bucketTs)
+  }
+
+  /**
+   * One series' level cell in one window, or `undefined` when it has none.
+   *
+   * @throws if the window holds a cell of another kind for that series
+   */
+  function levelCellAt(metric: string, at: number, dimKey: string): LevelCellAt | undefined {
+    const cell = live.get(metric)?.get(at)?.get(dimKey)
+    if (cell === undefined) return undefined
+    if (!isLevelCell(cell)) {
+      throw new Error(
+        `memory driver: ${metric} holds ${isGaugeCell(cell) ? 'gauge' : 'counter'} ` +
+          'cells, and set is a level op',
+      )
+    }
+    return { at, value: cell.level, carried: cell.carried === true }
+  }
+
+  /** One series' level cells strictly between `after` and `before`, ascending. */
+  function levelCellsBetween(
+    metric: string,
+    dimKey: string,
+    after: number,
+    before: number,
+  ): LevelCellAt[] {
+    let order = bucketOrder.get(metric)
+    if (!order) {
+      order = [...bucketsFor(metric).keys()].sort((a, b) => a - b)
+      bucketOrder.set(metric, order)
+    }
+    const found: LevelCellAt[] = []
+    for (let i = firstAbove(order, after); i < order.length; i++) {
+      const at = order[i] as number
+      if (at >= before) break
+      const cell = levelCellAt(metric, at, dimKey)
+      if (cell) found.push(cell)
+    }
+    return found
   }
 
   /** Get or create the bucket a write lands in, capping series on a new key. */
@@ -508,12 +617,16 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     at: number,
     dimKey: string,
     level: number,
+    carried: boolean,
     undo: (() => void)[],
   ): void {
     const byBucket = bucketsFor(metric)
     const hadBucket = byBucket.has(at)
     const previous = byBucket.get(at)?.get(dimKey)
-    cellSlot(metric, at, dimKey).set(dimKey, { level: plainZero(level) })
+    cellSlot(metric, at, dimKey).set(
+      dimKey,
+      carried ? { level: plainZero(level), carried: true } : { level: plainZero(level) },
+    )
     undo.push(() => {
       const bucket = byBucket.get(at)
       if (!bucket) return
@@ -523,7 +636,10 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       }
       bucket.delete(dimKey)
       removeHolder(metric, dimKey)
-      if (!hadBucket && bucket.size === 0) byBucket.delete(at)
+      if (!hadBucket && bucket.size === 0) {
+        byBucket.delete(at)
+        bucketOrder.delete(metric)
+      }
     })
   }
 
@@ -603,98 +719,114 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       // a series storage has never seen has nothing to carry, and a hold
       // must not be what brings one into existence
       if (!held) return
-
-      // the value the window ends at: the one carried into it, or the one a
-      // write already put there
-      let carried = plainZero(op.value)
+      const pointer = held.heldThrough
 
       // a window some claim has already taken is not filled again: that
-      // would ship it a second time. The pointer still moves past it
+      // would ship it a second time. The pointer still moves past it, and
+      // `carried` takes the value the flush worked out, because the cells
+      // that would say otherwise went with the claim. So did any write among
+      // them, and the newest one at or before this window is taken to be as
+      // late as it can be, so an expiry is never measured from too early
       const claimed = landing(op.metric, op.bucketTs, op.resolutionMs) !== op.bucketTs
-      if (!claimed) {
-        const written = bucketsFor(op.metric).get(op.bucketTs)?.get(op.dimKey)
-        // a written value always beats a carried one, so a window that
-        // already has a cell keeps it, and so does `carried`. The hold's
-        // value was read before that write landed
-        if (written === undefined) putLevelCell(op.metric, op.bucketTs, op.dimKey, carried, undo)
-        else if (isLevelCell(written)) carried = written.level
+      if (claimed) {
+        // a hold for the pointer's own window arriving again once a claim
+        // has taken it leaves `carried` alone: the cell that would say what
+        // the window ended at is gone, and `carried` already holds it
+        if (op.bucketTs > pointer) {
+          putLevelSeries(
+            series,
+            {
+              ...held,
+              carried: plainZero(op.value),
+              heldThrough: op.bucketTs,
+              carriedFrom: Math.max(held.carriedFrom, Math.min(held.writtenAt, op.bucketTs)),
+            },
+            undo,
+          )
+        }
+        return
       }
 
-      // `carried` belongs to the pointer's window. A hold for an older
-      // window, from a flusher whose clock runs behind, arrives after the
-      // pointer has passed it and must not drag `carried` back with it. Nor
-      // may a hold for the pointer's own window that arrives again once a
-      // claim has taken it: the cell that would say what it ended at is gone,
-      // and `carried` already holds that value
-      if (op.bucketTs > held.heldThrough || (op.bucketTs === held.heldThrough && !claimed)) {
-        putLevelSeries(series, { ...held, carried, heldThrough: op.bucketTs }, undo)
+      const cell = levelCellAt(op.metric, op.bucketTs, op.dimKey)
+
+      // `carried` belongs to the pointer's window. A hold for an older one,
+      // from a flusher whose clock runs behind, arrives after the pointer has
+      // passed it, fills it if it is empty, and moves nothing
+      if (op.bucketTs < pointer) {
+        if (cell === undefined) {
+          putLevelCell(op.metric, op.bucketTs, op.dimKey, op.value, true, undo)
+        }
+        return
       }
+
+      // the value in effect just before this window: the newest cell between
+      // the pointer and it, or what the pointer carried. Read now rather
+      // than taken from the op, because a write can land between the flush
+      // reading the series and this hold arriving
+      const between =
+        op.bucketTs > pointer ? levelCellsBetween(op.metric, op.dimKey, pointer, op.bucketTs) : []
+      const newestWrite = between.findLast((one) => !one.carried)
+
+      // a written value always beats a carried one, so a window that already
+      // has a cell keeps it, and `carried` takes it
+      let carried: number
+      if (cell === undefined) {
+        carried = plainZero(between.at(-1)?.value ?? held.carried)
+        putLevelCell(op.metric, op.bucketTs, op.dimKey, carried, true, undo)
+      } else {
+        carried = cell.value
+      }
+
+      putLevelSeries(
+        series,
+        {
+          ...held,
+          carried,
+          heldThrough: op.bucketTs,
+          carriedFrom:
+            cell !== undefined && !cell.carried
+              ? op.bucketTs
+              : (newestWrite?.at ?? held.carriedFrom),
+        },
+        undo,
+      )
       return
     }
 
     if (!held && series.size >= maxSeries) throw seriesLimitError(op.metric)
 
     const bucketTs = landing(op.metric, op.bucketTs, op.resolutionMs)
-    const byBucket = bucketsFor(op.metric)
-    const cellAt = (at: number): number | undefined => {
-      const cell = byBucket.get(at)?.get(op.dimKey)
-      if (cell === undefined) return undefined
-      if (!isLevelCell(cell)) {
-        throw new Error(
-          `memory driver: ${op.metric} holds ${isGaugeCell(cell) ? 'gauge' : 'counter'} ` +
-            'cells, and set is a level op',
-        )
-      }
-      return cell.level
-    }
 
     // windows after this one that already hold a value for the series. Two
     // processes writing across a boundary can land the later window first,
-    // and the rule below keeps both windows right whichever arrives second.
-    // A write at or past the newest bucket, which is nearly every write,
-    // has none, and skips a scan that grows with every unflushed window
-    const newest = newestBucket.get(op.metric)
-    const later =
-      newest === undefined || bucketTs >= newest
-        ? []
-        : [...byBucket.keys()]
-            .filter((at) => at > bucketTs && cellAt(at) !== undefined)
-            .sort((a, b) => a - b)
-
+    // and the rules keep both windows right whichever arrives second
     const plan = planLevelWrite(
       op,
       bucketTs,
       held,
-      cellAt(bucketTs),
-      later,
-      () => {
-        // the value in effect just before this window: the newest cell
-        // between the pointer and here, or what the pointer carried
-        let before: number | undefined
-        let newest = Number.NEGATIVE_INFINITY
-        for (const at of byBucket.keys()) {
-          const level = at < bucketTs && at > (held?.heldThrough ?? -1) ? cellAt(at) : undefined
-          if (level !== undefined && at > newest) {
-            newest = at
-            before = level
-          }
-        }
-        return before ?? held?.carried ?? 0
-      },
-      (at) => cellAt(at) as number,
+      levelCellAt(op.metric, bucketTs, op.dimKey),
+      levelCellsBetween(op.metric, op.dimKey, bucketTs, Number.POSITIVE_INFINITY),
+      // the value in effect just before this window: the newest cell between
+      // the pointer and here, or what the pointer carried
+      (one) =>
+        levelCellsBetween(op.metric, op.dimKey, one.heldThrough, bucketTs).at(-1)?.value ??
+        one.carried,
     )
+    if (plan === undefined) return
 
-    for (const [, level] of plan.cells) assertFinite(level, op.metric, 'level')
+    for (const cell of plan.cells) assertFinite(cell.value, op.metric, 'level')
     assertFinite(plan.series.value, op.metric, 'level')
     if (op.integer) {
-      for (const [, level] of plan.cells) assertSafe(level, op.metric, 'level')
+      for (const cell of plan.cells) assertSafe(cell.value, op.metric, 'level')
       assertSafe(plan.series.value, op.metric, 'level')
     }
 
     // the bucket first, because `cellSlot` is the other thing that can
     // refuse on the cap, and a held value written before it would name a
     // window that holds nothing
-    for (const [at, level] of plan.cells) putLevelCell(op.metric, at, op.dimKey, level, undo)
+    for (const cell of plan.cells) {
+      putLevelCell(op.metric, cell.at, op.dimKey, cell.value, cell.carried, undo)
+    }
     putLevelSeries(
       series,
       {
@@ -921,6 +1053,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           byBucket.delete(bucketTs)
           claimed.push({ bucketTs, values: bucket })
         }
+        if (claimed.length > 0) bucketOrder.delete(metric)
       }
 
       // no higher than one past the newest live window: every window past it

@@ -113,6 +113,25 @@ export function describeDriverContract(name: string, options: DriverContractOpti
     const hold = (bucketTs: number, dimKey: string, value: number) =>
       driver.setLevel([{ metric: L, bucketTs, resolutionMs: 1000, dimKey, value, mode: 'hold' }])
 
+    /** One call holding WILLOW through several windows, as a flush sends it. */
+    const holdAll = (buckets: readonly number[], value: number) =>
+      driver.setLevel(
+        buckets.map((bucketTs) => ({
+          metric: L,
+          bucketTs,
+          resolutionMs: 1000,
+          dimKey: WILLOW,
+          value,
+          mode: 'hold',
+        })),
+      )
+
+    /** An add from a level declared with `holdFor`. */
+    const moveHeld = (bucketTs: number, value: number, holdFor: number) =>
+      driver.setLevel([
+        { metric: L, bucketTs, resolutionMs: 1000, dimKey: WILLOW, value, mode: 'add', holdFor },
+      ])
+
     /** The one cell at a bucket and series, narrowed to a level. */
     const levelAt = async (bucketTs: number, dimKey: string): Promise<number | undefined> => {
       const rows = await driver.readBuckets({ metric: L, dimKey })
@@ -130,6 +149,10 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       if (!driver.landing) throw new Error(`${name} has no landing()`)
       return driver.landing(metric, bucketTs, resolutionMs)
     }
+
+    /** WILLOW's level cell in each of these windows. */
+    const levelsAt = (buckets: readonly number[]) =>
+      Promise.all(buckets.map((bucketTs) => levelAt(bucketTs, WILLOW)))
 
     const rec = (id: string, ts: number, fields: Record<string, unknown> = {}) => ({
       metric: M,
@@ -426,7 +449,14 @@ export function describeDriverContract(name: string, options: DriverContractOpti
 
         expect(await levelAt(1000, WILLOW)).toBe(42)
         expect(await driver.readLevels(L)).toEqual([
-          { dimKey: WILLOW, value: 42, carried: 42, writtenAt: 1000, heldThrough: 1000 },
+          {
+            dimKey: WILLOW,
+            value: 42,
+            carried: 42,
+            writtenAt: 1000,
+            heldThrough: 1000,
+            carriedFrom: 1000,
+          },
         ])
       })
 
@@ -493,8 +523,22 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(await levelAt(3000, REX)).toBe(1)
         expect((await driver.readLevels(L)).sort((a, b) => (a.dimKey < b.dimKey ? -1 : 1))).toEqual(
           [
-            { dimKey: REX, value: 1, carried: 1, writtenAt: 3000, heldThrough: 3000 },
-            { dimKey: WILLOW, value: 7, carried: 5, writtenAt: 2000, heldThrough: 1000 },
+            {
+              dimKey: REX,
+              value: 1,
+              carried: 1,
+              writtenAt: 3000,
+              heldThrough: 3000,
+              carriedFrom: 3000,
+            },
+            {
+              dimKey: WILLOW,
+              value: 7,
+              carried: 5,
+              writtenAt: 2000,
+              heldThrough: 1000,
+              carriedFrom: 1000,
+            },
           ],
         )
       })
@@ -508,6 +552,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       it('ignores a hold for a window older than the pointer', async () => {
         // a flusher whose clock runs behind carries late, after a newer one
         await put(1000, WILLOW, 5)
+        await put(3000, WILLOW, 7)
         await hold(3000, WILLOW, 7)
         await hold(2000, WILLOW, 5)
 
@@ -561,11 +606,11 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(await levelAt(2000, WILLOW)).toBe(42)
       })
 
-      it('carries the value it was given, not the one the series is at', async () => {
-        // the window being filled is in the past, and the series has moved
+      it('fills a window with the value in effect before it, not the one the series is at', async () => {
+        // the window being filled is in the past, and the series has moved since
         await put(1000, WILLOW, 42)
         await put(5000, WILLOW, 7)
-        await hold(2000, WILLOW, 42)
+        await hold(2000, WILLOW, 7)
 
         expect(await levelAt(2000, WILLOW)).toBe(42)
         expect((await driver.readLevels(L))[0]?.value).toBe(7)
@@ -590,7 +635,14 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await hold(2000, WILLOW, 42)
 
         expect(await driver.readLevels(L)).toEqual([
-          { dimKey: WILLOW, value: 7, carried: 7, writtenAt: 2000, heldThrough: 2000 },
+          {
+            dimKey: WILLOW,
+            value: 7,
+            carried: 7,
+            writtenAt: 2000,
+            heldThrough: 2000,
+            carriedFrom: 2000,
+          },
         ])
       })
 
@@ -615,7 +667,14 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await hold(2000, WILLOW, 5)
 
         expect(await driver.readLevels(L)).toEqual([
-          { dimKey: WILLOW, value: 9, carried: 9, writtenAt: 2000, heldThrough: 2000 },
+          {
+            dimKey: WILLOW,
+            value: 9,
+            carried: 9,
+            writtenAt: 2000,
+            heldThrough: 2000,
+            carriedFrom: 2000,
+          },
         ])
       })
 
@@ -649,8 +708,11 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         // more significant digits than Lua prints a number with
         const P = 100_000_000_000_003
         await put(P - 1, WILLOW, 10)
+        // another series in P, so the claim's watermark reaches past it
+        await put(P, REX, 1)
         const claim = await driver.claim(L, P + 1)
-        // below the watermark: no cell, and the pointer moves to P
+        // below the watermark: no cell, and the pointer moves to P carrying
+        // the value the hold names
         await hold(P, WILLOW, 20)
         await driver.release(claim)
         // the cell at P - 1 is live again, before the pointer, so the add
@@ -660,6 +722,135 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(await levelAt(P + 2, WILLOW)).toBe(21)
       })
 
+      it('starts an add from zero once the series has passed holdFor', async () => {
+        // written at 1000 and held for 3000, so its last window was 4000
+        await put(1000, WILLOW, 42)
+        await moveHeld(5000, 1, 3000)
+
+        expect(await levelAt(5000, WILLOW)).toBe(1)
+        expect(await driver.readLevels(L)).toEqual([
+          {
+            dimKey: WILLOW,
+            value: 1,
+            carried: 42,
+            writtenAt: 5000,
+            heldThrough: 1000,
+            carriedFrom: 1000,
+          },
+        ])
+      })
+
+      it('moves the held value by an add landing exactly holdFor after the last write', async () => {
+        await put(1000, WILLOW, 42)
+        await moveHeld(4000, 1, 3000)
+
+        expect(await levelAt(4000, WILLOW)).toBe(43)
+        expect((await driver.readLevels(L))[0]?.value).toBe(43)
+      })
+
+      it('marks a cell a hold wrote as carried', async () => {
+        await put(1000, WILLOW, 5)
+        await hold(2000, WILLOW, 5)
+
+        expect(await driver.readBuckets({ metric: L })).toEqual([
+          { bucketTs: 1000, dimKey: WILLOW, value: { level: 5 } },
+          { bucketTs: 2000, dimKey: WILLOW, value: { level: 5, carried: true } },
+        ])
+      })
+
+      it('holds the value in effect when a set landed after the flush read the series', async () => {
+        // the flush planned every hold at 5, and a set of 9 reached 3000
+        // before its holds did
+        await put(1000, WILLOW, 5)
+        await put(3000, WILLOW, 9)
+        await holdAll([2000, 3000, 4000, 5000], 5)
+
+        expect(await levelsAt([2000, 3000, 4000, 5000])).toEqual([5, 9, 9, 9])
+        expect(await driver.readLevels(L)).toEqual([
+          {
+            dimKey: WILLOW,
+            value: 9,
+            carried: 9,
+            writtenAt: 3000,
+            heldThrough: 5000,
+            carriedFrom: 3000,
+          },
+        ])
+      })
+
+      it('lets a set replace the carried windows after it once the holds have landed', async () => {
+        // the flush held through 4000 and has not claimed yet
+        await put(1000, WILLOW, 5)
+        await holdAll([2000, 3000, 4000], 5)
+        await put(2000, WILLOW, 9)
+
+        expect(await levelsAt([2000, 3000, 4000])).toEqual([9, 9, 9])
+        expect(await driver.readLevels(L)).toEqual([
+          {
+            dimKey: WILLOW,
+            value: 9,
+            carried: 9,
+            writtenAt: 2000,
+            heldThrough: 4000,
+            carriedFrom: 2000,
+          },
+        ])
+      })
+
+      it('stops replacing carried windows at the next written one', async () => {
+        await put(1000, WILLOW, 5)
+        await holdAll([2000, 3000, 4000, 5000], 5)
+        await put(4000, WILLOW, 7)
+        await put(2000, WILLOW, 9)
+
+        expect(await levelsAt([2000, 3000, 4000, 5000])).toEqual([9, 9, 7, 7])
+        expect(await driver.readLevels(L)).toEqual([
+          {
+            dimKey: WILLOW,
+            value: 7,
+            carried: 7,
+            writtenAt: 4000,
+            heldThrough: 5000,
+            carriedFrom: 4000,
+          },
+        ])
+      })
+
+      it('moves the pointer back to a set that lands before a new series began', async () => {
+        // another writer's first write reached storage before this older one
+        await put(3000, WILLOW, 5)
+        await put(1000, WILLOW, 3)
+
+        expect(await levelsAt([1000, 3000])).toEqual([3, 5])
+        expect(await driver.readLevels(L)).toEqual([
+          {
+            dimKey: WILLOW,
+            value: 5,
+            carried: 3,
+            writtenAt: 3000,
+            heldThrough: 1000,
+            carriedFrom: 1000,
+          },
+        ])
+      })
+
+      it('starts an add that lands before a new series began from zero', async () => {
+        await move(2000, WILLOW, 1)
+        await move(1000, WILLOW, 1)
+
+        expect(await levelsAt([1000, 2000])).toEqual([1, 2])
+        expect(await driver.readLevels(L)).toEqual([
+          {
+            dimKey: WILLOW,
+            value: 2,
+            carried: 1,
+            writtenAt: 2000,
+            heldThrough: 1000,
+            carriedFrom: 1000,
+          },
+        ])
+      })
+
       it('holds nothing for a series it has never seen', async () => {
         await hold(1000, WILLOW, 42)
 
@@ -667,7 +858,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(await driver.readLevels(L)).toEqual([])
       })
 
-      it('moves the pointer on a hold and never on a write', async () => {
+      it('moves the pointer forward on a hold and not on a write after it', async () => {
         await put(1000, WILLOW, 42)
         await put(5000, WILLOW, 7)
 
@@ -690,8 +881,22 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await put(1000, REX, 7)
 
         expect(await driver.readLevels(L)).toEqual([
-          { dimKey: REX, value: 7, carried: 7, writtenAt: 1000, heldThrough: 1000 },
-          { dimKey: WILLOW, value: 42, carried: 42, writtenAt: 1000, heldThrough: 1000 },
+          {
+            dimKey: REX,
+            value: 7,
+            carried: 7,
+            writtenAt: 1000,
+            heldThrough: 1000,
+            carriedFrom: 1000,
+          },
+          {
+            dimKey: WILLOW,
+            value: 42,
+            carried: 42,
+            writtenAt: 1000,
+            heldThrough: 1000,
+            carriedFrom: 1000,
+          },
         ])
       })
 
@@ -762,7 +967,14 @@ export function describeDriverContract(name: string, options: DriverContractOpti
 
         expect(await driver.readBuckets({ metric: L })).toEqual([])
         expect(await driver.readLevels(L)).toEqual([
-          { dimKey: WILLOW, value: 42, carried: 42, writtenAt: 1000, heldThrough: 1000 },
+          {
+            dimKey: WILLOW,
+            value: 42,
+            carried: 42,
+            writtenAt: 1000,
+            heldThrough: 1000,
+            carriedFrom: 1000,
+          },
         ])
       })
 
@@ -772,7 +984,14 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         Object.assign(read as object, { value: 9, heldThrough: 9000 })
 
         expect(await driver.readLevels(L)).toEqual([
-          { dimKey: WILLOW, value: 42, carried: 42, writtenAt: 1000, heldThrough: 1000 },
+          {
+            dimKey: WILLOW,
+            value: 42,
+            carried: 42,
+            writtenAt: 1000,
+            heldThrough: 1000,
+            carriedFrom: 1000,
+          },
         ])
       })
     })
@@ -785,7 +1004,14 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await driver.dropLevels(L, [WILLOW])
 
         expect(await driver.readLevels(L)).toEqual([
-          { dimKey: REX, value: 7, carried: 7, writtenAt: 1000, heldThrough: 1000 },
+          {
+            dimKey: REX,
+            value: 7,
+            carried: 7,
+            writtenAt: 1000,
+            heldThrough: 1000,
+            carriedFrom: 1000,
+          },
         ])
       })
 
@@ -867,6 +1093,27 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await put(1000, WILLOW, 8)
         expect(await levelAt(2000, WILLOW)).toBe(8)
         expect((await driver.readLevels(L))[0]).toMatchObject({ value: 8, writtenAt: 2000 })
+      })
+
+      it('drops a set moved to the watermark when a newer reading holds that window', async () => {
+        await put(1000, WILLOW, 5)
+        await put(3000, WILLOW, 9)
+        await driver.ack(await driver.claim(L, 3000))
+        // aimed at 2000, which has shipped, so it lands at 3000, where a
+        // reading taken after it already sits
+        await put(2000, WILLOW, 7)
+
+        expect(await levelAt(3000, WILLOW)).toBe(9)
+        expect(await driver.readLevels(L)).toEqual([
+          {
+            dimKey: WILLOW,
+            value: 9,
+            carried: 5,
+            writtenAt: 3000,
+            heldThrough: 1000,
+            carriedFrom: 1000,
+          },
+        ])
       })
 
       it('lets a hold move the pointer without refilling a claimed window', async () => {
@@ -1088,6 +1335,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
           carried: 7,
           writtenAt: 1000,
           heldThrough: 3000,
+          carriedFrom: 1000,
         })
       })
 
@@ -1109,6 +1357,7 @@ export function describeDriverContract(name: string, options: DriverContractOpti
           carried: 42,
           writtenAt: 1000,
           heldThrough: 1000,
+          carriedFrom: 1000,
         })
       })
 

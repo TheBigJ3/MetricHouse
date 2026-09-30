@@ -74,6 +74,15 @@ import {
  */
 export const MAX_CARRY_BUCKETS = 10_000
 
+/** `Number.MAX_SAFE_INTEGER` as a bigint, the bound an exact integer total is held to. */
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER)
+
+/** A level cell already in storage, and whether a flush carried it there. */
+interface StoredLevel {
+  readonly value: number
+  readonly carried: boolean
+}
+
 /** The row shape a level's `write()` receives. */
 export type LevelRow<D extends Shape> = Simplify<
   { id: string; bucket_ts: Date } & InferRow<D> & { value: number }
@@ -265,8 +274,16 @@ export function level<D extends Shape = Record<never, never>>(
     return encodeKey((values ?? {}) as Record<string, unknown>)
   }
 
-  /** The one write path. `set`, `inc` and `dec` all land here. */
-  function write(mode: 'set' | 'add', amount: number, values: InferShape<D> | undefined): void {
+  /**
+   * The one write path. `set`, `inc` and `dec` all land here, `dec` with
+   * `sign` at -1, so an error names the amount the caller passed.
+   */
+  function write(
+    mode: 'set' | 'add',
+    amount: number,
+    values: InferShape<D> | undefined,
+    sign: 1 | -1 = 1,
+  ): void {
     const active = slot.active()
 
     if (typeof amount !== 'number' || !Number.isFinite(amount)) {
@@ -284,9 +301,12 @@ export function level<D extends Shape = Record<never, never>>(
       bucketTs,
       resolutionMs,
       dimKey,
-      value: amount,
+      value: sign * amount,
       mode,
       ...(!isFloat && { integer: true }),
+      // so a write to a series past its hold, which no flush has dropped
+      // yet, starts it over rather than moving the value it expired with
+      ...(holdForMs !== undefined && { holdFor: holdForMs }),
     }
     writes.track(slot.deliver(active.driver.setLevel([op]), bucketTs, dimKey), () => active.onError)
   }
@@ -343,25 +363,41 @@ export function level<D extends Shape = Record<never, never>>(
       latest.set(key, row.value as number)
     }
 
-    let total = 0
-    for (const value of latest.values()) total += value
-    return { value: exactSum(total, 'a merged value') }
+    return { value: sumAcross(latest.values(), 'a merged value') }
   }
 
   /**
-   * A sum across series, refused for an integer level when a double cannot
-   * hold it exactly. The counter's rule: each series stays below
-   * `Number.MAX_SAFE_INTEGER` on its own, but several added together can pass
-   * it and come back as a different whole number with nothing to say so.
+   * Held values added across series, refused when a number cannot hold the
+   * answer.
+   *
+   * An integer level adds as whole numbers, exactly, and refuses a total past
+   * `Number.MAX_SAFE_INTEGER` on either side. Each series stays inside it on
+   * its own, but a running sum in doubles can pass it partway and come back
+   * as a different whole number that looks safe. A fractional level adds in
+   * doubles, and refuses a total past the largest one, which would otherwise
+   * come back as Infinity.
    */
-  function exactSum(total: number, what: string): number {
-    if (!isFloat && !Number.isSafeInteger(total)) {
+  function sumAcross(values: Iterable<number>, what: string): number {
+    if (isFloat) {
+      let total = 0
+      for (const value of values) total += value
+      if (!Number.isFinite(total)) {
+        throw new Error(
+          `${name}: ${what} would be ${total}, which is past the largest number a metric can store`,
+        )
+      }
+      return total
+    }
+
+    let total = 0n
+    for (const value of values) total += BigInt(value)
+    if (total > MAX_SAFE || total < -MAX_SAFE) {
       throw new Error(
         `${name}: ${what} would be ${total}, which is past ${Number.MAX_SAFE_INTEGER}, the ` +
           'largest whole number a double holds exactly',
       )
     }
-    return total
+    return Number(total)
   }
 
   /**
@@ -449,49 +485,67 @@ export function level<D extends Shape = Record<never, never>>(
    * when there is none, so a series that changed during a long gap resumes
    * at the value it changed to.
    *
+   * With `holdFor`, a window more than `holdFor` after the newest write
+   * before it is skipped, up to the next window something wrote to. That is
+   * a series that expired and was written to again before any flush dropped
+   * it: it reports to its old last window, nothing through the gap, and
+   * starts again at the write. The newest write before the walk begins is
+   * `carriedFrom`.
+   *
    * `written` holds the cells already in storage for this series, by bucket.
    */
   function walkCarry(
     one: LevelSeries,
-    written: ReadonlyMap<number, number> | undefined,
+    written: ReadonlyMap<number, StoredLevel> | undefined,
     until: number,
     capAt: number = until,
   ): { bucketTs: number; value: number; observed: boolean }[] {
     const start = one.heldThrough + resolutionMs
     const from = Math.max(start, capAt - MAX_CARRY_BUCKETS * resolutionMs)
 
-    // the value in effect at `heldThrough`, moved on by anything written in
-    // the windows the cap stepped over
+    // the value in effect at `heldThrough`, and the write it came from, moved
+    // on by anything written in the windows the cap stepped over
     let value = one.carried
+    let lastWrite = one.carriedFrom
     if (written && from > start) {
       let newest = Number.NEGATIVE_INFINITY
-      for (const [bucketTs, observed] of written) {
-        if (bucketTs >= start && bucketTs < from && bucketTs > newest) {
+      for (const [bucketTs, stored] of written) {
+        if (bucketTs < start || bucketTs >= from) continue
+        if (bucketTs > newest) {
           newest = bucketTs
-          value = observed
+          value = stored.value
         }
+        if (!stored.carried && bucketTs > lastWrite) lastWrite = bucketTs
       }
     }
 
     const windows: { bucketTs: number; value: number; observed: boolean }[] = []
     for (const bucketTs of bucketRange(from, until, resolutionMs)) {
-      const observed = written?.get(bucketTs)
-      if (observed !== undefined) value = observed
-      windows.push({ bucketTs, value, observed: observed !== undefined })
+      const stored = written?.get(bucketTs)
+      if (stored !== undefined) {
+        value = stored.value
+        if (!stored.carried) lastWrite = bucketTs
+      } else if (holdForMs !== undefined && lastWrite + holdForMs < bucketTs) {
+        continue
+      }
+      windows.push({ bucketTs, value, observed: stored !== undefined })
     }
     return windows
   }
 
   /** Level cells by series, then by bucket. */
   function byDimKey(rows: readonly { bucketTs: number; dimKey: string; value: Cell }[]) {
-    const written = new Map<string, Map<number, number>>()
+    const written = new Map<string, Map<number, StoredLevel>>()
     for (const row of rows) {
       let byBucket = written.get(row.dimKey)
       if (!byBucket) {
         byBucket = new Map()
         written.set(row.dimKey, byBucket)
       }
-      byBucket.set(row.bucketTs, asLevel(row.value))
+      byBucket.set(row.bucketTs, {
+        value: asLevel(row.value),
+        carried: isLevelCell(row.value) && row.value.carried === true,
+      })
     }
     return written
   }
@@ -732,7 +786,7 @@ export function level<D extends Shape = Record<never, never>>(
     dec(first?: number | InferShape<D>, second?: InferShape<D>): void {
       assertDeltaOrDims(name, first)
       const delta = typeof first === 'number' ? first : 1
-      write('add', -delta, (typeof first === 'number' ? second : first) as InferShape<D>)
+      write('add', delta, (typeof first === 'number' ? second : first) as InferShape<D>, -1)
     },
 
     async current(...args: DimsArgs<D>): Promise<number | undefined> {
@@ -742,8 +796,8 @@ export function level<D extends Shape = Record<never, never>>(
     async totals(): Promise<number | undefined> {
       const series = await heldNow()
       if (series.length === 0) return undefined
-      return exactSum(
-        series.reduce((sum, one) => sum + one.value, 0),
+      return sumAcross(
+        series.map((one) => one.value),
         'the total across series',
       )
     },
