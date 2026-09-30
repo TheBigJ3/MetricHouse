@@ -20,7 +20,7 @@ import type {
   RecoveryReport,
   StagedRecord,
 } from '../drivers/types.js'
-import { isRecordClaim, NOTHING_RECOVERED } from '../drivers/types.js'
+import { isRecordClaim } from '../drivers/types.js'
 import { uuidv7 } from '../identity.js'
 import { createAttempts, metricFlush } from '../runtime/flush.js'
 import {
@@ -34,6 +34,7 @@ import {
 import { shipClaim } from '../runtime/ship.js'
 import { applyDimDefaults, assertShapeNames, encodeDimKey, validateDims } from '../schema/dims.js'
 import {
+  assertValue,
   type FieldType,
   type InferRow,
   type InferShape,
@@ -100,6 +101,16 @@ export interface EventBatchConfig {
   readonly maxSize?: number
   /** Ship this long after the first record in a batch. Default `'10s'`. */
   readonly maxAge?: DurationInput
+  /**
+   * The most records this process holds for the event, waiting or being
+   * sent. Default `100_000`, or `maxSize` when that is larger.
+   *
+   * The local answer to `memory({ maxStaged })`: a sink that stays down would
+   * otherwise grow the buffer until the process runs out of memory. A record
+   * past it is refused and reported to `onError`, and the records already
+   * held stay.
+   */
+  readonly maxStaged?: number
 }
 
 /** One counter increment an event fans out to. `value` defaults to `1`. */
@@ -179,9 +190,13 @@ export interface EventConfig<F extends Shape, D extends EventDurability = EventD
   /**
    * Counters this event also writes, keyed by metric name.
    *
-   * **Derive runs before sampling**, always: the counters stay exact and
-   * unbiased while the event table holds a representative slice. That order is
-   * the entire value of the feature and is not configurable.
+   * **Derive counts every record, sampled out or kept**, always: the counters
+   * stay exact and unbiased while the event table holds a representative
+   * slice. That is the entire value of the feature and is not configurable.
+   *
+   * Each function receives its own copy of the record as it was stored, so a
+   * `json()` value reads as JSON gives it back, and one function changing
+   * what it was given changes nothing another one sees.
    *
    * It runs after validation, though. A call that throws, because a field is
    * wrong or `sample` returned something that is not a rate, increments
@@ -273,9 +288,12 @@ export interface Event<
 }
 
 /** One record's worth of `record()`, decided and not yet applied. */
-interface Prepared<F extends Shape> {
-  /** The fields with defaults filled, as `derive` sees them. */
-  readonly values: InferShape<F>
+interface Prepared {
+  /**
+   * The fields as they are stored, which is what `derive` sees. Kept apart
+   * from `record`, because a record sampling dropped is still derived.
+   */
+  readonly stored: Readonly<Record<string, unknown>>
   /** What to stage, or `undefined` when sampling dropped it. */
   readonly record: StagedRecord | undefined
 }
@@ -290,7 +308,25 @@ function describeValue(value: unknown): string {
 }
 
 const DEFAULT_MAX_SIZE = 500
+const DEFAULT_MAX_STAGED = 100_000
 const DEFAULT_FLUSH_MS = 30_000
+
+/**
+ * How many claims one immediate send may make. A claim that comes back full
+ * under `claimLimit` is followed by another, and this stops that chasing
+ * records other processes keep appending.
+ */
+const IMMEDIATE_CLAIM_CAP = 100
+
+/** Is this text JSON, as `record()` stores a `json()` value? */
+function isJsonText(text: string): boolean {
+  try {
+    JSON.parse(text)
+    return true
+  } catch {
+    return false
+  }
+}
 
 /**
  * Declare an event.
@@ -333,7 +369,9 @@ export function stagedMetric<
   const fields = config.fields ?? ({} as F)
   assertShapeNames(fields, name, 'field', RESERVED_EVENT_COLUMNS)
 
-  const stage: EventStage = config.stage ?? 'driver'
+  // `=== undefined` and not `??`, so a null from a config file is refused
+  // rather than read as the default
+  const stage: EventStage = config.stage === undefined ? 'driver' : config.stage
   // checked like `delivery` is, because a value from an environment variable
   // gets past TypeScript, and an unknown one would behave as `'driver'`
   if (stage !== 'driver' && stage !== 'local') {
@@ -367,6 +405,15 @@ export function stagedMetric<
 
   if (!Number.isSafeInteger(maxSize) || maxSize <= 0) {
     throw new Error(`${name}: batch.maxSize must be a positive integer, got ${maxSize}`)
+  }
+  const maxStaged = config.batch?.maxStaged ?? Math.max(DEFAULT_MAX_STAGED, maxSize)
+  if (!Number.isSafeInteger(maxStaged) || maxStaged <= 0) {
+    throw new Error(`${name}: batch.maxStaged must be a positive integer, got ${maxStaged}`)
+  }
+  if (maxStaged < maxSize) {
+    throw new Error(
+      `${name}: batch.maxStaged (${maxStaged}) must be at least batch.maxSize (${maxSize})`,
+    )
   }
   if (config.claimLimit !== undefined) {
     if (!Number.isSafeInteger(config.claimLimit) || config.claimLimit <= 0) {
@@ -428,9 +475,45 @@ export function stagedMetric<
    */
   const stagedOrder = new WeakMap<StagedRecord, number>()
   let stagedCount = 0
+  /** Local staging only: the records in {@link localInFlight}, kept as a count for `maxStaged`. */
+  let localInFlightRecords = 0
 
   /** One failure count for flush, batch and immediate sends alike. */
   const attempts = createAttempts()
+
+  /**
+   * When a send of this event last failed, by the house clock, until a send
+   * with records in it succeeds.
+   *
+   * Read by `record()`, which ships nothing itself while it is recent. Each
+   * send takes every record waiting, so a sink that is down would otherwise
+   * be handed the whole backlog again by every record, and the work would
+   * grow with the square of the backlog.
+   */
+  let failedAt: number | undefined
+
+  /** The house clock, or the wall clock before a house has bound this. */
+  function clockNow(): number {
+    return (binding?.now ?? Date.now)()
+  }
+
+  /**
+   * Has a send failed within the last `waitMs`? A clock that has stepped
+   * back since reads as no longer comparable, and holds nothing back.
+   */
+  function sendingPaused(waitMs: number): boolean {
+    if (failedAt === undefined) return false
+    const elapsed = clockNow() - failedAt
+    return elapsed >= 0 && elapsed < waitMs
+  }
+
+  /**
+   * Is this claim one the local buffer made, rather than one the driver did?
+   * A driver numbers its claims `metric#n`, so the two never share an id.
+   */
+  function isLocalClaim(claim: Claim): boolean {
+    return stage === 'local' && claim.id.startsWith(`${name}#local#`)
+  }
 
   /**
    * The event's own cadence, the house's, or the fallback.
@@ -541,7 +624,8 @@ export function stagedMetric<
    * returning three targets where the third names an unknown dim moves no
    * counter at all, rather than two of them.
    */
-  function runDerive(values: InferShape<F>): void {
+  function runDerive(stored: Readonly<Record<string, unknown>>): Set<Counter<Shape>> {
+    const written = new Set<Counter<Shape>>()
     for (const [target, fn] of Object.entries(derive)) {
       try {
         const metric = activeBinding().resolve?.(target)
@@ -558,12 +642,33 @@ export function stagedMetric<
           )
         }
 
-        const increments = plannedIncrements(target, metric, fn(values))
+        const increments = plannedIncrements(target, metric, fn(deriveView(stored)))
         for (const one of increments) metric.add(one.value, one.dims)
+        if (increments.length > 0) written.add(metric)
       } catch (error) {
         reportDetached(error)
       }
     }
+    return written
+  }
+
+  /**
+   * A fresh copy of the stored fields for one derive function.
+   *
+   * Built from the stored copy rather than the caller's object, so a durable
+   * record, derived only once the driver answers, counts what was stored
+   * even if the caller changed its object in the meantime. Fresh for each
+   * function, so one that changes what it was given cannot change what the
+   * next one sees. A `json()` value is read back from its JSON text.
+   */
+  function deriveView(stored: Readonly<Record<string, unknown>>): InferShape<F> {
+    const view: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(stored)) {
+      if (fields[key]?.kind === 'json') view[key] = JSON.parse(value as string)
+      else if (isDate(value)) view[key] = new Date(value.getTime())
+      else view[key] = value
+    }
+    return view as InferShape<F>
   }
 
   /**
@@ -631,23 +736,23 @@ export function stagedMetric<
    * staging wait until every record in the call has made it through, so a
    * call that throws leaves no trace anywhere.
    */
-  function prepare(values: InferShape<F>, at: Date | number | undefined): Prepared<F> {
+  function prepare(values: InferShape<F>, at: Date | number | undefined): Prepared {
     const checkedValues = checked(values)
     const ts = timestampFor(checkedValues, at)
-    // defaults applied: derive and sample see exactly what the row will carry,
-    // not what the call site happened to omit
+    // defaults applied: sample sees exactly what the row will carry, not what
+    // the call site happened to omit. Derive sees the stored copy made below
     const complete = checkedValues as InferShape<F>
 
     const rate = sampleRate(complete)
     const fieldsToStore = stored(checkedValues)
 
     // `< rate` is exact at both ends: 0 never keeps, 1 always does
-    if (rate < 1 && !(Math.random() < rate)) return { values: complete, record: undefined }
+    if (rate < 1 && !(Math.random() < rate)) return { stored: fieldsToStore, record: undefined }
 
     const ingestedAt = Math.floor((activeBinding().now ?? Date.now)())
 
     return {
-      values: complete,
+      stored: fieldsToStore,
       record: {
         // minted here, not at flush: a released batch keeps its ids, so a retry
         // is the same row rather than a new one
@@ -671,10 +776,10 @@ export function stagedMetric<
    * Derive runs for every prepared record, sampled out or not, which is what
    * keeps the counters exact.
    */
-  function commit(prepared: readonly Prepared<F>[]): void {
+  function commit(prepared: readonly Prepared[]): void {
     const records: StagedRecord[] = []
     for (const one of prepared) {
-      runDerive(one.values)
+      runDerive(one.stored)
       if (one.record) records.push(one.record)
     }
     stageAll(records)
@@ -684,6 +789,20 @@ export function stagedMetric<
     if (records.length === 0) return
 
     if (stage === 'local') {
+      // all or none, as a driver refuses an append past its own cap. Derive
+      // has run by now, as it has for a driver that refuses the append
+      const held = buffer.length + localInFlightRecords
+      if (held + records.length > maxStaged) {
+        const more = records.length === 1 ? '1 more record' : `${records.length} more records`
+        reportDetached(
+          new Error(
+            `${name}: staging ${more} would pass batch.maxStaged (${maxStaged}), with ${held} ` +
+              'already held in this process. Locally staged records only leave when a send ' +
+              'succeeds, so this is a backlog that nothing is shipping',
+          ),
+        )
+        return
+      }
       for (const record of records) {
         stagedCount += 1
         stagedOrder.set(record, stagedCount)
@@ -694,13 +813,12 @@ export function stagedMetric<
 
       // immediate delivery is `maxSize: 1` without saying so. The batch
       // settings still describe the shape of a send, they just stop being what
-      // decides when one happens
-      if (isImmediate()) {
-        shipLocal('immediate')
-        return
-      }
-      if (buffer.length >= maxSize) {
-        shipLocal('batch')
+      // decides when one happens. Within `maxAge` of a failed send neither
+      // ships from here, and the records wait for the age clock, `flush()` or
+      // `drain()`
+      const due = isImmediate() || buffer.length >= maxSize
+      if (due && !sendingPaused(maxAgeMs)) {
+        shipLocal(isImmediate() ? 'immediate' : 'batch')
         return
       }
       armBatchTimer()
@@ -713,7 +831,7 @@ export function stagedMetric<
     // `stage` says *where* a record waits; delivery says *when* it leaves. A
     // driver-staged event under immediate delivery still round-trips through
     // the driver. It just does not wait for a flush to claim it back.
-    track(isImmediate() ? append.then(shipStaged) : append)
+    track(isImmediate() ? append.then(shipStagedUnlessPaused) : append)
   }
 
   /**
@@ -727,7 +845,7 @@ export function stagedMetric<
    * does. Derive runs once the driver has answered and not before, so a
    * caller who retries a write the driver refused does not count it twice.
    */
-  function recordDurably(build: () => Prepared<F>[]): Promise<void> {
+  function recordDurably(build: () => Prepared[]): Promise<void> {
     // drain() waits on this rather than on the promise the caller gets. A
     // handler attached to that one would mark it handled, and a caller who
     // forgot to await it would never hear that the record was not kept
@@ -739,17 +857,25 @@ export function stagedMetric<
       () => undefined,
     )
 
+    // the writes the record set off once the driver answered: the derived
+    // counters' and an immediate send. Registered before `settled` fires, so
+    // a drain() waiting on this record waits for them too, where a drain of
+    // the counter made at the same moment found nothing yet to wait for
+    const followUps: Promise<unknown>[] = []
     return (async (): Promise<void> => {
       try {
-        await stageDurably(build)
+        await stageDurably(build, followUps)
       } finally {
-        settled()
+        void Promise.allSettled(followUps).then(() => settled())
       }
     })()
   }
 
-  /** The body of {@link recordDurably}. */
-  async function stageDurably(build: () => Prepared<F>[]): Promise<void> {
+  /** The body of {@link recordDurably}. Pushes what it sets off onto `followUps`. */
+  async function stageDurably(
+    build: () => Prepared[],
+    followUps: Promise<unknown>[],
+  ): Promise<void> {
     activeBinding()
     const prepared = build()
     // sampling is refused at declaration, so every prepared record is kept
@@ -768,8 +894,16 @@ export function stagedMetric<
         { cause: error },
       )
     }
-    for (const one of prepared) runDerive(one.values)
-    if (isImmediate()) track(shipStaged())
+    const derived = new Set<Counter<Shape>>()
+    for (const one of prepared) {
+      for (const metric of runDerive(one.stored)) derived.add(metric)
+    }
+    for (const metric of derived) followUps.push(metric.drain())
+    if (isImmediate()) {
+      const sending = shipStagedUnlessPaused()
+      track(sending)
+      followUps.push(sending)
+    }
   }
 
   /**
@@ -780,12 +914,29 @@ export function stagedMetric<
    * a bucketed kind there is no partial state to protect and the ordinary
    * claim/ack path is correct. Immediate delivery therefore *replaces* flush
    * here rather than running alongside it.
+   *
+   * A claim that comes back full under `claimLimit` is followed by another,
+   * up to {@link IMMEDIATE_CLAIM_CAP}, since no flush may come to take the
+   * rest. A failed send stops it: those records are back in the driver.
    */
   async function shipStaged(): Promise<void> {
-    const claim = await activeDriver().claimRecords(name, config.claimLimit)
-    const outcome = await shipClaim(self, claim, sink, { attempts, source: 'immediate' })
-    if (outcome.releaseError !== undefined) reportDetached(outcome.releaseError)
-    if (outcome.error !== undefined) throw outcome.error
+    for (let claims = 0; claims < IMMEDIATE_CLAIM_CAP; claims++) {
+      const claim = await activeDriver().claimRecords(name, config.claimLimit)
+      const outcome = await shipClaim(self, claim, sink, { attempts, source: 'immediate' })
+      if (outcome.releaseError !== undefined) reportDetached(outcome.releaseError)
+      if (outcome.ackError !== undefined) reportDetached(outcome.ackError)
+      if (outcome.error !== undefined) throw outcome.error
+      if (config.claimLimit === undefined || claim.records.length < config.claimLimit) return
+    }
+  }
+
+  /**
+   * {@link shipStaged}, unless a send failed within the last flush interval.
+   * The records stay staged in the driver for the next flush, or for the
+   * first `record()` after the interval.
+   */
+  function shipStagedUnlessPaused(): Promise<void> {
+    return sendingPaused(effectiveFlushMs()) ? Promise.resolve() : shipStaged()
   }
 
   /**
@@ -819,7 +970,9 @@ export function stagedMetric<
    * clock, which starts again for them. Immediate delivery always ships
    * everything. Each record is sent once per call, so a sink that is down
    * puts its records back and they wait for the next trigger rather than
-   * being retried in a loop.
+   * being retried in a loop. `record()` is not one of those triggers until
+   * `maxAge` has passed since the failure: the age clock, `flush()` and
+   * `drain()` are.
    */
   function shipLocal(source: WriteContext['source'], everything = false): void {
     if (batchTimer !== undefined) {
@@ -845,6 +998,7 @@ export function stagedMetric<
       (async (): Promise<void> => {
         const outcome = await shipClaim(self, claim, sink, { attempts, source })
         if (outcome.releaseError !== undefined) reportDetached(outcome.releaseError)
+        if (outcome.ackError !== undefined) reportDetached(outcome.ackError)
         // a failed sink already released the records back into the buffer.
         // Rethrown so the failure reaches onError rather than vanishing
         if (outcome.error !== undefined) throw outcome.error
@@ -866,7 +1020,36 @@ export function stagedMetric<
       records: taken,
     }
     localInFlight.set(claim.id, claim)
+    localInFlightRecords += taken.length
     return claim
+  }
+
+  /**
+   * Local staging only: take a claim of the records a driver staged
+   * declaration of this event left in the driver, or `undefined` when there
+   * are none.
+   *
+   * An event moved from `stage: 'driver'` to `'local'` keeps whatever it
+   * had staged there, and nothing else would ever claim it. Counted first,
+   * because counting is one round trip and an empty claim is two.
+   */
+  async function claimLeftover(): Promise<RecordClaim | undefined> {
+    const driver = activeDriver()
+    if ((await driver.countPending(name)) === 0) return undefined
+    const claim = await driver.claimRecords(name, config.claimLimit)
+    if (claim.records.length > 0) return claim
+    // what was counted is claimed by someone else. The empty claim only
+    // has a registration to drop
+    await driver.ack(claim)
+    return undefined
+  }
+
+  /** Take a local claim out of flight, or throw when it is not there. */
+  function settleLocal(claim: RecordClaim): void {
+    if (!localInFlight.delete(claim.id)) {
+      throw new Error(`${name}: claim ${claim.id} is not in flight. Was it already settled?`)
+    }
+    localInFlightRecords -= claim.records.length
   }
 
   function assertRecords(claim: Claim): asserts claim is RecordClaim {
@@ -893,7 +1076,18 @@ export function stagedMetric<
     return limit === undefined ? within : within.slice(0, limit)
   }
 
-  /** Turn one staged record into the row a sink receives. */
+  /**
+   * Turn one staged record into the row a sink receives, under the fields as
+   * declared now.
+   *
+   * A record can wait in the driver across a deploy that changed the
+   * declaration, so it is read against the new one: a default declared since
+   * fills a field the record lacks, and a value the field no longer accepts
+   * throws rather than ship a column of the wrong type.
+   *
+   * @throws naming the record and the field, when a stored value no longer
+   * fits its field or a field now required has no value and no default
+   */
   function materialize(record: StagedRecord): Row {
     const row: Row = { id: record.id, ts: new Date(record.ts) }
 
@@ -901,17 +1095,54 @@ export function stagedMetric<
       // own keys only: an omitted field named `constructor` would otherwise
       // read the one every object inherits
       const value = Object.hasOwn(record.fields, key) ? record.fields[key] : undefined
-      if (value === undefined) continue
-      // a payload is a string column, and `record()` already turned it into
-      // one. A record staged by an older version still holds the value
-      // itself, so that one is turned into text here
-      row[key] = type.kind === 'json' && typeof value !== 'string' ? JSON.stringify(value) : value
+      if (value === undefined) {
+        if (type.hasDefault) {
+          // the declared value itself, which `record()` would have stored
+          // as its JSON text for a payload
+          row[key] =
+            type.kind === 'json'
+              ? jsonText(type.defaultValue, key)
+              : rowValue(record, key, type, type.defaultValue)
+          continue
+        }
+        if (type.isOptional) continue
+        throw new Error(
+          `${name}: staged record ${record.id} has no value for field ${JSON.stringify(key)}, ` +
+            'which is now required and has no default',
+        )
+      }
+      row[key] = rowValue(record, key, type, value)
     }
 
     row._ingested_at = new Date(record.fields._ingested_at as number)
-    if (samples) row._sample_rate = record.fields._sample_rate
+    // a record staged before `sample` was declared was kept whole
+    if (samples) row._sample_rate = record.fields._sample_rate ?? 1
 
     return row
+  }
+
+  /** One stored value as its column carries it. See {@link materialize}. */
+  function rowValue(record: StagedRecord, key: string, type: FieldType, value: unknown): unknown {
+    if (type.kind === 'json') {
+      // a payload is a string column, and `record()` already turned it into
+      // JSON text. A record staged by an older version, or while the field
+      // was declared `str()`, holds the value itself, so that one is turned
+      // into text here
+      return typeof value === 'string' && isJsonText(value) ? value : JSON.stringify(value)
+    }
+    try {
+      assertValue(type, value, key)
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      throw new Error(
+        `${name}: staged record ${record.id} holds a value field ${JSON.stringify(key)} no ` +
+          `longer accepts. ${reason}`,
+        { cause: error },
+      )
+    }
+    // a copy, so a row changed by a sink, `peek()` or `snapshot()` cannot
+    // change a locally staged record that has not shipped yet
+    return isDate(value) ? new Date(value.getTime()) : value
   }
 
   const self: Event<F, K, D> = {
@@ -985,9 +1216,11 @@ export function stagedMetric<
 
     async pending(): Promise<number> {
       if (stage === 'local') {
-        let inFlight = 0
-        for (const claim of localInFlight.values()) inFlight += claim.records.length
-        return buffer.length + inFlight
+        // also what a driver staged declaration of this event left in the
+        // driver, since a flush of this one ships those too. Unbound, there
+        // is no driver to ask, and the buffer is all there is
+        const inDriver = binding === undefined ? 0 : await binding.driver.countPending(name)
+        return buffer.length + localInFlightRecords + inDriver
       }
       return activeDriver().countPending(name)
     },
@@ -1044,13 +1277,14 @@ export function stagedMetric<
       // a locally staged batch is claimed out of `buffer` into `localInFlight`,
       // both of which are this process's heap. A crash takes them with it, so
       // there is nothing left behind to put back, the same trade `stage:
-      // 'local'` already makes everywhere else
-      if (stage === 'local') return NOTHING_RECOVERED
+      // 'local'` already makes everywhere else. What the driver holds is
+      // recovered all the same: a claim of records a driver staged
+      // declaration left there, abandoned by a flusher that died
       return activeDriver().recover(name)
     },
 
     async claimBatch(): Promise<Claim> {
-      if (stage === 'local') return takeLocalClaim()
+      if (stage === 'local') return (await claimLeftover()) ?? takeLocalClaim()
       return activeDriver().claimRecords(name, config.claimLimit)
     },
 
@@ -1086,10 +1320,10 @@ export function stagedMetric<
 
     async ackBatch(claim: Claim): Promise<void> {
       assertRecords(claim)
-      if (stage === 'local') {
-        if (!localInFlight.delete(claim.id)) {
-          throw new Error(`${name}: claim ${claim.id} is not in flight. Was it already settled?`)
-        }
+      // written, so the sink is taking rows again and `record()` may ship
+      if (claim.records.length > 0) failedAt = undefined
+      if (isLocalClaim(claim)) {
+        settleLocal(claim)
         return
       }
       await activeDriver().ack(claim)
@@ -1097,10 +1331,10 @@ export function stagedMetric<
 
     async releaseBatch(claim: Claim): Promise<void> {
       assertRecords(claim)
-      if (stage === 'local') {
-        if (!localInFlight.delete(claim.id)) {
-          throw new Error(`${name}: claim ${claim.id} is not in flight. Was it already settled?`)
-        }
+      // only a failed send puts a claim back
+      failedAt = clockNow()
+      if (isLocalClaim(claim)) {
+        settleLocal(claim)
         // back in the order they were staged. These are older than anything
         // recorded since, but a claim that failed before this one may already
         // be back at the front, and its records are older still

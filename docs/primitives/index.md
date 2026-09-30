@@ -147,8 +147,8 @@ const checkoutAttempted = event('checkout_attempted', {
 
 The counter stays small and is fast to query for charts. The event holds the
 detail you need when a number looks wrong. [`derive`](/primitives/event#derive)
-keeps them consistent, and runs before sampling, so the counter stays exact
-even when the event table only keeps a slice.
+keeps them consistent, and counts every event, including the ones sampling
+drops, so the counter stays exact even when the event table only keeps a slice.
 
 The same pairing for durations is a timer with
 [`record`](/primitives/timer#record).

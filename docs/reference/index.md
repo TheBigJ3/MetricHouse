@@ -46,7 +46,7 @@ settings as one table per type.
 | `bool()` | `boolean` |
 | `ts()` | `Date` |
 | `oneOf([...])` | one of the listed values |
-| `json<T>()` | anything, on event fields only |
+| `json<T>()` | anything JSON can hold, on event and log fields only |
 
 Each returns a `FieldType` with `.optional()` and `.default(value)`. Full details
 in [Field types](/reference/field-types).

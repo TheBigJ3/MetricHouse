@@ -113,6 +113,21 @@ export type MarkOptional<S extends Shape, K extends PropertyKey> = {
   [P in keyof S]: P extends K ? FieldType<InferValue<S[P]>, true> : S[P]
 }
 
+/**
+ * The keys of `B` that are certain to hold a value: neither optional nor
+ * typed to allow `undefined`.
+ *
+ * What a bound object may mark as supplied. `keyof B` alone would count every
+ * key of a `Partial`, and a call that then leaves one out compiles and throws.
+ */
+export type DefinedKeys<B> = {
+  [K in keyof B]-?: Record<never, never> extends Pick<B, K>
+    ? never
+    : undefined extends B[K]
+      ? never
+      : K
+}[keyof B]
+
 /** Everything a constructor can vary. Carried through modifiers unchanged. */
 interface TypeOpts<TValue> {
   hasDefault?: boolean

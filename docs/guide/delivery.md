@@ -69,12 +69,21 @@ and ships it exactly as a flush would, just without waiting. Records leave the
 driver and are deleted normally.
 
 For these, immediate delivery **replaces** flushing while the sink succeeds.
-When a send fails, its records go back to where they were staged. A locally
-staged event retries them `batch.maxAge` later on its own. An event staged in
-the driver has no timer of its own, so its records wait until the next
-`record()` sends them together with the new one, or until a flush claims them.
-An event that can go quiet after a failure still wants a flush on a schedule,
-and `house.stop()` makes a final one.
+Each send takes every record waiting. With a
+[`claimLimit`](/primitives/event#claimlimit), an event staged in the driver
+claims again while a claim comes back full, so one send still empties the
+backlog.
+
+When a send fails, its records go back to where they were staged, and
+`record()` stops sending for a while, so a sink that is down is not handed the
+whole backlog again by every new record. A locally staged event holds back for
+`batch.maxAge` after the failure, and its age clock retries everything then on
+its own. An event staged in the driver holds back for its
+[`flush`](/primitives/event#flush) interval and has no timer of its own: its
+records wait until a flush claims them, or until the first `record()` after the
+interval sends them together with the new one. An event that can go quiet after
+a failure still wants a flush on a schedule, and `house.stop()` makes a final
+one.
 
 ### Counters, gauges and timers
 

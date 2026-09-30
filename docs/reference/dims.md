@@ -102,7 +102,7 @@ itself, so it cannot share a name with one of them.
 | --- | --- |
 | counter, level | `id`, `bucket_ts`, `value` |
 | gauge, timer | `id`, `bucket_ts`, and each aggregate the metric ships |
-| timer | `duration_ms` as well, the field a timing carries onto its record event |
+| timer | `duration_ms` as well, the field a timing carries onto its record event, and `ts`, `_ingested_at` and `_sample_rate`, the columns that event writes on every row |
 
 A dim sharing a name with a column would overwrite it or be overwritten by it. A
 dim named `id` would replace the row id, and every window of the series would
@@ -473,6 +473,7 @@ half finished state behind.
 | `dim "x" declares json(), which cannot be encoded into a series key` | `json()` used as a dim. At declaration |
 | `default for int(): expected a safe integer, got "five"` | `.default()` given a value its own type rejects. At declaration |
 | `dim "duration_ms" is reserved` | A timer dim using the name a timing carries onto its record event. At declaration |
+| `dim "ts" is reserved` | A timer dim using a column its record event writes on every row: `ts`, `_ingested_at` or `_sample_rate`. At declaration |
 | `dim "id" is a reserved column` | A dim named after a column the metric writes itself. At declaration |
 | `a dim cannot be named "__proto__"` | JavaScript treats that key as an object's prototype, so no row could carry it. At declaration |
 | `a dim cannot be named "2024"` | A name that reads as a whole number, which JavaScript moves ahead of every other key. At declaration |

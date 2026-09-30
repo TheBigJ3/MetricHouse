@@ -59,7 +59,8 @@ export const pageViewed = event('page_viewed', {
   // Drop bots entirely. Sample everything else.
   sample: (fields) => (fields.device === 'bot' ? 0 : 0.2),
 
-  // The counter is exact whatever the sampling does, because derive runs first.
+  // The counter is exact whatever the sampling does, because derive counts
+  // every view, the dropped ones too.
   derive: {
     page_views: (fields) => ({
       dims: { path: fields.path, device: fields.device, country: fields.country },

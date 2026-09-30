@@ -107,7 +107,7 @@ timer(name, { dims, resolution, flush, grace, aggregate, record, write })
 | `record` | event name | none | An event every timing is also written to |
 | `write` | `WriteFn` | required | Where the rows go |
 
-A dimension may not be named `duration_ms`.
+A dimension may not be named `duration_ms`, `ts`, `_ingested_at` or `_sample_rate`.
 
 ## event
 
@@ -124,6 +124,7 @@ event(name, { fields, stage, durability, batch, flush, timestamp, sample, derive
 | `durability` | `'relaxed'` or `'durable'` | `'relaxed'` | Whether `record()` returns at once or a promise that resolves once the driver has the record. `'durable'` needs `stage: 'driver'` and no `sample` |
 | `batch.maxSize` | number | `500` | Local staging: ship at this many |
 | `batch.maxAge` | duration | `'10s'` | Local staging: ship this long after the first |
+| `batch.maxStaged` | number | `100_000`, or `batch.maxSize` when larger | Local staging: the most records this process holds before it refuses more |
 | `flush` | duration | the house default, then `'30s'` | The fastest this may ship |
 | `timestamp` | `'auto'` or a `ts()` field | `'auto'` | Where `ts` comes from |
 | `sample` | number or function | keep everything | The fraction to keep, 0 to 1 |
@@ -149,6 +150,7 @@ log(name, { fields, levels, minLevel, stage, batch, flush, claimLimit, write })
 | `stage` | `'driver'` or `'local'` | `'driver'` | Where lines wait |
 | `batch.maxSize` | number | `500` | Local staging: ship at this many |
 | `batch.maxAge` | duration | `'10s'` | Local staging: ship this long after the first |
+| `batch.maxStaged` | number | `100_000`, or `batch.maxSize` when larger | Local staging: the most records this process holds before it refuses more |
 | `flush` | duration | the house default, then `'30s'` | The fastest this may ship |
 | `claimLimit` | number | unlimited | Lines one flush may carry |
 | `write` | `WriteFn` | required | Where the rows go |
@@ -267,7 +269,9 @@ These all throw when the module is first imported, not at the first write.
 | A dim named after a column the metric writes | `dim "id" is a reserved column` |
 | A dim or field named like a whole number | `a dim cannot be named "2024"` |
 | A dim or field named `bucket_open` or `bucket_elapsed_ms` | `a dim cannot be named "bucket_open"` |
-| An unknown event `stage` | `stage must be 'driver' or 'local', got "memory"` |
+| An unknown event `stage`, `null` included | `stage must be 'driver' or 'local', got "memory"` |
+| A `batch.maxStaged` that is not a positive whole number | `batch.maxStaged must be a positive integer, got 0` |
+| A `batch.maxStaged` below `batch.maxSize` | `batch.maxStaged (9) must be at least batch.maxSize (10)` |
 | An unknown event `durability` | `durability must be 'relaxed' or 'durable', got "always"` |
 | `durability: 'durable'` with `stage: 'local'` | `durability 'durable' needs stage 'driver'` |
 | `durability: 'durable'` with `sample` | `durability 'durable' cannot sample` |
@@ -277,6 +281,7 @@ These all throw when the module is first imported, not at the first write.
 | `minLevel` not in `levels` | `minLevel "trace" is not one of the declared levels` |
 | A level shadowing a method, or named `then` | `level "flush" would shadow an existing property on the logger` |
 | A timer dimension named `duration_ms` | `dim "duration_ms" is reserved` |
+| A timer dimension named after a column its `record` event writes | `dim "ts" is reserved, because a record event writes a column of that name on every row` |
 | Two metrics with the same name | `createHouse: two metrics are both named "x"` |
 | A metric registered with a second house | `already bound to a house` |
 | No cadence anywhere | `no flush cadence. Declare flush on the counter, or defaults.flush on the house` |
