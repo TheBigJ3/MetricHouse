@@ -748,6 +748,36 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect((await driver.readLevels(L))[0]?.value).toBe(43)
       })
 
+      it('starts a late add from zero in a window the series had expired by', async () => {
+        // written at 1000 and held for 3000, so its last window was 4000.
+        // Written again at 9000, and an add aimed at 7000 arrives after that
+        await put(1000, WILLOW, 42)
+        await put(9000, WILLOW, 1)
+        await moveHeld(7000, 1, 3000)
+
+        expect(await levelsAt([7000, 9000])).toEqual([1, 2])
+        expect(await driver.readLevels(L)).toEqual([
+          {
+            dimKey: WILLOW,
+            value: 2,
+            carried: 42,
+            writtenAt: 9000,
+            heldThrough: 1000,
+            carriedFrom: 1000,
+          },
+        ])
+      })
+
+      it('measures a late add against the newest write before its window', async () => {
+        // the write at 5000 keeps the series alive through 8000
+        await put(1000, WILLOW, 42)
+        await put(5000, WILLOW, 3)
+        await put(9000, WILLOW, 1)
+        await moveHeld(7000, 1, 3000)
+
+        expect(await levelsAt([5000, 7000, 9000])).toEqual([3, 4, 2])
+      })
+
       it('marks a cell a hold wrote as carried', async () => {
         await put(1000, WILLOW, 5)
         await hold(2000, WILLOW, 5)
@@ -1114,6 +1144,58 @@ export function describeDriverContract(name: string, options: DriverContractOpti
             carriedFrom: 1000,
           },
         ])
+      })
+
+      it('lets a second set moved to the watermark replace the first', async () => {
+        await put(1000, WILLOW, 5)
+        await put(3000, REX, 1)
+        await driver.ack(await driver.claim(L, 3000))
+        // both aimed at windows that have shipped, so both land at 3000.
+        // Neither is newer than the window, and the one that arrives second
+        // is the newer of the two
+        await put(1000, WILLOW, 7)
+        await put(2000, WILLOW, 8)
+
+        expect(await driver.readBuckets({ metric: L, dimKey: WILLOW })).toEqual([
+          { bucketTs: 3000, dimKey: WILLOW, value: { level: 8, moved: true } },
+        ])
+        expect((await driver.readLevels(L)).find((one) => one.dimKey === WILLOW)).toEqual({
+          dimKey: WILLOW,
+          value: 8,
+          carried: 5,
+          writtenAt: 3000,
+          heldThrough: 1000,
+          carriedFrom: 1000,
+        })
+      })
+
+      it('keeps a cell moved when a late add moves there too', async () => {
+        await put(1000, WILLOW, 5)
+        await put(3000, REX, 1)
+        await driver.ack(await driver.claim(L, 3000))
+        await put(1000, WILLOW, 7)
+        // aimed at 2000 as well, so every write in 3000 so far missed its window
+        await move(2000, WILLOW, 1)
+        await put(2000, WILLOW, 9)
+
+        expect(await driver.readBuckets({ metric: L, dimKey: WILLOW })).toEqual([
+          { bucketTs: 3000, dimKey: WILLOW, value: { level: 9, moved: true } },
+        ])
+      })
+
+      it('drops a set moved to the watermark after an add written in that window', async () => {
+        await put(1000, WILLOW, 5)
+        await put(3000, REX, 1)
+        await driver.ack(await driver.claim(L, 3000))
+        await put(1000, WILLOW, 7)
+        // written in 3000, so the window now holds a reading of its own
+        await move(3000, WILLOW, 1)
+        await put(2000, WILLOW, 9)
+
+        expect(await driver.readBuckets({ metric: L, dimKey: WILLOW })).toEqual([
+          { bucketTs: 3000, dimKey: WILLOW, value: { level: 8 } },
+        ])
+        expect((await driver.readLevels(L)).find((one) => one.dimKey === WILLOW)?.value).toBe(8)
       })
 
       it('lets a hold move the pointer without refilling a claimed window', async () => {

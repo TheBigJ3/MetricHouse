@@ -96,6 +96,9 @@ export interface LevelOp {
    * A series whose `writtenAt` plus this is below the window the write lands
    * in has stopped reporting, even if no flush has dropped it yet, and the
    * write treats it as a series it has never seen: an `add` starts from zero.
+   * An `add` that lands before `writtenAt` measures from the newest write
+   * before its own window instead, so one arriving late into a stretch where
+   * the series had expired starts from zero too.
    */
   readonly holdFor?: number
 }
@@ -209,6 +212,17 @@ export interface LevelCell {
    * before it, after the carry, replaces it with the new value.
    */
   readonly carried?: true
+  /**
+   * Written by a `set` or an `add` aimed at a window a claim had already
+   * taken, and moved forward to this one, with nothing written here in this
+   * window's own time.
+   *
+   * A `set` moved here later still replaces it: both readings are older than
+   * the window, and the one that arrives second is the newer of the two. A
+   * reading taken in this window's own time is newer than either, and a
+   * moved `set` leaves it alone.
+   */
+  readonly moved?: true
 }
 
 /**

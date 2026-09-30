@@ -203,9 +203,16 @@ local function mh_pack(l, mn, mx, s, c)
 end
 
 -- a level cell wears an '@' so storage can tell it from a counter's scalar,
--- which is otherwise the same digits meaning the opposite thing on a merge
-local function mh_pack_level(v)
-  return '@' .. string.format('%.17g', v)
+-- which is otherwise the same digits meaning the opposite thing on a merge.
+-- A cell a hold wrote has a space after the '@', and one a write moved to
+-- the watermark wrote has a space after the number. 0.7.0 reads all three
+-- as the bare number, because Lua's tonumber and JavaScript's Number both
+-- skip the space, so a 0.7 process sharing the namespace ships them right
+local function mh_pack_level(v, carried, moved)
+  local n = string.format('%.17g', v)
+  if carried then return '@ ' .. n end
+  if moved then return '@' .. n .. ' ' end
+  return '@' .. n
 end
 
 local function mh_is_level(v)
@@ -432,49 +439,92 @@ return 1
 `
 
 /**
- * The level state for one series, packed as
- * `value|carried|writtenAt|heldThrough|carriedFrom`, and the level cells a
- * write reads.
+ * The level state for one series, and the level cells a write reads.
+ *
+ * The state is packed as `value|carried|writtenAt|heldThrough`, the four
+ * fields 0.7.0 stores and reads, so a 0.7 process sharing the namespace
+ * during a rolling deploy reads every series a newer one writes. The fifth
+ * number a series needs, `carriedFrom`, sits in a hash of its own beside this
+ * one, and only when the four cannot say it. See `mh_write_state`.
  *
  * Its own hash per metric, never touched by a claim. That is the whole reason
  * a level can ship a row for a window nobody wrote to: the number outlives
  * the flush that shipped the last one.
+ *
+ * A series is a table of six, by position rather than by name, because a
+ * write builds one per op and a flush one per series per window:
+ * `{ value, carried, writtenAt, heldThrough, from, beside }`. `from` is
+ * carriedFrom when it is known, and false when it is not. `beside` is true
+ * when an entry in the carriedFrom hash may exist for the series.
  */
 const LUA_LEVEL_STATE = `
+-- the series stored under field, or nil. from is known when a build between
+-- 0.7.0 and this one stored it as a fifth field. An entry beside the state
+-- needs the newest write to be past the pointer
 local function mh_read_state(key, field)
   local raw = redis.call('HGET', key, field)
   if raw == false then return nil end
-  local v, c, w, h, f = string.match(raw, '^([^|]+)|([^|]+)|([^|]+)|([^|]+)|([^|]+)$')
-  if v == nil then
-    v, c, w, h = string.match(raw, '^([^|]+)|([^|]+)|([^|]+)|([^|]+)$')
-    if v == nil then return nil end
-    -- stored before carriedFrom was: the newest write is at or before the
-    -- pointer when it is not past it, and the pointer is the latest it can be
-    f = w
-    if tonumber(w) > tonumber(h) then f = h end
+  local v, c, w, h = string.match(raw, '^([^|]+)|([^|]+)|([^|]+)|([^|]+)$')
+  if v ~= nil then
+    w = tonumber(w)
+    h = tonumber(h)
+    return { tonumber(v), tonumber(c), w, h, false, w > h }
   end
-  return { tonumber(v), tonumber(c), tonumber(w), tonumber(h), tonumber(f) }
+  local f
+  v, c, w, h, f = string.match(raw, '^([^|]+)|([^|]+)|([^|]+)|([^|]+)|([^|]+)$')
+  if v == nil then return nil end
+  return { tonumber(v), tonumber(c), tonumber(w), tonumber(h), tonumber(f), false }
 end
 
--- '%.0f' and not '%d' for the three timestamps: they are whole numbers held
--- in a double, and '%d' in Lua asks for an integer cast that is a different
--- question on every build
-local function mh_write_state(key, field, value, carried, writtenAt, heldThrough, carriedFrom)
-  redis.call('HSET', key, field, string.format('%.17g|%.17g|%.0f|%.0f|%.0f',
-    value, carried, writtenAt, heldThrough, carriedFrom))
+-- carriedFrom, the window of the newest write at or before the pointer.
+-- When the newest write of all is at or before the pointer, it is that one.
+-- Otherwise it is the entry beside the state, if that entry was worked out
+-- against the pointer and carried value the state still holds, and the
+-- pointer when not: the latest that write can be, so an expiry is never
+-- measured from too early. The state was stored in the same formats the
+-- entry is checked in, so formatting its numbers again gives the same text
+local function mh_carried_from(fromKey, field, st)
+  if st[5] then return st[5] end
+  if st[3] <= st[4] then return st[3] end
+  local raw = redis.call('HGET', fromKey, field)
+  if raw ~= false then
+    local f, h, c = string.match(raw, '^([^|]+)|([^|]+)|([^|]+)$')
+    if f ~= nil and h == string.format('%.0f', st[4]) and c == string.format('%.17g', st[2]) then
+      return tonumber(f)
+    end
+  end
+  return st[4]
 end
 
--- a cell a hold wrote wears '@c' rather than '@', so a later set can tell a
--- carried value from a reading
-local function mh_pack_carried(v)
-  return '@c' .. string.format('%.17g', v)
+-- '%.0f' and not '%d' for the timestamps: they are whole numbers held in a
+-- double, and '%d' in Lua asks for an integer cast that is a different
+-- question on every build.
+--
+-- A from of false leaves the entry beside the state alone: the write left
+-- carriedFrom, the pointer and carried as they were. Otherwise the entry is
+-- written only when the four fields cannot say carriedFrom, which is when the
+-- newest write is past the pointer and the newest one at or before it is
+-- older than the pointer. It names the pointer and the carried value it was
+-- worked out against, so a 0.7 process that moves either makes it stale
+-- rather than wrong
+local function mh_write_state(key, fromKey, field, st)
+  redis.call('HSET', key, field, string.format('%.17g|%.17g|%.0f|%.0f', st[1], st[2], st[3], st[4]))
+  if not st[5] then return end
+  if st[3] > st[4] and st[5] < st[4] then
+    redis.call('HSET', fromKey, field, string.format('%.0f|%.0f|%.17g', st[5], st[4], st[2]))
+  elseif st[6] then
+    redis.call('HDEL', fromKey, field)
+  end
 end
 
--- the number in a level cell, and true when a hold wrote it. A cell stored
--- before carried cells were marked reads as written
+-- the number in a level cell, and its mark: 1 when a hold wrote it, 2 when a
+-- write moved to the watermark did, 0 otherwise. A build between 0.7.0 and
+-- this one marked a carried cell '@c'. 32 is a space and 99 a 'c'
 local function mh_level(v)
-  if string.sub(v, 2, 2) == 'c' then return tonumber(string.sub(v, 3)), true end
-  return tonumber(string.sub(v, 2)), false
+  local second = string.byte(v, 2)
+  if second == 32 or second == 99 then return tonumber(string.sub(v, 3)), 1 end
+  if string.byte(v, -1) == 32 then return tonumber(string.sub(v, 2, -2)), 2 end
+  return tonumber(string.sub(v, 2)), 0
 end
 `
 
@@ -494,10 +544,14 @@ end
  * the write lands at or before the window the pointer names, because that
  * window now ends at a different value.
  *
- * KEYS: bucket index, watermark, level hash. ARGV: bucket key prefix,
- * bucketTs, resolutionMs, mode, `1` when every level must stay a whole number
- * a double holds exactly, the level's holdFor or an empty string, then
- * dimKey/value pairs.
+ * Every op in a call lands in the same window, so the windows after it, and
+ * those between a pointer and it, are read once for the call rather than
+ * once per op. A write only ever adds the window it lands in.
+ *
+ * KEYS: bucket index, watermark, level hash, carriedFrom hash. ARGV: bucket
+ * key prefix, bucketTs, resolutionMs, mode, `1` when every level must stay a
+ * whole number a double holds exactly, the level's holdFor or an empty
+ * string, then dimKey/value pairs.
  */
 const SET_LEVEL = `${LUA_HELPERS}${LUA_LEVEL_STATE}${LUA_ONCE}
 if mh_seen() then return 0 end
@@ -512,19 +566,22 @@ local holdFor = tonumber(ARGV[6])
 -- nothing is written until every op in the call has been worked out and
 -- checked, so a refusal changes nothing, and a resend of a refused call is
 -- refused again rather than applying its first half twice. An op reads what
--- the ops before it planned, as it would read what they wrote
-local cellPlan = {}
+-- the ops before it planned, as it would read what they wrote. A planned
+-- cell is its number and its mark, keyed by window and field
+local cellValue = {}
+local cellMark = {}
 local cellOrder = {}
 local statePlan = {}
 local stateOrder = {}
 
--- the level one window holds for a series and whether a hold wrote it, or
--- nil when it holds nothing
+-- the level one window holds for a series and its mark, or nil when it
+-- holds nothing
 local function level_at(at, field)
-  local planned = cellPlan[tostring(at) .. ':' .. field]
-  if planned ~= nil then return planned[1], planned[2] end
+  local slot = at .. ':' .. field
+  local planned = cellValue[slot]
+  if planned ~= nil then return planned, cellMark[slot] end
   local cur = redis.call('HGET', prefix .. at, field)
-  if cur == false then return nil, false end
+  if cur == false then return nil, 0 end
   if not mh_is_level(cur) then
     local held = 'counter'
     if mh_parse(cur) ~= false then held = 'gauge' end
@@ -533,36 +590,65 @@ local function level_at(at, field)
   return mh_level(cur)
 end
 
--- the same rules as planLevelWrite in the memory driver: an add is a change
--- that applies from its window onwards, a set is a reading that replaces the
+-- a cell to write
+local function plan_cell(at, field, v, mark)
+  local slot = at .. ':' .. field
+  if cellValue[slot] == nil then cellOrder[#cellOrder + 1] = { at, field, slot } end
+  cellValue[slot] = v
+  cellMark[slot] = mark
+end
+
+-- the refusal for a number a cell or the held value would take, or nil
+local function refused(x)
+  if not mh_finite(x) then return MH_RANGE end
+  if integer and not mh_safe(x) then return mh_int_error(x) end
+  return nil
+end
+
+-- the windows after this one. Each keeps the text Redis stored beside its
+-- number, and cells are keyed by that text, because Lua prints a timestamp
+-- of fifteen digits in a shorter form that names another key
+local laterWindows = redis.call('ZRANGEBYSCORE', KEYS[1], '(' .. target, '+inf')
+-- the windows strictly between a pointer and this one, newest first, by
+-- pointer. Nearly always there are none
+local between = {}
+
+-- one op after another, in the main chunk rather than in a function per op:
+-- a function here would capture a score of the locals above as upvalues,
+-- and building those on every call costs more than the rest of the op. The
+-- same rules as planLevelWrite in the memory driver: an add is a change that
+-- applies from its window onwards, a set is a reading that replaces the
 -- carried cells after it and only becomes the held value if nothing newer
--- has been written. Returns an error message, or nil
-local function plan_op(field, v)
+-- has been written. A break skips the op
+for i = 7, MH_N, 2 do repeat
+  local field = ARGV[i]
+  local v = tonumber(ARGV[i + 1])
   local state = statePlan[field]
   if state == nil then state = mh_read_state(KEYS[3], field) end
-  local landing, landingCarried = level_at(target, field)
+  local landing, landingMark = level_at(target, field)
 
-  -- a set moved forward to the watermark is older than a reading already
-  -- in the window it lands in
-  if not add and moved and landing ~= nil and not landingCarried then return nil end
+  -- a set moved forward to the watermark is older than a reading taken in
+  -- the window it lands in, and changes nothing. A set moved there before
+  -- it is no newer than this one, which replaces it
+  if not add and moved and landingMark == 0 and landing ~= nil then break end
 
-  -- windows after this one that already hold a value for the series. Each
-  -- keeps the text Redis stored beside its number, and cells are keyed by
-  -- that text, because Lua prints a timestamp of fifteen digits in a shorter
-  -- form that names another key
+  -- windows after this one that already hold a value for the series:
+  -- { window as stored, number, mark, window as a number }
   local later = {}
-  for _, at in ipairs(redis.call('ZRANGEBYSCORE', KEYS[1], '(' .. target, '+inf')) do
-    local level, carried = level_at(at, field)
-    if level ~= nil then later[#later + 1] = { at, level, carried, tonumber(at) } end
+  for _, at in ipairs(laterWindows) do
+    local level, mark = level_at(at, field)
+    if level ~= nil then later[#later + 1] = { at, level, mark, tonumber(at) } end
   end
 
   local pointer = bucketTs
   local writtenAt = bucketTs
   local carriedFrom = bucketTs
+  local beside = true
   local expired = false
   local back = false
   if state ~= nil then
     pointer = state[4]
+    beside = state[6]
     if state[3] > writtenAt then writtenAt = state[3] end
     expired = holdFor ~= nil and state[3] + holdFor < bucketTs
     if bucketTs < pointer and landing == nil then
@@ -571,39 +657,75 @@ local function plan_op(field, v)
         if c[4] < pointer then back = false end
       end
     end
-    carriedFrom = state[5]
     if back then
       carriedFrom = bucketTs
-    elseif bucketTs <= pointer and bucketTs > carriedFrom then
-      carriedFrom = bucketTs
+    elseif bucketTs <= pointer then
+      carriedFrom = mh_carried_from(KEYS[4], field, state)
+      if bucketTs > carriedFrom then carriedFrom = bucketTs end
+    elseif state[5] or state[3] <= state[4] then
+      carriedFrom = mh_carried_from(KEYS[4], field, state)
+    else
+      -- past the pointer, which leaves the pointer, carried and carriedFrom
+      -- as they were, and the entry beside the state with them
+      carriedFrom = false
     end
   end
   local heldThrough = pointer
   if back then heldThrough = bucketTs end
 
-  local cells = {}
   local value = v
   local carried = v
   if add then
     local base = landing
     if base == nil then
       base = 0
-      if state ~= nil and not expired and bucketTs >= pointer then
-        base = state[2]
-        -- '%.0f', because Lua's own number format keeps fourteen digits
-        -- and would move this bound for a timestamp of fifteen
-        local after = '(' .. string.format('%.0f', pointer)
-        for _, at in ipairs(redis.call('ZREVRANGEBYSCORE', KEYS[1], '(' .. target, after)) do
-          local level = level_at(at, field)
+      if state ~= nil and bucketTs >= pointer then
+        -- the value in effect just before this window: the newest cell
+        -- between the pointer and here, or what the pointer carried. Unless
+        -- the series had passed holdFor by this window, measured from the
+        -- newest write before it rather than from writtenAt, so an add that
+        -- arrives late into a stretch where the series had expired starts
+        -- from zero
+        local found = between[pointer]
+        if found == nil then
+          -- '%.0f', because Lua's own number format keeps fourteen digits
+          -- and would move this bound for a timestamp of fifteen
+          local after = '(' .. string.format('%.0f', pointer)
+          found = redis.call('ZREVRANGEBYSCORE', KEYS[1], '(' .. target, after)
+          between[pointer] = found
+        end
+        local before = nil
+        local lastWrite = nil
+        for _, at in ipairs(found) do
+          local level, mark = level_at(at, field)
           if level ~= nil then
-            base = level
-            break
+            if before == nil then before = level end
+            if mark ~= 1 then lastWrite = tonumber(at) end
+            if holdFor == nil or lastWrite ~= nil then break end
           end
+        end
+        if before == nil then before = state[2] end
+        if holdFor == nil then
+          base = before
+        else
+          if lastWrite == nil then lastWrite = mh_carried_from(KEYS[4], field, state) end
+          if lastWrite + holdFor >= bucketTs then base = before end
         end
       end
     end
-    cells[1] = { target, base + v, false }
-    for _, c in ipairs(later) do cells[#cells + 1] = { c[1], c[2] + v, c[3] } end
+
+    local cell = base + v
+    local why = refused(cell)
+    if why ~= nil then return redis.error_reply(why) end
+    -- moved only while nothing in this window's own time has written here
+    local mark = 0
+    if moved and (landing == nil or landingMark ~= 0) then mark = 2 end
+    plan_cell(target, field, cell, mark)
+    for _, c in ipairs(later) do
+      why = refused(c[2] + v)
+      if why ~= nil then return redis.error_reply(why) end
+      plan_cell(c[1], field, c[2] + v, c[3])
+    end
     if state ~= nil then
       if not expired then value = state[1] + v end
       if back then
@@ -615,16 +737,20 @@ local function plan_op(field, v)
       end
     end
   else
+    local why = refused(v)
+    if why ~= nil then return redis.error_reply(why) end
     local written = nil
     for _, c in ipairs(later) do
-      if not c[3] then
+      if c[3] ~= 1 then
         written = c[4]
         break
       end
     end
-    cells[1] = { target, v, false }
+    local mark = 0
+    if moved then mark = 2 end
+    plan_cell(target, field, v, mark)
     for _, c in ipairs(later) do
-      if c[3] and (written == nil or c[4] < written) then cells[#cells + 1] = { c[1], v, true } end
+      if c[3] == 1 and (written == nil or c[4] < written) then plan_cell(c[1], field, v, 1) end
     end
     if state ~= nil then
       if written ~= nil then value = state[1] end
@@ -634,42 +760,20 @@ local function plan_op(field, v)
     end
   end
 
-  if not mh_finite(value) then return MH_RANGE end
-  for _, c in ipairs(cells) do
-    if not mh_finite(c[2]) then return MH_RANGE end
-  end
-  if integer then
-    if not mh_safe(value) then return mh_int_error(value) end
-    for _, c in ipairs(cells) do
-      if not mh_safe(c[2]) then return mh_int_error(c[2]) end
-    end
-  end
+  local why = refused(value)
+  if why ~= nil then return redis.error_reply(why) end
 
-  for _, c in ipairs(cells) do
-    local slot = tostring(c[1]) .. ':' .. field
-    if cellPlan[slot] == nil then cellOrder[#cellOrder + 1] = { c[1], field, slot } end
-    cellPlan[slot] = { c[2], c[3] }
-  end
   if statePlan[field] == nil then stateOrder[#stateOrder + 1] = field end
-  statePlan[field] = { value, carried, writtenAt, heldThrough, carriedFrom }
-  return nil
-end
-
-for i = 7, MH_N, 2 do
-  local refused = plan_op(ARGV[i], tonumber(ARGV[i + 1]))
-  if refused ~= nil then return redis.error_reply(refused) end
-end
+  statePlan[field] = { value, carried, writtenAt, heldThrough, carriedFrom, beside }
+until true end
 
 for _, c in ipairs(cellOrder) do
-  local cell = cellPlan[c[3]]
-  local packed = mh_pack_level(cell[1])
-  if cell[2] then packed = mh_pack_carried(cell[1]) end
-  redis.call('HSET', prefix .. c[1], c[2], packed)
+  local mark = cellMark[c[3]]
+  redis.call('HSET', prefix .. c[1], c[2], mh_pack_level(cellValue[c[3]], mark == 1, mark == 2))
   redis.call('ZADD', KEYS[1], c[1], c[1])
 end
 for _, field in ipairs(stateOrder) do
-  local st = statePlan[field]
-  mh_write_state(KEYS[3], field, st[1], st[2], st[3], st[4], st[5])
+  mh_write_state(KEYS[3], KEYS[4], field, statePlan[field])
 end
 
 mh_mark()
@@ -699,8 +803,12 @@ return 1
  * because a claim has taken it already, and the pointer still moves, carrying
  * the value the call names.
  *
- * KEYS: bucket index, watermark, level hash. ARGV: bucket key prefix,
- * bucketTs, then dimKey/value pairs.
+ * The windows between a pointer and this one are read once per pointer
+ * rather than once per series. A flush holds every series from the same
+ * pointer, and there are nearly always none.
+ *
+ * KEYS: bucket index, watermark, level hash, carriedFrom hash. ARGV: bucket
+ * key prefix, bucketTs, then dimKey/value pairs.
  */
 const HOLD_LEVEL = `${LUA_HELPERS}${LUA_LEVEL_STATE}
 local bucketTs = tonumber(ARGV[2])
@@ -709,11 +817,11 @@ local wm = redis.call('GET', KEYS[2])
 local claimed = wm ~= false and bucketTs < tonumber(wm)
 local written = 0
 
--- the level cell one window holds for a series and whether a hold wrote it,
--- or nil when it holds none
+-- the level cell one window holds for a series and its mark, or nil when it
+-- holds none
 local function level_at(at, field)
   local cur = redis.call('HGET', ARGV[1] .. at, field)
-  if cur == false then return nil, false end
+  if cur == false then return nil, 0 end
   if not mh_is_level(cur) then
     local held = 'counter'
     if mh_parse(cur) ~= false then held = 'gauge' end
@@ -722,70 +830,78 @@ local function level_at(at, field)
   return mh_level(cur)
 end
 
+local betweenCache = {}
+local function windows_between(pointer)
+  local found = betweenCache[pointer]
+  if found == nil then
+    local after = '(' .. string.format('%.0f', pointer)
+    found = redis.call('ZREVRANGEBYSCORE', KEYS[1], '(' .. ARGV[2], after)
+    betweenCache[pointer] = found
+  end
+  return found
+end
+
 for i = 3, #ARGV, 2 do
   local field = ARGV[i]
-  local value = tonumber(ARGV[i + 1])
   local state = mh_read_state(KEYS[3], field)
 
   if state ~= nil then
     local pointer = state[4]
     if claimed then
       -- the claim took the cells between the pointer and here, and any write
-      -- among them, so the newest write is taken to be as late as it can be.
-      -- A hold for the pointer's own window arriving again once a claim has
-      -- taken it leaves carried alone: the cell that says what it ended at
-      -- is gone, and carried has it
+      -- among them, so the newest write is taken to be as late as it can be:
+      -- writtenAt, or this window when that is earlier. Both are past
+      -- carriedFrom, which is at or before the pointer. A hold for the
+      -- pointer's own window arriving again once a claim has taken it leaves
+      -- carried alone: the cell that says what it ended at is gone, and
+      -- carried has it
       if bucketTs > pointer then
-        local from = state[3]
-        if from > bucketTs then from = bucketTs end
-        if state[5] > from then from = state[5] end
-        mh_write_state(KEYS[3], field, state[1], value, state[3], bucketTs, from)
+        state[5] = math.min(state[3], bucketTs)
+        state[2] = tonumber(ARGV[i + 1])
+        state[4] = bucketTs
+        mh_write_state(KEYS[3], KEYS[4], field, state)
+      end
+    elseif bucketTs < pointer then
+      -- carried belongs to the pointer's window, so a hold for an older one,
+      -- from a flusher whose clock runs behind, fills it if it is empty and
+      -- moves nothing
+      if level_at(bucketTs, field) == nil then
+        redis.call('HSET', key, field, mh_pack_level(tonumber(ARGV[i + 1]), true, false))
+        written = written + 1
       end
     else
-      local cell, cellCarried = level_at(bucketTs, field)
-      if bucketTs < pointer then
-        -- carried belongs to the pointer's window, so a hold for an older
-        -- one, from a flusher whose clock runs behind, fills it if it is
-        -- empty and moves nothing
-        if cell == nil then
-          redis.call('HSET', key, field, mh_pack_carried(value))
-          written = written + 1
-        end
-      else
-        -- the newest cell, and the newest written one, between the pointer
-        -- and this window. Nearly always there are none
-        local before = nil
-        local newestWrite = nil
-        if bucketTs > pointer then
-          local after = '(' .. string.format('%.0f', pointer)
-          for _, at in ipairs(redis.call('ZREVRANGEBYSCORE', KEYS[1], '(' .. ARGV[2], after)) do
-            local level, carried = level_at(at, field)
-            if level ~= nil then
-              if before == nil then before = level end
-              if not carried then
-                newestWrite = tonumber(at)
-                break
-              end
+      -- the newest cell, and the newest written one, between the pointer and
+      -- this window
+      local before = nil
+      local newestWrite = nil
+      if bucketTs > pointer then
+        for _, at in ipairs(windows_between(pointer)) do
+          local level, mark = level_at(at, field)
+          if level ~= nil then
+            if before == nil then before = level end
+            if mark ~= 1 then
+              newestWrite = tonumber(at)
+              break
             end
           end
         end
-
-        local carried = cell
-        if cell == nil then
-          carried = state[2]
-          if before ~= nil then carried = before end
-          redis.call('HSET', key, field, mh_pack_carried(carried))
-          written = written + 1
-        end
-
-        local carriedFrom = state[5]
-        if cell ~= nil and not cellCarried then
-          carriedFrom = bucketTs
-        elseif newestWrite ~= nil then
-          carriedFrom = newestWrite
-        end
-        mh_write_state(KEYS[3], field, state[1], carried, state[3], bucketTs, carriedFrom)
       end
+
+      local carried = before
+      if carried == nil then carried = state[2] end
+      local from = newestWrite
+      if redis.call('HSETNX', key, field, mh_pack_level(carried, true, false)) == 1 then
+        written = written + 1
+      else
+        local cell, mark = level_at(bucketTs, field)
+        carried = cell
+        if mark ~= 1 then from = bucketTs end
+      end
+      if from == nil then from = mh_carried_from(KEYS[4], field, state) end
+      state[2] = carried
+      state[4] = bucketTs
+      state[5] = from
+      mh_write_state(KEYS[3], KEYS[4], field, state)
     end
   end
 end
@@ -795,10 +911,11 @@ return written
 `
 
 /**
- * Forget level series, but only those not written since the caller looked.
+ * Forget level series, but only those not written since the caller looked,
+ * and the carriedFrom beside each one.
  *
- * KEYS: level hash. ARGV: writtenBefore, or an empty string to drop
- * unconditionally, then the dim keys.
+ * KEYS: level hash, carriedFrom hash. ARGV: writtenBefore, or an empty string
+ * to drop unconditionally, then the dim keys.
  */
 const DROP_LEVELS = `${LUA_LEVEL_STATE}
 local cutoff = tonumber(ARGV[1])
@@ -811,7 +928,10 @@ for i = 2, #ARGV do
     local state = mh_read_state(KEYS[1], field)
     if state ~= nil and state[3] >= cutoff then keep = true end
   end
-  if not keep then dropped = dropped + redis.call('HDEL', KEYS[1], field) end
+  if not keep then
+    dropped = dropped + redis.call('HDEL', KEYS[1], field)
+    redis.call('HDEL', KEYS[2], field)
+  end
 end
 return dropped
 `
@@ -1627,15 +1747,20 @@ function numberFrom(raw: string | undefined): number {
 }
 
 /**
- * A level series from its packed field,
- * `value|carried|writtenAt|heldThrough|carriedFrom`, or `undefined` for a
- * field of any other shape, which is left unread.
+ * A level series from its packed field, and the `carriedFrom` entry stored
+ * beside it if there is one, or `undefined` for a field of any other shape,
+ * which is left unread.
  *
- * A field stored before `carriedFrom` was has four parts. Its newest write is
- * at or before the pointer when it is not past it, and the pointer is the
- * latest that write can be otherwise, as the Lua reads it too.
+ * The field is `value|carried|writtenAt|heldThrough`, as 0.7.0 stores it, or
+ * the same with `carriedFrom` as a fifth part, as a build between that one
+ * and this stored it. With four parts, `carriedFrom` is read the way the Lua
+ * reads it in `mh_carried_from`.
  */
-function levelSeriesFrom(dimKey: string, packed: string): LevelSeries | undefined {
+function levelSeriesFrom(
+  dimKey: string,
+  packed: string,
+  beside: string | undefined,
+): LevelSeries | undefined {
   const parts = packed.split('|')
   if (parts.length !== 4 && parts.length !== 5) return undefined
   const writtenAt = Number(parts[2])
@@ -1646,14 +1771,50 @@ function levelSeriesFrom(dimKey: string, packed: string): LevelSeries | undefine
     carried: numberFrom(parts[1]),
     writtenAt,
     heldThrough,
-    carriedFrom: parts.length === 5 ? Number(parts[4]) : Math.min(writtenAt, heldThrough),
+    carriedFrom:
+      parts.length === 5
+        ? Number(parts[4])
+        : carriedFromOf(writtenAt, heldThrough, parts[1] as string, parts[3] as string, beside),
   }
 }
 
-/** A packed gauge fold, a level's held or carried value, or a counter's scalar. */
+/**
+ * `carriedFrom` for a series stored in four parts.
+ *
+ * The newest write, when it is at or before the pointer. Otherwise the entry
+ * beside the series, when it names the pointer and carried value the series
+ * still holds, and the pointer when it does not: a 0.7 process has moved the
+ * series since, and the pointer is the latest that write can be.
+ */
+function carriedFromOf(
+  writtenAt: number,
+  heldThrough: number,
+  carriedText: string,
+  heldText: string,
+  beside: string | undefined,
+): number {
+  if (writtenAt <= heldThrough) return writtenAt
+  const entry = beside?.split('|')
+  if (entry?.length === 3 && entry[1] === heldText && entry[2] === carriedText) {
+    return Number(entry[0])
+  }
+  return heldThrough
+}
+
+/**
+ * A packed gauge fold, a level cell, or a counter's scalar.
+ *
+ * A level cell is `@` and its number. A carried one has a space after the
+ * `@`, or a `c` from a build between 0.7.0 and this one, and a moved one has
+ * a space after the number.
+ */
 function decodeCell(raw: string): Cell {
-  if (raw.startsWith('@c')) return { level: numberFrom(raw.slice(2)), carried: true }
-  if (raw.startsWith('@')) return { level: numberFrom(raw.slice(1)) }
+  if (raw.startsWith('@')) {
+    const mark = raw[1]
+    if (mark === ' ' || mark === 'c') return { level: numberFrom(raw.slice(2)), carried: true }
+    if (raw.endsWith(' ')) return { level: numberFrom(raw.slice(1, -1)), moved: true }
+    return { level: numberFrom(raw.slice(1)) }
+  }
 
   const parts = raw.split('|')
   if (parts.length !== 5) return numberFrom(raw)
@@ -1758,6 +1919,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     bucketPrefix: (metric: string) => `${ns}:b:${metric}:`,
     idx: (metric: string) => `${ns}:idx:${metric}`,
     levels: (metric: string) => `${ns}:lvl:${metric}`,
+    levelsFrom: (metric: string) => `${ns}:lvlfrom:${metric}`,
     records: (metric: string) => `${ns}:e:${metric}`,
     recordSeq: (metric: string) => `${ns}:eseq:${metric}`,
     inflight: (claimId: string) => `${ns}:inflight:${claimId}`,
@@ -1802,14 +1964,33 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
   /** Script source -> SHA1, filled by the first call that needs it. */
   const shas = new Map<string, string>()
+  /**
+   * Script source -> the load still on its way, shared by every call that
+   * asks meanwhile. A first level carry sends one script per window, and
+   * without this each of a thousand windows loaded the same script again.
+   */
+  const loading = new Map<string, Promise<string>>()
 
-  async function shaFor(client: IoredisClient, script: string): Promise<string> {
+  function shaFor(client: IoredisClient, script: string): Promise<string> {
     const cached = shas.get(script)
-    if (cached !== undefined) return cached
+    if (cached !== undefined) return Promise.resolve(cached)
 
-    const sha = String(await client.script('LOAD', script))
-    shas.set(script, sha)
-    return sha
+    let load = loading.get(script)
+    if (load === undefined) {
+      load = Promise.resolve(client.script('LOAD', script)).then((reply) => {
+        const sha = String(reply)
+        shas.set(script, sha)
+        return sha
+      })
+      const settled = load
+      // forgotten once settled either way, so a failed load is tried again
+      const forget = () => {
+        if (loading.get(script) === settled) loading.delete(script)
+      }
+      settled.then(forget, forget)
+      loading.set(script, settled)
+    }
+    return load
   }
 
   /**
@@ -2376,7 +2557,12 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
             script: group.first.mode === 'hold' ? HOLD_LEVEL : SET_LEVEL,
             // a hold is safe to run twice; a set or an add is not
             once: group.first.mode !== 'hold',
-            keys: [key.idx(group.metric), key.watermark(group.metric), key.levels(group.metric)],
+            keys: [
+              key.idx(group.metric),
+              key.watermark(group.metric),
+              key.levels(group.metric),
+              key.levelsFrom(group.metric),
+            ],
             args: [
               key.bucketPrefix(group.metric),
               group.bucketTs,
@@ -2400,11 +2586,13 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
     async readLevels(metric: string): Promise<LevelSeries[]> {
       const client = await connect()
-      const flat = await afterSends(() => client.hgetall(key.levels(metric)))
+      const [flat, beside] = await afterSends(() =>
+        Promise.all([client.hgetall(key.levels(metric)), client.hgetall(key.levelsFrom(metric))]),
+      )
 
       const series: LevelSeries[] = []
       for (const [dimKey, packed] of Object.entries(flat)) {
-        const one = levelSeriesFrom(dimKey, packed)
+        const one = levelSeriesFrom(dimKey, packed, beside[dimKey])
         if (one !== undefined) series.push(one)
       }
 
@@ -2414,8 +2602,13 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     async readLevel(metric: string, dimKey: string): Promise<LevelSeries | undefined> {
       const client = await connect()
       // one field of the level hash, where `readLevels` fetches all of them
-      const packed = await afterSends(() => client.hget(key.levels(metric), dimKey))
-      return packed === null ? undefined : levelSeriesFrom(dimKey, packed)
+      const [packed, beside] = await afterSends(() =>
+        Promise.all([
+          client.hget(key.levels(metric), dimKey),
+          client.hget(key.levelsFrom(metric), dimKey),
+        ]),
+      )
+      return packed === null ? undefined : levelSeriesFrom(dimKey, packed, beside ?? undefined)
     },
 
     async sumBuckets(query: BucketRange): Promise<number | undefined> {
@@ -2443,7 +2636,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       await runScripts(
         chunks(dimKeys, MAX_PAIRS_PER_SCRIPT).map((some) => ({
           script: DROP_LEVELS,
-          keys: [key.levels(metric)],
+          keys: [key.levels(metric), key.levelsFrom(metric)],
           args: [writtenBefore === undefined ? '' : writtenBefore, ...some],
         })),
         'dropLevels',

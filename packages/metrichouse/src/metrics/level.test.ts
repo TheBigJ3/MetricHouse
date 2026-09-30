@@ -385,6 +385,51 @@ describe('reading', () => {
     expect(rows.map((row) => row.value)).toEqual([Number.MAX_SAFE_INTEGER])
   })
 
+  it('adds stored fractions on an integer level when their total is whole', async () => {
+    // a float level declared again as an integer one reads what it stored
+    const float = bound()
+    float.set(1.5, EMAIL)
+    float.set(0.5, EXPORT)
+    await float.drain()
+
+    const metric = bound({ value: int() })
+    expect(await metric.totals()).toBe(2)
+    const rows = await metric.snapshot({ complete: false, groupBy: [] })
+    expect(rows.map((row) => row.value)).toEqual([2])
+  })
+
+  it('refuses a total of stored fractions on an integer level that is not whole', async () => {
+    const float = bound()
+    float.set(1.5, EMAIL)
+    float.set(1, EXPORT)
+    await float.drain()
+
+    const metric = bound({ value: int() })
+    await expect(metric.totals()).rejects.toThrow(
+      'queue_depth: the total across series would be 2.5, which is not a whole number. A ' +
+        'stored value is a fraction, which happens when a float level is declared as an ' +
+        'integer one',
+    )
+    await expect(metric.snapshot({ complete: false, groupBy: [] })).rejects.toThrow(
+      'queue_depth: a merged value would be 2.5, which is not a whole number',
+    )
+  })
+
+  it('refuses a total of stored fractions on an integer level past the safe range', async () => {
+    // added as doubles, the two halves round the total up past the limit
+    const float = bound()
+    float.set(Number.MAX_SAFE_INTEGER, EMAIL)
+    float.set(0.5, EXPORT)
+    float.set(0.5, { queue: 'import' })
+    await float.drain()
+
+    const metric = bound({ value: int() })
+    await expect(metric.totals()).rejects.toThrow(
+      'queue_depth: the total across series would be 9007199254740992, which is past ' +
+        '9007199254740991, the largest whole number a double holds exactly',
+    )
+  })
+
   it('answers from the held value, not from the open window', async () => {
     // the whole difference from a gauge: nothing was written this window
     const metric = bound()

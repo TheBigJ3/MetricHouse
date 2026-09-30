@@ -509,6 +509,154 @@ if (!client) {
     })
   })
 
+  describe('ioredis · level storage shared with 0.7', () => {
+    const LV = 'dogs_in_park'
+    const one = (bucketTs: number, value: number, mode: 'set' | 'add' | 'hold') =>
+      ({ metric: LV, bucketTs, resolutionMs: 1000, dimKey: WILLOW, value, mode }) as const
+
+    /** A level cell's number as 0.7.0's scripts read it: `tonumber` of all but the `@`. */
+    const luaReads = async (key: string, field: string) =>
+      live.eval(
+        "return tostring(tonumber(string.sub(redis.call('HGET', KEYS[1], ARGV[1]), 2)))",
+        1,
+        key,
+        field,
+      )
+
+    it('reads the four field state and bare cells 0.7 stored', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      // `value|carried|writtenAt|heldThrough`. The newest write is at or
+      // before the pointer unless it is past it, and then the pointer is the
+      // latest the write carried can be
+      await live.hset(`${ns}:lvl:${LV}`, WILLOW, '7|5|3000|1000', 'Rex', '4|4|1000|2000')
+      await live.hset(`${ns}:b:${LV}:1000`, WILLOW, '@5')
+      await live.zadd(`${ns}:idx:${LV}`, 1000, '1000')
+
+      expect(await driver.readLevels(LV)).toEqual([
+        {
+          dimKey: 'Rex',
+          value: 4,
+          carried: 4,
+          writtenAt: 1000,
+          heldThrough: 2000,
+          carriedFrom: 1000,
+        },
+        {
+          dimKey: WILLOW,
+          value: 7,
+          carried: 5,
+          writtenAt: 3000,
+          heldThrough: 1000,
+          carriedFrom: 1000,
+        },
+      ])
+      expect(await driver.readBuckets({ metric: LV })).toEqual([
+        { bucketTs: 1000, dimKey: WILLOW, value: { level: 5 } },
+      ])
+
+      await wipe(ns)
+    })
+
+    it('keeps the state in four fields, and carriedFrom beside it only when they cannot say it', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      const state = () => live.hget(`${ns}:lvl:${LV}`, WILLOW)
+      const from = () => live.hget(`${ns}:lvlfrom:${LV}`, WILLOW)
+
+      await driver.setLevel([one(1000, 5, 'set')])
+      await driver.setLevel([one(2000, 5, 'hold')])
+      expect([await state(), await from()]).toEqual(['5|5|1000|2000', null])
+
+      // written past the pointer, and the write carried comes from is older
+      // than the pointer: the four fields cannot say which window that was
+      await driver.setLevel([one(4000, 7, 'set')])
+      expect([await state(), await from()]).toEqual(['7|5|4000|2000', '1000|2000|5'])
+      expect((await driver.readLevels(LV))[0]?.carriedFrom).toBe(1000)
+
+      await driver.setLevel([one(3000, 5, 'hold')])
+      expect([await state(), await from()]).toEqual(['7|5|4000|3000', '1000|3000|5'])
+
+      // the carry reaches the write, and the four fields say it again
+      await driver.setLevel([one(4000, 5, 'hold')])
+      expect([await state(), await from()]).toEqual(['7|7|4000|4000', null])
+      expect((await driver.readLevels(LV))[0]?.carriedFrom).toBe(4000)
+
+      await wipe(ns)
+    })
+
+    it('marks carried and moved cells with a space 0.7 reads past', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await driver.setLevel([one(1000, 5, 'set')])
+      await driver.setLevel([one(2000, 5, 'hold')])
+      await driver.setLevel([{ ...one(3000, 1, 'set'), dimKey: 'Rex' }])
+      await driver.ack(await driver.claim(LV, 3000))
+      await driver.setLevel([one(1000, 8, 'set')])
+
+      expect(await live.hget(`${ns}:b:${LV}:3000`, WILLOW)).toBe('@8 ')
+      // the claim took 2000 and holds the carried cell as it was stored
+      await driver.setLevel([one(4000, 8, 'hold')])
+      expect(await live.hget(`${ns}:b:${LV}:4000`, WILLOW)).toBe('@ 8')
+      expect(await luaReads(`${ns}:b:${LV}:3000`, WILLOW)).toBe('8')
+      expect(await luaReads(`${ns}:b:${LV}:4000`, WILLOW)).toBe('8')
+      // and 0.7.0's decodeCell, `Number` of all but the `@`
+      expect(Number('@8 '.slice(1))).toBe(8)
+      expect(Number('@ 8'.slice(1))).toBe(8)
+      expect(await driver.readBuckets({ metric: LV, dimKey: WILLOW })).toEqual([
+        { bucketTs: 3000, dimKey: WILLOW, value: { level: 8, moved: true } },
+        { bucketTs: 4000, dimKey: WILLOW, value: { level: 8, carried: true } },
+      ])
+
+      await wipe(ns)
+    })
+
+    it('ignores a carriedFrom beside a series that 0.7 has since carried on', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      // stored against a pointer of 2000, and a 0.7 hold has moved it to 3000
+      await live.hset(`${ns}:lvl:${LV}`, WILLOW, '7|5|4000|3000')
+      await live.hset(`${ns}:lvlfrom:${LV}`, WILLOW, '1000|2000|5')
+
+      expect((await driver.readLevels(LV))[0]?.carriedFrom).toBe(3000)
+      expect((await driver.readLevel?.(LV, WILLOW))?.carriedFrom).toBe(3000)
+
+      await wipe(ns)
+    })
+
+    it('reads the five field state and @c cells an unreleased build stored, and rewrites them', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.hset(`${ns}:lvl:${LV}`, WILLOW, '5|5|1000|2000|1000')
+      await live.hset(`${ns}:b:${LV}:2000`, WILLOW, '@c5')
+      await live.zadd(`${ns}:idx:${LV}`, 2000, '2000')
+
+      expect((await driver.readLevels(LV))[0]?.carriedFrom).toBe(1000)
+      expect(await driver.readBuckets({ metric: LV })).toEqual([
+        { bucketTs: 2000, dimKey: WILLOW, value: { level: 5, carried: true } },
+      ])
+
+      await driver.setLevel([one(4000, 7, 'set')])
+      expect(await live.hget(`${ns}:lvl:${LV}`, WILLOW)).toBe('7|5|4000|2000')
+      expect(await live.hget(`${ns}:lvlfrom:${LV}`, WILLOW)).toBe('1000|2000|5')
+
+      await wipe(ns)
+    })
+
+    it('forgets the carriedFrom beside a series it drops', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await driver.setLevel([one(1000, 5, 'set')])
+      await driver.setLevel([one(2000, 5, 'hold')])
+      await driver.setLevel([one(4000, 7, 'set')])
+
+      await driver.dropLevels(LV, [WILLOW])
+      expect(await live.exists(`${ns}:lvl:${LV}`, `${ns}:lvlfrom:${LV}`)).toBe(0)
+
+      await wipe(ns)
+    })
+  })
+
   describe('ioredis · one series read', () => {
     it('fails on a bound Redis refuses with the words the plain command uses', async () => {
       const ns = fresh()
@@ -994,6 +1142,41 @@ if (!client) {
         ]),
       ).resolves.toBeUndefined()
       expect(await live.hget(`${ns}:b:${G}:1000`, WILLOW)).toBe('7|5|7|12|2')
+
+      await wipe(ns)
+    })
+
+    it('loads a script once for every call in a batch that first needs it', async () => {
+      // a first carry sends one hold script per window
+      const ns = fresh()
+      const loads: unknown[] = []
+      const counting = new Proxy(live, {
+        get(target, prop, receiver) {
+          if (prop !== 'script') return Reflect.get(target, prop, receiver)
+          return (...args: [string, ...unknown[]]) => {
+            if (args[0] === 'LOAD') loads.push(args[1])
+            return target.script(...(args as Parameters<typeof target.script>))
+          }
+        },
+      })
+      const driver = ioredis(counting, { namespace: ns })
+      await driver.setLevel([
+        { metric: M, bucketTs: 0, resolutionMs: 1000, dimKey: WILLOW, value: 1, mode: 'set' },
+      ])
+      loads.length = 0
+
+      await driver.setLevel(
+        Array.from({ length: 20 }, (_, i) => ({
+          metric: M,
+          bucketTs: (i + 1) * 1000,
+          resolutionMs: 1000,
+          dimKey: WILLOW,
+          value: 1,
+          mode: 'hold' as const,
+        })),
+      )
+      expect(loads).toHaveLength(1)
+      expect((await driver.readLevels(M))[0]?.heldThrough).toBe(20_000)
 
       await wipe(ns)
     })
@@ -1530,42 +1713,6 @@ if (!client) {
 
       expect(sizes).toEqual([10, 10, 10, 10, 5])
       expect((await driver.readLevels(M))[0]?.heldThrough).toBe(45_000)
-
-      await wipe(ns)
-    })
-
-    it('reads a level series stored before it carried carriedFrom', async () => {
-      // `value|carried|writtenAt|heldThrough`. The newest write is at or
-      // before the pointer unless it is past it, and then the pointer is the
-      // latest the write carried can be
-      const ns = fresh()
-      const driver = ioredis(live, { namespace: ns })
-      await live.hset(`${ns}:lvl:${M}`, WILLOW, '7|5|3000|1000', 'Rex', '4|4|1000|2000')
-
-      expect(await driver.readLevels(M)).toEqual([
-        {
-          dimKey: 'Rex',
-          value: 4,
-          carried: 4,
-          writtenAt: 1000,
-          heldThrough: 2000,
-          carriedFrom: 1000,
-        },
-        {
-          dimKey: WILLOW,
-          value: 7,
-          carried: 5,
-          writtenAt: 3000,
-          heldThrough: 1000,
-          carriedFrom: 1000,
-        },
-      ])
-
-      // a hold reads it the same way, and stores it in the new form
-      await driver.setLevel([
-        { metric: M, bucketTs: 2000, resolutionMs: 1000, dimKey: WILLOW, value: 5, mode: 'hold' },
-      ])
-      expect(await live.hget(`${ns}:lvl:${M}`, WILLOW)).toBe('7|5|3000|2000|1000')
 
       await wipe(ns)
     })
