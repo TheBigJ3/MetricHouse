@@ -107,8 +107,8 @@ stage?: 'driver' | 'local'      // default: 'driver'
 ```
 
 Where records wait between `record()` and your `write` function. Any other value
-throws at declaration, since one read from an environment variable gets past
-TypeScript.
+throws at declaration, `null` included, since one read from an environment
+variable or a config file gets past TypeScript.
 
 | | `'driver'` | `'local'` |
 | --- | --- | --- |
@@ -130,6 +130,16 @@ export const pageViewed = event('page_viewed', {
 Local staging costs nothing per event and loses everything on a crash. Use it
 for page views, and use `'driver'` for money. A record a caller must not lose,
 such as an order or an audit entry, also wants [`durability: 'durable'`](#durability).
+
+A locally staged event never writes to the driver, but it still reads it for one
+thing: records an earlier `stage: 'driver'` declaration of the same event left
+there. So moving an event from `'driver'` to `'local'` strands nothing.
+[`pending()`](#event-pending) counts those records, and every
+[`flush()`](#event-flush) claims them before the local buffer, up to
+[`claimLimit`](#claimlimit) at a time, until none are left. That costs one
+`countPending` call to the driver per flush and per `pending()`.
+[`peek()`](#event-peek) and [`snapshot()`](#event-snapshot) read the local
+buffer only.
 
 ### durability
 
@@ -226,8 +236,8 @@ What durable does not cover:
 ### batch
 
 ```ts
-batch?: { maxSize?: number; maxAge?: DurationInput }
-// defaults: { maxSize: 500, maxAge: '10s' }
+batch?: { maxSize?: number; maxAge?: DurationInput; maxStaged?: number }
+// defaults: { maxSize: 500, maxAge: '10s', maxStaged: 100_000 }
 ```
 
 Local staging only, and ignored entirely when `stage: 'driver'`.
@@ -236,6 +246,7 @@ Local staging only, and ignored entirely when `stage: 'driver'`.
 | --- | --- | --- | --- |
 | `maxSize` | `number` | `500` | Ship once this many records are buffered |
 | `maxAge` | duration | `'10s'` | Ship this long after the first record in a batch |
+| `maxStaged` | `number` | `100_000`, or `maxSize` when larger | The most records this process holds, waiting or being sent |
 
 The age clock starts at the first record of a batch, so `maxAge` bounds how
 long the oldest record waits rather than the newest. A `maxSize` that is not a
@@ -248,6 +259,29 @@ and the age clock starts again. They are retried `maxAge` later, whether or not
 another record arrives, so a sink that recovers is caught up without anyone
 calling `flush()`. Two batches that fail one after the other go back in the
 order they were recorded.
+
+Until `maxAge` has passed since that failure, `record()` sends nothing, even
+once the buffer holds `maxSize` records, and neither does immediate delivery.
+Every send takes the whole buffer, so without the pause a sink that is down
+would be handed the whole backlog again by every new record, and report one
+failure to `onError` for each. The records wait for the age clock, a `flush()`
+or a `drain()`, which all send at once. A send with rows in it that succeeds
+ends the pause.
+
+`maxStaged` is the local counterpart of
+[`memory({ maxStaged })`](/reference/configuration): a sink that stays down
+would otherwise grow the buffer until the process runs out of memory. A
+`record()` or `recordMany()` that would take the count past it stages none of
+its records and reports this to `onError`, and the records already held stay.
+[`derive`](#derive) has run for them by then, as it has for a relaxed record a
+driver refuses.
+
+```
+page_viewed: staging 1 more record would pass batch.maxStaged (100000), with 100000 already held in this process. Locally staged records only leave when a send succeeds, so this is a backlog that nothing is shipping
+```
+
+A `maxStaged` that is not a positive whole number, or that is below `maxSize`,
+throws at declaration.
 
 ### flush
 
@@ -407,6 +441,7 @@ reported to `onError` with the event and the target in the message.
 | An array records several increments | One fact can feed two counters, or one counter twice |
 | A function's targets apply together | Every target a function returns is checked first. If one is wrong, none of that function's increments are applied |
 | A broken derive goes to `onError` | The event is still recorded. A mistake in a derived counter must not lose the underlying fact |
+| A function sees the stored record | Each function gets its own copy of the fields as they were stored, with a `json()` value read back from its JSON text. Changing the object passed to `record()` afterwards, or changing the copy inside one function, changes nothing another function counts |
 | The increment lands in the open window | The counter's window is the one `now` falls in, even for a record with an older `ts`. A counter cannot be written in the past |
 
 ### claimLimit
@@ -430,7 +465,10 @@ The places that have to empty the backlog still do, in batches of this size:
 [`drain()`](#event-drain) and `batch.maxAge` ship every locally staged record,
 and a [final flush](/reference/flush-options#final), which `house.stop()` makes,
 keeps claiming until nothing is left. A full buffer on `batch.maxSize` ships
-batches while it is still full and leaves the rest to the age clock.
+batches while it is still full and leaves the rest to the age clock. Under
+`delivery: 'immediate'`, an event staged in the driver claims again while a
+claim comes back full, up to 100 claims for one `record()`, and stops at the
+first send that fails.
 
 A limit that is not a positive whole number throws at declaration.
 
@@ -508,7 +546,9 @@ retries it does not count it twice.
 
 The stored copy is taken at the call. A `json()` value is turned into its JSON
 text there and a `Date` is copied, so changing the object you passed afterwards
-does not change what ships.
+does not change what ships. [`derive`](#derive) reads that stored copy too, so
+on a durable event, which derives only once the driver answers, a change made
+while the append is on its way changes neither the row nor the counters.
 
 ## event.recordMany()
 
@@ -547,7 +587,9 @@ pending(): Promise<number>
 
 How many records have not shipped yet: those waiting for a flush, plus those a
 flush has claimed and is still writing. A sink that hangs therefore shows up as
-a backlog rather than as zero.
+a backlog rather than as zero. On a locally staged event it also counts records
+a `stage: 'driver'` declaration left in the driver, as [`stage`](#stage)
+explains.
 
 ```ts
 await checkoutAttempted.pending()     // 128
@@ -576,6 +618,8 @@ await checkoutAttempted.peek(10)
 
 Records come back in the order they were staged, as the rows your `write`
 function would receive. Nothing is claimed, so the next flush still ships them.
+Each row is a copy, `Date` values included, so changing one changes nothing that
+ships.
 `peek(0)` returns nothing, and a negative or fractional `n` throws.
 
 ## event.snapshot()
@@ -623,8 +667,10 @@ drain(): Promise<void>
 Resolves once every `record()` issued so far has reached the driver. On a
 locally staged event it also ships whatever is buffered, because that buffer is
 the only place those records exist. It waits for a durable record the driver
-has not answered yet, and resolves even when that record's promise rejects,
-since the caller holding the promise has the error.
+has not answered yet, and for the counter writes that record's
+[`derive`](#derive) makes once the driver answers, so `house.drain()` does not
+resolve with a derived increment still on its way. It resolves even when that
+record's promise rejects, since the caller holding the promise has the error.
 
 ## event.rowShape()
 
@@ -684,6 +730,31 @@ metric type in one list.
 
 Inside `write`, each row is an `EventRow<F>`. See
 [Rows are typed](/guide/writing-a-sink#rows-are-typed).
+
+### Records staged under an earlier declaration
+
+A record can wait in the driver across a deploy that changes the event's
+fields. It becomes a row under the declaration the shipping process has, not
+the one that staged it:
+
+| The record | The row |
+| --- | --- |
+| lacks a field that now has a default | carries the default |
+| lacks a field that is now optional | leaves the column out, as for a record that omitted it |
+| lacks a field that is now required, with no default | throws, naming the record and the field |
+| holds a value the field no longer accepts, such as text in a field now `int()`, or a `oneOf()` member since removed | throws, naming the record and the field |
+| holds text in a field now `json()` | carries that text as JSON text, `"hello"` for `hello`. Text that already reads as JSON, such as `42`, is carried as it is |
+| was staged before `sample` was declared | carries a `_sample_rate` of `1`, since it was kept whole |
+
+```
+views: staged record 0192f3a1-5c7e-7b21-8d44-0e9a3c2b7f10 holds a value field "n" no longer accepts. n: expected a safe integer, got "abc"
+```
+
+A record that throws fails the flush that claimed it, as a sink failure does:
+the whole claim goes back and is retried on the next flush, so it holds up the
+records claimed with it. `peek()` and `snapshot()` throw the same error. Change
+a field's type in a way that accepts what is already staged, or let the backlog
+ship before the deploy that changes it.
 
 ### Table schema
 

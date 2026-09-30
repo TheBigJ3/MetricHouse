@@ -672,12 +672,12 @@ describe('observe() precision', () => {
     expect(rows[0]?.sum).toBe(1.235)
   })
 
-  it('returns the very Promise fn returned, and times it', async () => {
+  it('returns a Promise of what fn resolved to, settled once the timing is recorded', async () => {
     const latency = bound()
     const work = Promise.resolve([1, 2, 3])
     const returned = latency.time({ route: '/a', status: 'ok' }, () => work)
-    expect(returned).toBe(work)
-    await returned
+    expect(returned).not.toBe(work)
+    expect(await returned).toEqual([1, 2, 3])
     await latency.drain()
     expect((await latency.current({ route: '/a', status: 'ok' }))?.count).toBe(1)
   })
@@ -721,5 +721,81 @@ describe('observe() precision', () => {
     latency.observe(1e306, { route: '/a', status: 'ok' })
     await latency.drain()
     expect((await latency.current({ route: '/a', status: 'ok' }))?.max).toBe(1e306)
+  })
+})
+
+describe('dims a timer shares with the event it records to', () => {
+  it.each(['ts', '_ingested_at', '_sample_rate'])(
+    'refuses a dim named %s, even with no record event',
+    (reserved) => {
+      expect(() =>
+        timer('t', { write: discard, dims: { [reserved]: str() }, resolution: '1s', flush: '1s' }),
+      ).toThrow(
+        `t: dim "${reserved}" is reserved, because a record event writes a column of that name ` +
+          'on every row',
+      )
+    },
+  )
+})
+
+describe('dims the caller still holds', () => {
+  it('copies what start() bound, so changing the object afterwards moves nothing', async () => {
+    const latency = bound()
+    const dims: { route: string; status: 'ok' | 'error' } = { route: '/a', status: 'ok' }
+    const span = latency.start(dims)
+    dims.route = '/b'
+    mono += 5
+    span.end()
+    await latency.drain()
+
+    expect(await latency.current({ route: '/a', status: 'ok' })).toMatchObject({ sum: 5 })
+    expect(await latency.current({ route: '/b', status: 'ok' })).toBeUndefined()
+  })
+
+  it('copies what time() was given, so the work changing it moves nothing', async () => {
+    const latency = bound()
+    const dims: { route: string; status: 'ok' | 'error' } = { route: '/a', status: 'ok' }
+    latency.time(dims, () => {
+      dims.status = 'error'
+      mono += 3
+    })
+    await latency.drain()
+
+    expect(await latency.current({ route: '/a', status: 'ok' })).toMatchObject({ sum: 3 })
+  })
+
+  it('keeps a dim a Partial may not hold required at end()', () => {
+    const latency = bound()
+    const maybe: Partial<{ route: string; status: 'ok' | 'error' }> = { route: '/a' }
+    const span = latency.start(maybe)
+    // @ts-expect-error status may still be missing, so end() has to pass it
+    expect(() => span.end()).toThrow('missing required dim "status"')
+    expect(span.end({ route: '/a', status: 'ok' })).toBe(0)
+  })
+})
+
+describe('time() with a Promise', () => {
+  it('leaves a rejection nobody awaits to surface as an unhandled rejection', async () => {
+    const latency = bound()
+    const boom = new Error('timeout')
+
+    const theirs = process.listeners('unhandledRejection')
+    process.removeAllListeners('unhandledRejection')
+    const unhandled: unknown[] = []
+    const mine = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', mine)
+    try {
+      latency.time({ route: '/a', status: 'error' }, async () => {
+        throw boom
+      })
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    } finally {
+      process.off('unhandledRejection', mine)
+      for (const listener of theirs) process.on('unhandledRejection', listener)
+    }
+
+    expect(unhandled).toEqual([boom])
+    await latency.drain()
+    expect((await latency.current({ route: '/a', status: 'error' }))?.count).toBe(1)
   })
 })

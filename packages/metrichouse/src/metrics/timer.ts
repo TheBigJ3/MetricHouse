@@ -29,6 +29,7 @@ import type { SnapshotOptions } from '../runtime/live.js'
 import { dimKeyEncoder } from '../schema/dims.js'
 import {
   assertValue,
+  type DefinedKeys,
   type InferShape,
   type MarkOptional,
   type RequiredKeys,
@@ -76,6 +77,14 @@ export const TIMER_AGGREGATES = ['min', 'max', 'sum', 'count'] as const
  * never invalidate a declaration that used to work.
  */
 export const DURATION_FIELD = 'duration_ms'
+
+/**
+ * Columns a `record` event writes on every row, which no timer dim may take
+ * either. Reserved whether or not `record` is set, for the same reason as
+ * {@link DURATION_FIELD}: the event a timer records to declares the timer's
+ * dims as fields, and an event refuses a field of one of these names.
+ */
+const RECORD_EVENT_COLUMNS = ['ts', '_ingested_at', '_sample_rate'] as const
 
 export interface TimerConfig<D extends Shape> {
   /** Omit entirely for a timer with no dimensions. */
@@ -135,22 +144,23 @@ export interface TimerHandle<D extends Shape> {
   end(...dims: ShapeArgs<D>): number
 }
 
-/** `time(fn)` is only legal when no dim is required. */
 /**
  * What `time()` hands back for a function returning `T`.
  *
- * A Promise comes back as it is. Any other thenable, a query builder for one,
- * is subscribed to once and replaced by a Promise of what it resolves to, so
- * a builder method on the result does not exist at run time and is not
- * offered by the type either. Anything else comes back unchanged.
+ * A Promise, or any other thenable such as a query builder, is subscribed to
+ * once and replaced by a new Promise of what it resolves to, settled once the
+ * timing is recorded. A builder method on the result therefore does not exist
+ * at run time and is not offered by the type either. Anything else comes
+ * back unchanged.
  */
 type TimeResult<T> =
-  T extends Promise<unknown>
-    ? T
+  T extends Promise<infer U>
+    ? Promise<U>
     : T extends { then(onFulfilled: (value: infer U) => unknown, ...rest: never[]): unknown }
       ? Promise<U>
       : T
 
+/** `time(fn)` is only legal when no dim is required. */
 export type TimeArgs<D extends Shape, T> = [RequiredKeys<D>] extends [never]
   ? [fn: () => T] | [dims: InferShape<D>, fn: () => T]
   : [dims: InferShape<D>, fn: () => T]
@@ -179,7 +189,7 @@ export interface Timer<D extends Shape> extends AnyMetric {
    */
   start<const B extends Partial<InferShape<D>> = Record<never, never>>(
     dims?: B,
-  ): TimerHandle<MarkOptional<D, keyof B>>
+  ): TimerHandle<MarkOptional<D, DefinedKeys<B>>>
 
   /**
    * Time a function, sync or async, and return what it returns.
@@ -189,8 +199,8 @@ export interface Timer<D extends Shape> extends AnyMetric {
    * and dropping failures would hide it. Split by outcome with a dim on
    * `start()`/`end()` instead.
    *
-   * A thenable that is not a Promise comes back as a Promise of its result.
-   * See {@link TimeResult}.
+   * A Promise, or any other thenable, comes back as a new Promise of its
+   * result, which rejects when it rejects. See {@link TimeResult}.
    *
    * @throws before `fn` runs if the timer is unbound or the dims are invalid,
    * never after, when the work has already happened. Whatever `fn` throws is
@@ -279,6 +289,14 @@ export function timer<D extends Shape = Record<never, never>>(
       `${name}: dim ${JSON.stringify(DURATION_FIELD)} is reserved, because it is the field a ` +
         'timing carries onto a record event',
     )
+  }
+  for (const column of RECORD_EVENT_COLUMNS) {
+    if (Object.hasOwn(dims, column)) {
+      throw new Error(
+        `${name}: dim ${JSON.stringify(column)} is reserved, because a record event writes a ` +
+          'column of that name on every row',
+      )
+    }
   }
   if (config.record !== undefined) {
     if (typeof config.record !== 'string' || config.record.trim() === '') {
@@ -422,8 +440,11 @@ export function timer<D extends Shape = Record<never, never>>(
     }
   }
 
-  function start(bound: Record<string, unknown> = {}): OpenTiming {
+  function start(given: Record<string, unknown> = {}): OpenTiming {
     assertBound()
+    // a copy, so the caller changing its object before end() cannot move the
+    // timing to another series
+    const bound = { ...given }
     assertKnownDims(bound)
 
     const startedAt = performance.now()
@@ -510,17 +531,11 @@ export function timer<D extends Shape = Record<never, never>>(
         throw error
       }
 
-      // a Promise is returned as it is, and timed through a second
-      // subscription, which a Promise allows. Any other thenable, a query
-      // builder for one, may run its work each time `then` is called, so it
-      // is subscribed to exactly once and a Promise of its result is returned
-      if (result instanceof Promise) {
-        result.then(
-          () => handle.end(),
-          () => handle.end(),
-        )
-        return result
-      }
+      // subscribed to exactly once, and a new Promise of the result is
+      // returned. A handler on the caller's own Promise would mark it handled,
+      // and a rejection nobody awaits would never be reported. Any other
+      // thenable, a query builder for one, may run its work each time `then`
+      // is called, which is the other reason for one subscription
       if (isThenable(result)) {
         return Promise.resolve(result).then(
           (value) => {

@@ -1021,9 +1021,10 @@ describe('local staging after a failure', () => {
     pageViews.record({ path: '/c' })
     await house.drain()
 
-    // drain() ships the buffer too, so each record is followed by a second
-    // try at whatever failed; every one of them counts
-    expect(attempts).toEqual([1, 2, 3, 4, 5, 1])
+    // drain() ships the buffer too, so the first record is followed by a
+    // second try. A record within maxAge of a failure waits for the next
+    // drain() rather than shipping itself, and every try counts
+    expect(attempts).toEqual([1, 2, 3, 4, 1])
   })
 
   it('retries maxAge after a failed send, without a new record or a flush', async () => {
@@ -1544,5 +1545,460 @@ describe('durability', () => {
     await house.drain()
     expect(shipped.map((row) => row.orderId)).toEqual(['o_1'])
     expect(await log.pending()).toBe(0)
+  })
+})
+
+describe('house.drain() after a durable record that derives', () => {
+  it('waits for the derived counter write as well as the append', async () => {
+    const base = memory()
+    const calls: string[] = []
+    const slow: Driver = {
+      ...base,
+      capabilities: { durable: true, shared: true, atomicMerge: true },
+      append: async (ops) => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        await base.append(ops)
+        calls.push('append')
+      },
+      increment: async (ops) => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        await base.increment(ops)
+        calls.push('increment')
+      },
+    }
+    const orders = counter('orders', {
+      dims: { plan: str() },
+      resolution: '1m',
+      flush: '1m',
+      write: discard,
+    })
+    const audit = event('order_audit', {
+      fields: { plan: str() },
+      durability: 'durable',
+      derive: { orders: (fields) => ({ dims: { plan: fields.plan } }) },
+      write: discard,
+    })
+    const house = createHouse({ driver: slow, schema: [orders, audit], now })
+
+    const recorded = audit.record({ plan: 'pro' })
+    await house.drain()
+    expect(calls).toEqual(['append', 'increment'])
+    await recorded
+  })
+})
+
+describe('derive sees the record as it was stored', () => {
+  it('counts what a durable record stored, not what the caller changed before the reply', async () => {
+    let answer = () => {}
+    const base = memory()
+    const held: Driver = {
+      ...base,
+      capabilities: { durable: true, shared: true, atomicMerge: true },
+      append: (ops) =>
+        new Promise<void>((resolve) => {
+          answer = () => resolve(base.append(ops))
+        }),
+    }
+    const orders = counter('orders', {
+      dims: { plan: str() },
+      resolution: '1m',
+      flush: '1m',
+      write: discard,
+    })
+    const audit = event('order_audit', {
+      fields: { order: json<{ plan: string }>() },
+      durability: 'durable',
+      derive: { orders: (fields) => ({ dims: { plan: fields.order.plan } }) },
+      write: discard,
+    })
+    createHouse({ driver: held, schema: [orders, audit], now })
+
+    const order = { plan: 'pro' }
+    const recorded = audit.record({ order })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    order.plan = 'team'
+    answer()
+    await recorded
+    await orders.drain()
+
+    expect([await orders.current({ plan: 'pro' }), await orders.current({ plan: 'team' })]).toEqual(
+      [1, 0],
+    )
+    expect((await audit.peek())[0]?.order).toBe('{"plan":"pro"}')
+  })
+
+  it('gives each derive function its own copy, so one cannot change what the next sees', () => {
+    const seen: unknown[] = []
+    const first = counter('first', { resolution: '1m', flush: '1m', write: discard })
+    const second = counter('second', { resolution: '1m', flush: '1m', write: discard })
+    const checkout = event('checkout', {
+      fields: { cart: json<{ items: string[] }>(), at: ts() },
+      derive: {
+        first: (fields) => {
+          fields.cart.items.push('mutated')
+          fields.at.setTime(0)
+          return {}
+        },
+        second: (fields) => {
+          seen.push(fields.cart.items, fields.at.getTime())
+          return {}
+        },
+      },
+      write: discard,
+    })
+    createHouse({ driver, schema: [first, second, checkout], now })
+
+    checkout.record({ cart: { items: ['tee'] }, at: new Date(clock) })
+    expect(seen).toEqual([['tee'], clock])
+  })
+})
+
+describe('ackError on sends that are not a flush', () => {
+  it('reports a failed ack after an immediate send of driver staged records', async () => {
+    const failure = new Error('claim was taken back')
+    const errors: unknown[] = []
+    const acking: Driver = { ...driver, ack: () => Promise.reject(failure) }
+    const views = event('views', { fields: { path: str() }, write: discard })
+    const house = createHouse({
+      driver: acking,
+      schema: [views],
+      now,
+      delivery: 'immediate',
+      onError: (error) => errors.push(error),
+    })
+
+    views.record({ path: '/' })
+    await house.drain()
+    expect(errors).toEqual([failure])
+  })
+
+  it('reports a failed ack after a local batch send', async () => {
+    const failure = new Error('ack failed')
+    const errors: unknown[] = []
+    const views = event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      batch: { maxSize: 1 },
+      write: discard,
+    })
+    const house = createHouse({
+      driver,
+      schema: [views],
+      now,
+      onError: (error) => errors.push(error),
+    })
+    vi.spyOn(views, 'ackBatch').mockRejectedValue(failure)
+
+    views.record({ path: '/' })
+    await house.drain()
+    expect(errors).toEqual([failure])
+  })
+})
+
+describe('sending after a failed send', () => {
+  function failing(stage: 'local' | 'driver', batch?: { maxSize?: number; maxAge?: string }) {
+    const sent: string[][] = []
+    const errors: unknown[] = []
+    let fail = true
+    const views = event('views', {
+      fields: { path: str() },
+      stage,
+      ...(batch && { batch }),
+      flush: '30s',
+      write: (rows) => {
+        sent.push(rows.map((row) => row.path))
+        if (fail) throw new Error('down')
+      },
+    })
+    const house = createHouse({
+      driver,
+      schema: [views],
+      now,
+      delivery: batch ? 'staged' : 'immediate',
+      onError: (error) => errors.push(error),
+    })
+    return {
+      views,
+      house,
+      sent,
+      errors,
+      recover: () => {
+        fail = false
+      },
+    }
+  }
+
+  it('holds locally staged records back from immediate sends until maxAge has passed', async () => {
+    const { views, sent, errors } = failing('local')
+    for (const path of ['/1', '/2', '/3', '/4']) views.record({ path })
+    expect(sent).toEqual([['/1']])
+
+    clock += 9_999
+    views.record({ path: '/5' })
+    expect(sent).toEqual([['/1']])
+
+    clock += 1
+    views.record({ path: '/6' })
+    expect(sent).toEqual([['/1'], ['/1', '/2', '/3', '/4', '/5', '/6']])
+    // one report per send, rather than one per record
+    await vi.waitFor(() => expect(errors).toHaveLength(2))
+  })
+
+  it('holds a full local batch back until maxAge has passed', async () => {
+    const { views, sent, errors, house } = failing('local', { maxSize: 1, maxAge: '10s' })
+    for (const path of ['/1', '/2', '/3', '/4', '/5']) views.record({ path })
+    await vi.waitFor(() => expect(errors).toHaveLength(1))
+    expect(sent).toEqual([['/1']])
+
+    clock += 9_999
+    views.record({ path: '/6' })
+    expect(sent).toEqual([['/1']])
+
+    clock += 1
+    views.record({ path: '/7' })
+    expect(sent.at(-1)).toEqual(['/1', '/2', '/3', '/4', '/5', '/6', '/7'])
+    await house.drain()
+  })
+
+  it('holds driver staged records back from immediate sends until flush has passed', async () => {
+    const { views, house, sent, errors, recover } = failing('driver')
+    for (const path of ['/1', '/2', '/3']) {
+      views.record({ path })
+      await house.drain()
+    }
+    expect(sent).toEqual([['/1']])
+    expect(errors).toHaveLength(1)
+
+    recover()
+    clock += 30_000
+    views.record({ path: '/4' })
+    await house.drain()
+    expect(sent).toEqual([['/1'], ['/1', '/2', '/3', '/4']])
+    expect(await views.pending()).toBe(0)
+  })
+})
+
+describe('the local staging cap', () => {
+  it('refuses records past batch.maxStaged and reports it, keeping what it holds', async () => {
+    const errors: unknown[] = []
+    const views = event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      batch: { maxSize: 3, maxStaged: 3 },
+      write: discard,
+    })
+    createHouse({ driver, schema: [views], now, onError: (error) => errors.push(error) })
+
+    views.recordMany([{ path: '/1' }, { path: '/2' }])
+    views.recordMany([{ path: '/3' }, { path: '/4' }])
+
+    expect(errors.map((error) => (error as Error).message)).toEqual([
+      'views: staging 2 more records would pass batch.maxStaged (3), with 2 already held in ' +
+        'this process. Locally staged records only leave when a send succeeds, so this is a ' +
+        'backlog that nothing is shipping',
+    ])
+    expect((await views.peek()).map((row) => row.path)).toEqual(['/1', '/2'])
+  })
+
+  it('counts records a send is still writing', async () => {
+    const errors: unknown[] = []
+    const views = event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      batch: { maxSize: 2, maxStaged: 2 },
+      write: () => new Promise<void>(() => {}),
+    })
+    createHouse({ driver, schema: [views], now, onError: (error) => errors.push(error) })
+
+    views.recordMany([{ path: '/1' }, { path: '/2' }])
+    views.record({ path: '/3' })
+    expect(errors).toHaveLength(1)
+    expect(await views.pending()).toBe(2)
+  })
+
+  it('defaults to 100,000 records', () => {
+    const errors: unknown[] = []
+    const views = event('views', { fields: { n: int() }, stage: 'local', write: discard })
+    createHouse({ driver, schema: [views], now, onError: (error) => errors.push(error) })
+
+    views.recordMany(Array.from({ length: 100_000 }, (_, n) => ({ n })))
+    expect(errors).toEqual([])
+    views.record({ n: 0 })
+    expect((errors[0] as Error).message).toMatch(
+      /^views: staging 1 more record would pass batch\.maxStaged \(100000\)/,
+    )
+  })
+
+  it.each([0, -1, 1.5, Number.NaN])('refuses a maxStaged of %s', (maxStaged) => {
+    expect(() =>
+      event('views', { fields: {}, stage: 'local', batch: { maxStaged }, write: discard }),
+    ).toThrow(`views: batch.maxStaged must be a positive integer, got ${maxStaged}`)
+  })
+
+  it('refuses a maxStaged below maxSize, which no batch could ever fill', () => {
+    expect(() =>
+      event('views', {
+        fields: {},
+        stage: 'local',
+        batch: { maxSize: 10, maxStaged: 9 },
+        write: discard,
+      }),
+    ).toThrow('views: batch.maxStaged (9) must be at least batch.maxSize (10)')
+  })
+})
+
+describe('stage: null', () => {
+  it('is refused rather than read as driver', () => {
+    expect(() =>
+      event('e', { write: discard, fields: {}, stage: null as unknown as 'local' }),
+    ).toThrow(new Error("e: stage must be 'driver' or 'local', got null"))
+  })
+})
+
+describe('records staged under an earlier declaration', () => {
+  /** Stage `records` into `views` on the shared driver, declared with `fields`. */
+  async function stagedBefore(
+    fields: Record<string, ReturnType<typeof str>>,
+    records: Record<string, unknown>[],
+  ): Promise<void> {
+    const old = event('views', { fields, write: discard })
+    createHouse({ driver, schema: [old], now })
+    old.recordMany(records as never)
+    await old.drain()
+  }
+
+  it('ships records a driver staged event left behind once it is staged locally', async () => {
+    await stagedBefore({ path: str() }, [{ path: '/old1' }, { path: '/old2' }])
+    const shipped: string[] = []
+    const views = event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      write: (rows) => {
+        shipped.push(...rows.map((row) => row.path))
+      },
+    })
+    const house = createHouse({ driver, schema: [views], now })
+    views.record({ path: '/new' })
+
+    expect(await views.pending()).toBe(3)
+    await house.flush({ force: true })
+    expect(shipped).toEqual(['/old1', '/old2'])
+    await house.stop()
+    expect(shipped).toEqual(['/old1', '/old2', '/new'])
+    expect(await driver.countPending('views')).toBe(0)
+  })
+
+  it('gives a record staged before sample was declared a _sample_rate of 1', async () => {
+    await stagedBefore({ path: str() }, [{ path: '/' }])
+    const views = event('views', { fields: { path: str() }, sample: 0.5, write: discard })
+    createHouse({ driver, schema: [views], now })
+
+    expect((await views.peek())[0]?._sample_rate).toBe(1)
+  })
+
+  it('fills a default declared after the record was staged', async () => {
+    await stagedBefore({ path: str() }, [{ path: '/' }])
+    const views = event('views', {
+      fields: { path: str(), env: str().default('prod') },
+      write: discard,
+    })
+    createHouse({ driver, schema: [views], now })
+
+    expect((await views.peek())[0]?.env).toBe('prod')
+  })
+
+  it('refuses a stored value the field no longer accepts, naming the field', async () => {
+    await stagedBefore({ n: str() }, [{ n: 'abc' }])
+    const [staged] = await driver.readPending({ metric: 'views' })
+    const views = event('views', { fields: { n: int() }, write: discard })
+    createHouse({ driver, schema: [views], now })
+
+    await expect(views.peek()).rejects.toThrow(
+      new Error(
+        `views: staged record ${staged?.id} holds a value field "n" no longer accepts. ` +
+          'n: expected a safe integer, got "abc"',
+      ),
+    )
+  })
+
+  it('refuses a record missing a field that is now required, naming the field', async () => {
+    await stagedBefore({ path: str() }, [{ path: '/' }])
+    const [staged] = await driver.readPending({ metric: 'views' })
+    const views = event('views', { fields: { path: str(), user: str() }, write: discard })
+    createHouse({ driver, schema: [views], now })
+
+    await expect(views.peek()).rejects.toThrow(
+      new Error(
+        `views: staged record ${staged?.id} has no value for field "user", which is now ` +
+          'required and has no default',
+      ),
+    )
+  })
+
+  it('ships text stored under str() as JSON text once the field is json()', async () => {
+    await stagedBefore({ note: str() }, [{ note: 'hello' }])
+    const views = event('views', { fields: { note: json() }, write: discard })
+    createHouse({ driver, schema: [views], now })
+
+    expect((await views.peek())[0]?.note).toBe('"hello"')
+  })
+})
+
+describe('immediate sends with a claimLimit', () => {
+  it('keeps claiming while a claim comes back full', async () => {
+    const sent: number[] = []
+    const views = event('views', {
+      fields: { path: str() },
+      claimLimit: 2,
+      write: (rows) => {
+        sent.push(rows.length)
+      },
+    })
+    const house = createHouse({ driver, schema: [views], now, delivery: 'immediate' })
+
+    views.recordMany(Array.from({ length: 5 }, (_, i) => ({ path: `/${i}` })))
+    await house.drain()
+    expect(sent).toEqual([2, 2, 1])
+    expect(await views.pending()).toBe(0)
+  })
+
+  it('stops claiming once a send fails', async () => {
+    const sent: number[] = []
+    const views = event('views', {
+      fields: { path: str() },
+      claimLimit: 2,
+      write: (rows) => {
+        sent.push(rows.length)
+        throw new Error('down')
+      },
+    })
+    const house = createHouse({
+      driver,
+      schema: [views],
+      now,
+      delivery: 'immediate',
+      onError: () => {},
+    })
+
+    views.recordMany(Array.from({ length: 5 }, (_, i) => ({ path: `/${i}` })))
+    await house.drain()
+    expect(sent).toEqual([2])
+    expect(await views.pending()).toBe(5)
+  })
+})
+
+describe('ts() fields of locally staged records', () => {
+  it('hands out a copy, so changing a row changes nothing that ships', async () => {
+    const readings = event('readings', {
+      fields: { at: ts() },
+      stage: 'local',
+      write: discard,
+    })
+    createHouse({ driver, schema: [readings], now })
+    readings.record({ at: new Date(1_000) })
+
+    const [row] = await readings.peek()
+    row?.at.setTime(0)
+    expect((await readings.peek())[0]?.at.getTime()).toBe(1_000)
   })
 })

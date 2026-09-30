@@ -167,12 +167,13 @@ would lose them.
 ### batch
 
 ```ts
-batch?: { maxSize?: number; maxAge?: DurationInput }
-// defaults: { maxSize: 500, maxAge: '10s' }
+batch?: { maxSize?: number; maxAge?: DurationInput; maxStaged?: number }
+// defaults: { maxSize: 500, maxAge: '10s', maxStaged: 100_000 }
 ```
 
 Local staging only, and ignored when `stage: 'driver'`. Identical to
-[the event's](/primitives/event#batch).
+[the event's](/primitives/event#batch), including the cap on how many lines
+this process holds.
 
 ### flush
 
@@ -238,8 +239,10 @@ are all optional or bound by a [`child()`](#log-child).
 **Returns** nothing. A line below [`minLevel`](#minlevel) returns immediately
 and stages nothing.
 
-**Throws** on an unbound log, or on a field that is unknown, missing or ill
-typed. A field named after a [column the log writes itself](#reserved-names),
+**Throws**, for a line at or above `minLevel`, on an unbound log, or on a field
+that is unknown, missing or ill typed. A line below `minLevel` is dropped before
+any of those checks, so it never throws, bound or not. A field named after a
+[column the log writes itself](#reserved-names),
 such as `error_stack`, throws too, whether the call passes it or a
 [`child()`](#log-child) bound it. The message itself never throws, which is the
 next section.
@@ -334,9 +337,15 @@ requestLog.bound                     // { service: 'checkout', requestId: 'req_9
 
 A bound field becomes omittable rather than absent in the child's type, so
 `child({ service })` satisfies a required field and a call site may still
-override it. Passing it as `undefined` at the call site does not count as an
-override: the bound value stays. The same goes for a nested `child()` that
-passes a bound field as `undefined`.
+override it. Only a key the argument is sure to hold counts: from an object
+typed `Partial<...>`, where any key may be missing, every required field stays
+required at the call site. Passing a field as `undefined` at the call site does
+not count as an override: the bound value stays. `child()` drops a field passed
+to it as `undefined` in the same way, so it binds nothing and a parent's value
+stays.
+
+`child()` copies the fields it is given. Changing that object afterwards
+changes nothing the child writes.
 
 ```ts
 requestLog.info('retrying', { requestId: 'req_9f22' })   // the call site wins

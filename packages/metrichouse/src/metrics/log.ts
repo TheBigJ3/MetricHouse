@@ -18,6 +18,7 @@
 
 import type { LiveFields, SnapshotOptions } from '../runtime/live.js'
 import type {
+  DefinedKeys,
   InferRow,
   InferShape,
   MarkOptional,
@@ -155,7 +156,9 @@ export type ChildLog<F extends Shape, L extends readonly string[]> = LogWriters<
 
   at(level: L[number], message: string | Error, ...fields: LogFieldsArgs<F>): void
 
-  child<const B extends Partial<InferShape<F>>>(fields: B): ChildLog<MarkOptional<F, keyof B>, L>
+  child<const B extends Partial<InferShape<F>>>(
+    fields: B,
+  ): ChildLog<MarkOptional<F, DefinedKeys<B>>, L>
 }
 
 export interface LogConfig<F extends Shape, L extends readonly string[]> {
@@ -255,7 +258,9 @@ export type Log<F extends Shape, L extends readonly string[]> = Omit<
     at(level: L[number], message: string | Error, ...fields: LogFieldsArgs<F>): void
 
     /** A logger that merges `fields` into every call. */
-    child<const B extends Partial<InferShape<F>>>(fields: B): ChildLog<MarkOptional<F, keyof B>, L>
+    child<const B extends Partial<InferShape<F>>>(
+      fields: B,
+    ): ChildLog<MarkOptional<F, DefinedKeys<B>>, L>
 
     /** How many records are staged and not yet shipped. */
     pending(): Promise<number>
@@ -488,6 +493,17 @@ export function log<
     return methods
   }
 
+  /**
+   * The keys of `fields` that say something, copied. A key passed as
+   * `undefined` says nothing, as it does at a call site, and the copy keeps
+   * a caller changing its object afterwards from changing every later line.
+   */
+  function defined(fields: Record<string, unknown> | undefined): Record<string, unknown> {
+    return Object.fromEntries(
+      Object.entries(fields ?? {}).filter(([, value]) => value !== undefined),
+    )
+  }
+
   function makeChild(bound: Record<string, unknown>): ChildLog<Shape, L> {
     return {
       ...writers(bound),
@@ -501,10 +517,8 @@ export function log<
       // merged, not replaced: a child of a child keeps the request id its
       // parent bound and adds to it
       child(fields: Record<string, unknown>) {
-        // a key passed as `undefined` says nothing, as it does at a call site,
-        // so the value the parent bound stays
-        const given = Object.entries(fields ?? {}).filter(([, value]) => value !== undefined)
-        return makeChild({ ...bound, ...Object.fromEntries(given) })
+        // the value the parent bound stays under a key passed as `undefined`
+        return makeChild({ ...bound, ...defined(fields) })
       },
     } as unknown as ChildLog<Shape, L>
   }
@@ -549,7 +563,7 @@ export function log<
     },
 
     child(fields: Record<string, unknown>) {
-      return makeChild(fields)
+      return makeChild(defined(fields))
     },
 
     pending(): Promise<number> {

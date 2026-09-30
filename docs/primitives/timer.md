@@ -77,9 +77,12 @@ dims: { route: str(), status: oneOf(['ok', 'error']) }
 ```
 
 A dim may not be called `duration_ms`. That name is reserved for the field a
-timing carries onto a [`record`](#record) event, whether or not you use one. The
-names a [gauge dim](/primitives/gauge#dims) cannot take are refused here too:
-`id`, `bucket_ts`, and each aggregate the timer ships.
+timing carries onto a [`record`](#record) event, whether or not you use one.
+Nor may a dim be called `ts`, `_ingested_at` or `_sample_rate`, the columns that
+event writes on every row, which it would refuse as fields. Both rules hold
+with no `record` set, so adding one later never invalidates a timer that used to
+work. The names a [gauge dim](/primitives/gauge#dims) cannot take are refused
+here too: `id`, `bucket_ts`, and each aggregate the timer ships.
 
 ```ts
 import { DURATION_FIELD } from 'metrichouse/core'
@@ -232,13 +235,19 @@ const user = await httpLatency.time({ route: '/users/:id', status: 'ok' }, async
 })
 ```
 
-**Returns** exactly what `fn` returned, including its promise when `fn` is
-asynchronous: the same `Promise` object, not a new one wrapping it. A thenable
-that is not a `Promise`, such as a query builder that runs its query each time
-`then` is called, is awaited exactly once, and a `Promise` of its result is
-returned in its place, so the work never runs twice. The return type says the
-same, so calling a builder method such as `.where()` on the result is a type
-error rather than a crash when the program runs.
+**Returns** what `fn` returned when that is not a promise. When it is a
+`Promise`, or any other thenable such as a query builder that runs its query
+each time `then` is called, `time()` awaits it exactly once and returns a new
+`Promise` in its place. That promise resolves to the same value, or rejects with
+the same error, once the timing is recorded. It is a new object, so a rejection
+nobody awaits is still reported by the runtime as an unhandled rejection, where
+a handler on the original would have hidden it. Awaiting it once also means a
+builder's work never runs twice. The return type says the same, so calling a
+builder method such as `.where()` on the result is a type error rather than a
+crash when the program runs.
+
+`dims` is copied before `fn` runs, so `fn` changing that object does not move
+the timing to another series.
 
 The duration is recorded whether `fn` returns or throws. A request that times
 out after thirty seconds is the latency you most need to see, so dropping
@@ -273,7 +282,12 @@ try {
 ```
 
 **Returns** a [`TimerHandle`](#handle-end), whose type remembers which keys were
-bound here, so `end()` asks only for what is left.
+bound here, so `end()` asks only for what is left. Only a key the argument is
+sure to hold counts: from an object typed `Partial<...>`, where any key may be
+missing, `end()` still asks for every required dim.
+
+`start()` copies `dims`, so changing that object before `end()` does not move
+the timing to another series.
 
 **Throws** when the timer is unbound, or a dim given here is undeclared or ill
 typed. A required dim that is still missing is only checkable at `end()`.

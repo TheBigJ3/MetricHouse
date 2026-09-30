@@ -184,14 +184,21 @@ nothing and leaves nothing behind. The order for one `record()` is:
 2. Unknown and ill typed fields throw at the caller.
 3. `ts` is chosen. An explicit `at` wins, then a declared `ts()` field, then the
    house clock.
-4. [`derive`](/primitives/event#derive) runs, so derived counters see the
-   complete row.
-5. [`sample`](/primitives/event#sample) decides whether this record is kept.
-6. The record is staged, with `id` and `_ingested_at` stamped.
+4. [`sample`](/primitives/event#sample) gives this record its rate, and throws
+   for one outside `[0, 1]`.
+5. The stored copy is made. A `json()` value becomes its JSON text here, and
+   throws when JSON cannot hold it.
+6. The rate decides whether this record is kept.
+7. [`derive`](/primitives/event#derive) runs on the stored copy, for every
+   record, kept or dropped.
+8. The kept records are staged, with `id` and `_ingested_at` stamped.
 
-Steps 4 and 5 are in that order on purpose, and it is not configurable.
-Counters derived from an event stay exact whatever fraction of the event table
-you keep.
+Steps 1 to 6 change nothing, so a call that throws in any of them derives
+nothing and stages nothing. Step 7 ignores the decision step 6 made, and that is
+not configurable: counters derived from an event stay exact whatever fraction
+of the event table you keep. A [durable](/primitives/event#durability) event
+swaps the last two steps and derives only once the driver has answered that the
+record is staged.
 
 ## Reading fields back
 

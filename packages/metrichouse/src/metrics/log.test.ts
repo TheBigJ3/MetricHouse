@@ -584,3 +584,34 @@ describe('child fields and errors from elsewhere', () => {
     expect(String(rows[0]?.error_stack)).toMatch(/far away/)
   })
 })
+
+describe('child() on the log itself', () => {
+  it('copies the fields it was given, so changing them afterwards changes nothing', async () => {
+    const appLog = bound()
+    const given = { service: 'api' }
+    const reqLog = appLog.child(given)
+    given.service = 'worker'
+    reqLog.info('booked')
+    await appLog.drain()
+
+    expect(reqLog.bound).toEqual({ service: 'api' })
+    expect((await shipped(appLog))[0]?.service).toBe('api')
+  })
+
+  it('drops a key passed as undefined, as a nested child does', () => {
+    const appLog = bound()
+    const reqLog = appLog.child({ service: 'api', requestId: undefined } as unknown as {
+      service: string
+    })
+    expect(Object.keys(reqLog.bound)).toEqual(['service'])
+  })
+
+  it('keeps a field a Partial may not hold required at the call site', () => {
+    const appLog = bound()
+    const maybe: Partial<{ service: string }> = {}
+    const reqLog = appLog.child(maybe)
+    // @ts-expect-error service may still be missing, so the call has to pass it
+    expect(() => reqLog.info('booked')).toThrow('missing required field "service"')
+    expect(() => reqLog.info('booked', { service: 'api' })).not.toThrow()
+  })
+})
