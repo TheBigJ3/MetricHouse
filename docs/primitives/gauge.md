@@ -252,7 +252,9 @@ picking one would be the same mistake as storing an average.
 snapshot<O extends SnapshotOptions>(options?: O): Promise<GaugeLiveRow<D, O>[]>
 ```
 
-Every unflushed window of folds, as rows.
+Every closed window of folds that has not been flushed and acknowledged, as
+rows. `complete: false` adds the open window, and a window a flush has claimed
+but not yet acknowledged is out of view until that flush settles.
 
 ```ts
 await onlineUsers.snapshot()
@@ -263,6 +265,12 @@ await onlineUsers.snapshot({ rollup: 'sum', groupBy: ['region'] })
 A rollup merges folds the way the five aggregates merge: `sum` and `count` add,
 `min` and `max` take the extreme, and `last` takes the latest window. Every
 option is in [Snapshot options](/reference/snapshot-options).
+
+A merged row has no `last` when several series share the newest window in the
+group, because a fold does not record which series was observed most recently.
+`rollup: 'sum'` on one series keeps it, and a `groupBy` that merges series
+inside their newest window drops it. A sum across series that passes the
+largest double throws, as does `totals()`, instead of returning `Infinity`.
 
 ## gauge.flush()
 
@@ -307,7 +315,7 @@ cacheHitRatio.rowShape().columns.map((c) => c.name)
 | `storage` | `'bucketed'` | It folds writes into windows |
 | `dims` | `Shape` | The declared dims |
 | `resolutionMs` | `number` | `resolution`, parsed |
-| `flushMs` | `number` | `flush`, parsed, including one taken from the house |
+| `flushMs` | `number` | `flush`, parsed, including one taken from the house. Throws on an unbound metric that declared no `flush` |
 | `graceMs` | `number` | `grace`, parsed, including one taken from the house. `2000` when neither sets it |
 | `aggregate` | `readonly GaugeAggregate[]` | The columns this gauge writes |
 | `isBound` | `boolean` | `true` once a house has registered it |

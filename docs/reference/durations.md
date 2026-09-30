@@ -97,7 +97,7 @@ A flush ships whole windows, so `flush` has to be a whole multiple of
 ```ts
 counter('requests', { resolution: '10s', flush: '1m', write })   // 6 windows per flush
 counter('requests', { resolution: '7s', flush: '1m', write })
-// Error: resolution 7s does not divide flush 1m evenly, and a shipment would
+// Error: requests: resolution 7s does not divide flush 1m evenly, and a shipment would
 // split a bucket
 ```
 

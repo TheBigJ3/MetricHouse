@@ -1,5 +1,16 @@
-import { describe, expect, it } from 'vitest'
-import { assertValue, bool, float, type InferShape, int, json, oneOf, str, ts } from './types.js'
+import { describe, expect, expectTypeOf, it } from 'vitest'
+import {
+  assertValue,
+  bool,
+  float,
+  type InferRow,
+  type InferShape,
+  int,
+  json,
+  oneOf,
+  str,
+  ts,
+} from './types.js'
 
 describe('constructors', () => {
   it('tag their kind', () => {
@@ -179,5 +190,37 @@ describe('error messages', () => {
     expect(() => assertValue(ts(), new Date(Number.NaN), 'placedAt')).toThrow(
       /placedAt: expected a valid Date, got an invalid Date/,
     )
+  })
+})
+
+describe('InferRow', () => {
+  const shape = {
+    plain: str(),
+    defaulted: str().default('x'),
+    optional: int().optional(),
+    both: int().default(0).optional(),
+  }
+
+  it('requires a defaulted key on a row and keeps an optional one omittable', () => {
+    expectTypeOf<InferRow<typeof shape>>().toEqualTypeOf<{
+      plain: string
+      defaulted: string
+      both: number
+      optional?: number
+    }>()
+  })
+
+  it('leaves a call site omitting the defaulted key', () => {
+    expectTypeOf<InferShape<typeof shape>>().toEqualTypeOf<{
+      plain: string
+      defaulted?: string
+      both?: number
+      optional?: number
+    }>()
+  })
+
+  it('tracks the default through the type, not only at runtime', () => {
+    expectTypeOf(str().default('x').hasDefault).toEqualTypeOf<true>()
+    expectTypeOf(str().hasDefault).toEqualTypeOf<false>()
   })
 })

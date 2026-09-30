@@ -194,28 +194,69 @@ export function hasLoneSurrogate(text: string): boolean {
   return LONE_SURROGATE.test(text)
 }
 
-function encodeDimValue(type: FieldType, value: unknown): string {
+function encodeDimValue(type: FieldType, value: unknown, at = ''): string {
   if (type.kind === 'ts') return String((value as Date).getTime())
   if (type.kind === 'bool') return value ? 'true' : 'false'
 
   const text = String(value)
   if (hasLoneSurrogate(text)) {
     throw new Error(
-      `dim value ${JSON.stringify(text)} holds half of a surrogate pair, which cannot be ` +
+      `${at}dim value ${JSON.stringify(text)} holds half of a surrogate pair, which cannot be ` +
         'stored as UTF-8. It usually means a string was cut in the middle of an emoji',
     )
   }
   return text
 }
 
-function decodeDimValue(type: FieldType, raw: string): unknown {
-  if (type.kind === 'ts') return new Date(Number(raw))
-  if (type.kind === 'bool') return raw === 'true'
-  if (type.kind === 'int' || type.kind === 'float') return Number(raw)
-  // a member comes back as the member, so `oneOf([1, 2, 4])` returns the
-  // number 2 and not the text "2" it was stored as
-  if (type.kind === 'oneOf') return type.values?.find((member) => String(member) === raw) ?? raw
-  return raw
+/**
+ * Read one stored segment back as the declared type.
+ *
+ * A key outlives the declaration that wrote it, so the stored text may not
+ * fit the type the dim has now: a `str()` turned into an `int()` holds "abc",
+ * and a removed `oneOf` member holds a value the set no longer has. Each is
+ * refused here, naming the dim, where reading it as `NaN`, an invalid `Date`,
+ * `false` or a value outside the set would put a row nobody wrote in front of
+ * the sink.
+ */
+function decodeDimValue(name: string, type: FieldType, raw: string): unknown {
+  const bad = (why: string): never => {
+    throw new Error(
+      `decodeDimKey: dim ${JSON.stringify(name)} is declared as ${type.kind}(), but the stored ` +
+        `value ${JSON.stringify(raw)} ${why}. The stored series was written under an earlier ` +
+        'declaration',
+    )
+  }
+  switch (type.kind) {
+    case 'ts': {
+      const ms = Number(raw)
+      if (!/^-?\d+$/.test(raw) || Number.isNaN(new Date(ms).getTime())) {
+        return bad('is not a valid timestamp')
+      }
+      return new Date(ms)
+    }
+    case 'bool':
+      if (raw !== 'true' && raw !== 'false') return bad('is not "true" or "false"')
+      return raw === 'true'
+    case 'int': {
+      const n = Number(raw)
+      if (raw === '' || !Number.isSafeInteger(n)) return bad('is not a safe integer')
+      return n
+    }
+    case 'float': {
+      const n = Number(raw)
+      if (raw.trim() === '' || !Number.isFinite(n)) return bad('is not a finite number')
+      return n
+    }
+    case 'oneOf': {
+      // a member comes back as the member, so `oneOf([1, 2, 4])` returns the
+      // number 2 and not the text "2" it was stored as
+      const member = type.values?.find((one) => String(one) === raw)
+      if (member === undefined) return bad('is not one of the declared members')
+      return member
+    }
+    default:
+      return raw
+  }
 }
 
 /**
@@ -250,12 +291,18 @@ function ownEnumerable(values: object, key: string): unknown {
  *
  * Does what {@link encodeDimKey} does, in the same order and with the same
  * errors: an undeclared key, then each declared dim in order, missing or of
- * the wrong type, then a value no key can store. Only the work that depends on
+ * the wrong type, then a value no key can store. `metricName`, when given,
+ * starts every message, as it does every other error a metric throws. Only the
+ * work that depends on
  * the declaration alone moves out of the call, which is listing its dims.
  * Nothing is kept from one call's values to the next, so a caller may reuse
  * and change one values object between writes.
  */
-export function dimKeyEncoder(dims: Shape): (values: Record<string, unknown>) => string {
+export function dimKeyEncoder(
+  dims: Shape,
+  metricName?: string,
+): (values: Record<string, unknown>) => string {
+  const at = metricName === undefined ? '' : `${metricName}: `
   const entries = Object.entries(dims) as [string, FieldType][]
   const declared = entries.map(([key]) => key)
 
@@ -266,7 +313,7 @@ export function dimKeyEncoder(dims: Shape): (values: Record<string, unknown>) =>
     for (const key of Object.keys(given)) {
       if (!Object.hasOwn(dims, key)) {
         throw new Error(
-          `unknown dim ${JSON.stringify(key)}. The declared dims are [${declared.join(', ')}]`,
+          `${at}unknown dim ${JSON.stringify(key)}. The declared dims are [${declared.join(', ')}]`,
         )
       }
     }
@@ -279,9 +326,9 @@ export function dimKeyEncoder(dims: Shape): (values: Record<string, unknown>) =>
       let value = ownEnumerable(given, key)
       if (value === undefined && type.hasDefault) value = type.defaultValue
       if (value === undefined) {
-        if (!type.isOptional) throw new Error(`missing required dim ${JSON.stringify(key)}`)
+        if (!type.isOptional) throw new Error(`${at}missing required dim ${JSON.stringify(key)}`)
       } else {
-        assertValue(type, value, key)
+        assertValue(type, value, at + key)
       }
       filled[i] = value
     }
@@ -293,7 +340,7 @@ export function dimKeyEncoder(dims: Shape): (values: Record<string, unknown>) =>
       key +=
         value === undefined
           ? DIM_ABSENT
-          : escapeDimValue(encodeDimValue((entries[i] as [string, FieldType])[1], value))
+          : escapeDimValue(encodeDimValue((entries[i] as [string, FieldType])[1], value, at))
     }
     return key
   }
@@ -343,6 +390,20 @@ export function isShorterDimKey(dims: Shape, key: string): boolean {
   return splitKey(key).length < order.length
 }
 
+/**
+ * True when `key` reads back under `dims`. False for a key written under an
+ * earlier declaration that the current one cannot hold, which
+ * {@link decodeDimKey} refuses with an error.
+ */
+export function isDecodableDimKey(dims: Shape, key: string): boolean {
+  try {
+    decodeDimKey(dims, key)
+    return true
+  } catch {
+    return false
+  }
+}
+
 export function decodeDimKey(dims: Shape, key: string): Record<string, unknown> {
   const order = dimOrder(dims)
 
@@ -375,8 +436,21 @@ export function decodeDimKey(dims: Shape, key: string): Record<string, unknown> 
   order.forEach((name, index) => {
     const segment = segments[index]
     // an absent optional dim comes back missing, not as an undefined key
-    if (segment === undefined || segment === DIM_ABSENT) return
-    values[name] = decodeDimValue(dims[name] as FieldType, unescapeDimValue(segment))
+    if (segment === undefined) return
+    const type = dims[name] as FieldType
+    if (segment === DIM_ABSENT) {
+      // a dim that is required or defaulted now was optional when this key
+      // was written, and a row without it is one no sink was promised
+      if (!type.isOptional || type.hasDefault) {
+        throw new Error(
+          `decodeDimKey: dim ${JSON.stringify(name)} is ${type.hasDefault ? 'defaulted' : 'required'} ` +
+            'now, but the stored key has no value for it. The stored series was written under ' +
+            'an earlier declaration',
+        )
+      }
+      return
+    }
+    values[name] = decodeDimValue(name, type, unescapeDimValue(segment))
   })
   return values
 }
@@ -407,7 +481,8 @@ export function dimKeyDecoder(dims: Shape): (key: string) => Record<string, unkn
     // end, and the dims past its last segment stay absent, as they do there
     const values: Record<string, unknown> = {}
     for (let i = 0; i < segments.length; i++) {
-      values[order[i] as string] = decodeDimValue(types[i] as FieldType, segments[i] as string)
+      const name = order[i] as string
+      values[name] = decodeDimValue(name, types[i] as FieldType, segments[i] as string)
     }
     return values
   }

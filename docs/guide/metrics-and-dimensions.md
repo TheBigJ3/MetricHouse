@@ -58,7 +58,7 @@ bad default value all throw there.
 
 ```ts
 counter('requests', { resolution: '7s', flush: '1m', write })
-// Error: resolution 7s does not divide flush 1m evenly
+// Error: requests: resolution 7s does not divide flush 1m evenly
 ```
 
 [Validation that runs at startup](/reference/configuration#validation-that-runs-at-startup)

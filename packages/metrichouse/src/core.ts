@@ -159,6 +159,7 @@ export type { OpenSeriesShip, ShipOutcome } from './runtime/ship.js'
 export { shipClaim, shipOpenSeries } from './runtime/ship.js'
 export type {
   FieldType,
+  InferRow,
   InferShape,
   InferValue,
   MarkOptional,

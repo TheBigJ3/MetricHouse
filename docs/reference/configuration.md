@@ -257,7 +257,7 @@ These all throw when the module is first imported, not at the first write.
 | A `oneOf` whose members print the same | `oneOf: "2" prints the same as another member` |
 | A `json()` default JSON cannot hold | `default for json(): json() needs a value JSON can hold` |
 | `json()` as a dimension | `dim "x" declares json(), which cannot be encoded into a series key` |
-| Resolution does not divide flush | `resolution 7s does not divide flush 1m evenly` |
+| Resolution does not divide flush | `sold: resolution 7s does not divide flush 1m evenly` |
 | A zero `flush`, `defaults.flush` or `batch.maxAge` | `flush must be longer than zero, got "0s"` |
 | A `flush`, `defaults.flush` or `batch.maxAge` past 2147483647ms | `flush is 30d, longer than 2147483647ms (just under 25 days)` |
 | Invalid duration | `parseDuration: "1.5m"` |

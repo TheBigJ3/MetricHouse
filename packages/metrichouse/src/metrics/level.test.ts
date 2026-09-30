@@ -199,6 +199,23 @@ describe('writing', () => {
     expect(await metric.current(EXPORT)).toBe(7)
   })
 
+  it('names the type of a value that is not a number', () => {
+    const metric = bound()
+    expect(() => metric.set('1' as never, EMAIL)).toThrow(
+      'queue_depth: value must be a finite number, got "1"',
+    )
+  })
+
+  it('names the kind of a cell it refuses', () => {
+    const metric = bound()
+    expect(() => metric.materialize(BASE, 'email', 7)).toThrow(
+      'queue_depth: expected a level cell but the driver returned a counter cell',
+    )
+    expect(() =>
+      metric.materialize(BASE, 'email', { last: 1, min: 1, max: 1, sum: 1, count: 1 } as never),
+    ).toThrow('queue_depth: expected a level cell but the driver returned a gauge fold')
+  })
+
   it('refuses a value that is not a finite number', async () => {
     const metric = bound()
     expect(() => metric.set(Number.NaN, EMAIL)).toThrow(
@@ -255,7 +272,7 @@ describe('writing', () => {
   it('refuses an undeclared dim', () => {
     const metric = bound()
     expect(() => metric.set(1, { park: 'riverside' } as unknown as typeof EMAIL)).toThrow(
-      'unknown dim "park". The declared dims are [queue]',
+      new Error('queue_depth: unknown dim "park". The declared dims are [queue]'),
     )
   })
 })
@@ -852,6 +869,33 @@ describe('round two', () => {
     clock = at(2) + 5_000
     const rows = await metric.snapshot({ complete: false, to: clock + 60_000 })
     expect(rows.map((row) => row.bucket_ts.getTime())).toEqual([at(0), at(1), at(2)])
+  })
+
+  it('leaves a series its dim type can no longer read out of totals()', async () => {
+    const before = level('queue_depth', {
+      dims: { queue: str() },
+      resolution: '10s',
+      flush: '10s',
+      write: discard,
+    })
+    before.bind({ driver, now })
+    before.set(5, { queue: 'email' })
+    await before.drain()
+    before.unbind()
+
+    // the dim is now an int(), and the stored text "email" is not one
+    const after = level('queue_depth', {
+      dims: { queue: int() },
+      resolution: '10s',
+      flush: '10s',
+      write: discard,
+    })
+    after.bind({ driver, now })
+    after.set(3, { queue: 1 })
+    await after.drain()
+    clock = at(3)
+
+    expect(await after.totals()).toBe(3)
   })
 
   it('forgets a series past holdFor in current() and totals() before any flush', async () => {

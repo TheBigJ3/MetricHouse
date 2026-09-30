@@ -22,8 +22,8 @@
  * with the numbers rather than an accident.
  */
 
-import type { Row } from '../metrics/types.js'
-import { type InferShape, isDate, type Shape, type Simplify } from '../schema/types.js'
+import type { Row, RowShape } from '../metrics/types.js'
+import { type InferRow, isDate, type Shape, type Simplify } from '../schema/types.js'
 
 /**
  * How to collapse buckets before returning them.
@@ -112,10 +112,10 @@ export type LiveDims<D extends Shape, O extends SnapshotOptions> = O extends {
 }
   ? // bracketed so `groupBy: []`, where K is never, keeps no dims rather than
     // distributing over nothing and making the whole row `never`
-    [K] extends [keyof InferShape<D>]
-    ? Pick<InferShape<D>, K>
-    : InferShape<D>
-  : InferShape<D>
+    [K] extends [keyof InferRow<D>]
+    ? Pick<InferRow<D>, K>
+    : InferRow<D>
+  : InferRow<D>
 
 /**
  * One live row, typed to the metric that produced it.
@@ -141,6 +141,15 @@ export interface TypedSnapshot<D extends Shape, V> {
   snapshot<const O extends SnapshotOptions = Record<never, never>>(
     options?: O,
   ): Promise<LiveRowOf<D, V, O>[]>
+}
+
+/**
+ * Every column a live row of a metric can carry: the columns a sink receives,
+ * plus the two a live read adds. What `orderBy` is checked against, so a typo
+ * is refused whether or not any row is waiting.
+ */
+export function liveColumns(shape: RowShape): string[] {
+  return [...shape.columns.map((column) => column.name), 'bucket_open', 'bucket_elapsed_ms']
 }
 
 /** A materialized row, with the bucket it came from kept alongside. */
@@ -242,7 +251,7 @@ export function liveness(bucketTs: number, resolutionMs: number, nowMs: number):
 /**
  * Filter, collapse, order and cut, the whole read path after materialization.
  *
- * @throws if `dims` or `groupBy` names something the metric does not declare
+ * @throws if `dims`, `groupBy` or `orderBy` names something the metric does not declare
  */
 export function applySnapshot(
   rows: readonly BucketedRow[],
@@ -253,9 +262,11 @@ export function applySnapshot(
     readonly resolutionMs: number
     readonly nowMs: number
     readonly mergeValues: MergeValues
+    /** Every column a row of this metric can have, for `orderBy`. See {@link liveColumns}. */
+    readonly columns?: readonly string[]
   },
 ): LiveRow[] {
-  const { metric, dims, resolutionMs, nowMs, mergeValues } = context
+  const { metric, dims, resolutionMs, nowMs, mergeValues, columns } = context
 
   if (options.dims) assertDimsKnown(dims, Object.keys(options.dims), 'dims', metric)
   if (options.groupBy) assertDimsKnown(dims, options.groupBy, 'groupBy', metric)
@@ -285,7 +296,7 @@ export function applySnapshot(
     ? collapse(matched, options, { dims, resolutionMs, nowMs, mergeValues, rollup })
     : matched.map((one) => ({ ...one.row, ...liveness(one.bucketTs, resolutionMs, nowMs) }))
 
-  return orderAndLimit(live, options, metric)
+  return orderAndLimit(live, options, metric, columns)
 }
 
 /**
@@ -377,11 +388,16 @@ export function assertLimit(limit: unknown, metric: string, label = 'limit'): vo
  *
  * Exported for the staged kinds, whose rows are records rather than buckets
  * but sort and cut by the same rules.
+ *
+ * `columns` is every column a row of the metric can have. With it, an
+ * `orderBy` outside that list throws even when there are no rows to sort. A
+ * column is a row's own property, so `'toString'` is never one.
  */
 export function orderAndLimit<R extends Record<string, unknown>>(
   rows: R[],
   options: SnapshotOptions,
   metric: string,
+  columns?: readonly string[],
 ): R[] {
   const { orderBy, limit } = options
   if (limit !== undefined) assertLimit(limit, metric)
@@ -395,10 +411,19 @@ export function orderAndLimit<R extends Record<string, unknown>>(
   }
 
   if (orderBy !== undefined) {
+    if (columns !== undefined && !columns.includes(orderBy)) {
+      throw new Error(
+        `${metric}: orderBy names ${JSON.stringify(orderBy)}, which is not a column on these ` +
+          `rows. They have [${columns.join(', ')}]`,
+      )
+    }
     // any row will do, not only the first: a merged gauge row can leave
     // `last` off while its neighbours keep it
     const sample = rows[0]
-    if (sample !== undefined && !rows.some((row) => row[orderBy] !== undefined)) {
+    if (
+      sample !== undefined &&
+      !rows.some((row) => Object.hasOwn(row, orderBy) && row[orderBy] !== undefined)
+    ) {
       throw new Error(
         `${metric}: orderBy names ${JSON.stringify(orderBy)}, which is not a column on these ` +
           `rows. They have [${Object.keys(sample).join(', ')}]`,
@@ -409,8 +434,8 @@ export function orderAndLimit<R extends Record<string, unknown>>(
     rows.sort((a, b) => {
       // a row without the column goes last whichever way the sort runs, so
       // a top ten is ten rows that have the value being ranked
-      const left = a[orderBy]
-      const right = b[orderBy]
+      const left = Object.hasOwn(a, orderBy) ? a[orderBy] : undefined
+      const right = Object.hasOwn(b, orderBy) ? b[orderBy] : undefined
       if (left === undefined || right === undefined) {
         return left === undefined ? (right === undefined ? 0 : 1) : -1
       }

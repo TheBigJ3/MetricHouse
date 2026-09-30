@@ -188,6 +188,15 @@ being exact without any error. A delta past it throws at `add()`, and an
 `onError`, leaving the total where it was. A `float()` counter has no such
 limit.
 
+A total across series or windows, from `current()` or a `rollup` or `groupBy`
+snapshot, is added exactly and refused only when the exact total passes that
+limit, so a large series and a large negative one cancel as they should.
+
+Moving a counter from `float()` to `int()` needs whole stored values. A series
+that holds a fraction refuses every integer write with `would be 3.5, which is
+not a whole number`, and a total that reads one throws the same. Flush the
+fractional windows before the change, or keep `float()`.
+
 ```ts
 import { float } from 'metrichouse/core'
 
@@ -321,8 +330,10 @@ float counter always adds the series itself. See
 snapshot<O extends SnapshotOptions>(options?: O): Promise<CounterLiveRow<D, O>[]>
 ```
 
-Every window still held by the driver, as rows: the open one, and any closed
-window that has not been flushed and acknowledged.
+Every closed window that has not been flushed and acknowledged, as rows. By
+default (`complete: true`) the open window is left out, and `complete: false`
+adds it. A window a flush has claimed but not yet acknowledged is out of view
+until that flush settles. See [what a live read cannot do](/guide/reading-live-data#what-a-live-read-cannot-do).
 
 ```ts
 await httpRequests.snapshot()
@@ -349,7 +360,7 @@ flush(options?: FlushOptions): Promise<MetricFlushReport>
 ```
 
 Ships every closed window to this counter's own `write` function and settles
-the claim. Needs no house.
+the claim. Needs a bound counter, so it throws before a house has registered it.
 
 ```ts
 await httpRequests.flush()
@@ -414,7 +425,7 @@ Everything a counter reports about itself, all read only.
 | `storage` | `'bucketed'` | It folds writes into windows |
 | `dims` | `Shape` | The declared dims |
 | `resolutionMs` | `number` | `resolution`, parsed |
-| `flushMs` | `number` | `flush`, parsed, including one taken from the house |
+| `flushMs` | `number` | `flush`, parsed, including one taken from the house. Throws on an unbound metric that declared no `flush` |
 | `graceMs` | `number` | `grace`, parsed, including one taken from the house. `2000` when neither sets it |
 | `isFloat` | `boolean` | `true` when `value: float()` was declared |
 | `isBound` | `boolean` | `true` once a house has registered it |

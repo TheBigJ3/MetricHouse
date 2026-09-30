@@ -52,7 +52,14 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink, delegateBatch, isEvent, reportError } from './types.js'
+import {
+  assertMetricName,
+  assertSink,
+  delegateBatch,
+  describeValue,
+  isEvent,
+  reportError,
+} from './types.js'
 
 /**
  * What a timer ships unless told otherwise: the gauge's five, minus `last`.
@@ -265,7 +272,7 @@ export function timer<D extends Shape = Record<never, never>>(
 
   const dims = (config.dims ?? {}) as D
   // built once: `time()` checks its dims on every call, before the work runs
-  const encodeKey = dimKeyEncoder(dims)
+  const encodeKey = dimKeyEncoder(dims, name)
 
   if (Object.hasOwn(dims, DURATION_FIELD)) {
     throw new Error(
@@ -314,10 +321,10 @@ export function timer<D extends Shape = Record<never, never>>(
       const type = Object.hasOwn(dims, key) ? dims[key] : undefined
       if (!type) {
         throw new Error(
-          `unknown dim ${JSON.stringify(key)}. The declared dims are [${Object.keys(dims).join(', ')}]`,
+          `${name}: unknown dim ${JSON.stringify(key)}. The declared dims are [${Object.keys(dims).join(', ')}]`,
         )
       }
-      if (value !== undefined) assertValue(type, value, key)
+      if (value !== undefined) assertValue(type, value, `${name}: ${key}`)
     }
   }
 
@@ -393,7 +400,7 @@ export function timer<D extends Shape = Record<never, never>>(
   function recordTiming(given: number, values: Record<string, unknown>): void {
     if (typeof given !== 'number' || !Number.isFinite(given) || given < 0) {
       throw new Error(
-        `${name}: a duration must be a finite, non-negative number, got ${String(given)}`,
+        `${name}: a duration must be a finite, non-negative number, got ${describeValue(given)}`,
       )
     }
     // rounded here as well as in `end()`, so `observe()` keeps the same

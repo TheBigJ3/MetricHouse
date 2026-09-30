@@ -168,6 +168,36 @@ describe('encodeDimKey', () => {
 })
 
 describe('decodeDimKey', () => {
+  it.each([
+    ['int', int(), 'abc', 'is not a safe integer'],
+    ['int', int(), '2.5', 'is not a safe integer'],
+    ['float', float(), 'abc', 'is not a finite number'],
+    ['ts', ts(), 'soon', 'is not a valid timestamp'],
+    ['bool', bool(), 'yes', 'is not "true" or "false"'],
+    ['oneOf', oneOf(['a', 'b']), 'c', 'is not one of the declared members'],
+  ])('refuses a stored value the dim %s can no longer hold', (kind, type, raw, why) => {
+    const shape = { x: type }
+    const message =
+      `decodeDimKey: dim "x" is declared as ${kind}(), but the stored value ` +
+      `${JSON.stringify(raw)} ${why}. The stored series was written under an earlier declaration`
+    expect(() => decodeDimKey(shape, raw)).toThrow(new Error(message))
+    expect(() => dimKeyDecoder(shape)(raw)).toThrow(new Error(message))
+  })
+
+  it('refuses an absent marker for a dim that is required or defaulted now', () => {
+    expect(() => decodeDimKey({ a: str(), b: str() }, `x|${DIM_ABSENT}`)).toThrow(
+      new Error(
+        'decodeDimKey: dim "b" is required now, but the stored key has no value for it. The ' +
+          'stored series was written under an earlier declaration',
+      ),
+    )
+    expect(() => decodeDimKey({ a: str().default('d') }, DIM_ABSENT)).toThrow(/is defaulted now/)
+  })
+
+  it('reads a key back with the marker for an optional dim', () => {
+    expect(decodeDimKey({ a: str(), b: str().optional() }, `x|${DIM_ABSENT}`)).toEqual({ a: 'x' })
+  })
+
   it('inverts encodeDimKey', () => {
     const values = { dogName: 'Willow', park: 'riverside', kind: 'solid' }
     expect(decodeDimKey(dims, encodeDimKey(dims, values))).toEqual(values)
@@ -466,6 +496,18 @@ describe('dimKeyEncoder', () => {
       'count: expected a safe integer, got "x"',
     )
     expect(() => encode({ tenant: 'a\uD83D', count: 1 })).toThrow(/surrogate/)
+  })
+
+  it('starts every message with the metric name when it is given one', () => {
+    const encode = dimKeyEncoder({ tenant: str(), count: int() }, 'seats')
+    expect(() => encode({ tenant: 'a' })).toThrow(new Error('seats: missing required dim "count"'))
+    expect(() => encode({ tenant: 'a', count: 1, x: 1 })).toThrow(
+      new Error('seats: unknown dim "x". The declared dims are [tenant, count]'),
+    )
+    expect(() => encode({ tenant: 'a', count: 'x' })).toThrow(
+      new Error('seats: count: expected a safe integer, got "x"'),
+    )
+    expect(() => encode({ tenant: 'a\uD83D', count: 1 })).toThrow(/^seats: dim value "a/)
   })
 
   it('fills a default the caller left out', () => {

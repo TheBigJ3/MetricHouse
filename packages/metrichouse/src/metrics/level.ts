@@ -26,11 +26,18 @@ import {
   applySnapshot,
   type LiveRow,
   type LiveRowOf,
+  liveColumns,
   type SnapshotOptions,
   snapshotRange,
 } from '../runtime/live.js'
-import { assertDimsLegal, dimKeyDecoder, dimKeyEncoder, isShorterDimKey } from '../schema/dims.js'
-import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
+import {
+  assertDimsLegal,
+  dimKeyDecoder,
+  dimKeyEncoder,
+  isDecodableDimKey,
+  isShorterDimKey,
+} from '../schema/dims.js'
+import type { FieldType, InferRow, InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketRange, bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
 import { bucketedBinding, bucketedLifecycle, claimWatermark, seriesKey } from './bucketed.js'
@@ -49,6 +56,7 @@ import {
   assertMetricName,
   assertSink,
   assertWhole,
+  describeValue,
   dimColumns,
   pendingWrites,
 } from './types.js'
@@ -67,7 +75,7 @@ export const MAX_CARRY_BUCKETS = 10_000
 
 /** The row shape a level's `write()` receives. */
 export type LevelRow<D extends Shape> = Simplify<
-  { id: string; bucket_ts: Date } & InferShape<D> & { value: number }
+  { id: string; bucket_ts: Date } & InferRow<D> & { value: number }
 >
 
 /** One live row from a level, typed to its dims and to the options asked for. */
@@ -239,14 +247,17 @@ export function level<D extends Shape = Record<never, never>>(
   /** The driver stores whatever a metric wrote; a level only writes level cells. */
   function asLevel(cell: Cell): number {
     if (!isLevelCell(cell)) {
-      throw new Error(`${name}: expected a level cell but the driver returned another kind`)
+      throw new Error(
+        `${name}: expected a level cell but the driver returned a ` +
+          `${typeof cell === 'number' ? 'counter cell' : 'gauge fold'}`,
+      )
     }
     return cell.level
   }
 
   // built once, here: every write encodes a key and every row a flush or a
   // snapshot builds decodes one, against a declaration that never changes
-  const encodeKey = dimKeyEncoder(dims)
+  const encodeKey = dimKeyEncoder(dims, name)
   const decodeKey = dimKeyDecoder(dims)
 
   function keyFor(values: InferShape<D> | undefined): string {
@@ -258,7 +269,7 @@ export function level<D extends Shape = Record<never, never>>(
     const active = slot.active()
 
     if (typeof amount !== 'number' || !Number.isFinite(amount)) {
-      throw new Error(`${name}: value must be a finite number, got ${String(amount)}`)
+      throw new Error(`${name}: value must be a finite number, got ${describeValue(amount)}`)
     }
     if (!isFloat) assertWhole(name, 'level', amount, mode === 'set' ? 'value' : 'delta')
 
@@ -380,7 +391,7 @@ export function level<D extends Shape = Record<never, never>>(
    * `totals()` all ask this one function, so they agree about it.
    */
   function carries(one: LevelSeries): boolean {
-    return !isShorterDimKey(dims, one.dimKey)
+    return !isShorterDimKey(dims, one.dimKey) && isDecodableDimKey(dims, one.dimKey)
   }
 
   /**
@@ -632,7 +643,14 @@ export function level<D extends Shape = Record<never, never>>(
           row: materialize(row.bucketTs, row.dimKey, row.cell),
         })),
       options,
-      { metric: name, dims, resolutionMs, nowMs: now, mergeValues },
+      {
+        metric: name,
+        dims,
+        resolutionMs,
+        nowMs: now,
+        mergeValues,
+        columns: liveColumns(self.rowShape()),
+      },
     )
   }
 

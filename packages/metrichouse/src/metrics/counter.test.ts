@@ -1,9 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
 import { memory } from '../drivers/memory.js'
 import type { Driver } from '../drivers/types.js'
 import { rowId } from '../identity.js'
 import { bool, type FieldType, float, int, json, oneOf, str, ts } from '../schema/types.js'
-import { type Counter, type CounterRow, counter } from './counter.js'
+import { type Counter, type CounterLiveRow, type CounterRow, counter } from './counter.js'
 import type { WriteFn } from './types.js'
 
 /** A sink that keeps nothing, for declaration tests that never ship. */
@@ -72,7 +72,7 @@ describe('declaration', () => {
   it('rejects a resolution that does not divide the flush interval', () => {
     // a shipment would split a bucket in half
     expect(() => make({ resolution: '7s', flush: '1m' })).toThrow(
-      'assertResolution: resolution 7s does not divide flush 1m evenly, and a shipment would ' +
+      'dog_poops: resolution 7s does not divide flush 1m evenly, and a shipment would ' +
         'split a bucket',
     )
   })
@@ -343,14 +343,14 @@ describe('add validates synchronously', () => {
     const metric = bound()
     // a programming error: it surfaces at the call site, not in onError
     expect(() => metric.add({ dogName: 'W', kind: 'solid' } as never)).toThrow(
-      'missing required dim "park"',
+      new Error('dog_poops: missing required dim "park"'),
     )
   })
 
   it('rejects an unknown dim', () => {
     const metric = bound()
     expect(() => metric.add({ ...WILLOW, breed: 'corgi' } as never)).toThrow(
-      'unknown dim "breed". The declared dims are [dogName, park, kind]',
+      new Error('dog_poops: unknown dim "breed". The declared dims are [dogName, park, kind]'),
     )
   })
 
@@ -417,7 +417,9 @@ describe('add validates synchronously', () => {
 
   it('writes nothing when validation fails', async () => {
     const metric = bound()
-    expect(() => metric.add({ dogName: 'W' } as never)).toThrow('missing required dim "park"')
+    expect(() => metric.add({ dogName: 'W' } as never)).toThrow(
+      new Error('dog_poops: missing required dim "park"'),
+    )
     await metric.drain()
     expect(await driver.readBuckets({ metric: 'dog_poops' })).toEqual([])
   })
@@ -497,11 +499,47 @@ describe('current() with no dims is the metric total', () => {
     await metric.drain()
 
     await expect(metric.current()).rejects.toThrow(
-      'dog_poops: the total across series would be 9007199254740992, which is past ' +
+      'dog_poops: the total across series would be 9007199254740993, which is past ' +
         '9007199254740991, the largest whole number a double holds exactly',
     )
     await expect(metric.snapshot({ complete: false, groupBy: [] })).rejects.toThrow(
-      /^dog_poops: a merged value would be 9007199254740992/,
+      /^dog_poops: a merged value would be 9007199254740993/,
+    )
+  })
+
+  it('judges a total by its exact sum, not by where the running sum rounded', async () => {
+    const metric = bound()
+    metric.add(Number.MAX_SAFE_INTEGER, { ...WILLOW, park: 'a' })
+    metric.add(2, { ...WILLOW, park: 'b' })
+    metric.add(-Number.MAX_SAFE_INTEGER, { ...WILLOW, park: 'c' })
+    await metric.drain()
+
+    // as doubles the running sum reaches 2 ** 53 and comes back as 1
+    expect(await metric.current()).toBe(2)
+    const [merged] = await metric.snapshot({ complete: false, groupBy: [] })
+    expect(merged?.value).toBe(2)
+
+    // the same across buckets of one series, which a rollup adds
+    const series = { ...WILLOW, park: 'd' }
+    metric.add(Number.MAX_SAFE_INTEGER, series)
+    clock += 1000
+    metric.add(2, series)
+    clock += 1000
+    metric.add(-Number.MAX_SAFE_INTEGER, series)
+    await metric.drain()
+    const [rolled] = await metric.snapshot({ complete: false, rollup: 'sum', dims: series })
+    expect(rolled?.value).toBe(2)
+  })
+
+  it('names a stored fraction, not an overflow, when an integer counter reads one', async () => {
+    await driver.increment([
+      { metric: 'dog_poops', bucketTs: 1_788_616_987_000, dimKey: 'Willow|a|solid', delta: 2.5 },
+      { metric: 'dog_poops', bucketTs: 1_788_616_987_000, dimKey: 'Willow|b|solid', delta: 1 },
+    ])
+    const metric = bound()
+    await expect(metric.current()).rejects.toThrow(
+      'dog_poops: the total across series would be 3.5, which is not a whole number. A stored ' +
+        'value is a fraction, which happens when a float counter is declared as an integer one',
     )
   })
 
@@ -579,8 +617,8 @@ describe('current() with no dims is the metric total', () => {
     const cases: { fractional: boolean; deltas: number[] }[] = [
       { fractional: false, deltas: [2, 3, -1] },
       { fractional: false, deltas: [MAX, 2] },
-      // the true total is 2, and adding in the order the series are read
-      // gives 1. Both drivers have to give the same one
+      // the true total is 2, and rounding in the order the series are read
+      // gives 1. Both drivers have to give the exact one
       { fractional: false, deltas: [MAX, 2, -MAX] },
       { fractional: true, deltas: [0.1, 0.2, 0.3] },
       { fractional: true, deltas: [MAX, 2] },
@@ -604,7 +642,7 @@ describe('current() with no dims is the metric total', () => {
         await answer(true, fractional, deltas),
       )
     }
-    expect(await answer(false, false, [MAX, 2, -MAX])).toEqual({ total: 1 })
+    expect(await answer(false, false, [MAX, 2, -MAX])).toEqual({ total: 2 })
   })
 })
 
@@ -929,5 +967,19 @@ describe('dims added to a counter that had none', () => {
     const { live, shipped } = await after({ route: str().optional() })
     expect(live).toEqual([{ ...bare, route: '' }])
     expect(shipped).toEqual([{ ...bare, route: '' }])
+  })
+})
+
+describe('row types', () => {
+  it('make a defaulted dim required on a sink row and a live row, optional on a call', () => {
+    const dims = { route: str().default('unknown'), user: str().optional() }
+    type Row = CounterRow<typeof dims>
+    expectTypeOf<Row['route']>().toEqualTypeOf<string>()
+    expectTypeOf<Row['user']>().toEqualTypeOf<string | undefined>()
+    const metric = counter('hits', { dims, resolution: '1s', flush: '5m', write: discard })
+    expectTypeOf<Parameters<typeof metric.current>[0]>().toEqualTypeOf<
+      { route?: string; user?: string } | undefined
+    >()
+    expectTypeOf<CounterLiveRow<typeof dims>['route']>().toEqualTypeOf<string>()
   })
 })

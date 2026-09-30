@@ -380,6 +380,20 @@ export function assertSink(write: unknown, name: string): void {
 }
 
 /**
+ * A short rendering of a value for an error message: numbers and booleans as
+ * they print, a string quoted, anything else by its type. `'1'` reads as
+ * `"1"`, so a string is never mistaken for the number it looks like.
+ */
+export function describeValue(value: unknown): string {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'an array'
+  if (typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'object') return 'an object'
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return typeof value
+}
+
+/**
  * Refuse a first argument that is neither a delta nor a dims object.
  *
  * `add(delta)` and `add(dims)` share the first position, so anything that is

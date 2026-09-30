@@ -5,8 +5,8 @@ them shared defaults, and offers a few operations that apply to all of them at
 once.
 
 It is not the thing that ships your data. Each metric owns its own shipping
-cadence and its own write function, so `metric.flush()` works with no house
-involved. The house exists so that code holding a whole schema does not have to
+cadence and its own write function, so `metric.flush()` needs no house code
+of yours, only a metric a house has bound. The house exists so that code holding a whole schema does not have to
 loop.
 
 ## Creating one

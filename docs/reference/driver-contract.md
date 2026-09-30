@@ -180,7 +180,7 @@ because `last` is whichever observation came last.
 
 ```ts
 setLevel(ops: readonly LevelOp[]): Promise<void>
-// LevelOp: { metric, bucketTs, dimKey, value, mode }
+// LevelOp: { metric, bucketTs, dimKey, value, mode, integer? }
 // mode: 'set' | 'add' | 'hold'
 ```
 
