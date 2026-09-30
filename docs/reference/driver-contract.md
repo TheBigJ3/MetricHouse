@@ -514,8 +514,11 @@ The window a write aimed at `bucketTs` would land in now, by the rule in
 otherwise the first window of `resolutionMs` at or past the watermark.
 `counter.current()`, `gauge.current()` and `gauge.totals()` read the window this
 names. After a clock steps back behind the watermark, writes land ahead of the
-clock, and reading the window the clock is in would leave them out. A driver
-without this method is read at `bucketTs`.
+clock, and reading the window the clock is in would leave them out. An
+immediate send reads every window of its series from `bucketTs` through the one
+this names. A metric asks for it at the same time as it reads `bucketTs`, so
+when the two agree, which is nearly always, it waits for one answer rather than
+two in a row. A driver without this method is read at `bucketTs`.
 
 The Redis driver runs the same Lua function its write scripts use, so a read
 and a write cannot disagree about where a write goes.
@@ -678,7 +681,10 @@ Four rules that are easy to get wrong:
   behind the one before it, because a send that first has to load its script
   would otherwise be overtaken. A call split into several round trips by
   `maxPipelineSize` issues all of them in one step of that queue, so a call made
-  after it cannot land between two of them.
+  after it cannot land between two of them. When Redis has forgotten a script,
+  after a restart or a `SCRIPT FLUSH`, the driver waits for every round trip of
+  the call to be answered and sends the scripts it refused again in one step,
+  in the order they were made.
 
 ### Settling twice
 
@@ -792,10 +798,14 @@ no other turn has, or refuse it.
 
 Check and record in one atomic step. Two processes asking at the same moment
 must get one grant and one refusal. The Redis driver does both in one script,
-against a key per metric, `mh:turn:<metric>`, holding the time in milliseconds
-and the token as `at|token`. It mints the token in the process, a UUID version
-7, and reads a turn stored by an earlier version, the time alone, as a turn
-with an empty token.
+against two keys per metric: `mh:turn:<metric>` holds the time in milliseconds
+and nothing else, the layout 0.7.0 reads, and `mh:turntok:<metric>` holds the
+token. The script writes and compares both together. It mints the token in the
+process, a UUID version 7. A turn 0.7.0 took has no token of its own and reads
+with whatever token the second key held before it. A turn stored as
+`at|token` in a single key, the layout of builds between 0.7.0 and this one,
+is read as that turn and rewritten into the two keys the first time a
+process of this version asks for or gives back the turn.
 
 The time is the caller's `now`, so an injected test clock applies to turns as it
 does to windows.
@@ -809,7 +819,9 @@ still running, and writing an older one over it would let a third process ship
 beside that one. The token is what tells them apart when both were taken in
 the same millisecond, as a forced flush and a scheduled one can be. Compared by
 time alone, the scheduled flush giving back its turn would erase the forced
-one.
+one. A 0.7.0 process writes no token, so a turn it takes in the same
+millisecond as a newer process's is told apart by time alone, as it was in
+0.7.0.
 
 A flush calls it when it wrote nothing: the claim was empty, or the `write`
 function threw. A failure here is ignored. The next turn is then granted one

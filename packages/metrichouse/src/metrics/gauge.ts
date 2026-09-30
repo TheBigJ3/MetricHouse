@@ -17,6 +17,7 @@ import { type Cell, type GaugeCell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
 import { metricFlush } from '../runtime/flush.js'
 import { type LiveRowOf, liveColumns, type SnapshotOptions } from '../runtime/live.js'
+import { readOpenWindow } from '../runtime/ship.js'
 import { assertDimsLegal, dimKeyEncoder } from '../schema/dims.js'
 import type { InferRow, InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketStart } from '../time/buckets.js'
@@ -25,7 +26,6 @@ import {
   bucketedBinding,
   bucketedLifecycle,
   bucketedReader,
-  openWindow,
   seriesKey,
   storedKeyReader,
 } from './bucketed.js'
@@ -428,19 +428,22 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
 
     async openFolds(values?: InferShape<D>): Promise<GaugeCell[]> {
       const active = slot.active()
-      const bucketTs = await openWindow(
+      // before anything is sent, so dims that do not validate throw alone
+      const dimKey = values === undefined ? undefined : keyFor(values)
+
+      const rows = await readOpenWindow(
         active.driver,
         name,
         bucketStart((active.now ?? Date.now)(), resolutionMs),
         resolutionMs,
+        (bucketTs) =>
+          active.driver.readBuckets({
+            metric: name,
+            from: bucketTs,
+            to: bucketTs + resolutionMs,
+            ...(dimKey !== undefined && { dimKey }),
+          }),
       )
-
-      const rows = await active.driver.readBuckets({
-        metric: name,
-        from: bucketTs,
-        to: bucketTs + resolutionMs,
-        ...(values !== undefined && { dimKey: keyFor(values) }),
-      })
       return rows.map((row) => asFold(row.value))
     },
 

@@ -158,7 +158,9 @@ A flush that is still running counts as the latest shipment. A second call
 while the first is inside your `write` function reports `skipped: true` with
 `reason: 'cadence'`, rather than claiming what closed since and shipping beside
 it in the same interval. If the first ships nothing, because nothing was closed
-or because your function threw, the next call goes ahead.
+or because your function threw, the next call goes ahead. When flushes overlap,
+a forced one beside a slow one, the cadence counts from the one started last,
+even when the slow one finishes after it.
 
 The cadence is measured from the last flush that shipped rows. Before the first
 one there is nothing to measure from, so the first flush always goes ahead,
@@ -175,7 +177,9 @@ explains why, and where the write lands.
 
 With a driver every process can see, such as `ioredis()`, the cadence holds for
 the whole fleet. Every server runs the same code, and each metric still ships
-at most once per `flush` interval between all of them.
+about once per `flush` interval between all of them. Two shipments without
+`force` are never closer together than nine tenths of the interval, the same
+tenth of slack a single process allows.
 
 ```ts
 // on every server
@@ -216,9 +220,9 @@ What follows from how the turn works:
   server rather than split into smaller inserts.
 - **The turn uses each server's own clock.** Servers whose clocks differ by a
   few milliseconds see the interval move by that much. A turn stamped by a clock
-  running ahead, by less than that gap, holds the others back like any other.
-  One more than the gap away is taken as a clock that stepped, and the flush
-  goes ahead.
+  running ahead, by less than nine tenths of an interval, holds the others back
+  like any other. One further away than that is taken as a clock that stepped,
+  and the flush goes ahead.
 - **`force` ships regardless**, and still records its turn, so the other
   servers count the interval from that shipment.
 - **A final flush waits for the turn too**, when the driver is durable as well

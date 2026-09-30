@@ -122,10 +122,18 @@ claimed and deleted, otherwise they pile up in the driver forever.
 The flush sends the same id with the complete value, so it supersedes every
 partial send, as long as your table lets it. An immediate send reads the running
 total and then calls your function, and a flush can claim the window in
-between. Within one process the flush waits for every immediate send already
-under way for that metric before it hands its rows over, so its row reaches your
-function after theirs. Sends that start after the claim cannot read the claimed
-window, so they are not waited for.
+between. Within one process the flush waits for the immediate sends already
+under way for that metric that could have read a window it claimed, so its row
+reaches your function after theirs. Sends that start after the claim cannot
+read the claimed window, and a send aimed at a window newer than every one the
+flush claimed reads none of them, so neither is waited for.
+
+The wait lasts at most one `flush` interval. A `write` function that never
+answers an immediate send would otherwise hold up every flush of the metric.
+When the interval runs out, the flush hands its rows over anyway. The send
+still waiting may then reach your function after the flush row, with an older
+total under the same id, exactly as a send from another process can. The table
+below keeps the flush row in that case.
 
 Across processes nothing can order the two. Another process may read its running
 total just before the claim and deliver it just after the flush row. So your
@@ -135,11 +143,12 @@ sink](#telling-the-two-apart-in-your-sink) shows one way.
 
 A write that arrived after its window was claimed is
 [moved forward](/guide/buckets-and-time#a-write-that-misses-its-window) to a
-window that has not shipped, and the immediate send follows it. It sends every
-live window of that series from the one the write aimed at onward, so the
-landing window is among them even when a window a failed flush released sits in
-front of it. A failed send counts toward `attempt` exactly as a failed flush
-does.
+window that has not shipped, and the immediate send follows it. It asks the
+driver which window the write landed in, and sends every live window of that
+series from the one the write aimed at through that one. A window a failed
+flush released can sit in front of the landing window, or be the aimed window
+itself, and the landing window is still sent. A failed send counts toward
+`attempt` exactly as a failed flush does.
 
 With several processes writing to one Redis, each of them sends the running
 total it read, and two immediate sends can arrive at your table in either order.

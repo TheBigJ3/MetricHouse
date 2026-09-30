@@ -1499,6 +1499,65 @@ describe('a flush still in flight', () => {
     fail = false
     expect(await metric.flush()).toEqual({ buckets: 1, rows: 1, skipped: false })
   })
+
+  /**
+   * A flush held in its sink, then a forced one 203 seconds later that
+   * ships, then a third write closed 103 seconds after that.
+   */
+  async function overtaken() {
+    let release = (): void => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const sent: number[] = []
+    const metric = make('m', {
+      write: async (rows: Row[]) => {
+        sent.push(rows.length)
+        if (sent.length === 1) await gate
+      },
+    })
+    createHouse({ driver, schema: [metric], now })
+    metric.add(A)
+    await metric.drain()
+    settle()
+
+    const first = metric.flush()
+    await vi.waitFor(() => expect(sent).toEqual([1]))
+    clock += 200_000
+    metric.add(A)
+    await metric.drain()
+    settle()
+    expect(await metric.flush({ force: true })).toEqual({ buckets: 1, rows: 1, skipped: false })
+    clock += 100_000
+    metric.add(A)
+    await metric.drain()
+    settle()
+    return { metric, first, release }
+  }
+
+  const tooSoon = {
+    buckets: 0,
+    rows: 0,
+    skipped: true,
+    reason: 'cadence',
+    nextEligibleInMs: 300_000 - 103_000,
+  }
+
+  it('counts from a newer shipment than a flush let through before it and still running', async () => {
+    const { metric, first, release } = await overtaken()
+
+    expect(await metric.flush()).toEqual(tooSoon)
+    release()
+    await first
+  })
+
+  it('keeps a newer shipment as the latest when an older flush finishes after it', async () => {
+    const { metric, first, release } = await overtaken()
+    release()
+    expect(await first).toEqual({ buckets: 1, rows: 1, skipped: false })
+
+    expect(await metric.flush()).toEqual(tooSoon)
+  })
 })
 
 describe('a flush whose later claim fails', () => {

@@ -263,6 +263,32 @@ describe('ioredis · round trips of one call', () => {
     await expect(driver.increment([op(1000), op(2000)])).rejects.toThrow('ERR refused')
     expect(windows(sent)).toEqual([1000, 2000])
   })
+
+  it('resends what Redis forgot in every round trip of a call before a call made after', async () => {
+    const forgot = Object.assign(new Error('NOSCRIPT No matching script. Please use EVAL.'), {
+      name: 'ReplyError',
+    })
+    const { client, sent } = scriptedClient([[[forgot, null]], [[forgot, null]]])
+    const driver = ioredis(client, { maxPipelineSize: 1 })
+    // a call made the moment the first resend goes out
+    let later: Promise<void> | undefined
+    const pipelineOf = client.pipeline.bind(client)
+    let execs = 0
+    ;(client as { pipeline: () => unknown }).pipeline = () => {
+      const pipeline = pipelineOf()
+      const exec = pipeline.exec.bind(pipeline)
+      pipeline.exec = () => {
+        execs += 1
+        if (execs === 3) later = driver.increment([op(3000)])
+        return exec()
+      }
+      return pipeline
+    }
+
+    await driver.increment([op(1000), op(2000)])
+    await later
+    expect(windows(sent)).toEqual([1000, 2000, 1000, 2000, 3000])
+  })
 })
 
 // no server needed: these never read what a script stored
@@ -442,6 +468,23 @@ if (!client) {
       expect(await live.zrange(`${ns}:idx:${M}`, '0', '-1')).toEqual(['1000', '2000'])
       await driver.claim(M, 2000)
       expect(await live.zrange(`${ns}:idx:${M}`, '0', '-1')).toEqual(['2000'])
+
+      await wipe(ns)
+    })
+
+    it('keeps a turn as the bare time 0.7.0 reads, with its token in a key beside it', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+
+      const first = await driver.takeTurn?.(M, 5000, 1000)
+      if (!first?.granted) throw new Error('expected the turn to be granted')
+      expect(await live.get(`${ns}:turn:${M}`)).toBe('5000')
+      expect(await live.get(`${ns}:turntok:${M}`)).toBe(first.turn.token)
+
+      const second = await driver.takeTurn?.(M, 6000, 1000)
+      if (!second?.granted) throw new Error('expected the turn to be granted')
+      expect(await live.get(`${ns}:turn:${M}`)).toBe('6000')
+      expect(await live.get(`${ns}:turntok:${M}`)).toBe(second.turn.token)
 
       await wipe(ns)
     })
@@ -1148,11 +1191,12 @@ if (!client) {
       const answer = await resent.takeTurn?.(M, 5000, 1000)
       if (!answer?.granted) throw new Error('expected the turn to be granted')
       expect(answer.previous).toBeUndefined()
-      expect(await live.get(`${ns}:turn:${M}`)).toBe(`5000|${answer.turn.token}`)
+      expect(await live.get(`${ns}:turn:${M}`)).toBe('5000')
+      expect(await live.get(`${ns}:turntok:${M}`)).toBe(answer.turn.token)
       await wipe(ns)
     })
 
-    it('reads a turn recorded before turns carried a token, and gives it back', async () => {
+    it('reads a turn 0.7.0 recorded as the time alone, and gives it back the same way', async () => {
       const ns = fresh()
       const driver = ioredis(live, { namespace: ns })
       await live.set(`${ns}:turn:${M}`, '5000')
@@ -1163,7 +1207,39 @@ if (!client) {
       expect(answer.previous).toEqual({ at: 5000, token: '' })
 
       await driver.returnTurn?.(M, answer.turn, answer.previous)
+      // what 0.7.0's own script parses: the time and nothing after it
+      expect(await live.get(`${ns}:turn:${M}`)).toBe('5000')
+      expect(await live.exists(`${ns}:turntok:${M}`)).toBe(0)
       expect(await driver.takeTurn?.(M, 5500, 1000)).toEqual({ granted: false, lastTakenAt: 5000 })
+      await wipe(ns)
+    })
+
+    it('rewrites a turn stored as at|token into the time and a token key', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.set(`${ns}:turn:${M}`, '5000|abc')
+
+      expect(await driver.takeTurn?.(M, 5500, 1000)).toEqual({ granted: false, lastTakenAt: 5000 })
+      expect(await live.get(`${ns}:turn:${M}`)).toBe('5000')
+      expect(await live.get(`${ns}:turntok:${M}`)).toBe('abc')
+
+      const answer = await driver.takeTurn?.(M, 6000, 1000)
+      if (!answer?.granted) throw new Error('expected the turn to be granted')
+      expect(answer.previous).toEqual({ at: 5000, token: 'abc' })
+      await driver.returnTurn?.(M, answer.turn, answer.previous)
+      expect(await live.get(`${ns}:turn:${M}`)).toBe('5000')
+      expect(await live.get(`${ns}:turntok:${M}`)).toBe('abc')
+      await wipe(ns)
+    })
+
+    it('gives back a turn still stored as at|token', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.set(`${ns}:turn:${M}`, '5000|abc')
+
+      await driver.returnTurn?.(M, { at: 5000, token: 'abc' }, { at: 4000, token: '' })
+      expect(await live.get(`${ns}:turn:${M}`)).toBe('4000')
+      expect(await live.exists(`${ns}:turntok:${M}`)).toBe(0)
       await wipe(ns)
     })
 
