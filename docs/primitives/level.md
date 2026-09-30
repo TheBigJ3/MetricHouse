@@ -460,7 +460,7 @@ A value somebody wrote always beats a carried one, whichever of the two lands
 first. Two processes carrying the same window write the same number, so they
 cannot disagree.
 
-Eight consequences worth knowing:
+Nine consequences worth knowing:
 
 - **A series appears from its first write.** Nothing is backfilled before it, so
   a queue declared on Monday and first written on Friday has no Monday rows.
@@ -499,6 +499,13 @@ Eight consequences worth knowing:
   a reading taken in that window's own time, because that reading was taken
   later. When the window holds only a value an earlier late write moved there,
   both missed their windows, and the `set()` that arrives second replaces it.
+- **A series that starts late during a flush can lose windows.** A flush reads
+  every series, fills the empty windows, and then claims. When a series' first
+  write, or a write that moves its start earlier, reaches storage between that
+  read and that claim and is stamped below the watermark, the flush claims those
+  windows without a value in them, and they never ship. It takes a write stamped
+  more than `grace` in the past, so a clock that runs behind by more than `grace`
+  is the usual cause. Keep clocks in sync, or raise `grace`, to keep it away.
 
 ## What it costs
 

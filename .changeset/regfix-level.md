@@ -8,5 +8,6 @@
 - `totals()` and a merging `snapshot()` on a level declared `value: int()` add stored fractions, which a `float()` level wrote, as doubles: `1.5` and `0.5` total `2`, and a total that is not a whole number rejects with an error naming the cause. They used to throw a bare `RangeError`.
 - Level writes and flushes on Redis cost about what they cost in 0.7.0 again. A flush holds every series from one read of the windows between its pointer and the window it fills, and a write reads the windows after its own once per call.
 - The Redis driver loads a script once when many calls in one batch first need it. A first level carry used to load the same script once per window it filled.
+- Document that a level series whose first write lands between a flush's read and its claim, stamped more than `grace` in the past, loses the windows that flush claims.
 
 Custom drivers: `LevelCell` gains `moved`, which a driver sets on a cell only writes moved forward to the watermark have written.

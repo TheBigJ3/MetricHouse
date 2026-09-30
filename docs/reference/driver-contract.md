@@ -331,6 +331,12 @@ fills that window with the value it names if it is empty, and changes neither
 `carried` belongs to the pointer's window. An `add` whose result would not be a
 finite number is refused.
 
+The metric reads the series, sends the holds, and then claims, in three calls.
+A write that starts a series, or moves its `heldThrough` back, and lands between
+the read and the claim below the watermark is not carried by that flush, and the
+claim takes those windows empty. The contract does not close that gap. A driver
+that did would need to carry and claim in one step.
+
 ### readLevels
 
 ```ts
