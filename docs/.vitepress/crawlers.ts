@@ -224,7 +224,8 @@ CLI. Failed *writes* retry correctly today, and on the Redis
 driver a failed *process* has the window it was holding put back into the live
 set by a later flush, once the claim is older than \`recoverAfter\`. On the memory
 driver a failed process still loses the window in flight, because its claims
-never leave the process.
+never leave the process. The Redis driver needs Redis 4.0 or later and does not
+support Redis Cluster.
 
 ## A complete example
 

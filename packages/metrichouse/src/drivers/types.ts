@@ -253,7 +253,10 @@ export interface BucketClaim extends ClaimBase {
 /** Staged records moved out of the live set: event. */
 export interface RecordClaim extends ClaimBase {
   readonly kind: 'records'
-  /** Ascending by `ts`, then by append order within a millisecond. */
+  /**
+   * In append order, which is ascending by `ts` for every record that was
+   * not backdated.
+   */
   readonly records: readonly StagedRecord[]
 }
 
@@ -314,14 +317,29 @@ export const NOTHING_RECOVERED: RecoveryReport = Object.freeze({
 })
 
 /**
+ * One turn to ship, as a driver records it.
+ *
+ * The token is what tells two turns apart. Two processes can take a turn in
+ * the same millisecond, a forced flush beside a scheduled one, and a turn
+ * named by its time alone would let the first give back the second.
+ */
+export interface Turn {
+  /** When it was taken, by the clock of the flush that took it. */
+  readonly at: number
+  /** Unique to this turn. */
+  readonly token: string
+}
+
+/**
  * What {@link Driver.takeTurn} answers.
  *
- * Granted, it carries the turn it replaced, so a flush that ships nothing can
- * put that one back with {@link Driver.returnTurn}. Refused, it carries when
- * the turn in the way was taken, so the flush can say how long to wait.
+ * Granted, it carries the turn it recorded and the one that turn replaced, so
+ * a flush that ships nothing can put the old one back with
+ * {@link Driver.returnTurn}. Refused, it carries when the turn in the way was
+ * taken, so the flush can say how long to wait.
  */
 export type ShipTurn =
-  | { readonly granted: true; readonly previous: number | undefined }
+  | { readonly granted: true; readonly turn: Turn; readonly previous: Turn | undefined }
   | { readonly granted: false; readonly lastTakenAt: number }
 
 /**
@@ -441,7 +459,11 @@ export interface Driver {
    */
   sumBuckets?(query: BucketRange): Promise<number | undefined>
 
-  /** Staged, unclaimed records only, ascending by `ts`. */
+  /**
+   * Staged, unclaimed records only, in append order. That is ascending by
+   * `ts` except for a record appended with a `ts` older than one before it,
+   * which keeps its place in the line.
+   */
   readPending(query: PendingQuery): Promise<StagedRecord[]>
 
   /**
@@ -470,6 +492,10 @@ export interface Driver {
    *
    * A level `hold` aimed below the watermark writes no cell and still moves
    * the series' pointer, for the same reason.
+   *
+   * @throws when `upToBucketTs` is not a finite number, before anything is
+   * claimed. A watermark of NaN would compare false against every window and
+   * stop every later write from moving forward.
    */
   claim(metric: string, upToBucketTs: number): Promise<BucketClaim>
 
@@ -515,7 +541,8 @@ export interface Driver {
 
   /**
    * Take this metric's turn to ship, on behalf of every process sharing the
-   * driver, and record `now` as the time it was taken.
+   * driver, and record `now` as the time it was taken, with a token no other
+   * turn has.
    *
    * A metric's `flush` setting bounds how often it ships. Each process keeps
    * that clock for itself, and with only that, N processes sharing a driver
@@ -543,9 +570,10 @@ export interface Driver {
    * Give back a turn that shipped nothing, putting `previous` in its place,
    * or clearing it when `previous` is `undefined`.
    *
-   * Only while the recorded turn is still the one taken at `at`. A later turn
-   * belongs to a flush that is still running, and putting an older one over
-   * it would let a third process ship beside it.
+   * Only while the recorded turn is still `turn`, token included. A later
+   * turn belongs to a flush that is still running, and putting an older one
+   * over it would let a third process ship beside it. That holds for a later
+   * turn taken in the same millisecond too, which only the token tells apart.
    */
-  returnTurn?(metric: string, at: number, previous: number | undefined): Promise<void>
+  returnTurn?(metric: string, turn: Turn, previous: Turn | undefined): Promise<void>
 }

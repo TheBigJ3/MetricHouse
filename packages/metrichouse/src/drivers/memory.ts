@@ -31,6 +31,7 @@ import {
   type RecoveryReport,
   type ShipTurn,
   type StagedRecord,
+  type Turn,
 } from './types.js'
 
 /**
@@ -150,6 +151,25 @@ const DEFAULT_MAX_SERIES = 100_000
 const DEFAULT_MAX_STAGED = 100_000
 
 /**
+ * A cap from the options, or its default.
+ *
+ * `NaN` compares false against every count and would switch the cap off
+ * without saying so, and `0` or a negative number would refuse every write.
+ * Anything but a positive whole number, or no cap at all, is refused when the
+ * driver is made.
+ */
+function capFrom(value: number | undefined, fallback: number, name: string): number {
+  const cap = value ?? fallback
+  if (cap !== Number.POSITIVE_INFINITY && !(Number.isSafeInteger(cap) && cap > 0)) {
+    throw new Error(
+      `memory driver: ${name} must be a positive whole number or Number.POSITIVE_INFINITY, ` +
+        `got ${String(cap)}`,
+    )
+  }
+  return cap
+}
+
+/**
  * Make `target` hold exactly `items`, in place.
  *
  * A loop rather than `splice(0, n, ...items)` or `push(...items)`, which pass
@@ -222,6 +242,42 @@ function copied(cell: Cell): Cell {
   return typeof cell === 'number' ? cell : { ...cell }
 }
 
+/**
+ * A record's fields, copied so that editing one copy changes nothing in the
+ * other.
+ *
+ * Taken on the way in, so a caller who reuses the object it passed to
+ * `append` does not rewrite a staged record, and on the way out, so a caller
+ * who edits what `readPending` returned does not either. Redis parses a fresh
+ * record from text on every read, and this does the same. A primitive is
+ * copied as it is. A Date, an array or a nested object is cloned whole.
+ */
+function copiedFields(fields: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const key of Object.keys(fields)) {
+    const raw = fields[key]
+    const value = typeof raw === 'object' && raw !== null ? structuredClone(raw) : raw
+    // an own `__proto__` key is a key like any other, and assigning it would
+    // set the copy's prototype instead
+    if (key === '__proto__') {
+      Object.defineProperty(out, key, {
+        value,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      })
+    } else {
+      out[key] = value
+    }
+  }
+  return out
+}
+
+/** A staged record, copied as {@link copiedFields} says. */
+function copiedRecord(record: StagedRecord): StagedRecord {
+  return { id: record.id, ts: record.ts, fields: copiedFields(record.fields) }
+}
+
 /** The value `map` holds under `key`, made and stored first if it holds none. */
 function getOrCreate<K, V>(map: Map<K, V>, key: K, make: () => V): V {
   let value = map.get(key)
@@ -233,8 +289,8 @@ function getOrCreate<K, V>(map: Map<K, V>, key: K, make: () => V): V {
 }
 
 export function memory(options: MemoryDriverOptions = {}): Driver {
-  const maxSeries = options.maxSeries ?? DEFAULT_MAX_SERIES
-  const maxStaged = options.maxStaged ?? DEFAULT_MAX_STAGED
+  const maxSeries = capFrom(options.maxSeries, DEFAULT_MAX_SERIES, 'maxSeries')
+  const maxStaged = capFrom(options.maxStaged, DEFAULT_MAX_STAGED, 'maxStaged')
 
   /** metric -> bucketTs -> dimKey -> cell */
   const live = new Map<string, Map<number, Map<string, Cell>>>()
@@ -280,8 +336,10 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
    */
   const claimedUpTo = new Map<string, number>()
 
-  /** metric -> when its last turn to ship was taken. See {@link Driver.takeTurn}. */
-  const turns = new Map<string, number>()
+  /** metric -> its last turn to ship. See {@link Driver.takeTurn}. */
+  const turns = new Map<string, Turn>()
+  /** What each turn's token is made from. One process, so a count is unique. */
+  let turnSeq = 0
 
   /** Where a write aimed at `bucketTs` actually lands. */
   function landing(metric: string, bucketTs: number): number {
@@ -330,16 +388,22 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     return claim
   }
 
+  /** @throws if the claim is not in flight, because it was settled already */
+  function assertInFlight(claim: Claim): void {
+    if (!inFlight.has(claim.id)) {
+      throw new Error(`memory driver: claim ${claim.id} is not in flight. Was it already settled?`)
+    }
+  }
+
   /**
-   * Take a claim out of the in-flight set, the first step of an ack or a
-   * release.
+   * Take a claim out of the in-flight set, once nothing is left that can stop
+   * the ack or the release it belongs to.
    *
    * @throws if the claim is not in flight, because it was settled already
    */
   function settle(claim: Claim): void {
-    if (!inFlight.delete(claim.id)) {
-      throw new Error(`memory driver: claim ${claim.id} is not in flight. Was it already settled?`)
-    }
+    assertInFlight(claim)
+    inFlight.delete(claim.id)
   }
 
   /** Staged plus in-flight, because a claim that is never acked still occupies memory. */
@@ -698,11 +762,15 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     async readLevels(metric: string): Promise<LevelSeries[]> {
       const series = levels.get(metric)
       if (!series) return []
-      return [...series.values()].sort((a, b) => (a.dimKey < b.dimKey ? -1 : 1))
+      // copies, as a cell read hands out, so editing one changes nothing stored
+      return [...series.values()]
+        .map((one) => ({ ...one }))
+        .sort((a, b) => (a.dimKey < b.dimKey ? -1 : 1))
     },
 
     async readLevel(metric: string, dimKey: string): Promise<LevelSeries | undefined> {
-      return levels.get(metric)?.get(dimKey)
+      const one = levels.get(metric)?.get(dimKey)
+      return one === undefined ? undefined : { ...one }
     },
 
     async dropLevels(
@@ -740,7 +808,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       }
 
       for (const op of ops) {
-        const record: StagedRecord = { id: op.id, ts: op.ts, fields: op.fields }
+        const record: StagedRecord = { id: op.id, ts: op.ts, fields: copiedFields(op.fields) }
         appendSeq += 1
         appendOrder.set(record, appendSeq)
         stagedFor(op.metric).push(record)
@@ -802,7 +870,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       for (const record of records) {
         if (query.from !== undefined && record.ts < query.from) continue
         if (query.to !== undefined && record.ts >= query.to) continue
-        matched.push(record)
+        matched.push(copiedRecord(record))
         // append order is already ts order for anything not backdated, and the
         // caller asked for the first n, so stop rather than scan the backlog
         if (query.limit !== undefined && matched.length >= query.limit) break
@@ -817,6 +885,12 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     },
 
     async claim(metric: string, upToBucketTs: number): Promise<BucketClaim> {
+      if (!Number.isFinite(upToBucketTs)) {
+        throw new Error(
+          `memory driver: ${metric} cannot be claimed up to ${upToBucketTs}, which is not a ` +
+            'finite number',
+        )
+      }
       const byBucket = live.get(metric)
       const claimed: ClaimedBucket[] = []
 
@@ -882,9 +956,8 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     },
 
     async release(claim: Claim): Promise<void> {
-      settle(claim)
-
       if (isRecordClaim(claim)) {
+        settle(claim)
         addStagedInFlight(claim.metric, -claim.records.length)
         // back where they were taken from. They are older than anything
         // appended while they were in flight, but a claim released before
@@ -900,28 +973,41 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         return
       }
 
+      // every merge is worked out before anything moves. A cell of another
+      // kind then stops the release with the live set as it was and the claim
+      // still in flight, where a retried release finds all of it. A claim
+      // settled first would be gone, with part of its cells never put back
+      assertInFlight(claim)
       const byBucket = bucketsFor(claim.metric)
-
+      const planned = new Map<number, Map<string, Cell>>()
+      const collapsed: string[] = []
       for (const claimedBucket of claim.buckets) {
+        const cells = getOrCreate(planned, claimedBucket.bucketTs, () => new Map<string, Cell>())
         const existing = byBucket.get(claimedBucket.bucketTs)
-
-        if (!existing) {
-          addBucket(claim.metric, byBucket, claimedBucket.bucketTs, new Map(claimedBucket.values))
-          continue
-        }
-
-        // a write can land in a bucket while it is claimed, backdated or a
-        // straggler. Merge rather than overwrite, or that increment is lost.
+        // a cell already there was left by a driver older than the watermark,
+        // which let a late write land in a claimed window. Merged rather than
+        // overwritten, or that write is lost
         for (const [dimKey, value] of claimedBucket.values) {
-          const current = existing.get(dimKey)
+          const current = cells.get(dimKey) ?? existing?.get(dimKey)
           if (current === undefined) {
-            existing.set(dimKey, value)
+            cells.set(dimKey, value)
             continue
           }
           // two holders collapse into one
-          removeHolder(claim.metric, dimKey)
-          existing.set(dimKey, mergeCells(value, current))
+          collapsed.push(dimKey)
+          cells.set(dimKey, mergeCells(value, current))
         }
+      }
+
+      settle(claim)
+      for (const dimKey of collapsed) removeHolder(claim.metric, dimKey)
+      for (const [bucketTs, cells] of planned) {
+        const existing = byBucket.get(bucketTs)
+        if (!existing) {
+          addBucket(claim.metric, byBucket, bucketTs, cells)
+          continue
+        }
+        for (const [dimKey, cell] of cells) existing.set(dimKey, cell)
       }
     },
 
@@ -937,17 +1023,22 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
 
     async takeTurn(metric: string, now: number, gapMs: number): Promise<ShipTurn> {
       const last = turns.get(metric)
-      if (last !== undefined && Math.abs(now - last) < gapMs) {
-        return { granted: false, lastTakenAt: last }
+      if (last !== undefined && Math.abs(now - last.at) < gapMs) {
+        return { granted: false, lastTakenAt: last.at }
       }
-      turns.set(metric, now)
-      return { granted: true, previous: last }
+      turnSeq += 1
+      const turn: Turn = { at: now, token: String(turnSeq) }
+      turns.set(metric, turn)
+      return { granted: true, turn: { ...turn }, previous: last && { ...last } }
     },
 
-    async returnTurn(metric: string, at: number, previous: number | undefined): Promise<void> {
-      if (turns.get(metric) !== at) return
+    async returnTurn(metric: string, turn: Turn, previous: Turn | undefined): Promise<void> {
+      // by token as well as time: a turn taken in the same millisecond is a
+      // later turn all the same, and not this one
+      const current = turns.get(metric)
+      if (current?.at !== turn.at || current.token !== turn.token) return
       if (previous === undefined) turns.delete(metric)
-      else turns.set(metric, previous)
+      else turns.set(metric, { at: previous.at, token: previous.token })
     },
   }
 }

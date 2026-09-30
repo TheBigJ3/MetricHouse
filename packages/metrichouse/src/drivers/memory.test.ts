@@ -10,13 +10,44 @@
 import { describe, expect, it } from 'vitest'
 import { describeDriverContract } from './contract.js'
 import { memory } from './memory.js'
+import type { ClaimedBucket } from './types.js'
 
 describeDriverContract('memory', {
   make: () => memory(),
   capabilities: { durable: false, shared: false, atomicMerge: true },
+  // this driver keeps no storage a test can reach, so the cell goes in the
+  // one way that skips the watermark: carried by a claim being released
+  plant: async (driver, metric, bucketTs, dimKey, cell) => {
+    const carrier = await driver.claim(metric, Number.MIN_SAFE_INTEGER)
+    ;(carrier.buckets as ClaimedBucket[]).push({ bucketTs, values: new Map([[dimKey, cell]]) })
+    await driver.release(carrier)
+  },
 })
 
 const M = 'dog_poops'
+
+describe('memory · options', () => {
+  it('refuses a cap that is not a positive whole number', () => {
+    for (const bad of [Number.NaN, 0, -1, 2.5, Number.NEGATIVE_INFINITY]) {
+      expect(() => memory({ maxSeries: bad })).toThrow(
+        `memory driver: maxSeries must be a positive whole number or Number.POSITIVE_INFINITY, got ${bad}`,
+      )
+      expect(() => memory({ maxStaged: bad })).toThrow(
+        `memory driver: maxStaged must be a positive whole number or Number.POSITIVE_INFINITY, got ${bad}`,
+      )
+    }
+  })
+
+  it('takes Number.POSITIVE_INFINITY as no cap', async () => {
+    const open = memory({
+      maxSeries: Number.POSITIVE_INFINITY,
+      maxStaged: Number.POSITIVE_INFINITY,
+    })
+    await expect(
+      open.increment([{ metric: M, bucketTs: 1000, dimKey: 'a', delta: 1 }]),
+    ).resolves.toBeUndefined()
+  })
+})
 
 describe('memory · maxStaged', () => {
   const one = (id: string) => ({ metric: M, id, ts: 1000, fields: {} })

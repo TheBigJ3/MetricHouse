@@ -26,6 +26,7 @@
  */
 
 import { uuidv7 } from '../identity.js'
+import { hasLoneSurrogate } from '../schema/dims.js'
 import { isDate } from '../schema/types.js'
 import { type DurationInput, parseDuration } from '../time/duration.js'
 import {
@@ -49,6 +50,7 @@ import {
   type RecoveryReport,
   type ShipTurn,
   type StagedRecord,
+  type Turn,
 } from './types.js'
 
 /**
@@ -70,7 +72,6 @@ export interface IoredisClient {
   llen(key: string): Promise<number>
   lrange(key: string, start: number, stop: number): Promise<string[]>
   zrangebyscore(key: string, min: string | number, max: string | number): Promise<string[]>
-  incr(key: string): Promise<number>
   /**
    * Close the connection. Optional in this shape, because only
    * {@link IoredisDriver.close} uses it, and only on a client the driver
@@ -99,7 +100,8 @@ export interface IoredisDriverOptions {
    *
    * Two houses sharing one Redis need different namespaces, and so do two
    * test runs. The suite gives each driver a random one for exactly that
-   * reason. No colon and no whitespace, or the constructor throws.
+   * reason. No colon, no whitespace and no half of a surrogate pair, or the
+   * constructor throws.
    */
   readonly namespace?: string
 
@@ -107,9 +109,13 @@ export interface IoredisDriverOptions {
    * How many commands go into one pipelined round trip. Defaults to 1000. A
    * value that is not a positive integer throws at construction.
    *
-   * A batch larger than this is split. The cap is about the reply buffer and
-   * the Lua stack, not about correctness: a split batch is still one logical
-   * write, and nothing reads between the halves.
+   * A batch larger than this is split into several round trips. The cap is
+   * about the reply buffer. Every round trip of one call is issued before any
+   * send made after that call, so this process never puts a write of its own
+   * between two of them. Another process can still read or write between
+   * them, and each script call is applied or refused on its own: a window
+   * with more than 1000 ops in one call is already split into several script
+   * calls, and a refusal in one of them keeps the ones that were applied.
    */
   readonly maxPipelineSize?: number
 
@@ -859,16 +865,29 @@ local function mh_push_front(list, items)
   end
 end
 
--- byte order, not string '<': Lua compares strings with strcoll, and Redis
--- sets the collation locale from its environment
+-- the sequence stamp in front of a stored record, or an empty string for a
+-- record staged before stamps existed, which starts with its JSON. The rule
+-- stampOf keeps in the driver, so an unstamped record sorts before every
+-- stamped one here as it does there
+local function mh_stamp(record)
+  if string.sub(record, 1, 1) == '{' then return '' end
+  local bar = string.find(record, '|', 1, true)
+  if bar == nil then return record end
+  return string.sub(record, 1, bar - 1)
+end
+
+-- byte order of the stamps, not string '<': Lua compares strings with
+-- strcoll, and Redis sets the collation locale from its environment
 local function mh_before(a, b)
-  local n = math.min(#a, #b, 64)
+  local sa = mh_stamp(a)
+  local sb = mh_stamp(b)
+  local n = math.min(#sa, #sb)
   for k = 1, n do
-    local x = string.byte(a, k)
-    local y = string.byte(b, k)
+    local x = string.byte(sa, k)
+    local y = string.byte(sb, k)
     if x ~= y then return x < y end
   end
-  return false
+  return #sa < #sb
 end
 
 local function mh_restore_records(inflight, records)
@@ -1073,8 +1092,12 @@ return { claims, buckets, records, oldest }
  * would otherwise find the one it had just taken in its way and be refused,
  * and the flush would skip while holding a turn nobody gives back.
  *
- * KEYS: turn. ARGV: now, gapMs. Returns `1` or `0` for granted, and the turn
- * recorded before this one, or an empty string when there was none.
+ * A turn is stored as `at|token`. One stored before turns carried a token is
+ * the time alone, and reads as a turn with an empty token.
+ *
+ * KEYS: turn. ARGV: now, gapMs, the new turn's token. Returns `1` or `0` for
+ * granted, and the turn recorded before this one, or an empty string when
+ * there was none.
  */
 const TAKE_TURN = `${LUA_ONCE}
 local replayed = mh_seen()
@@ -1088,10 +1111,10 @@ local gap = tonumber(ARGV[2])
 local last = redis.call('GET', KEYS[1])
 local granted = 1
 if last then
-  local elapsed = now - tonumber(last)
+  local elapsed = now - tonumber(string.match(last, '^[^|]*'))
   if elapsed < gap and -elapsed < gap then granted = 0 end
 end
-if granted == 1 then redis.call('SET', KEYS[1], ARGV[1]) end
+if granted == 1 then redis.call('SET', KEYS[1], ARGV[1] .. '|' .. ARGV[3]) end
 
 last = last or ''
 mh_mark(granted .. ',' .. last)
@@ -1100,9 +1123,11 @@ return { granted, last }
 
 /**
  * Give back a turn that shipped nothing, while it is still the one recorded.
+ * Compared with its token, so a turn taken later in the same millisecond is
+ * left alone.
  *
  * KEYS: turn. ARGV: the turn being given back, the one to restore or an empty
- * string to clear it.
+ * string to clear it, each as `at|token`.
  */
 const RETURN_TURN = `${LUA_ONCE}
 if mh_seen() then return 1 end
@@ -1269,6 +1294,9 @@ const DATE_TAG = '__mh_date'
  */
 const RESERVED_PREFIX = '__mh_'
 
+/** What a key of the caller's that starts with {@link RESERVED_PREFIX} is stored as. */
+const ESCAPED_PREFIX = RESERVED_PREFIX + RESERVED_PREFIX
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value) && !isDate(value)
 }
@@ -1366,10 +1394,13 @@ export function decodeRecordTagged(stored: string): StagedRecord {
     if (keys.length === 1 && keys[0] === DATE_TAG && (typeof ms === 'number' || ms === null)) {
       return new Date(ms ?? Number.NaN)
     }
-    if (!keys.some((k) => k.startsWith(RESERVED_PREFIX))) return value
+    // only a key with the prefix written twice was escaped. One with it once
+    // was stored as it is, by a driver from before keys were escaped, and
+    // comes back as it went in
+    if (!keys.some((k) => k.startsWith(ESCAPED_PREFIX))) return value
     return Object.fromEntries(
       Object.entries(value).map(([k, v]) => [
-        k.startsWith(RESERVED_PREFIX) ? k.slice(RESERVED_PREFIX.length) : k,
+        k.startsWith(ESCAPED_PREFIX) ? k.slice(RESERVED_PREFIX.length) : k,
         v,
       ]),
     )
@@ -1420,6 +1451,22 @@ function decodeCell(raw: string): Cell {
   }
 }
 
+/** A turn as {@link TAKE_TURN} stores it, `at|token`. */
+function turnText(turn: Turn): string {
+  return `${turn.at}|${turn.token}`
+}
+
+/**
+ * A stored turn, or `undefined` for none. One stored before turns carried a
+ * token is the time alone, and comes back with an empty token.
+ */
+function turnFrom(stored: string): Turn | undefined {
+  if (stored === '') return undefined
+  const bar = stored.indexOf('|')
+  if (bar === -1) return { at: Number(stored), token: '' }
+  return { at: Number(stored.slice(0, bar)), token: stored.slice(bar + 1) }
+}
+
 function isNoScript(error: unknown): boolean {
   return error instanceof Error && error.message.includes('NOSCRIPT')
 }
@@ -1468,13 +1515,22 @@ function typedError(error: unknown, metric: string): Error {
 export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {}): IoredisDriver {
   const ns = options.namespace ?? DEFAULT_NAMESPACE
   // no colon, for the same reason a metric name has none: every key is
-  // namespace, a type, then a metric, split on colons. A namespace `org:idx`
-  // would make its `org:idx:seq` counter the same key as the index of a
-  // metric named `seq` in namespace `org`
+  // namespace, a type, then a metric, split on colons. A namespace `org:e`
+  // would store an event named `checkout` at the same key as an event named
+  // `e:checkout` in namespace `org`
   if (typeof ns !== 'string' || !/^[^\s:]+$/.test(ns)) {
     throw new Error(
       `ioredis driver: namespace ${JSON.stringify(ns)} must be non-empty with no colon or ` +
         'whitespace, because the driver builds every key by joining it to the rest with colons',
+    )
+  }
+  // Redis keeps a key as UTF-8, which cannot hold half of a surrogate pair,
+  // and ioredis sends one as the replacement character. `mh\uD800` and
+  // `mh\uDC00` would then share every key
+  if (hasLoneSurrogate(ns)) {
+    throw new Error(
+      `ioredis driver: namespace ${JSON.stringify(ns)} holds half of a surrogate pair, ` +
+        'which Redis would store as the same replacement character for every such namespace',
     )
   }
   const maxPipeline = options.maxPipelineSize ?? DEFAULT_MAX_PIPELINE
@@ -1498,7 +1554,6 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     claims: (metric: string) => `${ns}:claims:${metric}`,
     watermark: (metric: string) => `${ns}:wm:${metric}`,
     turn: (metric: string) => `${ns}:turn:${metric}`,
-    seq: `${ns}:seq`,
   }
 
   /**
@@ -1697,93 +1752,132 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     if (calls.length === 0) return []
     const client = await connect()
 
-    const out: unknown[] = []
-    for (let start = 0; start < calls.length; start += maxPipeline) {
-      const chunk = calls.slice(start, start + maxPipeline)
-      // one number per write, kept across a NOSCRIPT retry: the retried call
-      // is the same write, so if it did run after all, the script sees it
-      const seqs = chunk.map((call) => (call.once ? ++writeSeq : 0))
-      for (const seq of seqs) if (seq > 0) unanswered.add(seq)
+    // one number per write, kept across a NOSCRIPT retry: the retried call
+    // is the same write, so if it did run after all, the script sees it
+    const seqs = calls.map((call) => (call.once ? ++writeSeq : 0))
+    for (const seq of seqs) if (seq > 0) unanswered.add(seq)
 
-      // per call: the round trip that last carried it, and whether Redis
-      // answered it there
-      const tripOf: number[] = []
-      const heard: boolean[] = []
+    // per call: the round trip that last carried it, and whether Redis
+    // answered it there
+    const tripOf: number[] = []
+    const heard: boolean[] = []
 
-      const send = (
-        indexes: readonly number[],
-      ): Promise<[error: Error | null, result: unknown][] | null> =>
-        inOrder(async () => {
-          const found = shasFor(
-            client,
-            indexes.map((i) => (chunk[i] as ScriptCall).script),
-          )
-          const resolved = Array.isArray(found) ? found : await found
-          // the floor is taken after the await, as late as possible, so it
-          // accounts for every write still waiting at the moment this one goes
-          const floor = floorOfUnanswered()
-          const pipeline = client.pipeline()
-          indexes.forEach((i, n) => {
-            const call = chunk[i] as ScriptCall
-            const seq = seqs[i] as number
-            const keys = seq > 0 ? [...call.keys, writerKey] : call.keys
-            const args = seq > 0 ? [...call.args, floor, seq] : call.args
-            pipeline.evalsha(resolved[n] as string, keys.length, ...keys, ...args)
-          })
-          const trip = ++issued
-          for (const i of indexes) {
-            tripOf[i] = trip
-            heard[i] = false
-          }
-          const reply = pipeline.exec().then((results) => {
-            indexes.forEach((i, n) => {
-              heard[i] = answered(results?.[n])
-            })
-            if (indexes.some((i) => heard[i])) settleBefore(trip)
-            return results
-          })
-          return { reply }
-        })
+    type Results = [error: Error | null, result: unknown][] | null
 
-      try {
-        const every = chunk.map((_, i) => i)
-        let results = await send(every)
-        const missing = every.filter((i) => isNoScript(results?.[i]?.[0]))
-        if (results !== null && missing.length > 0) {
-          // only the calls Redis did not recognise go again. The others ran,
-          // and running them twice is the very thing LUA_ONCE guards against
-          shas.clear()
-          const retried = await send(missing)
-          const merged = [...results]
-          missing.forEach((i, n) => {
-            merged[i] = retried?.[n] ?? [new Error('ioredis driver: retry was discarded'), null]
-          })
-          results = merged
-        }
-        // one at a time: a spread passes every reply as an argument, and a
-        // pipeline of a hundred thousand replies overflows the stack
-        for (const reply of unwrap(results, what, start)) out.push(reply)
-      } finally {
-        chunk.forEach((_, i) => {
-          const seq = seqs[i] as number
-          if (seq === 0) return
-          if (heard[i]) {
-            unanswered.delete(seq)
-            return
-          }
-          // never answered, possibly never sent: kept until a later round
-          // trip is answered, or for good when it was not sent at all
-          const trip = tripOf[i]
-          if (trip === undefined) {
-            unanswered.delete(seq)
-            return
-          }
-          const parked = unsettled.get(trip)
-          if (parked) parked.push(seq)
-          else unsettled.set(trip, [seq])
-        })
+    /** One round trip carrying the calls at `indexes`, issued now. */
+    function issue(indexes: readonly number[], resolved: readonly string[], floor: number) {
+      const pipeline = client.pipeline()
+      indexes.forEach((i, n) => {
+        const call = calls[i] as ScriptCall
+        const seq = seqs[i] as number
+        const keys = seq > 0 ? [...call.keys, writerKey] : call.keys
+        const args = seq > 0 ? [...call.args, floor, seq] : call.args
+        pipeline.evalsha(resolved[n] as string, keys.length, ...keys, ...args)
+      })
+      const trip = ++issued
+      for (const i of indexes) {
+        tripOf[i] = trip
+        heard[i] = false
       }
+      const reply = pipeline.exec().then((results) => {
+        indexes.forEach((i, n) => {
+          heard[i] = answered(results?.[n])
+        })
+        if (indexes.some((i) => heard[i])) settleBefore(trip)
+        return results
+      })
+      // awaited in order below, and a rejection waiting its turn there must
+      // not be reported as unhandled meanwhile
+      reply.catch(() => undefined)
+      return reply
     }
+
+    /**
+     * Every round trip in `trips` issued in one queued step, so no send made
+     * after this one reaches Redis between two of them, and a call split
+     * across round trips still lands in the order it was made.
+     */
+    const send = (trips: readonly (readonly number[])[]): Promise<Promise<Results>[]> =>
+      inOrder(async () => {
+        const indexes = trips.flat()
+        const found = shasFor(
+          client,
+          indexes.map((i) => (calls[i] as ScriptCall).script),
+        )
+        const resolved = Array.isArray(found) ? found : await found
+        // the floor is taken after the await, as late as possible, so it
+        // accounts for every write still waiting at the moment this one goes
+        const floor = floorOfUnanswered()
+        let at = 0
+        const replies = trips.map((trip) => {
+          const reply = issue(trip, resolved.slice(at, at + trip.length), floor)
+          at += trip.length
+          return reply
+        })
+        return { reply: Promise.resolve(replies) }
+      })
+
+    const trips: number[][] = []
+    for (let start = 0; start < calls.length; start += maxPipeline) {
+      trips.push(
+        Array.from({ length: Math.min(maxPipeline, calls.length - start) }, (_, n) => start + n),
+      )
+    }
+
+    const out: unknown[] = []
+    // the first refusal, thrown once every round trip has been answered, so
+    // none of them is left running with nothing waiting on it
+    let failure: { error: unknown } | undefined
+    try {
+      const replies = await send(trips)
+      for (const [t, indexes] of trips.entries()) {
+        try {
+          let results = await (replies[t] as Promise<Results>)
+          const missing = indexes.filter((_, n) => isNoScript(results?.[n]?.[0]))
+          if (results !== null && missing.length > 0) {
+            // only the calls Redis did not recognise go again. The others
+            // ran, and running them twice is the very thing LUA_ONCE guards
+            // against
+            shas.clear()
+            const [again] = await send([missing])
+            const retried = await (again as Promise<Results>)
+            const merged = [...results]
+            missing.forEach((i, n) => {
+              merged[i - (indexes[0] as number)] = retried?.[n] ?? [
+                new Error('ioredis driver: retry was discarded'),
+                null,
+              ]
+            })
+            results = merged
+          }
+          // one at a time: a spread passes every reply as an argument, and
+          // a pipeline of a hundred thousand replies overflows the stack
+          for (const reply of unwrap(results, what, indexes[0])) out.push(reply)
+        } catch (error) {
+          failure ??= { error }
+        }
+      }
+    } finally {
+      calls.forEach((_, i) => {
+        const seq = seqs[i] as number
+        if (seq === 0) return
+        if (heard[i]) {
+          unanswered.delete(seq)
+          return
+        }
+        // never answered, possibly never sent: kept until a later round
+        // trip is answered, or for good when it was not sent at all
+        const trip = tripOf[i]
+        if (trip === undefined) {
+          unanswered.delete(seq)
+          return
+        }
+        const parked = unsettled.get(trip)
+        if (parked) parked.push(seq)
+        else unsettled.set(trip, [seq])
+      })
+    }
+    if (failure !== undefined) throw failure.error
     return out
   }
 
@@ -1813,9 +1907,19 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     return reply
   }
 
-  async function nextClaimId(metric: string): Promise<string> {
-    const client = await connect()
-    return `${metric}#${await client.incr(key.seq)}`
+  /**
+   * A claim id no other claim has had, minted here rather than by Redis.
+   *
+   * A counter in Redis rolls back when Redis loses its most recent writes, to
+   * a restart between two syncs or a failover to a replica that was behind,
+   * and would then hand out an id a claim still in flight already has. The
+   * two claims would share one in-flight key, and whichever settled first
+   * would settle the other with it. A UUID version 7 needs nothing Redis
+   * remembers. Claims taken under the old `metric#n` ids recover and settle
+   * as before, since nothing reads an id back apart from the key it names.
+   */
+  function nextClaimId(metric: string): string {
+    return `${metric}#${uuidv7(Date.now())}`
   }
 
   /**
@@ -2234,7 +2338,16 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     },
 
     async claim(metric: string, upToBucketTs: number): Promise<BucketClaim> {
-      const id = await nextClaimId(metric)
+      // refused before the script, which would store it as the watermark: a
+      // watermark of NaN compares false against every window, and no late
+      // write would move forward past a claimed one again
+      if (!Number.isFinite(upToBucketTs)) {
+        throw new Error(
+          `ioredis driver: ${metric} cannot be claimed up to ${upToBucketTs}, which is not a ` +
+            'finite number',
+        )
+      }
+      const id = nextClaimId(metric)
 
       // stamped by Redis, inside the script: the score in the claims ZSET is
       // what decides whether this claim is stale, and a stamp from this
@@ -2254,7 +2367,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     },
 
     async claimRecords(metric: string, limit?: number): Promise<RecordClaim> {
-      const id = await nextClaimId(metric)
+      const id = nextClaimId(metric)
 
       const { claimedAt, taken } = claimReply(
         await runScript(
@@ -2337,23 +2450,24 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     },
 
     async takeTurn(metric: string, now: number, gapMs: number): Promise<ShipTurn> {
+      const token = uuidv7(Date.now())
       const reply = await runScript(
-        { script: TAKE_TURN, once: true, keys: [key.turn(metric)], args: [now, gapMs] },
+        { script: TAKE_TURN, once: true, keys: [key.turn(metric)], args: [now, gapMs, token] },
         'takeTurn',
       )
       const [granted, last] = reply as [number, string]
-      const previous = last === '' ? undefined : Number(last)
-      if (granted === 1) return { granted: true, previous }
-      return { granted: false, lastTakenAt: previous as number }
+      const previous = turnFrom(last)
+      if (granted === 1) return { granted: true, turn: { at: now, token }, previous }
+      return { granted: false, lastTakenAt: previous?.at as number }
     },
 
-    async returnTurn(metric: string, at: number, previous: number | undefined): Promise<void> {
+    async returnTurn(metric: string, turn: Turn, previous: Turn | undefined): Promise<void> {
       await runScript(
         {
           script: RETURN_TURN,
           once: true,
           keys: [key.turn(metric)],
-          args: [at, previous ?? ''],
+          args: [turnText(turn), previous === undefined ? '' : turnText(previous)],
         },
         'returnTurn',
       )

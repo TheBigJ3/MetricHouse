@@ -175,8 +175,8 @@ house.start()
 ```
 
 Before a flush claims anything, it takes the metric's turn from the driver. The
-driver records when the turn was taken and refuses the next one until a full
-interval has passed, whichever process asks. A refused flush reports
+driver records when the turn was taken, with a token unique to that turn, and
+refuses the next one until a full interval has passed, whichever process asks. A refused flush reports
 `skipped: true` with `reason: 'cadence'`, and `nextEligibleInMs` counts from the
 turn the other process took.
 
@@ -188,7 +188,9 @@ const report = await httpRequests.flush()      // on server B
 
 A flush that writes nothing gives its turn back, so another process can ship
 straight away. That covers a flush that found nothing closed and one whose
-`write` function threw.
+`write` function threw. It gives back only the turn it took, matched by token,
+so a turn another flush took since is kept, even one taken in the same
+millisecond.
 
 Each process keeping its own clock would let ten servers on `flush: '1m'` make
 up to ten small inserts a minute between them. The claim stops two of them

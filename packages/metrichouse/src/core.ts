@@ -27,6 +27,7 @@ export type {
   RecoveryReport,
   ShipTurn,
   StagedRecord,
+  Turn,
 } from './drivers/types.js'
 // the driver contract, for anyone implementing a backend
 export {
