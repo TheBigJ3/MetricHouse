@@ -369,7 +369,7 @@ export function metricFlush(
     //    this process, since whoever takes the next turn ships what it
     //    leaves, and takes it with no gap when storage does not.
     const driver = options.sharedDriver?.()
-    let turn: { readonly driver: Driver; readonly previous: number | undefined } | undefined
+    let turn: { readonly driver: Driver; readonly taken: ShipTurn & { granted: true } } | undefined
     if (driver?.capabilities.shared === true && driver.takeTurn !== undefined) {
       const waits = flushOptions.force !== true && (!final || driver.capabilities.durable)
       let taken: ShipTurn
@@ -387,7 +387,7 @@ export function metricFlush(
           nextEligibleInMs: taken.lastTakenAt + flushMs - now,
         }
       }
-      turn = { driver, previous: taken.previous }
+      turn = { driver, taken }
     }
 
     const { report, wrote } = await ship(metric, now, final)
@@ -399,7 +399,7 @@ export function metricFlush(
     // flush's own failure, if it had one, is already in the report
     if (turn !== undefined && !wrote) {
       try {
-        await turn.driver.returnTurn?.(options.name, now, turn.previous)
+        await turn.driver.returnTurn?.(options.name, turn.taken.turn, turn.taken.previous)
       } catch {
         // see above
       }

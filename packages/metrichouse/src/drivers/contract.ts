@@ -24,7 +24,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { Driver, DriverCapabilities, GaugeCell } from './types.js'
+import type { Cell, Driver, DriverCapabilities, GaugeCell, Turn } from './types.js'
 import { isGaugeCell, isLevelCell } from './types.js'
 
 /** A counter metric, and two series inside it. */
@@ -50,6 +50,30 @@ export interface DriverContractOptions {
 
   /** What this driver claims about itself, asserted rather than assumed. */
   capabilities: DriverCapabilities
+
+  /**
+   * Put a cell straight into a window, past the watermark, the way a driver
+   * from before the watermark existed could have left one.
+   *
+   * Nothing written through the contract can land in a claimed window, so
+   * this is the only way to hand `release` a window that already holds a
+   * cell. A suite without it skips those tests.
+   */
+  plant?(
+    driver: Driver,
+    metric: string,
+    bucketTs: number,
+    dimKey: string,
+    cell: Cell,
+  ): Promise<void>
+
+  /**
+   * A second driver on the same storage that treats every claim as
+   * abandoned, standing in for a process started after the one that claimed
+   * has died. Only a durable driver has one: a claim that dies with its
+   * process leaves nothing to recover. A suite without it skips those tests.
+   */
+  abandoned?(driver: Driver): Promise<Driver> | Driver
 }
 
 export function describeDriverContract(name: string, options: DriverContractOptions): void {
@@ -666,6 +690,16 @@ export function describeDriverContract(name: string, options: DriverContractOpti
           { dimKey: WILLOW, value: 42, carried: 42, writtenAt: 1000, heldThrough: 1000 },
         ])
       })
+
+      it('hands out copies, so editing one changes nothing stored', async () => {
+        await put(1000, WILLOW, 42)
+        const [read] = await driver.readLevels(L)
+        Object.assign(read as object, { value: 9, heldThrough: 9000 })
+
+        expect(await driver.readLevels(L)).toEqual([
+          { dimKey: WILLOW, value: 42, carried: 42, writtenAt: 1000, heldThrough: 1000 },
+        ])
+      })
     })
 
     describe('dropLevels', () => {
@@ -891,6 +925,20 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(await driver.readLevel(L, WILLOW)).toBeUndefined()
       })
 
+      it('hands out a copy, so editing it changes nothing stored', async () => {
+        if (!driver.readLevel) return
+        await put(1000, WILLOW, 42)
+        Object.assign((await driver.readLevel(L, WILLOW)) as object, { value: 9 })
+
+        expect(await driver.readLevel(L, WILLOW)).toEqual({
+          dimKey: WILLOW,
+          value: 42,
+          carried: 42,
+          writtenAt: 1000,
+          heldThrough: 1000,
+        })
+      })
+
       it('sees a write issued before it and not yet awaited', async () => {
         if (!driver.readLevel) return
         const write = put(1000, WILLOW, 2)
@@ -1029,6 +1077,22 @@ export function describeDriverContract(name: string, options: DriverContractOpti
           [WILLOW, { last: 10, min: 4, max: 10, sum: 14, count: 2 }],
         ])
       })
+
+      it('refuses a watermark that is not a finite number, and keeps the one it had', async () => {
+        for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+          await expect(driver.claim(M, bad)).rejects.toThrow(
+            `${M} cannot be claimed up to ${bad}, which is not a finite number`,
+          )
+        }
+
+        expect((await driver.claim(M, 3000)).buckets.map((b) => b.bucketTs)).toEqual([1000, 2000])
+        // a late write still moves forward to the watermark, so it was kept
+        await incr(1000, WILLOW, 5)
+        expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: 3000, dimKey: REX, value: 3 },
+          { bucketTs: 3000, dimKey: WILLOW, value: 5 },
+        ])
+      })
     })
 
     describe('ack', () => {
@@ -1134,6 +1198,55 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await driver.release(claim)
         await expect(driver.ack(claim)).rejects.toThrow(/not in flight/)
       })
+
+      it('adds a released counter cell to one already in its window', async () => {
+        if (!options.plant) return
+        await incr(1000, WILLOW, 5)
+        const claim = await driver.claim(M, 2000)
+        await options.plant(driver, M, 1000, WILLOW, 2)
+
+        await driver.release(claim)
+        expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: 1000, dimKey: WILLOW, value: 7 },
+        ])
+      })
+
+      it('folds a released gauge cell into one already in its window, which keeps last', async () => {
+        if (!options.plant) return
+        await obs(1000, WILLOW, 5)
+        await obs(1000, WILLOW, 3)
+        const claim = await driver.claim(G, 2000)
+        await options.plant(driver, G, 1000, WILLOW, { last: 9, min: 9, max: 9, sum: 9, count: 1 })
+
+        await driver.release(claim)
+        expect(await gaugeAt(1000, WILLOW)).toEqual({ last: 9, min: 3, max: 9, sum: 17, count: 3 })
+      })
+
+      it('keeps the level cell already in its window over the released one', async () => {
+        if (!options.plant) return
+        await put(1000, WILLOW, 4)
+        const claim = await driver.claim(L, 2000)
+        await options.plant(driver, L, 1000, WILLOW, { level: 7 })
+
+        await driver.release(claim)
+        expect(await levelAt(1000, WILLOW)).toBe(7)
+      })
+
+      it('keeps the claim in flight when a cell of another kind stops the release', async () => {
+        if (!options.plant) return
+        await incr(1000, 'a', 1)
+        await incr(1000, 'b', 2)
+        const claim = await driver.claim(M, 2000)
+        await options.plant(driver, M, 1000, 'a', { last: 1, min: 1, max: 1, sum: 1, count: 1 })
+
+        await expect(driver.release(claim)).rejects.toThrow(
+          /cannot merge cells of two different kinds/,
+        )
+        // refused for the same reason again, rather than as a claim that is gone
+        await expect(driver.release(claim)).rejects.toThrow(
+          /cannot merge cells of two different kinds/,
+        )
+      })
     })
 
     describe('at-least-once', () => {
@@ -1195,15 +1308,60 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect(await driver.readPending({ metric: M })).toEqual([])
         await expect(driver.ack(claim)).resolves.toBeUndefined()
       })
+
+      it('puts back a window whose flusher died holding it', async () => {
+        if (!options.abandoned) return
+        await incr(1000, WILLOW, 4)
+        const claim = await driver.claim(M, 2000)
+
+        const sweeper = await options.abandoned(driver)
+        expect(await sweeper.recover(M)).toEqual({
+          claims: 1,
+          buckets: 1,
+          records: 0,
+          oldestClaimedAt: claim.claimedAt,
+        })
+        expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: 1000, dimKey: WILLOW, value: 4 },
+        ])
+        await expect(driver.ack(claim)).rejects.toThrow(/not in flight/)
+      })
+
+      it('puts back records whose flusher died holding them, ahead of later ones', async () => {
+        if (!options.abandoned) return
+        await driver.append([rec('a', 1000), rec('b', 2000)])
+        const claim = await driver.claimRecords(M)
+        await driver.append([rec('c', 3000)])
+
+        const sweeper = await options.abandoned(driver)
+        expect(await sweeper.recover(M)).toEqual({
+          claims: 1,
+          buckets: 0,
+          records: 2,
+          oldestClaimedAt: claim.claimedAt,
+        })
+        expect((await driver.readPending({ metric: M })).map((r) => r.id)).toEqual(['a', 'b', 'c'])
+      })
     })
 
     describe('takeTurn', () => {
       // optional, so a driver that keeps no turns passes without checking
       const take = (now: number, gapMs = 1000, metric = M) => driver.takeTurn?.(metric, now, gapMs)
+      /** A turn taken at `now`, which the test expects to be granted. */
+      const granted = async (now: number, gapMs = 1000) => {
+        const answer = await take(now, gapMs)
+        if (!answer?.granted) throw new Error(`expected a turn at ${now} to be granted`)
+        return answer
+      }
+      const anyToken = (at: number) => ({ at, token: expect.any(String) })
 
       it('grants the first turn, with none before it', async () => {
         if (!driver.takeTurn) return
-        expect(await take(5000)).toEqual({ granted: true, previous: undefined })
+        expect(await take(5000)).toEqual({
+          granted: true,
+          turn: anyToken(5000),
+          previous: undefined,
+        })
       })
 
       it('refuses a turn inside the gap, and says when the last one was taken', async () => {
@@ -1214,8 +1372,12 @@ export function describeDriverContract(name: string, options: DriverContractOpti
 
       it('grants a turn exactly the gap after the last, and hands back the one it replaced', async () => {
         if (!driver.takeTurn) return
-        await take(5000)
-        expect(await take(6000)).toEqual({ granted: true, previous: 5000 })
+        const first = await granted(5000)
+        expect(await take(6000)).toEqual({
+          granted: true,
+          turn: anyToken(6000),
+          previous: first.turn,
+        })
         expect(await take(6999)).toEqual({ granted: false, lastTakenAt: 6000 })
       })
 
@@ -1227,21 +1389,40 @@ export function describeDriverContract(name: string, options: DriverContractOpti
 
       it('grants a turn from a clock that stepped back the gap or more', async () => {
         if (!driver.takeTurn) return
-        await take(5000)
-        expect(await take(4000)).toEqual({ granted: true, previous: 5000 })
+        const first = await granted(5000)
+        expect(await take(4000)).toEqual({
+          granted: true,
+          turn: anyToken(4000),
+          previous: first.turn,
+        })
       })
 
       it('always grants a gap of zero, and still records the turn', async () => {
         if (!driver.takeTurn) return
-        await take(5000)
-        expect(await take(5000, 0)).toEqual({ granted: true, previous: 5000 })
+        const first = await granted(5000)
+        expect(await take(5000, 0)).toEqual({
+          granted: true,
+          turn: anyToken(5000),
+          previous: first.turn,
+        })
         expect(await take(5500)).toEqual({ granted: false, lastTakenAt: 5000 })
+      })
+
+      it('gives each turn a token of its own, two in one millisecond included', async () => {
+        if (!driver.takeTurn) return
+        const first = await granted(5000)
+        const second = await granted(5000, 0)
+        expect(second.turn.token).not.toBe(first.turn.token)
       })
 
       it('keeps a turn per metric', async () => {
         if (!driver.takeTurn) return
         await take(5000)
-        expect(await take(5000, 1000, G)).toEqual({ granted: true, previous: undefined })
+        expect(await take(5000, 1000, G)).toEqual({
+          granted: true,
+          turn: anyToken(5000),
+          previous: undefined,
+        })
       })
 
       it('grants one of two turns asked for at the same moment', async () => {
@@ -1252,31 +1433,52 @@ export function describeDriverContract(name: string, options: DriverContractOpti
     })
 
     describe('returnTurn', () => {
-      const take = (now: number) => driver.takeTurn?.(M, now, 1000)
-      const giveBack = (at: number, previous: number | undefined) =>
-        driver.returnTurn?.(M, at, previous)
+      const take = (now: number, gapMs = 1000) => driver.takeTurn?.(M, now, gapMs)
+      const granted = async (now: number, gapMs = 1000) => {
+        const answer = await take(now, gapMs)
+        if (!answer?.granted) throw new Error(`expected a turn at ${now} to be granted`)
+        return answer
+      }
+      /** Give back a granted turn, putting back the one it replaced. */
+      const giveBack = (answer: { turn: Turn; previous: Turn | undefined }) =>
+        driver.returnTurn?.(M, answer.turn, answer.previous)
 
       it('puts the previous turn back', async () => {
         if (!driver.takeTurn) return
         await take(5000)
-        await take(6000)
-        await giveBack(6000, 5000)
+        await giveBack(await granted(6000))
         expect(await take(5500)).toEqual({ granted: false, lastTakenAt: 5000 })
       })
 
       it('clears the turn when there was none before it', async () => {
         if (!driver.takeTurn) return
-        await take(5000)
-        await giveBack(5000, undefined)
-        expect(await take(5001)).toEqual({ granted: true, previous: undefined })
+        await giveBack(await granted(5000))
+        expect(await take(5001)).toEqual({
+          granted: true,
+          turn: { at: 5001, token: expect.any(String) },
+          previous: undefined,
+        })
       })
 
       it('leaves a later turn alone', async () => {
         if (!driver.takeTurn) return
-        await take(5000)
+        const first = await granted(5000)
         await take(6000)
-        await giveBack(5000, undefined)
+        await giveBack(first)
         expect(await take(6500)).toEqual({ granted: false, lastTakenAt: 6000 })
+      })
+
+      it('leaves a later turn taken in the same millisecond alone', async () => {
+        if (!driver.takeTurn) return
+        const first = await granted(5000)
+        const forced = await granted(5000, 0)
+        await giveBack(first)
+        expect(await take(5500)).toEqual({ granted: false, lastTakenAt: 5000 })
+
+        // the forced turn is still the one recorded, so it can be given back
+        await giveBack(forced)
+        await giveBack(first)
+        expect(await take(5001)).toMatchObject({ granted: true, previous: undefined })
       })
     })
 
@@ -1333,6 +1535,17 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect((await driver.readPending({ metric: M }))[0]?.fields).toEqual(fields)
       })
 
+      it('keeps what it stored when the caller edits the fields it passed', async () => {
+        const fields: Record<string, unknown> = { dog: 'Willow', tags: ['good'] }
+        await driver.append([rec('a', 1000, fields)])
+        fields.dog = 'Rex'
+        ;(fields.tags as string[]).push('bad')
+
+        expect(await driver.readPending({ metric: M })).toEqual([
+          { id: 'a', ts: 1000, fields: { dog: 'Willow', tags: ['good'] } },
+        ])
+      })
+
       it('keeps metrics separate', async () => {
         await driver.append([rec('a', 1000), { metric: 'other', id: 'b', ts: 1000, fields: {} }])
         expect(await driver.countPending(M)).toBe(1)
@@ -1369,6 +1582,35 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect((await driver.readPending({ metric: M, limit: 2 })).map((r) => r.id)).toEqual([
           'a',
           'b',
+        ])
+      })
+
+      it('stops at the limit inside a ts range', async () => {
+        await seed()
+        const found = await driver.readPending({ metric: M, from: 2000, limit: 1 })
+        expect(found.map((r) => r.id)).toEqual(['b'])
+      })
+
+      it('hands records back in append order, a backdated one included', async () => {
+        await driver.append([rec('late', 3000), rec('early', 1000)])
+        const ids = async (query: { from?: number; limit?: number }) =>
+          (await driver.readPending({ metric: M, ...query })).map((r) => r.id)
+
+        expect(await ids({})).toEqual(['late', 'early'])
+        expect(await ids({ limit: 1 })).toEqual(['late'])
+        expect(await ids({ from: 0 })).toEqual(['late', 'early'])
+      })
+
+      it('hands out copies, so editing one changes nothing stored', async () => {
+        await driver.append([rec('a', 1000, { dog: 'Willow', tags: ['good'] })])
+        const [read] = await driver.readPending({ metric: M })
+        if (!read) throw new Error('expected one staged record')
+        Object.assign(read, { id: 'b' })
+        Object.assign(read.fields, { dog: 'Rex' })
+        ;(read.fields.tags as string[]).push('bad')
+
+        expect(await driver.readPending({ metric: M })).toEqual([
+          { id: 'a', ts: 1000, fields: { dog: 'Willow', tags: ['good'] } },
         ])
       })
 
@@ -1486,6 +1728,22 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       it('reads nothing for a limit of zero', async () => {
         await seed(2)
         expect(await driver.readPending({ metric: M, limit: 0 })).toEqual([])
+      })
+
+      it('claims nothing for a limit of zero or below, and all of a backlog under the limit', async () => {
+        await seed(3)
+        expect((await driver.claimRecords(M, 0)).records).toEqual([])
+        expect((await driver.claimRecords(M, -1)).records).toEqual([])
+        expect((await driver.claimRecords(M, 10)).records.map((r) => r.id)).toEqual([
+          'r0',
+          'r1',
+          'r2',
+        ])
+      })
+
+      it('takes a backdated record in append order', async () => {
+        await driver.append([rec('late', 3000), rec('early', 1000)])
+        expect((await driver.claimRecords(M, 1)).records.map((r) => r.id)).toEqual(['late'])
       })
 
       it('ack discards the claim for good', async () => {

@@ -42,7 +42,9 @@ memory({
 ```
 
 Both default to 100,000 and both can be disabled with
-`Number.POSITIVE_INFINITY`.
+`Number.POSITIVE_INFINITY`. Anything else has to be a positive whole number,
+and the driver throws when it is created if it is not. `NaN` would otherwise
+switch the cap off without a word, and `0` would refuse every write.
 
 These limits exist because an unbounded dimension in a single process is an out
 of memory crash with no warning. The cap turns it into a loud error that names
@@ -81,7 +83,7 @@ into the live set before claiming, so those rows ship rather than sitting in
 Redis for ever. See [Recovering a crashed flush](/guide/reliability#recovering-a-crashed-flush).
 
 The driver also keeps each metric's turn to ship, in one small key per metric,
-`mh:turn:<metric>`. Every instance can run its own flush timers, and each
+`mh:turn:<metric>`, holding when the turn was taken and a token unique to it. Every instance can run its own flush timers, and each
 metric still ships once per interval for the whole fleet. See
 [Several processes on one driver](/guide/flushing#several-processes-on-one-driver).
 
@@ -132,12 +134,19 @@ that is what keeps two namespaces apart. Every key is the namespace, a short
 type, then the metric, joined with colons. With a colon allowed in either, the
 key for an event named `checkout` under namespace `org:e` would be the same as
 the key for one named `e:checkout` under namespace `org`. A namespace with a
-colon throws when the driver is created.
+colon throws when the driver is created. So does one holding half of a UTF-16
+surrogate pair, such as a string cut in the middle of an emoji. Redis keeps
+keys as UTF-8, which cannot hold one, and every such namespace would reach
+Redis as the same replacement character.
 
 `maxPipelineSize` bounds how many commands, or Lua scripts, go to Redis in one
 round trip. A batch larger than that is sent in several. Most writes are one
 script per window, so this mostly matters to a level carrying a series through a
-long gap, which can be ten thousand windows. It has to be a positive whole
+long gap, which can be ten thousand windows. All the round trips of one call
+go out together, so a later call from the same process never lands between
+them. Each Lua script in them is applied or refused on its own, though, and so
+is each slice of 1000 operations for one window, so a refusal partway through a
+large call keeps what came before it. It has to be a positive whole
 number, and anything else throws when the driver is created. That includes
 `NaN`, which is what `Number(process.env.MH_PIPELINE)` gives when the variable
 is not set.
@@ -168,6 +177,35 @@ lost either way. A claim's age is measured by Redis's clock, not the clock of
 the host that claimed it or the host checking it, so hosts whose clocks disagree
 do not take each other's claims early.
 
+### What Redis it needs
+
+Redis 4.0 or later. The scripts set several hash fields in one `HSET`, which
+Redis 4.0 added, and read Redis's clock with `TIME` inside a script that also
+writes, which needs the effects replication that Redis 3.2 introduced and
+Redis 5 made the default. The driver switches it on itself where it is not.
+
+Redis Cluster is not supported. A cluster refuses a script that touches keys in
+more than one hash slot, and the keys one script touches carry no hash tag to
+put them in the same slot. The driver also loads each script with `SCRIPT LOAD`
+on the one connection it has, and a cluster node does not share its scripts
+with the others. Use a single primary, with replicas if you want them.
+
+Set `maxmemory-policy` to `noeviction`. Under it, Redis that runs out of memory
+refuses new writes, and the driver reports each one as an error. Any other
+policy deletes keys instead. An `allkeys-*` policy can take any of them,
+staged records and open windows included. A `volatile-*` policy takes keys that
+have an expiry first, and the only keys this driver gives one are its
+`mh:w:<id>` records of which writes it has applied. Losing one means a write
+that ioredis sends again after a reconnect is applied a second time, and a
+counter counts it twice.
+
+A flush claims everything below its watermark in one script, and Redis runs
+nothing else while a script runs. Claiming a window or two of a few thousand
+series costs a few milliseconds. A backlog of about a million cells, from a
+metric that has not flushed for a long time or one with a very large number of
+series, holds Redis for about a second, and every other client waits that
+long. Keeping flushes on schedule is what keeps claims small.
+
 ### Durable events on Redis
 
 An event declared [`durability: 'durable'`](/primitives/event#durability) needs
@@ -178,7 +216,7 @@ Redis to answer it. What that answer means is up to how Redis is run.
 | --- | --- |
 | `appendonly yes` | without it Redis keeps records only in memory and in snapshots, and a crash loses everything since the last snapshot |
 | `appendfsync always` | Redis writes the batch of commands it has just run to disk, and only then answers them. Under the default, `everysec`, it answers first and writes within the second |
-| `maxmemory-policy` of `noeviction` or a `volatile-*` policy | an `allkeys-*` policy can evict any key when memory runs short, staged records included. Records carry no expiry, so `volatile-*` leaves them alone |
+| `maxmemory-policy noeviction` | any other policy deletes keys when memory runs short. `allkeys-*` can delete staged records, and `volatile-*` deletes the driver's records of which writes it has applied, so a resent write applies twice. See [What Redis it needs](#what-redis-it-needs) |
 
 The driver checks none of these, because many hosted Redis services refuse the
 `CONFIG` command that would read them.

@@ -54,7 +54,6 @@ const client = await probe()
 /** The per-namespace counters a driver keeps between claims, by design. */
 function survives(ns: string, key: string): boolean {
   return (
-    key === `${ns}:seq` ||
     key.startsWith(`${ns}:wm:`) ||
     key.startsWith(`${ns}:eseq:`) ||
     // a writer's record of the writes it has applied, which expires a day
@@ -117,6 +116,14 @@ describe('ioredis · record encoding', () => {
     for (const one of stored) expect(decodeRecord(one)).toEqual(decodeRecordTagged(one))
     expect(decodeRecord(stored[2] as string).fields.at).toEqual(new Date(5000))
     expect(decodeRecord(stored[3] as string).fields).toEqual({ __mh_date: 5 })
+  })
+
+  it('keeps a key a record stored before keys were escaped under the reserved prefix', () => {
+    // written unescaped by a driver before 0.6.0, so the prefix appears once
+    const stored = '{"id":"r1","ts":1000,"fields":{"__mh_x":1,"json":{"__mh_y":2}}}'
+    const fields = { __mh_x: 1, json: { __mh_y: 2 } }
+    expect(decodeRecordTagged(stored).fields).toEqual(fields)
+    expect(decodeRecord(stored).fields).toEqual(fields)
   })
 })
 
@@ -228,6 +235,30 @@ describe('ioredis · writes Redis never answered', () => {
   })
 })
 
+// no server needed: the replies are scripted
+describe('ioredis · round trips of one call', () => {
+  const op = (bucketTs: number) => ({ metric: M, bucketTs, dimKey: WILLOW, delta: 1 })
+  /** The window each script was aimed at, after its three keys and the key prefix. */
+  const windows = (sent: (string | number)[][]) => sent.map((args) => args[4])
+
+  it('sends every round trip of a call before a call made after it', async () => {
+    const { client, sent } = scriptedClient([])
+    const driver = ioredis(client, { maxPipelineSize: 1 })
+
+    await Promise.all([driver.increment([op(1000), op(2000)]), driver.increment([op(3000)])])
+    expect(windows(sent)).toEqual([1000, 2000, 3000])
+  })
+
+  it('rejects with a refusal in an earlier round trip once every round trip is answered', async () => {
+    const refused = Object.assign(new Error('ERR refused'), { name: 'ReplyError' })
+    const { client, sent } = scriptedClient([[[refused, null]], [[null, 1]]])
+    const driver = ioredis(client, { maxPipelineSize: 1 })
+
+    await expect(driver.increment([op(1000), op(2000)])).rejects.toThrow('ERR refused')
+    expect(windows(sent)).toEqual([1000, 2000])
+  })
+})
+
 // no server needed: these never read what a script stored
 describe('ioredis · options and connection', () => {
   it('refuses a maxPipelineSize that is not a positive integer', () => {
@@ -243,6 +274,15 @@ describe('ioredis · options and connection', () => {
       expect(() => ioredis(stubClient(), { namespace: bad })).toThrow(
         `ioredis driver: namespace ${JSON.stringify(bad)} must be non-empty with no colon or ` +
           'whitespace, because the driver builds every key by joining it to the rest with colons',
+      )
+    }
+  })
+
+  it('refuses a namespace holding half of a surrogate pair', () => {
+    for (const bad of ['mh\uD800', 'mh\uDC00x']) {
+      expect(() => ioredis(stubClient(), { namespace: bad })).toThrow(
+        `ioredis driver: namespace ${JSON.stringify(bad)} holds half of a surrogate pair, ` +
+          'which Redis would store as the same replacement character for every such namespace',
       )
     }
   })
@@ -341,6 +381,17 @@ if (!client) {
     },
     cleanup: () => wipe(namespace),
     capabilities: { durable: true, shared: true, atomicMerge: true },
+    plant: async (_driver, metric, bucketTs, dimKey, cell) => {
+      const raw =
+        typeof cell === 'number'
+          ? String(cell)
+          : isGaugeCell(cell)
+            ? [cell.last, cell.min, cell.max, cell.sum, cell.count].join('|')
+            : `@${cell.level}`
+      await live.hset(`${namespace}:b:${metric}:${bucketTs}`, dimKey, raw)
+      await live.zadd(`${namespace}:idx:${metric}`, bucketTs, String(bucketTs))
+    },
+    abandoned: () => ioredis(live, { namespace, recoverAfter: 0 }),
   })
 
   describe('ioredis · key layout', () => {
@@ -729,6 +780,32 @@ if (!client) {
 
       await wipe(ns)
     })
+
+    it('recovers and acks claims taken under ids from the old Redis counter', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      // two claims an earlier version left in flight, one stranded and one
+      // still owned by a process that is about to ack it
+      await live.hset(`${ns}:inflight:${M}#7`, `1000:${WILLOW}`, '4')
+      await live.zadd(`${ns}:claims:${M}`, 1, `${M}#7`)
+      await live.hset(`${ns}:inflight:${M}#8`, `1000:${WILLOW}`, '5')
+      await live.zadd(`${ns}:claims:${M}`, Date.now() + 60_000, `${M}#8`)
+
+      expect(await driver.recover(M)).toEqual({
+        claims: 1,
+        buckets: 1,
+        records: 0,
+        oldestClaimedAt: 1,
+      })
+      expect(await driver.readBuckets({ metric: M })).toEqual([
+        { bucketTs: 1000, dimKey: WILLOW, value: 4 },
+      ])
+      await driver.ack({ kind: 'buckets', id: `${M}#8`, metric: M, claimedAt: 1, buckets: [] })
+      expect(await live.zrange(`${ns}:claims:${M}`, '0', '-1')).toEqual([])
+      expect(await live.exists(`${ns}:inflight:${M}#8`)).toBe(0)
+
+      await wipe(ns)
+    })
   })
 
   describe('ioredis · shared', () => {
@@ -781,6 +858,27 @@ if (!client) {
       const [first, second] = await Promise.all([a.claim(M, 2000), b.claim(M, 2000)])
       expect(first.id).not.toBe(second.id)
       expect(first.buckets.length + second.buckets.length).toBe(1)
+
+      await wipe(ns)
+    })
+
+    it('gives a claim an id no earlier claim had after Redis loses recent writes', async () => {
+      const ns = fresh()
+      const one = ioredis(live, { namespace: ns })
+      await one.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+      const first = await one.claim(M, 2000)
+      // what a restart that lost its last second of writes can leave behind:
+      // every counter Redis kept rolled back, and the claim still in flight
+      for (const key of await live.keys(`${ns}:seq*`)) await live.del(key)
+
+      const other = ioredis(live, { namespace: ns })
+      await other.increment([{ metric: M, bucketTs: 2000, dimKey: WILLOW, delta: 2 }])
+      const second = await other.claim(M, 3000)
+      expect(second.id).not.toBe(first.id)
+
+      // settling one leaves the other in flight for its owner
+      await other.ack(second)
+      await expect(one.ack(first)).resolves.toBeUndefined()
 
       await wipe(ns)
     })
@@ -972,8 +1070,25 @@ if (!client) {
       const ns = fresh()
       const resent = ioredis(lostReply(), { namespace: ns })
 
-      expect(await resent.takeTurn?.(M, 5000, 1000)).toEqual({ granted: true, previous: undefined })
-      expect(await live.get(`${ns}:turn:${M}`)).toBe('5000')
+      const answer = await resent.takeTurn?.(M, 5000, 1000)
+      if (!answer?.granted) throw new Error('expected the turn to be granted')
+      expect(answer.previous).toBeUndefined()
+      expect(await live.get(`${ns}:turn:${M}`)).toBe(`5000|${answer.turn.token}`)
+      await wipe(ns)
+    })
+
+    it('reads a turn recorded before turns carried a token, and gives it back', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.set(`${ns}:turn:${M}`, '5000')
+
+      expect(await driver.takeTurn?.(M, 5500, 1000)).toEqual({ granted: false, lastTakenAt: 5000 })
+      const answer = await driver.takeTurn?.(M, 6000, 1000)
+      if (!answer?.granted) throw new Error('expected the turn to be granted')
+      expect(answer.previous).toEqual({ at: 5000, token: '' })
+
+      await driver.returnTurn?.(M, answer.turn, answer.previous)
+      expect(await driver.takeTurn?.(M, 5500, 1000)).toEqual({ granted: false, lastTakenAt: 5000 })
       await wipe(ns)
     })
 
@@ -1250,6 +1365,18 @@ if (!client) {
         { id: 'old', ts: 1000, fields: { a: 1 } },
         { id: 'new', ts: 2000, fields: { a: 2 } },
       ])
+
+      await wipe(ns)
+    })
+
+    it('puts a record staged before sequence stamps back ahead of stamped ones', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.rpush(`${ns}:e:${M}`, JSON.stringify({ id: 'old', ts: 1000, fields: {} }))
+      await driver.append([{ metric: M, id: 'new', ts: 2000, fields: {} }])
+
+      await driver.release(await driver.claimRecords(M))
+      expect((await driver.readPending({ metric: M })).map((r) => r.id)).toEqual(['old', 'new'])
 
       await wipe(ns)
     })

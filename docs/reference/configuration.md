@@ -169,7 +169,8 @@ memory({ maxSeries, maxStaged })
 | `maxSeries` | number | `100_000` | Distinct label combinations per metric |
 | `maxStaged` | number | `100_000` | Staged records per metric |
 
-Set either to `Number.POSITIVE_INFINITY` to disable. Leave them on. They turn a
+Each has to be a positive whole number, or the driver throws when it is
+created. Set either to `Number.POSITIVE_INFINITY` to disable. Leave them on. They turn a
 runaway dimension into a loud error instead of a crash with no warning.
 
 ## ioredis
@@ -180,7 +181,7 @@ ioredis(clientOrFactory, { namespace, maxPipelineSize, recoverAfter })
 
 | Option | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `namespace` | string | `'mh'` | Key prefix, with no colon or whitespace. Two houses sharing one Redis need different ones |
+| `namespace` | string | `'mh'` | Key prefix, with no colon, no whitespace and no half of a surrogate pair. Two houses sharing one Redis need different ones |
 | `maxPipelineSize` | number | `1000` | Commands or Lua scripts per round trip. A positive whole number, or the driver throws when it is created |
 | `recoverAfter` | duration | `'5m'` | How long a claim may be held before a flush treats it as abandoned |
 

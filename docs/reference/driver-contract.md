@@ -139,11 +139,14 @@ Apply the operations in the order they were given. Two aimed at different
 windows can land in the same one, as the next paragraph explains, and a sum of
 doubles depends on the order it was added in.
 
-A refusal is only promised to leave its own window unchanged. The memory driver
-checks a whole call before storing any of it, and the Redis driver checks each
-window's operations as one step, so a call spanning two windows can keep the
-first when the second is refused. Every metric writes one operation per call,
-so this only shows through the driver itself.
+A refusal is only promised to leave unchanged the operations it was checked
+together with. The memory driver checks a whole call before storing any of it.
+The Redis driver checks one script call as one step, and a script call carries
+the neighbouring operations for one window, up to 1000 of them. So a call
+spanning two windows can keep the first when the second is refused, and a call
+with more than 1000 operations for one window is split into several script
+calls, each applied or refused on its own. Every metric writes one operation
+per call, so this only shows through the driver itself.
 
 A write aimed below the claimed watermark lands at the watermark instead. See
 [claim](#claim).
@@ -276,6 +279,11 @@ readLevels(metric: string): Promise<LevelSeries[]>
 Every series the metric currently holds, ascending by dim key. Unaffected by
 claims, because this is the state beside the buckets rather than in them.
 
+Hand out copies. A caller that edits a series it was given must not change what
+the driver holds. The Redis driver builds a fresh object on every read, and the
+memory driver copies what it stores. The same goes for every other read:
+`readLevel`, a cell from `readBuckets`, and a record from `readPending`.
+
 ### dropLevels
 
 ```ts
@@ -303,7 +311,10 @@ append(ops: readonly AppendOp[]): Promise<void>
 ```
 
 Store each record verbatim, preserving append order. Never aggregate: two
-identical records are two records.
+identical records are two records. Store a copy of `fields`, so a caller who
+reuses the object it passed does not change a record already staged. The
+memory driver copies each value and clones a `Date`, an array or a nested
+object whole.
 
 `fields` is opaque. The driver stores it and hands it back untouched. It does not
 know which keys are declared, which are reserved, or how any of it becomes a
@@ -354,10 +365,13 @@ readPending(query: PendingQuery): Promise<StagedRecord[]>
 // PendingQuery: { metric, from?, to?, limit? }
 ```
 
-Staged, unclaimed records, oldest first. `from` and `to` bound the record
-timestamp and are half open. `limit` caps what comes back, and on storage that
-supports it this should be a bounded read rather than fetching everything and
-slicing.
+Staged, unclaimed records, in the order they were appended. That is ascending
+by `ts` for every record appended in time order. A record appended with a `ts`
+older than one staged before it keeps its place in the line and is not sorted
+forward, so `limit` takes the first records appended, whatever their `ts`.
+`from` and `to` bound the record timestamp and are half open. `limit` caps what
+comes back, and on storage that supports it this should be a bounded read rather
+than fetching everything and slicing.
 
 A read taken in pages must not skip a record, or return one twice, when
 another process claims or releases records between two pages. The Redis driver
@@ -466,9 +480,28 @@ interface BucketClaim {
 Buckets ascend by `bucketTs`, so rows ship in a predictable order. When nothing
 qualifies, return an empty claim rather than null.
 
+Throw when `upToBucketTs` is not a finite number, before claiming anything or
+storing it as the watermark. A watermark of `NaN` compares false against every
+window, so no late write would ever move forward again.
+
+**Never reuse a claim id**, even after storage loses its most recent writes. A
+Redis restart between two disk syncs, or a failover to a replica that was
+behind, rolls back anything Redis kept, a counter included. An id handed out a
+second time names a claim still in flight, the two share one in-flight key, and
+settling either one settles both. The Redis driver mints each id in the process
+as the metric name and a UUID version 7, which needs nothing Redis remembers.
+Claims taken under the `metric#n` ids of an earlier version still recover and
+settle, because nothing reads an id apart from the key it names.
+
 The driver knows nothing about time here. It is handed a watermark and claims
 everything below it. Deciding what "finished" means belongs to the metric, which
 is the only thing that knows its own resolution and grace.
+
+The Redis driver claims the whole backlog below the watermark in one script,
+and Redis runs nothing else while a script runs. A backlog of about a million
+cells, from a metric that has not flushed in a long while or one with very many
+series, holds Redis for roughly a second, and every other client waits that
+long. Flushing on schedule keeps a claim to one or two windows.
 
 **Stamp the claim with storage's own clock** where there is one. The age of a
 claim decides whether [`recover`](#recover) takes it back, and a stamp from the
@@ -493,7 +526,9 @@ can slip below the watermark between the two.
 claimRecords(metric: string, limit?: number): Promise<RecordClaim>
 ```
 
-Move staged records into a claim, oldest first, at most `limit` of them.
+Move staged records into a claim, first appended first, at most `limit` of
+them. A `limit` of zero or less claims nothing, and one past the backlog claims
+all of it. The order is the one [`readPending`](#readpending) returns.
 
 ```ts
 interface RecordClaim {
@@ -532,20 +567,28 @@ Four rules that are easy to get wrong:
   for instance on a cell of another kind, must leave the rest of the claim
   where a retried release or a recovery pass still finds it. The Redis driver
   removes the claim from its registry only once every cell has been restored.
+  The memory driver works out every merge before it moves anything, so a
+  refused release leaves the live set as it was and the whole claim in flight.
 - **Merge, do not overwrite.** With writes moved past the watermark, nothing
   new should land in a claimed window. Data written by an older driver still
   might have, so a release that finds a cell already there merges the two rather
   than replacing one with the other. Counter cells add. Gauge folds merge the way
-  the five aggregates merge, with the newer observation winning `last`.
+  the five aggregates merge, with the cell already in the window winning `last`,
+  since it was written later. Level cells do not merge: the one already in the
+  window is kept, for the same reason.
 - **Records go back where they came from.** Released records are older than
   anything appended since, so they go ahead of it. Records an earlier release
   already put back can be older than some of them and newer than others, so the
   two are merged by the order they were appended in. Keep that order somewhere
-  a release can read it.
+  a release can read it. The Redis driver keeps it as a sequence stamp in front
+  of each stored record, and counts a record staged before stamps existed as
+  older than every stamped one, in its scripts and in the driver alike.
 - **Keep one writer's writes in order.** Two `set` calls from one process must
   reach storage in the order they were made. The Redis driver queues each send
   behind the one before it, because a send that first has to load its script
-  would otherwise be overtaken.
+  would otherwise be overtaken. A call split into several round trips by
+  `maxPipelineSize` issues all of them in one step of that queue, so a call made
+  after it cannot land between two of them.
 
 ### Settling twice
 
@@ -625,11 +668,16 @@ cadence for every process that shares the driver.
 
 ```ts
 takeTurn?(metric: string, now: number, gapMs: number): Promise<ShipTurn>
-returnTurn?(metric: string, at: number, previous: number | undefined): Promise<void>
+returnTurn?(metric: string, turn: Turn, previous: Turn | undefined): Promise<void>
+
+interface Turn {
+  at: number     // when it was taken, by the caller's clock
+  token: string  // unique to this turn
+}
 
 type ShipTurn =
-  | { granted: true; previous: number | undefined }   // the turn this one replaced
-  | { granted: false; lastTakenAt: number }            // the turn in the way
+  | { granted: true; turn: Turn; previous: Turn | undefined }  // this turn, and the one it replaced
+  | { granted: false; lastTakenAt: number }                     // when the turn in the way was taken
 ```
 
 A metric's `flush` setting is the fastest it may ship. Each process tracks its
@@ -639,7 +687,8 @@ driver answers for every process at once.
 
 ### takeTurn
 
-Grant the turn and record `now` as the time it was taken, or refuse it.
+Grant the turn and record it, with `now` as the time it was taken and a token
+no other turn has, or refuse it.
 
 - Grant it when no turn has been taken for the metric.
 - Grant it when the last turn is `gapMs` or more away from `now`, before or
@@ -653,17 +702,24 @@ Grant the turn and record `now` as the time it was taken, or refuse it.
 
 Check and record in one atomic step. Two processes asking at the same moment
 must get one grant and one refusal. The Redis driver does both in one script,
-against a key per metric, `mh:turn:<metric>`, holding the time in milliseconds.
+against a key per metric, `mh:turn:<metric>`, holding the time in milliseconds
+and the token as `at|token`. It mints the token in the process, a UUID version
+7, and reads a turn stored by an earlier version, the time alone, as a turn
+with an empty token.
 
 The time is the caller's `now`, so an injected test clock applies to turns as it
 does to windows.
 
 ### returnTurn
 
-Put `previous` back as the recorded turn, or clear the turn when `previous` is
-`undefined`. Do it only while the recorded turn is still the one taken at `at`.
-A later turn belongs to a flush that is still running, and writing an older
-time over it would let a third process ship beside that one.
+Put `previous` back as the recorded turn, token included, or clear the turn
+when `previous` is `undefined`. Do it only while the recorded turn is still
+`turn`, compared by time and token. A later turn belongs to a flush that is
+still running, and writing an older one over it would let a third process ship
+beside that one. The token is what tells them apart when both were taken in
+the same millisecond, as a forced flush and a scheduled one can be. Compared by
+time alone, the scheduled flush giving back its turn would erase the forced
+one.
 
 A flush calls it when it wrote nothing: the claim was empty, or the `write`
 function threw. A failure here is ignored. The next turn is then granted one
@@ -700,6 +756,8 @@ A driver has to satisfy all of these.
 - With `integer` set, a total or level past `9007199254740991` is refused too.
 - `-0` is stored as `0`.
 - A write aimed below the highest claimed watermark lands at the watermark.
+- A record's fields are stored as a copy, so editing the object passed in
+  changes nothing staged.
 - Writing a cell of one kind into a series that holds another throws, whichever
   two kinds they are.
 
@@ -732,6 +790,9 @@ A driver has to satisfy all of these.
 - Reading never consumes.
 - A read sees a write issued before it, awaited or not.
 - An error names the metric of the operation that was refused.
+- Every read hands out copies, so editing what it returned changes nothing
+  stored.
+- Staged records come back in append order, a backdated one included.
 - An invalid `Date` in `fields` comes back as an invalid `Date`.
 - A field shaped like the driver's own date marker comes back untouched.
 
@@ -742,12 +803,19 @@ A driver has to satisfy all of these.
 - An empty claim is returned rather than null.
 - Every claim gets a distinct id.
 - A claim carries its values keyed by series, and a gauge fold arrives intact.
+- A watermark that is not a finite number throws and changes nothing.
+- A record claim takes nothing for a `limit` of zero or less, and takes records
+  in append order.
 
 **Settling**
 
 - Ack discards permanently and leaves unclaimed data alone.
 - Release restores the data unchanged, including record ids.
 - A late write that moved forward stays apart from the released window.
+- A release that finds a cell already in its window merges into it: counters
+  add, gauge folds fold with the existing cell keeping `last`, and the existing
+  level cell is kept.
+- A release stopped by a cell of another kind leaves the claim in flight.
 - Released records return ahead of anything appended since, merged by append
   order with records an earlier release already put back.
 - `countPending` counts records in a claim until it is settled.
@@ -758,6 +826,8 @@ A driver has to satisfy all of these.
 **Recovering**
 
 - A metric with no abandoned claim recovers nothing.
+- An abandoned window, or an abandoned run of records, is put back and
+  reported, with when its claim was taken.
 - A claim that was only just taken is left alone, so a flush still writing keeps
   what it is holding.
 - Recovery never touches the live set beyond merging into it.
@@ -778,8 +848,10 @@ A driver has to satisfy all of these.
 - A gap of zero is always granted, and recorded.
 - Each metric keeps its own turn.
 - Of two turns asked for at once, one is granted.
-- Giving a turn back restores the previous one, or clears it when there was
-  none, and leaves a later turn alone.
+- Every turn gets a token of its own, two taken in one millisecond included.
+- Giving a turn back restores the previous one, token included, or clears it
+  when there was none, and leaves a later turn alone, one taken in the same
+  millisecond included.
 - A turn that reaches storage twice answers the way the first arrival did.
 
 ## Testing your driver
@@ -813,6 +885,14 @@ than in the shared suite.
 The tests for the [optional reads](#optional-reads) and for
 [taking turns](#taking-turns) pass without checking anything when a driver
 leaves the methods out, and hold it to the rules above when it has them.
+
+Two more options switch on the tests that need to reach past the contract.
+`plant(driver, metric, bucketTs, dimKey, cell)` puts a cell straight into a
+window, past the watermark, the way a driver older than the watermark could
+have left one. It is the only way to hand `release` a window that already
+holds a cell. `abandoned(driver)` returns a second driver on the same storage
+that treats every claim as abandoned, for the recovery tests. A driver whose
+claims die with its process has nothing to recover and leaves it out.
 
 ## A worked minimal driver
 
