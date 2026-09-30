@@ -103,10 +103,11 @@ deliberately not from the value. Sending one row per increment would mint the
 same id three times with `value: 1`, and a table that keeps the last write would
 end up believing the answer was one.
 
-::: danger Your table must keep the newest row per id
+::: danger Your table must upsert on id, and let the flush row win
 Under immediate delivery, a folded row is a running total that a later send
-replaces. A table that adds up duplicate ids rather than keeping the newest will
-badly over count. The house warns about this once at startup through `onWarn`.
+replaces. A table that adds up duplicate ids will badly over count, and one that
+keeps whichever row arrived last can end on an older total than the flush row.
+The house warns about this once at startup through `onWarn`.
 :::
 
 In ClickHouse that means `ReplacingMergeTree`. In Postgres it means
@@ -142,7 +143,7 @@ does.
 
 With several processes writing to one Redis, each of them sends the running
 total it read, and two immediate sends can arrive at your table in either order.
-A table that keeps the newest arrival can briefly hold an older total. Rows
+A table that keeps whichever row arrived last can briefly hold an older total. Rows
 carry no version number to settle that. What settles it is the flush row, which
 holds the complete value, provided your table keeps it over any immediate row
 that arrives after it.
@@ -152,7 +153,7 @@ that arrives after it.
 | Immediate delivery replaces flush | Yes | No |
 | Still need to call flush | Only to retry a failed send of a driver staged event | Yes, to retire finished windows |
 | Rows are deleted after sending | Yes | Only by a flush |
-| Duplicate ids in your table | No | Yes, keep the newest |
+| Duplicate ids in your table | No | Yes, upsert on `id` and keep the flush row |
 
 ## Telling the two apart in your sink
 
@@ -194,7 +195,7 @@ a failed acknowledgement replaces the row with the same value.
 | --- | --- | --- |
 | `'flush'` | A normal flush | Upsert on `id`. Under immediate delivery it replaces the running totals sent before it, and keeps its place against any that arrive after it |
 | `'batch'` | A locally staged event shipped itself | Insert, or upsert on `id`. A duplicate is an identical retry |
-| `'immediate'` | Immediate delivery | Keep the newest row per id, unless the row held came from a flush |
+| `'immediate'` | Immediate delivery | Upsert on `id`, unless the row held came from a flush |
 
 ## Choosing
 

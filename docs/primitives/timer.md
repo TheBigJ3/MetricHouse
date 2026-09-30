@@ -636,6 +636,13 @@ Both `finish` and `close` can fire for the same response, and the timing should
 be recorded once, by whichever came first. That is what
 [`end()`](#handle-end) being idempotent buys.
 
+Recording a dropped connection is a choice. Here it counts as an `'error'`
+timing, so a client that hangs up mid response shows in the latency numbers. The
+[API requests example](/examples/api-requests) counts requests, and a request
+that never got a response is not one it wants to count, so it records on
+`finish` only and ignores `close`. Pick the one that matches what the metric is
+for.
+
 ## Playground
 
 ### The fold

@@ -202,8 +202,8 @@ export const house = createHouse({
 ```
 
 The cost is one database call per application write, and folded metrics resend
-the same row id with a rising running total, so your table must keep the newest
-row per id. Read [Delivery modes](/guide/delivery) before choosing this.
+the same row id with a rising running total, so your table must upsert on id and
+let the flush row win. Read [Delivery modes](/guide/delivery) before choosing this.
 
 Events and logs ship on `record()` and leave the driver, so they need no flush.
 Counters, gauges, levels and timers do not: immediate delivery sends their open

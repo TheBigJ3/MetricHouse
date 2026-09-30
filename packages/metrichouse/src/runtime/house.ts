@@ -250,8 +250,9 @@ export function createHouse(config: HouseConfig): House {
   if (delivery === 'immediate') {
     config.onWarn?.(
       "delivery is 'immediate', so bucketed rows are resent as their bucket fills. The sink " +
-        'must keep the newest row per id rather than fold duplicates together. Staged kinds ' +
-        'ship without flush(); bucketed kinds still need it to retire closed buckets',
+        'must upsert on id rather than fold duplicates together, and must keep the flush row ' +
+        'over an immediate one. Staged kinds ship without flush(); bucketed kinds still ' +
+        'need it to retire closed buckets',
       {},
     )
   }

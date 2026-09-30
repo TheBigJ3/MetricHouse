@@ -452,7 +452,7 @@ A value somebody wrote always beats a carried one, whichever of the two lands
 first. Two processes carrying the same window write the same number, so they
 cannot disagree.
 
-Five consequences worth knowing:
+Eight consequences worth knowing:
 
 - **A series appears from its first write.** Nothing is backfilled before it, so
   a queue declared on Monday and first written on Friday has no Monday rows.
@@ -486,8 +486,8 @@ Five consequences worth knowing:
   the windows after it replaces those carried values, up to the next window
   somebody wrote to.
 - **A late write that missed its window moves forward.** A write aimed at a
-  window that has already shipped lands in the oldest window that has not, as on
-  every type. A `set()` moved that way is dropped when that window already holds
+  window that has already shipped lands in the first window of its own resolution at or
+  past the watermark, as on every type. A `set()` moved that way is dropped when that window already holds
   a reading, because that reading was taken later.
 
 ## What it costs

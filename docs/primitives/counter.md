@@ -154,7 +154,7 @@ window back until writes like that have landed. It never moves a write into an
 earlier window: an `add()` called at `:10.001` counts in the `:10` window.
 
 A write that arrives after its window was claimed anyway is moved forward into
-the oldest window that has not shipped. See
+the first window of its own resolution at or past the watermark. See
 [Buckets and time](/guide/buckets-and-time#a-write-that-misses-its-window).
 
 ```ts

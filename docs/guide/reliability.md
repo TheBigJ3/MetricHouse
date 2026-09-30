@@ -66,7 +66,10 @@ await sql`
 Use `DO UPDATE` rather than `DO NOTHING`. A retry resends a row with the value
 it had the first time, so either handles that. Under
 [immediate delivery](/guide/delivery) a row is also sent again as its window
-fills, with a larger value each time, and `DO UPDATE` keeps the newest.
+fills, with a larger value each time, and `DO UPDATE` takes the newer one. The
+flush row holds the complete value, so a sink should not let a later immediate
+row replace it, as [Delivery modes](/guide/delivery#telling-the-two-apart-in-your-sink)
+shows.
 
 ```ts
 import { naturalKey } from 'metrichouse/core'
@@ -140,7 +143,8 @@ happen.
 
 Grace holds a just finished window back from the flush for a little longer. A
 write that arrives after its window has been claimed anyway is moved forward
-into the oldest window that has not shipped, and ships with that one. Nothing
+into the first window of its own resolution at or past the watermark, and ships
+with that one. Nothing
 is lost and no window ships twice with different values, so a table that keeps
 one row per id stays correct. The write is counted a window late, which is the
 price of that. [Buckets and time](/guide/buckets-and-time#a-write-that-misses-its-window)
@@ -301,7 +305,8 @@ onWarn: (message) => logger.warn({ message }, 'metrichouse')
 ```
 
 - The driver cannot survive a restart, so the guarantee is best effort.
-- Delivery is immediate, so your table has to keep the newest row per id.
+- Delivery is immediate, so your table has to upsert on id and let the flush
+  row win.
 - An event declared `durability: 'durable'` is bound to a driver that cannot
   survive a restart. This one comes once per such event, when the house
   registers it, with the event's name in `metric`.
@@ -408,7 +413,7 @@ write: async (rows, context) => {
 - [ ] Your dimensions have a small, known set of values.
 - [ ] Events a caller must not lose are `durability: 'durable'`, and Redis runs
       with `appendonly yes`, `appendfsync always`, and a `maxmemory-policy`
-      that cannot evict them.
+      that is `noeviction`.
 - [ ] Something alerts on repeated flush failures.
 - [ ] Your sink has a timeout, and `recoverAfter` is longer than it.
 - [ ] Your sink chunks very large batches.

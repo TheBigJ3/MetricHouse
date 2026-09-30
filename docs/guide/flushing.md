@@ -42,7 +42,10 @@ const report = await httpRequests.flush()
 ```
 
 A metric is a complete unit. It knows its own cadence, its own write function and
-its own retry state, so this needs no house.
+its own retry state, so flushing one needs no scheduler and no call to
+`house.flush()`. It does have to be bound, by passing it to
+`createHouse({ schema })`, because a metric that no house holds has no driver to
+claim from.
 
 ### Every metric in a house
 
@@ -181,7 +184,9 @@ house.start()
 
 Before a flush claims anything, it takes the metric's turn from the driver. The
 driver records when the turn was taken, with a token unique to that turn, and
-refuses the next one until a full interval has passed, whichever process asks. A refused flush reports
+refuses the next one until nine tenths of the interval has passed, whichever
+process asks. The last tenth is slack, so a cron that fires a little earlier
+within its minute than it did last time still gets the turn. A refused flush reports
 `skipped: true` with `reason: 'cadence'`, and `nextEligibleInMs` counts from the
 turn the other process took.
 
@@ -211,9 +216,9 @@ What follows from how the turn works:
   server rather than split into smaller inserts.
 - **The turn uses each server's own clock.** Servers whose clocks differ by a
   few milliseconds see the interval move by that much. A turn stamped by a clock
-  running ahead, by less than one interval, holds the others back like any
-  other. One more than an interval away is taken as a clock that stepped, and
-  the flush goes ahead.
+  running ahead, by less than that gap, holds the others back like any other.
+  One more than the gap away is taken as a clock that stepped, and the flush
+  goes ahead.
 - **`force` ships regardless**, and still records its turn, so the other
   servers count the interval from that shipment.
 - **A final flush waits for the turn too**, when the driver is durable as well
