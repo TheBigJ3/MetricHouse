@@ -359,7 +359,7 @@ export function myDriver(): Driver {
     async countPending(metric) { return 0 },
 
     // Claims. Each returns the claim or report the contract describes.
-    async claim(metric, upToBucketTs) { throw new Error('not implemented') },
+    async claim(metric, upToBucketTs, aheadFrom) { throw new Error('not implemented') },
     async claimRecords(metric, limit) { throw new Error('not implemented') },
     async ack(claim) {},
     async release(claim) {},
@@ -371,13 +371,16 @@ export function myDriver(): Driver {
 The bodies are placeholders, so this compiles and does nothing useful yet.
 Fill in each one from the contract.
 
-Two more methods are optional. `readLevel` reads one series of a level, and
+Three more methods are optional. `readLevel` reads one series of a level, and
 `sumBuckets` adds up an integer counter's window where the data lives. Leave
 them out and every answer stays the same: `level.current(dims)` and
 `counter.current()` read through the fourteen methods instead, which fetches
 every series. Add them when your storage is across a network and a metric has
-many series. The [optional reads](/reference/driver-contract#optional-reads)
-section says what each one has to return.
+many series. The third, `landing`, says which window a write aimed at a given
+one would land in, so `current()` still counts a write the driver moved ahead
+of the clock. Without it, `current()` reads the window the clock is in. The
+[optional reads](/reference/driver-contract#optional-reads) section says what
+each one has to return.
 
 The full method by method contract, including the rules a driver has to obey, is
 in the [driver contract reference](/reference/driver-contract).

@@ -489,6 +489,91 @@ describe('current', () => {
   it('validates its dims like add does', async () => {
     await expect(bound().current({ dogName: 'W' } as never)).rejects.toThrow(/park/)
   })
+
+  it('reads the window a write lands in when the clock is behind the watermark', async () => {
+    const metric = bound()
+    metric.add(1, WILLOW)
+    await metric.drain()
+    clock += 3000
+    await metric.flush({ force: true })
+
+    // an NTP correction steps the clock back, so this add moves forward
+    clock -= 4000
+    metric.add(5, WILLOW)
+    await metric.drain()
+    expect(await metric.current(WILLOW)).toBe(5)
+    expect(await metric.current()).toBe(5)
+  })
+})
+
+describe('a change of resolution', () => {
+  /** On a five minute boundary, and five seconds past a seven second one. */
+  const base = 1_788_616_800_000
+  const minute = 60_000
+
+  /**
+   * A one minute counter that shipped the window at `base + 7m` and has one
+   * write in the open window at `base + 8m`, then the same counter redeclared
+   * at `resolution`, bound to the same storage.
+   */
+  async function redeclared(resolution: string) {
+    const shared = memory()
+    let at = base + 7 * minute + 10_000
+    const before = counter('orders', { resolution: '1m', flush: '1m', write: discard })
+    before.bind({ driver: shared, now: () => at })
+    before.add()
+    at = base + 8 * minute + 1000
+    before.add()
+    await before.drain()
+    at = base + 8 * minute + 3000
+    await before.flush()
+
+    const shipped: [number, number][] = []
+    const after = counter('orders', {
+      resolution,
+      flush: resolution,
+      write: (rows) => {
+        for (const row of rows) shipped.push([row.bucket_ts.getTime() - base, row.value])
+      },
+    })
+    after.bind({ driver: shared, now: () => at })
+    return {
+      after,
+      shipped,
+      at: (ms: number) => {
+        at = ms
+      },
+    }
+  }
+
+  it('lands a late write on the first window of a coarser grid past the watermark', async () => {
+    const { after, shipped, at } = await redeclared('5m')
+    at(base + 8 * minute + 10_000)
+    after.add(2)
+    await after.drain()
+
+    at(base + 15 * minute + 3000)
+    await after.flush()
+    expect(shipped).toEqual([
+      [8 * minute, 1],
+      [10 * minute, 2],
+    ])
+  })
+
+  it('lands a late write on the first window of a finer grid past the watermark', async () => {
+    const { after, shipped, at } = await redeclared('7s')
+    at(base + 8 * minute + 2000)
+    after.add(2)
+    await after.drain()
+
+    at(base + 9 * minute)
+    await after.flush()
+    // the seven second grid has a boundary 485 seconds past `base`
+    expect(shipped).toEqual([
+      [8 * minute, 1],
+      [485_000, 2],
+    ])
+  })
 })
 
 describe('current() with no dims is the metric total', () => {
@@ -533,8 +618,20 @@ describe('current() with no dims is the metric total', () => {
 
   it('names a stored fraction, not an overflow, when an integer counter reads one', async () => {
     await driver.increment([
-      { metric: 'dog_poops', bucketTs: 1_788_616_987_000, dimKey: 'Willow|a|solid', delta: 2.5 },
-      { metric: 'dog_poops', bucketTs: 1_788_616_987_000, dimKey: 'Willow|b|solid', delta: 1 },
+      {
+        metric: 'dog_poops',
+        bucketTs: 1_788_616_987_000,
+        resolutionMs: 1000,
+        dimKey: 'Willow|a|solid',
+        delta: 2.5,
+      },
+      {
+        metric: 'dog_poops',
+        bucketTs: 1_788_616_987_000,
+        resolutionMs: 1000,
+        dimKey: 'Willow|b|solid',
+        delta: 1,
+      },
     ])
     const metric = bound()
     await expect(metric.current()).rejects.toThrow(
@@ -836,7 +933,11 @@ describe('immediate delivery', () => {
     const at = 1_788_616_980_000
     hits.bind({ driver, now: () => at, delivery: 'immediate' })
 
-    // another process has already claimed up to five seconds ahead
+    // another process, its clock five seconds ahead, has written its window
+    // and claimed up to it
+    await driver.increment([
+      { metric: 'hits', bucketTs: at + 5_000, resolutionMs: 1000, dimKey: '', delta: 1 },
+    ])
     await driver.ack(await driver.claim('hits', at + 5_000))
     hits.add()
     await hits.drain()

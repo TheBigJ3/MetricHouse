@@ -186,6 +186,21 @@ describe('set and the fold', () => {
     expect(await metric.current(B1)).toBeUndefined()
   })
 
+  it('reads the window an observation lands in when the clock is behind the watermark', async () => {
+    const metric = bound()
+    metric.set(1, B1)
+    await metric.drain()
+    clock += 12_000
+    await metric.flush({ force: true })
+
+    // an NTP correction steps the clock back, so this observation moves forward
+    clock -= 20_000
+    metric.set(7, B1)
+    await metric.drain()
+    expect(await metric.current(B1)).toEqual({ last: 7, min: 7, max: 7, sum: 7, count: 1 })
+    expect(await metric.totals()).toMatchObject({ min: 7, max: 7, sum: 7 })
+  })
+
   it('keeps series apart', async () => {
     const metric = bound()
     metric.set(1, B1)
@@ -388,14 +403,24 @@ describe('mixing kinds is refused at the driver', () => {
     await metric.drain()
 
     await expect(
-      driver.increment([{ metric: 'bowl_level', bucketTs: clock, dimKey: 'b1|kitchen', delta: 1 }]),
+      driver.increment([
+        {
+          metric: 'bowl_level',
+          bucketTs: clock,
+          resolutionMs: 1000,
+          dimKey: 'b1|kitchen',
+          delta: 1,
+        },
+      ]),
     ).rejects.toThrow(/gauge cells/)
   })
 
   it('will not observe a metric holding counter cells', async () => {
-    await driver.increment([{ metric: 'c', bucketTs: clock, dimKey: '', delta: 1 }])
+    await driver.increment([
+      { metric: 'c', bucketTs: clock, resolutionMs: 1000, dimKey: '', delta: 1 },
+    ])
     await expect(
-      driver.observe([{ metric: 'c', bucketTs: clock, dimKey: '', value: 1 }]),
+      driver.observe([{ metric: 'c', bucketTs: clock, resolutionMs: 1000, dimKey: '', value: 1 }]),
     ).rejects.toThrow(/counter cells/)
   })
 })

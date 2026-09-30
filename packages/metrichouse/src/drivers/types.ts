@@ -35,6 +35,13 @@
 export interface IncrOp {
   readonly metric: string
   readonly bucketTs: number
+  /**
+   * How wide the metric's windows are. A write aimed below the claimed
+   * watermark lands on the first window of this grid at or past it, so it
+   * stays on the metric's own boundaries even when the watermark was set by
+   * a claim on another grid. See {@link Driver.claim}.
+   */
+  readonly resolutionMs: number
   readonly dimKey: string
   readonly delta: number
   /**
@@ -49,6 +56,8 @@ export interface IncrOp {
 export interface GaugeOp {
   readonly metric: string
   readonly bucketTs: number
+  /** How wide the metric's windows are, as {@link IncrOp.resolutionMs} says. */
+  readonly resolutionMs: number
   readonly dimKey: string
   readonly value: number
 }
@@ -72,6 +81,8 @@ export interface GaugeOp {
 export interface LevelOp {
   readonly metric: string
   readonly bucketTs: number
+  /** How wide the metric's windows are, as {@link IncrOp.resolutionMs} says. */
+  readonly resolutionMs: number
   readonly dimKey: string
   readonly value: number
   readonly mode: 'set' | 'add' | 'hold'
@@ -477,18 +488,33 @@ export interface Driver {
   countPending(metric: string): Promise<number>
 
   /**
-   * Move every bucket **strictly below** `upToBucketTs` into a claim.
+   * Move every bucket **strictly below** `upToBucketTs` into a claim, and
+   * with `aheadFrom`, every bucket at or past `aheadFrom` too.
    *
-   * Also remembers the highest `upToBucketTs` any claim of this metric has
-   * used, and from then on every write aimed below it (`increment`,
-   * `observe`, and a level `set` or `add`) lands in that window instead. A
-   * window below the watermark has already been claimed, and a write that
-   * reaches it late, from a slow request or a clock that runs behind, would
-   * otherwise start a second copy of a window that already shipped. That copy
-   * would carry the same row id and only the late part of the value, and a
-   * sink keeping the newest row per id would throw away the rest. Moving the
-   * write forward keeps every total exact, at the cost of counting it one
-   * window later than it happened.
+   * `aheadFrom` is for a final flush on storage that does not outlive the
+   * process. The windows ahead of the flusher's clock would die with it, so
+   * it takes them as well and leaves only the window its clock is in. A
+   * bound below `upToBucketTs` counts as `upToBucketTs`.
+   *
+   * Also raises the metric's **watermark**, and from then on every write
+   * aimed below it (`increment`, `observe`, and a level `set` or `add`) lands
+   * on the first window of its own resolution at or past the watermark
+   * instead. A window below the watermark has already been claimed, and a
+   * write that reaches it late, from a slow request or a clock that runs
+   * behind, would otherwise start a second copy of a window that already
+   * shipped. That copy would carry the same row id and only the late part of
+   * the value, and a sink keeping the newest row per id would throw away the
+   * rest. Moving the write forward keeps every total exact, at the cost of
+   * counting it one window later than it happened.
+   *
+   * The watermark rises to `upToBucketTs`, or to one past the newest window
+   * any live bucket held when the claim began if that is lower, or to one
+   * past the newest window the claim took if that is higher. It never falls.
+   * The newest live window is the limit because every window past it was
+   * empty: nothing in it shipped, so a write that arrives for it later is
+   * its first copy and keeps its own window. That is what stops a claim on a
+   * clock far ahead from moving every write for days into one window. A
+   * claim that finds no live bucket leaves the watermark where it was.
    *
    * A level `hold` aimed below the watermark writes no cell and still moves
    * the series' pointer, for the same reason.
@@ -497,7 +523,18 @@ export interface Driver {
    * claimed. A watermark of NaN would compare false against every window and
    * stop every later write from moving forward.
    */
-  claim(metric: string, upToBucketTs: number): Promise<BucketClaim>
+  claim(metric: string, upToBucketTs: number, aheadFrom?: number): Promise<BucketClaim>
+
+  /**
+   * The window a write aimed at `bucketTs` would land in now: `bucketTs`
+   * itself, or the first window of `resolutionMs` at or past the watermark
+   * when `bucketTs` is below it. See {@link claim}.
+   *
+   * Optional. `current()` reads the window this names, so a write the
+   * watermark moved ahead of the clock still counts in the open total. A
+   * driver that leaves it out is read at `bucketTs`.
+   */
+  landing?(metric: string, bucketTs: number, resolutionMs: number): Promise<number>
 
   /**
    * Move staged records into a claim, oldest first, at most `limit` of them.

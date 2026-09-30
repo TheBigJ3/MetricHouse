@@ -293,7 +293,10 @@ payments.add(-4_999, { currency: 'usd', status: 'refunded' })
 current(dims?: InferShape<D>): Promise<number>
 ```
 
-The live value of the window still filling.
+The live value of the window still filling, which is the window a write made now
+lands in. That is the window the clock is in, except after the clock steps back
+behind a flush that already ran. [Buckets and time](/guide/buckets-and-time#a-write-that-misses-its-window)
+covers that case.
 
 | Parameter | Type | Default | Meaning |
 | --- | --- | --- | --- |

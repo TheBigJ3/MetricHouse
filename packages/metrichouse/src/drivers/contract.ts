@@ -88,11 +88,12 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       await options.cleanup?.(driver)
     })
 
-    const incr = (bucketTs: number, dimKey: string, delta = 1) =>
-      driver.increment([{ metric: M, bucketTs, dimKey, delta }])
+    /** Every helper writes on a one second grid unless told otherwise. */
+    const incr = (bucketTs: number, dimKey: string, delta = 1, resolutionMs = 1000) =>
+      driver.increment([{ metric: M, bucketTs, resolutionMs, dimKey, delta }])
 
-    const obs = (bucketTs: number, dimKey: string, value: number) =>
-      driver.observe([{ metric: G, bucketTs, dimKey, value }])
+    const obs = (bucketTs: number, dimKey: string, value: number, resolutionMs = 1000) =>
+      driver.observe([{ metric: G, bucketTs, resolutionMs, dimKey, value }])
 
     /** The one cell at a bucket and series, narrowed to a gauge fold. */
     const gaugeAt = async (bucketTs: number, dimKey: string): Promise<GaugeCell> => {
@@ -103,14 +104,14 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       return row.value
     }
 
-    const put = (bucketTs: number, dimKey: string, value: number) =>
-      driver.setLevel([{ metric: L, bucketTs, dimKey, value, mode: 'set' }])
+    const put = (bucketTs: number, dimKey: string, value: number, resolutionMs = 1000) =>
+      driver.setLevel([{ metric: L, bucketTs, resolutionMs, dimKey, value, mode: 'set' }])
 
     const move = (bucketTs: number, dimKey: string, value: number) =>
-      driver.setLevel([{ metric: L, bucketTs, dimKey, value, mode: 'add' }])
+      driver.setLevel([{ metric: L, bucketTs, resolutionMs: 1000, dimKey, value, mode: 'add' }])
 
     const hold = (bucketTs: number, dimKey: string, value: number) =>
-      driver.setLevel([{ metric: L, bucketTs, dimKey, value, mode: 'hold' }])
+      driver.setLevel([{ metric: L, bucketTs, resolutionMs: 1000, dimKey, value, mode: 'hold' }])
 
     /** The one cell at a bucket and series, narrowed to a level. */
     const levelAt = async (bucketTs: number, dimKey: string): Promise<number | undefined> => {
@@ -119,6 +120,15 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       if (!row) return undefined
       if (!isLevelCell(row.value)) throw new Error(`expected a level cell, got ${row.value}`)
       return row.value.level
+    }
+
+    /**
+     * Where a write aimed at `bucketTs` on `resolutionMs` lands in `metric`.
+     * Optional, so each test that calls it returns early without it.
+     */
+    const landing = (metric: string, bucketTs: number, resolutionMs = 1000): Promise<number> => {
+      if (!driver.landing) throw new Error(`${name} has no landing()`)
+      return driver.landing(metric, bucketTs, resolutionMs)
     }
 
     const rec = (id: string, ts: number, fields: Record<string, unknown> = {}) => ({
@@ -157,9 +167,9 @@ export function describeDriverContract(name: string, options: DriverContractOpti
 
       it('applies a whole batch in one call', async () => {
         await driver.increment([
-          { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 },
-          { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 2 },
-          { metric: M, bucketTs: 1000, dimKey: REX, delta: 4 },
+          { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+          { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 2 },
+          { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: REX, delta: 4 },
         ])
         expect(await driver.readBuckets({ metric: M })).toEqual([
           { bucketTs: 1000, dimKey: REX, value: 4 },
@@ -207,9 +217,21 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       it('changes nothing when one increment in a batch is refused', async () => {
         await expect(
           driver.increment([
-            { metric: M, bucketTs: 1000, dimKey: REX, delta: 1 },
-            { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: Number.MAX_VALUE },
-            { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: Number.MAX_VALUE },
+            { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: REX, delta: 1 },
+            {
+              metric: M,
+              bucketTs: 1000,
+              resolutionMs: 1000,
+              dimKey: WILLOW,
+              delta: Number.MAX_VALUE,
+            },
+            {
+              metric: M,
+              bucketTs: 1000,
+              resolutionMs: 1000,
+              dimKey: WILLOW,
+              delta: Number.MAX_VALUE,
+            },
           ]),
         ).rejects.toThrow(/largest number/)
         expect(await driver.readBuckets({ metric: M })).toEqual([])
@@ -218,15 +240,23 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       it('names the metric it refused in a batch spanning two metrics', async () => {
         await expect(
           driver.increment([
-            { metric: 'first', bucketTs: 1000, dimKey: WILLOW, delta: 1 },
-            { metric: 'second', bucketTs: 1000, dimKey: WILLOW, delta: Number.POSITIVE_INFINITY },
+            { metric: 'first', bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+            {
+              metric: 'second',
+              bucketTs: 1000,
+              resolutionMs: 1000,
+              dimKey: WILLOW,
+              delta: Number.POSITIVE_INFINITY,
+            },
           ]),
         ).rejects.toThrow(/driver: second /)
       })
 
       it('refuses an integer total past the largest safe integer', async () => {
         const whole = (delta: number) =>
-          driver.increment([{ metric: M, bucketTs: 1000, dimKey: WILLOW, delta, integer: true }])
+          driver.increment([
+            { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta, integer: true },
+          ])
         await whole(Number.MAX_SAFE_INTEGER)
         await expect(whole(1)).rejects.toThrow(/largest whole number/)
         expect((await driver.readBuckets({ metric: M }))[0]?.value).toBe(Number.MAX_SAFE_INTEGER)
@@ -236,7 +266,14 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await incr(1000, WILLOW, 2.5)
         await expect(
           driver.increment([
-            { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1, integer: true },
+            {
+              metric: M,
+              bucketTs: 1000,
+              resolutionMs: 1000,
+              dimKey: WILLOW,
+              delta: 1,
+              integer: true,
+            },
           ]),
         ).rejects.toThrow(/not (be )?a whole number/)
         expect((await driver.readBuckets({ metric: M }))[0]?.value).toBe(2.5)
@@ -254,8 +291,12 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       })
 
       it('keeps metrics independent', async () => {
-        await driver.increment([{ metric: 'a', bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
-        await driver.increment([{ metric: 'b', bucketTs: 1000, dimKey: WILLOW, delta: 9 }])
+        await driver.increment([
+          { metric: 'a', bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+        ])
+        await driver.increment([
+          { metric: 'b', bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 9 },
+        ])
         expect(await driver.readBuckets({ metric: 'a' })).toEqual([
           { bucketTs: 1000, dimKey: WILLOW, value: 1 },
         ])
@@ -271,7 +312,9 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         // `|` and `\` still in it. A driver that packs keys into a composite
         // field has to survive that.
         const nasty = 'a\\|b|c\\\\'
-        await driver.increment([{ metric: M, bucketTs: 1000, dimKey: nasty, delta: 2 }])
+        await driver.increment([
+          { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: nasty, delta: 2 },
+        ])
         expect(await driver.readBuckets({ metric: M })).toEqual([
           { bucketTs: 1000, dimKey: nasty, value: 2 },
         ])
@@ -305,8 +348,8 @@ export function describeDriverContract(name: string, options: DriverContractOpti
 
       it('folds a whole batch in order', async () => {
         await driver.observe([
-          { metric: G, bucketTs: 1000, dimKey: WILLOW, value: 4 },
-          { metric: G, bucketTs: 1000, dimKey: WILLOW, value: 8 },
+          { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: 4 },
+          { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: 8 },
         ])
         expect(await gaugeAt(1000, WILLOW)).toEqual({
           last: 8,
@@ -361,14 +404,18 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       })
 
       it('refuses to observe into a series holding counter cells', async () => {
-        await driver.increment([{ metric: G, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+        await driver.increment([
+          { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+        ])
         await expect(obs(1000, WILLOW, 5)).rejects.toThrow()
       })
 
       it('refuses to increment a series holding gauge cells', async () => {
         await obs(1000, WILLOW, 5)
         await expect(
-          driver.increment([{ metric: G, bucketTs: 1000, dimKey: WILLOW, delta: 1 }]),
+          driver.increment([
+            { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+          ]),
         ).rejects.toThrow()
       })
     })
@@ -484,7 +531,15 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       it('refuses an integer level past the largest safe integer', async () => {
         const whole = (value: number, mode: 'set' | 'add') =>
           driver.setLevel([
-            { metric: L, bucketTs: 1000, dimKey: WILLOW, value, mode, integer: true },
+            {
+              metric: L,
+              bucketTs: 1000,
+              resolutionMs: 1000,
+              dimKey: WILLOW,
+              value,
+              mode,
+              integer: true,
+            },
           ])
         await whole(Number.MAX_SAFE_INTEGER, 'set')
         await expect(whole(1, 'add')).rejects.toThrow(/largest whole number/)
@@ -567,9 +622,23 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       it('changes nothing when one level write in a batch is refused', async () => {
         await expect(
           driver.setLevel([
-            { metric: L, bucketTs: 1000, dimKey: REX, value: 5, mode: 'add' },
-            { metric: L, bucketTs: 1000, dimKey: WILLOW, value: Number.MAX_VALUE, mode: 'add' },
-            { metric: L, bucketTs: 1000, dimKey: WILLOW, value: Number.MAX_VALUE, mode: 'add' },
+            { metric: L, bucketTs: 1000, resolutionMs: 1000, dimKey: REX, value: 5, mode: 'add' },
+            {
+              metric: L,
+              bucketTs: 1000,
+              resolutionMs: 1000,
+              dimKey: WILLOW,
+              value: Number.MAX_VALUE,
+              mode: 'add',
+            },
+            {
+              metric: L,
+              bucketTs: 1000,
+              resolutionMs: 1000,
+              dimKey: WILLOW,
+              value: Number.MAX_VALUE,
+              mode: 'add',
+            },
           ]),
         ).rejects.toThrow(/largest number/)
         expect(await driver.readBuckets({ metric: L })).toEqual([])
@@ -646,7 +715,9 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       })
 
       it('refuses to set a series holding cells of another kind', async () => {
-        await driver.increment([{ metric: L, bucketTs: 1000, dimKey: WILLOW, delta: 1 }])
+        await driver.increment([
+          { metric: L, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+        ])
         await expect(put(1000, WILLOW, 5)).rejects.toThrow()
       })
 
@@ -654,10 +725,14 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         await put(1000, WILLOW, 5)
 
         await expect(
-          driver.increment([{ metric: L, bucketTs: 1000, dimKey: WILLOW, delta: 1 }]),
+          driver.increment([
+            { metric: L, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+          ]),
         ).rejects.toThrow()
         await expect(
-          driver.observe([{ metric: L, bucketTs: 1000, dimKey: WILLOW, value: 1 }]),
+          driver.observe([
+            { metric: L, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: 1 },
+          ]),
         ).rejects.toThrow()
       })
     })
@@ -752,11 +827,14 @@ export function describeDriverContract(name: string, options: DriverContractOpti
     describe('writes below the claimed watermark', () => {
       it('moves a counter increment forward to the watermark', async () => {
         await incr(1000, WILLOW, 5)
+        // the open window, so the claim raises the watermark all the way
+        await incr(3000, REX)
         await driver.ack(await driver.claim(M, 3000))
 
         await incr(1000, WILLOW, 2)
         await incr(2000, WILLOW, 1)
         expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: 3000, dimKey: REX, value: 1 },
           { bucketTs: 3000, dimKey: WILLOW, value: 3 },
         ])
       })
@@ -772,11 +850,12 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       it('folds a batch in order when its observations move to one window', async () => {
         // aimed at two windows, both below the watermark, so all three land
         // at 5000 and the last one written has to win `last`
+        await obs(5000, REX, 0)
         await driver.ack(await driver.claim(G, 5000))
         await driver.observe([
-          { metric: G, bucketTs: 2000, dimKey: WILLOW, value: 1 },
-          { metric: G, bucketTs: 1000, dimKey: WILLOW, value: 2 },
-          { metric: G, bucketTs: 2000, dimKey: WILLOW, value: 3 },
+          { metric: G, bucketTs: 2000, resolutionMs: 1000, dimKey: WILLOW, value: 1 },
+          { metric: G, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value: 2 },
+          { metric: G, bucketTs: 2000, resolutionMs: 1000, dimKey: WILLOW, value: 3 },
         ])
         expect(await gaugeAt(5000, WILLOW)).toEqual({ last: 3, min: 1, max: 3, sum: 6, count: 3 })
       })
@@ -792,22 +871,71 @@ export function describeDriverContract(name: string, options: DriverContractOpti
 
       it('lets a hold move the pointer without refilling a claimed window', async () => {
         await put(1000, WILLOW, 5)
+        await put(3000, REX, 1)
         await driver.ack(await driver.claim(L, 3000))
 
         await hold(2000, WILLOW, 5)
         expect(await levelAt(2000, WILLOW)).toBeUndefined()
-        expect((await driver.readLevels(L))[0]?.heldThrough).toBe(2000)
+        const willow = (await driver.readLevels(L)).find((one) => one.dimKey === WILLOW)
+        expect(willow?.heldThrough).toBe(2000)
       })
 
-      it('raises the watermark even for a claim that found nothing', async () => {
+      it('lands a counter increment on the first window of its coarser grid', async () => {
+        // the watermark is 7000, where a five second grid has no window
+        await incr(8000, REX)
+        await driver.ack(await driver.claim(M, 7000))
+
+        await incr(5000, WILLOW, 2, 5000)
+        expect(await driver.readBuckets({ metric: M, dimKey: WILLOW })).toEqual([
+          { bucketTs: 10_000, dimKey: WILLOW, value: 2 },
+        ])
+      })
+
+      it('lands a gauge observation on the first window of its finer grid', async () => {
+        // seven seconds does not divide the watermark of 8000
+        await obs(9000, REX, 1)
+        await driver.ack(await driver.claim(G, 8000))
+
+        await obs(7000, WILLOW, 4, 7000)
+        expect(await gaugeAt(14_000, WILLOW)).toEqual({ last: 4, min: 4, max: 4, sum: 4, count: 1 })
+      })
+
+      it('lands a level write on the first window of its own grid', async () => {
+        await put(8000, REX, 1)
+        await driver.ack(await driver.claim(L, 7000))
+
+        await put(5000, WILLOW, 6, 5000)
+        expect(await levelAt(10_000, WILLOW)).toBe(6)
+        expect((await driver.readLevels(L)).find((one) => one.dimKey === WILLOW)).toMatchObject({
+          value: 6,
+          writtenAt: 10_000,
+        })
+      })
+
+      it('raises the watermark no further than one past the newest live window', async () => {
+        // a claim on a clock far ahead. The windows between 1000 and 5000
+        // were empty and shipped nothing, so a write for one keeps it
+        await incr(1000, WILLOW)
+        await driver.ack(await driver.claim(M, 5000))
+
+        await incr(3000, WILLOW)
+        await incr(500, WILLOW)
+        expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: 2000, dimKey: WILLOW, value: 1 },
+          { bucketTs: 3000, dimKey: WILLOW, value: 1 },
+        ])
+      })
+
+      it('leaves the watermark where it was for a claim that found nothing', async () => {
         await driver.ack(await driver.claim(M, 5000))
         await incr(1000, WILLOW)
         expect(await driver.readBuckets({ metric: M })).toEqual([
-          { bucketTs: 5000, dimKey: WILLOW, value: 1 },
+          { bucketTs: 1000, dimKey: WILLOW, value: 1 },
         ])
       })
 
       it('never lowers the watermark', async () => {
+        await incr(6000, REX)
         await driver.ack(await driver.claim(M, 5000))
         await driver.ack(await driver.claim(M, 2000))
         await incr(3000, WILLOW)
@@ -815,9 +943,54 @@ export function describeDriverContract(name: string, options: DriverContractOpti
       })
 
       it('keeps metrics apart', async () => {
+        await incr(5000, WILLOW)
         await driver.ack(await driver.claim(M, 5000))
         await obs(1000, WILLOW, 1)
         expect((await driver.readBuckets({ metric: G }))[0]?.bucketTs).toBe(1000)
+      })
+    })
+
+    describe('landing', () => {
+      it('names the window itself before any claim', async () => {
+        if (!driver.landing) return
+        expect(await landing(M, 1000)).toBe(1000)
+      })
+
+      it('names the window itself at or past the watermark', async () => {
+        if (!driver.landing) return
+        await incr(8000, REX)
+        await driver.ack(await driver.claim(M, 7000))
+        expect(await landing(M, 7000)).toBe(7000)
+        expect(await landing(M, 9000)).toBe(9000)
+      })
+
+      it('names the first window of the resolution past the watermark', async () => {
+        if (!driver.landing) return
+        await incr(8000, REX)
+        await driver.ack(await driver.claim(M, 7000))
+        expect(await landing(M, 1000)).toBe(7000)
+        expect(await landing(M, 5000, 5000)).toBe(10_000)
+        expect(await landing(M, 0, 7000)).toBe(7000)
+      })
+
+      it('names the window a write aimed there lands in', async () => {
+        if (!driver.landing) return
+        await incr(1000, WILLOW)
+        await driver.ack(await driver.claim(M, 9000))
+        const at = await landing(M, 0, 3000)
+
+        await incr(0, WILLOW, 1, 3000)
+        expect(at).toBe(3000)
+        expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: at, dimKey: WILLOW, value: 1 },
+        ])
+      })
+
+      it('keeps metrics apart', async () => {
+        if (!driver.landing) return
+        await incr(8000, REX)
+        await driver.ack(await driver.claim(M, 7000))
+        expect(await landing(G, 1000)).toBe(1000)
       })
     })
 
@@ -1049,6 +1222,35 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         const second = await driver.claim(M, 3000)
         expect(first.buckets).toHaveLength(2)
         expect(second.buckets).toHaveLength(0)
+      })
+
+      it('takes the windows at or past aheadFrom as well', async () => {
+        await incr(5000, WILLOW, 4)
+        const claim = await driver.claim(M, 2000, 4000)
+        expect(claim.buckets.map((b) => b.bucketTs)).toEqual([1000, 5000])
+        expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: 2000, dimKey: WILLOW, value: 2 },
+          { bucketTs: 3000, dimKey: REX, value: 3 },
+        ])
+      })
+
+      it('raises the watermark past the newest window it took ahead', async () => {
+        await incr(5000, WILLOW, 4)
+        await driver.ack(await driver.claim(M, 2000, 4000))
+
+        // below the watermark of 5001, so it lands on the window after 5000
+        await incr(3000, REX)
+        expect(await driver.readBuckets({ metric: M })).toEqual([
+          { bucketTs: 2000, dimKey: WILLOW, value: 2 },
+          { bucketTs: 3000, dimKey: REX, value: 3 },
+          { bucketTs: 6000, dimKey: REX, value: 1 },
+        ])
+      })
+
+      it('takes each window once when aheadFrom is below the watermark', async () => {
+        const claim = await driver.claim(M, 2000, 1000)
+        expect(claim.buckets.map((b) => b.bucketTs)).toEqual([1000, 2000, 3000])
+        expect(await driver.readBuckets({ metric: M })).toEqual([])
       })
 
       it('returns an empty claim rather than null when nothing qualifies', async () => {

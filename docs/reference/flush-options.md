@@ -92,6 +92,14 @@ those windows, and that write is moved forward into a window that has not
 shipped rather than lost
 ([Buckets and time](/guide/buckets-and-time#a-write-that-misses-its-window)).
 
+On a driver that is not durable, such as `memory()`, a final flush also claims
+every window ahead of the clock, and leaves out only the window the clock is in.
+Those windows hold writes made before the clock stepped back, or writes the
+watermark moved ahead of the clock, and on this driver they would otherwise end
+with the process. A durable driver keeps them for a later flush, and the final
+flush leaves them alone, because on shared storage a window ahead of this clock
+may be the window another server is still filling.
+
 Every flush claims again after a claim that came back with exactly
 [`claimLimit`](/primitives/event#claimlimit) records, and stops at the first
 that carries fewer. A final flush goes further and keeps claiming until a claim

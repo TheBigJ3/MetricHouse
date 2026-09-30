@@ -103,7 +103,13 @@ describe('bucketedReader', () => {
     const metric = dogs()
     metric.add({ dogName: 'Willow', park: 'riverside' })
     await driver.observe([
-      { metric: 'dog_poops', bucketTs: 1_788_616_987_000, dimKey: 'Rex|hilltop|\\0', value: 3 },
+      {
+        metric: 'dog_poops',
+        bucketTs: 1_788_616_987_000,
+        resolutionMs: 1000,
+        dimKey: 'Rex|hilltop|\\0',
+        value: 3,
+      },
     ])
     await metric.drain()
 
@@ -115,7 +121,13 @@ describe('bucketedReader', () => {
   it('fails on a key it cannot read with the error building that row gives', async () => {
     const metric = dogs()
     await driver.increment([
-      { metric: 'dog_poops', bucketTs: 1_788_616_987_000, dimKey: 'Rex|hilltop|\\0|x', delta: 1 },
+      {
+        metric: 'dog_poops',
+        bucketTs: 1_788_616_987_000,
+        resolutionMs: 1000,
+        dimKey: 'Rex|hilltop|\\0|x',
+        delta: 1,
+      },
     ])
 
     await expect(metric.snapshot({ complete: false, dims: { park: 'riverside' } })).rejects.toThrow(
@@ -166,5 +178,101 @@ describe('bucketedLifecycle', () => {
       ['immediate', 1],
       ['flush', 2],
     ])
+  })
+
+  /** A one second counter that ships every second, and the values its sink received. */
+  function perSecond(on: Driver = driver) {
+    const shipped: number[] = []
+    const metric = counter('dog_poops', {
+      resolution: '1s',
+      flush: '1s',
+      write: (rows) => {
+        for (const row of rows) shipped.push(row.value)
+      },
+    })
+    metric.bind({ driver: on, now })
+    return { metric, shipped }
+  }
+
+  it('ships the writes made after a flush on a clock two days ahead', async () => {
+    const { metric, shipped } = perSecond()
+    const start = clock
+    metric.add(1)
+    await metric.drain()
+    clock = start + 2 * 86_400_000
+    await metric.flush()
+    expect(shipped).toEqual([1])
+
+    // the clock is corrected, and the metric carries on as normal
+    clock = start + 1000
+    for (let i = 0; i < 60; i++) {
+      metric.add(1)
+      await metric.drain()
+      clock += 1000
+      await metric.flush()
+    }
+
+    // the first write, then every window since but the two still inside grace
+    expect(shipped).toHaveLength(59)
+    expect(shipped.reduce((sum, value) => sum + value, 0)).toBe(59)
+  })
+
+  it('ships in a final flush a write the watermark moved ahead of the clock', async () => {
+    const { metric, shipped } = perSecond()
+    metric.add(1)
+    await metric.drain()
+    clock += 3000
+    await metric.flush()
+    expect(shipped).toEqual([1])
+
+    // an NTP correction steps the clock back four seconds
+    clock -= 4000
+    metric.add(5)
+    await metric.drain()
+
+    const report = await metric.flush({ final: true })
+    expect(report.rows).toBe(1)
+    expect(shipped).toEqual([1, 5])
+  })
+
+  it('ships in a final flush a window the clock stepped back behind', async () => {
+    const { metric, shipped } = perSecond()
+    clock += 5000
+    metric.add(3)
+    await metric.drain()
+    clock -= 60_000
+
+    const report = await metric.flush({ final: true })
+    expect(report.rows).toBe(1)
+    expect(shipped).toEqual([3])
+  })
+
+  it('leaves the window the clock is in out of a final flush', async () => {
+    const { metric, shipped } = perSecond()
+    metric.add(2)
+    clock += 5000
+    metric.add(3)
+    await metric.drain()
+    clock -= 5000
+
+    await metric.flush({ final: true })
+    expect(shipped).toEqual([3])
+    expect((await metric.snapshot({ complete: false })).map((row) => row.value)).toEqual([2])
+  })
+
+  it('leaves windows ahead of the clock in storage that outlives the process', async () => {
+    const durable: Driver = {
+      ...driver,
+      capabilities: { ...driver.capabilities, durable: true },
+    }
+    const { metric, shipped } = perSecond(durable)
+    clock += 5000
+    metric.add(3)
+    await metric.drain()
+    clock -= 60_000
+
+    await metric.flush({ final: true })
+    expect(shipped).toEqual([])
+    expect((await metric.snapshot({ complete: false })).map((row) => row.value)).toEqual([3])
   })
 })

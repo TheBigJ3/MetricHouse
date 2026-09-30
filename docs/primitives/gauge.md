@@ -212,7 +212,8 @@ current(dims: Dims): Promise<GaugeCell | undefined>
 current(): Promise<GaugeCell | undefined>      // no dims declared
 ```
 
-The open window's fold for one series.
+The open window's fold for one series. The open window is the one a write made
+now lands in, as for [`counter.current()`](/primitives/counter#counter-current).
 
 ```ts
 await onlineUsers.current({ region: 'us-east' })

@@ -175,7 +175,13 @@ off the new grid. Flush them first, as
 [Changing a schema with data in storage](/guide/production#changing-a-schema-with-data-in-storage)
 describes. Old rows are fine for any query that groups to something coarser than both, which is
 almost every query, but a chart that reads raw `bucket_ts` values will see the
-granularity change at the point you made the switch.
+granularity change at the point you made the switch. Windows still in storage
+when you switch ship with their old boundaries too. A write for a window the old
+resolution already shipped is moved to the first window of the new resolution
+past that point, so every row the metric ships from then on sits on the new
+grid. Going from one minute to five, a write for `12:05` after `12:07` has
+shipped lands in `12:10`
+([A write that misses its window](#a-write-that-misses-its-window)).
 
 ## Where the boundaries are
 
@@ -389,17 +395,51 @@ grace was too short, or the server that made it has a clock running behind. That
 write is moved forward into the oldest window that has not shipped yet, and it
 ships with that window.
 
+The driver keeps track of this with a **watermark** per metric: every window
+below it has been claimed at least once. A write aimed below the watermark lands
+on the first window of the metric's own resolution at or past it. The watermark
+is a timestamp and may fall between two of those windows, for instance when the
+resolution has changed since the flush that set it, and the write still lands on
+a window the metric's rows can name.
+
 The total stays exact, and every row id still ships with one final value. The
 cost is that the write is counted a window or two later than it happened. A
 table that treats `id` as unique handles this with no special work, whether it
 keeps the first row per id or the newest.
 
+A flush raises the watermark to the point it claimed up to, but no further than
+the newest window that held any data when it claimed. Windows beyond that one were
+empty, so nothing shipped for them, and a write that arrives for one of them
+later keeps its own window. This limit matters when a single flush runs on a
+clock that is far ahead, say by two days. Without it, every write for the next
+two days would be moved into one window, which no flush could claim until the
+clock caught up.
+
 The same rule has a consequence when a server's clock runs ahead. A flusher on
 that server claims windows that are still open everywhere else, and the writes
 of correctly clocked servers for those windows move forward to the fast
-server's idea of now. Nothing is lost, and totals stay exact, but those writes
-land in windows up to the size of the skew ahead of their own. Keep your servers
-on NTP.
+server's idea of now. Totals stay exact, but those writes land in windows up to
+the size of the skew ahead of their own. Keep your servers on NTP.
+
+A clock that steps backwards, for instance after an NTP correction, can leave
+the watermark ahead of the clock. A write made then is moved to the first window
+past the watermark, which is ahead of the clock as well. Here is what happens to
+it:
+
+- `current()` reads the window a write made now lands in, so the moved write
+  counts in the open total.
+- `snapshot({ complete: false })` includes it. A complete snapshot leaves it
+  out, the same way it leaves out the open window.
+- An ordinary flush ships it once the clock has passed the end of that window
+  plus grace, like any other window.
+- A [final flush](/reference/flush-options#final) on a driver whose storage
+  ends with the process, such as `memory()`, also claims every window ahead of
+  the clock, and leaves only the window the clock is in. So `house.stop()`
+  ships these writes rather than losing them. The same applies to a write made
+  before the clock stepped back, whose window is now ahead of the clock too.
+- On a driver whose storage outlives the process, such as `ioredis()`, a final
+  flush leaves them in storage. The first flush whose clock has passed them
+  ships them, from this process after a restart or from any other process.
 
 ## Flush is a minimum, not a schedule
 

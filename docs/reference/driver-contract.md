@@ -38,7 +38,7 @@ export function myDriver(): Driver {
 
     // These return a BucketClaim, a RecordClaim and a RecoveryReport. The
     // sections below say what each one holds.
-    async claim(metric, upToBucketTs) { throw new Error('not implemented') },
+    async claim(metric, upToBucketTs, aheadFrom) { throw new Error('not implemented') },
     async claimRecords(metric, limit) { throw new Error('not implemented') },
     async ack(claim) {},
     async release(claim) {},
@@ -117,7 +117,7 @@ keys apart.
 
 ```ts
 increment(ops: readonly IncrOp[]): Promise<void>
-// IncrOp: { metric, bucketTs, dimKey, delta, integer? }
+// IncrOp: { metric, bucketTs, resolutionMs, dimKey, delta, integer? }
 ```
 
 Add `delta` to the cell at that metric, window and series. Create the cell if it
@@ -148,8 +148,12 @@ with more than 1000 operations for one window is split into several script
 calls, each applied or refused on its own. Every metric writes one operation
 per call, so this only shows through the driver itself.
 
-A write aimed below the claimed watermark lands at the watermark instead. See
-[claim](#claim).
+A write aimed below the claimed watermark lands on the first window of its own
+`resolutionMs` at or past the watermark instead. See [claim](#claim). Every
+operation carries its metric's resolution for this reason alone: the watermark
+can sit between two windows of the metric's grid, after a claim that stopped
+short of the flush's cutoff or one made under an older resolution, and a write
+landing on it as it is would start a window no row of this metric can name.
 
 One round trip per call, not per operation. An empty array does nothing.
 
@@ -157,7 +161,7 @@ One round trip per call, not per operation. An empty array does nothing.
 
 ```ts
 observe(ops: readonly GaugeOp[]): Promise<void>
-// GaugeOp: { metric, bucketTs, dimKey, value }
+// GaugeOp: { metric, bucketTs, resolutionMs, dimKey, value }
 ```
 
 Fold `value` into the cell:
@@ -175,15 +179,15 @@ be atomic, or two writers lose observations. The Redis driver uses a Lua script
 for exactly this.
 
 Refuse an observation whose `sum` would not be a finite number, as `increment`
-does, the first one into an empty cell included. Move it to the watermark the
-same way when it is aimed below it, and fold a batch in the order it was given,
+does, the first one into an empty cell included. Move it past the watermark
+the same way when it is aimed below it, and fold a batch in the order it was given,
 because `last` is whichever observation came last.
 
 ### setLevel
 
 ```ts
 setLevel(ops: readonly LevelOp[]): Promise<void>
-// LevelOp: { metric, bucketTs, dimKey, value, mode, integer? }
+// LevelOp: { metric, bucketTs, resolutionMs, dimKey, value, mode, integer? }
 // mode: 'set' | 'add' | 'hold'
 ```
 
@@ -262,8 +266,9 @@ Getting these wrong is easy and shows up as a bug nobody notices for a while:
 it, or an `inc` from one process and a `dec` from another leaving every carried
 window one off.
 
-A `set` or an `add` aimed below the claimed watermark lands at the watermark,
-and the rule above uses the window it landed in. A `hold` aimed below it writes
+A `set` or an `add` aimed below the claimed watermark lands on the first window
+of its resolution at or past the watermark, as an increment does, and the rule
+above uses the window it landed in. A `hold` aimed below it writes
 no cell, because a claim has already taken that window, and still moves
 `heldThrough`. A `hold` for a window before `heldThrough` changes neither
 `heldThrough` nor `carried`: it comes from a flusher running behind, and
@@ -397,11 +402,13 @@ it. `readPending` still returns only unclaimed records.
 
 ## Optional reads
 
-Two methods a driver may leave out. Each answers a question a metric could
-also answer from the required reads, by fetching everything and picking out
-what it needs. A driver on remote storage adds them so that the answer crosses
-the wire instead of the data. When a driver has neither, every result is the
-same, only slower on a metric with many series.
+Three methods a driver may leave out. The first two answer a question a
+metric could also answer from the required reads, by fetching everything and
+picking out what it needs. A driver on remote storage adds them so that the
+answer crosses the wire instead of the data. When a driver has neither, every
+result is the same, only slower on a metric with many series. The third,
+`landing`, is what lets `current()` find a write the watermark moved ahead of
+the clock.
 
 ```ts
 export function myDriver(): Driver {
@@ -409,12 +416,13 @@ export function myDriver(): Driver {
     // ...the fourteen methods above, then, if storage can do better:
     async readLevel(metric, dimKey) { return undefined },
     async sumBuckets(query) { return undefined },
+    async landing(metric, bucketTs, resolutionMs) { return bucketTs },
   }
 }
 ```
 
-Both follow the ordering rule of [readBuckets](#readbuckets): they see every
-write the same driver was handed before them.
+All three follow the ordering rule of [readBuckets](#readbuckets): they see
+every write the same driver was handed before them.
 
 ### readLevel
 
@@ -453,6 +461,23 @@ changes the last bits of their sum.
 
 The Redis driver adds the cells inside a script and sends back one number.
 
+### landing
+
+```ts
+landing?(metric: string, bucketTs: number, resolutionMs: number): Promise<number>
+```
+
+The window a write aimed at `bucketTs` would land in now, by the rule in
+[claim](#claim): `bucketTs` itself when it is at or past the watermark, and
+otherwise the first window of `resolutionMs` at or past the watermark.
+`counter.current()`, `gauge.current()` and `gauge.totals()` read the window this
+names. After a clock steps back behind the watermark, writes land ahead of the
+clock, and reading the window the clock is in would leave them out. A driver
+without this method is read at `bucketTs`.
+
+The Redis driver runs the same Lua function its write scripts use, so a read
+and a write cannot disagree about where a write goes.
+
 ## Claiming
 
 A claim moves data out of the live set and holds it pending a write. Claimed data
@@ -462,10 +487,18 @@ invisibility is what stops two processes shipping the same window.
 ### claim
 
 ```ts
-claim(metric: string, upToBucketTs: number): Promise<BucketClaim>
+claim(metric: string, upToBucketTs: number, aheadFrom?: number): Promise<BucketClaim>
 ```
 
-Move every window **strictly below** `upToBucketTs` into a claim.
+Move every window **strictly below** `upToBucketTs` into a claim. With
+`aheadFrom`, also move every window at or past it. A value below `upToBucketTs`
+counts as `upToBucketTs`, so no window is taken twice.
+
+A [final flush](/reference/flush-options#final) on a driver that is not durable
+passes `aheadFrom` as the start of the window after the one its clock is in.
+Windows ahead of the clock hold writes made before the clock stepped back, or
+writes the watermark moved forward, and on storage that ends with the process
+nothing else will ship them. Every other claim leaves it out.
 
 ```ts
 interface BucketClaim {
@@ -510,15 +543,30 @@ Two hosts whose clocks disagree by a minute would then take back claims that
 are seconds old. The Redis driver reads Redis's `TIME` inside the claim script
 and inside recovery.
 
-**Remember the highest watermark any claim of a metric has used**, even a claim
-that found nothing, and never lower it. From then on, every `increment`,
-`observe`, `set` and `add` aimed at a window below it lands in the watermark
-window instead. A window below the watermark has been claimed already. A write
-that reaches it late, from a slow request or a clock running behind, would
+**Keep a watermark per metric, raised by every claim and never lowered.** From
+then on, every `increment`, `observe`, `set` and `add` aimed at a window below
+it lands on the first window of the operation's `resolutionMs` at or past the
+watermark instead. A window below the watermark has been claimed already. A
+write that reaches it late, from a slow request or a clock running behind, would
 otherwise start a second copy of a window that shipped, with the same row id and
 only the late part of the value, and a sink keeping one row per id would lose
 the rest. On shared storage the raise and the move have to be atomic, or a write
 can slip below the watermark between the two.
+
+A claim raises the watermark to the highest of these, and leaves it alone when
+it is already higher:
+
+- `upToBucketTs`, or one past the newest window any live bucket held when the
+  claim began, whichever is lower;
+- one past the newest window the claim took, which only matters for a window
+  taken through `aheadFrom`.
+
+A claim that finds no live bucket at all leaves the watermark where it was.
+Every window past the newest live one was empty when the claim ran, so nothing
+shipped for it, and a write that arrives for it later is its first copy and
+may keep its own window. Without that limit, one claim on a clock two days
+ahead would move every write of the next two days into a single window that no
+claim could take until the clock caught up.
 
 ### claimRecords
 
@@ -755,7 +803,8 @@ A driver has to satisfy all of these.
   nothing in that window changes. That includes the first write into a cell.
 - With `integer` set, a total or level past `9007199254740991` is refused too.
 - `-0` is stored as `0`.
-- A write aimed below the highest claimed watermark lands at the watermark.
+- A write aimed below the watermark lands on the first window of its own
+  resolution at or past it, on a coarser grid, a finer one, or the same one.
 - A record's fields are stored as a copy, so editing the object passed in
   changes nothing staged.
 - Writing a cell of one kind into a series that holds another throws, whichever
@@ -798,7 +847,11 @@ A driver has to satisfy all of these.
 
 **Claiming**
 
-- A claim takes everything strictly below the watermark.
+- A claim takes everything strictly below the watermark, and with `aheadFrom`
+  everything at or past it too, each window once.
+- A claim raises the watermark no further than one past the newest live
+  window, past every window it took ahead, and not at all when nothing is live.
+- `landing` names the window a write aimed there lands in.
 - Claimed windows are hidden from reads and from a second claim.
 - An empty claim is returned rather than null.
 - Every claim gets a distinct id.
@@ -906,7 +959,7 @@ export function tinyDriver(): Driver {
   // metric -> bucketTs -> dimKey -> cell
   const live = new Map<string, Map<number, Map<string, Cell>>>()
   const inFlight = new Map<string, Claim>()
-  // metric -> the highest watermark a claim has used
+  // metric -> the watermark, below which every window has been claimed
   const claimedUpTo = new Map<string, number>()
   let seq = 0
 
@@ -921,10 +974,15 @@ export function tinyDriver(): Driver {
 
     async increment(ops) {
       for (const op of ops) {
-        // A write aimed at a window a claim already took lands at the
-        // watermark instead, so a late write never reopens a shipped window.
-        const floor = claimedUpTo.get(op.metric) ?? Number.NEGATIVE_INFINITY
-        const bucketTs = Math.max(op.bucketTs, floor)
+        // A write aimed at a window a claim already took lands on the first
+        // window of its own grid at or past the watermark instead, so a late
+        // write never reopens a shipped window.
+        const floor = claimedUpTo.get(op.metric)
+        let bucketTs = op.bucketTs
+        if (floor !== undefined && bucketTs < floor) {
+          const past = floor % op.resolutionMs
+          bucketTs = past === 0 ? floor : floor - past + op.resolutionMs
+        }
 
         const byBucket = bucketsFor(op.metric)
         let series = byBucket.get(bucketTs)
@@ -953,12 +1011,14 @@ export function tinyDriver(): Driver {
       return rows.sort((a, b) => a.bucketTs - b.bucketTs || a.dimKey.localeCompare(b.dimKey))
     },
 
-    async claim(metric, upToBucketTs) {
+    async claim(metric, upToBucketTs, aheadFrom) {
       const byBucket = bucketsFor(metric)
       const buckets = []
+      const ahead = aheadFrom === undefined ? Number.POSITIVE_INFINITY : aheadFrom
+      const newest = Math.max(...byBucket.keys())
 
       for (const [bucketTs, series] of [...byBucket].sort((a, b) => a[0] - b[0])) {
-        if (bucketTs >= upToBucketTs) continue
+        if (bucketTs >= upToBucketTs && bucketTs < ahead) continue
 
         buckets.push({ bucketTs, values: new Map(series) })
 
@@ -966,8 +1026,13 @@ export function tinyDriver(): Driver {
         byBucket.delete(bucketTs)
       }
 
-      // Raised even when nothing was claimed, and never lowered.
-      claimedUpTo.set(metric, Math.max(claimedUpTo.get(metric) ?? upToBucketTs, upToBucketTs))
+      // No further than one past the newest live window, past every window
+      // taken ahead, and never lowered. Nothing live leaves it alone.
+      if (Number.isFinite(newest)) {
+        const taken = buckets.at(-1)?.bucketTs ?? Number.NEGATIVE_INFINITY
+        const raised = Math.max(Math.min(upToBucketTs, newest + 1), taken + 1)
+        claimedUpTo.set(metric, Math.max(claimedUpTo.get(metric) ?? raised, raised))
+      }
 
       const claim: BucketClaim = {
         kind: 'buckets',

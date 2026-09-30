@@ -327,12 +327,13 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
   let claimSeq = 0
 
   /**
-   * metric -> the highest watermark any claim has used.
+   * metric -> its watermark, the highest any claim has raised it to.
    *
    * Every window below it has been claimed at least once, so a write that
-   * arrives for one of them now is late. It is moved to this window, the
-   * oldest that has not shipped, rather than starting a second copy of a
-   * window that already went. See {@link Driver.claim}.
+   * arrives for one of them now is late. It is moved to the first window at
+   * or past the watermark, the oldest that has not shipped, rather than
+   * starting a second copy of a window that already went. See
+   * {@link Driver.claim}.
    */
   const claimedUpTo = new Map<string, number>()
 
@@ -341,10 +342,18 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
   /** What each turn's token is made from. One process, so a count is unique. */
   let turnSeq = 0
 
-  /** Where a write aimed at `bucketTs` actually lands. */
-  function landing(metric: string, bucketTs: number): number {
+  /**
+   * Where a write aimed at `bucketTs` actually lands: the first boundary of
+   * its own grid at or past the watermark, when it is aimed below it. The
+   * watermark may sit on another grid, or between two boundaries, and a
+   * write landing on it as it is would start a window no row of this
+   * resolution can name.
+   */
+  function landing(metric: string, bucketTs: number, resolutionMs: number): number {
     const floor = claimedUpTo.get(metric)
-    return floor !== undefined && bucketTs < floor ? floor : bucketTs
+    if (floor === undefined || bucketTs >= floor) return bucketTs
+    const past = floor % resolutionMs
+    return past === 0 ? floor : floor - past + resolutionMs
   }
 
   /**
@@ -561,16 +570,15 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
    * has left it so far, which is what keeps two ops for one series in one call
    * in order.
    */
-  function applyCells<Op extends { metric: string; bucketTs: number; dimKey: string }>(
-    ops: readonly Op[],
-    fold: (op: Op, existing: Cell | undefined) => Cell,
-  ): void {
+  function applyCells<
+    Op extends { metric: string; bucketTs: number; resolutionMs: number; dimKey: string },
+  >(ops: readonly Op[], fold: (op: Op, existing: Cell | undefined) => Cell): void {
     const planned = new Map<
       string,
       { metric: string; bucketTs: number; dimKey: string; cell: Cell }
     >()
     for (const op of ops) {
-      const bucketTs = landing(op.metric, op.bucketTs)
+      const bucketTs = landing(op.metric, op.bucketTs, op.resolutionMs)
       const slot = `${op.metric}\u0000${bucketTs}\u0000${op.dimKey}`
       const existing = planned.get(slot)?.cell ?? live.get(op.metric)?.get(bucketTs)?.get(op.dimKey)
       planned.set(slot, {
@@ -602,7 +610,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
 
       // a window some claim has already taken is not filled again: that
       // would ship it a second time. The pointer still moves past it
-      const claimed = landing(op.metric, op.bucketTs) !== op.bucketTs
+      const claimed = landing(op.metric, op.bucketTs, op.resolutionMs) !== op.bucketTs
       if (!claimed) {
         const written = bucketsFor(op.metric).get(op.bucketTs)?.get(op.dimKey)
         // a written value always beats a carried one, so a window that
@@ -626,7 +634,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
 
     if (!held && series.size >= maxSeries) throw seriesLimitError(op.metric)
 
-    const bucketTs = landing(op.metric, op.bucketTs)
+    const bucketTs = landing(op.metric, op.bucketTs, op.resolutionMs)
     const byBucket = bucketsFor(op.metric)
     const cellAt = (at: number): number | undefined => {
       const cell = byBucket.get(at)?.get(op.dimKey)
@@ -884,7 +892,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       return stagedHeld(metric)
     },
 
-    async claim(metric: string, upToBucketTs: number): Promise<BucketClaim> {
+    async claim(metric: string, upToBucketTs: number, aheadFrom?: number): Promise<BucketClaim> {
       if (!Number.isFinite(upToBucketTs)) {
         throw new Error(
           `memory driver: ${metric} cannot be claimed up to ${upToBucketTs}, which is not a ` +
@@ -893,10 +901,16 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       }
       const byBucket = live.get(metric)
       const claimed: ClaimedBucket[] = []
+      const ahead = aheadFrom === undefined ? undefined : Math.max(aheadFrom, upToBucketTs)
+      let newest = Number.NEGATIVE_INFINITY
 
       if (byBucket) {
-        const timestamps = [...byBucket.keys()]
-          .filter((bucketTs) => bucketTs < upToBucketTs)
+        const all = [...byBucket.keys()]
+        for (const bucketTs of all) newest = Math.max(newest, bucketTs)
+        const timestamps = all
+          .filter(
+            (bucketTs) => bucketTs < upToBucketTs || (ahead !== undefined && bucketTs >= ahead),
+          )
           .sort((a, b) => a - b)
 
         for (const bucketTs of timestamps) {
@@ -909,9 +923,18 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
         }
       }
 
-      // raised even by a claim that found nothing: the watermark is the promise
-      // that every window below it has been claimed once, whatever was in it
-      claimedUpTo.set(metric, Math.max(claimedUpTo.get(metric) ?? upToBucketTs, upToBucketTs))
+      // no higher than one past the newest live window: every window past it
+      // was empty, shipped nothing, and a write for one of them later is its
+      // first copy. A claim that took windows ahead raises it past the newest
+      // of those, so none of them can start a second copy either
+      if (newest !== Number.NEGATIVE_INFINITY) {
+        const taken = claimed.at(-1)?.bucketTs
+        const raised = Math.max(
+          Math.min(upToBucketTs, newest + 1),
+          taken === undefined ? Number.NEGATIVE_INFINITY : taken + 1,
+        )
+        claimedUpTo.set(metric, Math.max(claimedUpTo.get(metric) ?? raised, raised))
+      }
 
       return hold<BucketClaim>({
         kind: 'buckets',
@@ -1019,6 +1042,10 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       // That is the whole of what `durable: false` costs, said once more here
       // so it cannot be mistaken for an oversight.
       return NOTHING_RECOVERED
+    },
+
+    async landing(metric: string, bucketTs: number, resolutionMs: number): Promise<number> {
+      return landing(metric, bucketTs, resolutionMs)
     },
 
     async takeTurn(metric: string, now: number, gapMs: number): Promise<ShipTurn> {
