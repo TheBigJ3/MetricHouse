@@ -14,6 +14,7 @@ import {
   escapeDimValue,
   isDecodableDimKey,
   isShorterDimKey,
+  reportedOnce,
   unescapeDimValue,
   validateDims,
 } from './dims.js'
@@ -388,6 +389,74 @@ describe('dimKeyReader', () => {
     read('abd')
     read('abc')
     expect(errors).toHaveLength(2)
+  })
+
+  it('reports past 10,000 unreadable keys once, and not again on the next read', () => {
+    const { read, errors } = reader()
+    for (let i = 0; i < 10_001; i++) read(`x${i}`)
+    expect(errors).toHaveLength(10_001)
+    expect(errors.at(-1)).toBe(
+      'orders: more than 10,000 stored series keys cannot be read under the current dims. Each ' +
+        "ships with the stored text as each unreadable dim's value, and no more are reported",
+    )
+    for (let i = 0; i < 10_002; i++) read(`x${i}`)
+    expect(errors).toHaveLength(10_001)
+  })
+})
+
+describe('reportedOnce', () => {
+  function tracked(cap: number) {
+    let overflows = 0
+    const reported = reportedOnce(cap, () => {
+      overflows += 1
+    })
+    return { reported, overflows: () => overflows }
+  }
+
+  it('says to report an id the first time only', () => {
+    const { reported } = tracked(3)
+    expect(reported.first('a')).toBe(true)
+    expect(reported.first('a')).toBe(false)
+    expect(reported.first('b')).toBe(true)
+  })
+
+  it('keeps exactly as many ids as the cap without overflowing', () => {
+    const { reported, overflows } = tracked(2)
+    expect([reported.first('a'), reported.first('b')]).toEqual([true, true])
+    expect(overflows()).toBe(0)
+  })
+
+  it('overflows once past the cap, and keeps what it holds rather than evicting', () => {
+    const { reported, overflows } = tracked(2)
+    reported.first('a')
+    reported.first('b')
+    expect([reported.first('c'), reported.first('d'), reported.first('c')]).toEqual([
+      false,
+      false,
+      false,
+    ])
+    expect(overflows()).toBe(1)
+    expect([reported.first('a'), reported.first('b')]).toEqual([false, false])
+  })
+
+  it('takes new ids again once forgetting brings it below the cap, and overflows again when full', () => {
+    const { reported, overflows } = tracked(2)
+    reported.first('a')
+    reported.first('b')
+    reported.first('c')
+    reported.forget('a')
+    expect(reported.first('c')).toBe(true)
+    expect(reported.first('d')).toBe(false)
+    expect(overflows()).toBe(2)
+  })
+
+  it('stays silent after forgetting an id it never held while still at the cap', () => {
+    const { reported, overflows } = tracked(1)
+    reported.first('a')
+    reported.first('b')
+    reported.forget('z')
+    expect(reported.first('c')).toBe(false)
+    expect(overflows()).toBe(1)
   })
 })
 

@@ -292,11 +292,29 @@ const house = createHouse({
 - A broken `derive` on an event, or a broken `record` pairing on a timer.
 - An `onWarn` that threw while the house registered a metric. The metric is
   registered anyway.
+- A stored series key the current dims cannot read, once per key, as
+  [Keys the declaration cannot read](/reference/dims#keys-the-declaration-cannot-read)
+  describes. The series ships as stored.
+- A staged record the current fields cannot read, once per record, as
+  [Records staged under an earlier declaration](/primitives/event#records-staged-under-an-earlier-declaration)
+  describes. The record ships as stored.
+- A locally staged event that could not ask the driver for records an earlier
+  `stage: 'driver'` declaration left there, from `pending()` or a scheduled
+  flush. A `flush()` you call returns it as `recoveryError` instead, as the
+  [event page](/primitives/event#stage) sets out.
 
-Without a handler these become unhandled promise rejections. That is noisy, and
-deliberately better than a failure disappearing quietly. A handler that throws
-is raised the same way, and neither case stops `drain()` or `stop()` from
-waiting for the rest.
+Without a handler these become unhandled promise rejections, except the last
+three. That is noisy, and deliberately better than a failure disappearing
+quietly. A handler that throws is raised the same way, and neither case stops
+`drain()` or `stop()` from waiting for the rest.
+
+The last three are dropped without a handler, because each is something the
+library found on its own schedule, or while a caller read data, and already
+copes with: the row ships as stored, or the local buffer ships and the driver
+is asked again an interval later. Nothing was lost, and an unhandled rejection
+would end a Node process that set no `onError`. A `flush()` you call still
+returns the driver failure in its report, so a caller without a handler can
+see it there.
 
 `onWarn` receives startup warnings about your setup, and there are three kinds:
 

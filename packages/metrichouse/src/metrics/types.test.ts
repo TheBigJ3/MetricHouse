@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { pendingWrites } from './types.js'
+import { forHandlerOnly, pendingWrites, reportError } from './types.js'
 
 /** A promise and the functions that settle it, for deciding when a write lands. */
 function deferred() {
@@ -105,5 +105,41 @@ describe('pendingWrites', () => {
     second.resolve()
     await draining
     expect(drained).toBe(true)
+  })
+})
+
+describe('reportError', () => {
+  /** What `work` raised as unhandled rejections, with vitest's own listener stepped aside. */
+  async function raisedDuring(work: () => void): Promise<unknown[]> {
+    const theirs = process.listeners('unhandledRejection')
+    process.removeAllListeners('unhandledRejection')
+    const raised: unknown[] = []
+    const mine = (reason: unknown) => raised.push(reason)
+    process.on('unhandledRejection', mine)
+    try {
+      work()
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    } finally {
+      process.off('unhandledRejection', mine)
+      for (const listener of theirs) process.on('unhandledRejection', listener)
+    }
+    return raised
+  }
+
+  it('raises a failure as an unhandled rejection when there is no onError', async () => {
+    const boom = new Error('boom')
+    expect(await raisedDuring(() => reportError(undefined, boom, { metric: 'm' }))).toEqual([boom])
+  })
+
+  it('drops a failure marked for a handler only when there is no onError', async () => {
+    const quiet = forHandlerOnly(new Error('quiet'))
+    expect(await raisedDuring(() => reportError(undefined, quiet, { metric: 'm' }))).toEqual([])
+  })
+
+  it('hands a failure marked for a handler only to onError when there is one', () => {
+    const quiet = forHandlerOnly(new Error('quiet'))
+    const heard: [unknown, string][] = []
+    reportError((error, { metric }) => heard.push([error, metric]), quiet, { metric: 'm' })
+    expect(heard).toEqual([[quiet, 'm']])
   })
 })

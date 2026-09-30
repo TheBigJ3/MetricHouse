@@ -32,7 +32,14 @@ import {
   type SnapshotOptions,
 } from '../runtime/live.js'
 import { shipClaim } from '../runtime/ship.js'
-import { applyDimDefaults, assertShapeNames, encodeDimKey, validateDims } from '../schema/dims.js'
+import {
+  applyDimDefaults,
+  assertShapeNames,
+  encodeDimKey,
+  REPORTED_CAP,
+  reportedOnce,
+  validateDims,
+} from '../schema/dims.js'
 import {
   assertValue,
   type FieldType,
@@ -59,6 +66,7 @@ import type {
 import {
   assertMetricName,
   assertSink,
+  forHandlerOnly,
   isCounter,
   pendingWrites,
   reportError,
@@ -335,12 +343,6 @@ const IMMEDIATE_CLAIM_CAP = 100
 const DRIVER_CHECK_MS = 5_000
 
 /**
- * How many unreadable records an event remembers having reported. Past it
- * the oldest is forgotten, and would be reported again if read again.
- */
-const REPORTED_CAP = 10_000
-
-/**
  * A claim of the local buffer, with the records it took from there and, when
  * it carries some, the driver's claim of records an earlier `stage: 'driver'`
  * declaration left behind.
@@ -526,9 +528,19 @@ export function stagedMetric<
 
   /**
    * The ids of staged records reported as unreadable under the fields as
-   * declared now, so each is reported once however often it is read.
+   * declared now, so each is reported once however often it is read. Past
+   * {@link REPORTED_CAP} of them, one report says so and the rest go
+   * unreported until records it holds have shipped.
    */
-  const reportedUnreadable = new Set<string>()
+  const reportedUnreadable = reportedOnce(REPORTED_CAP, () =>
+    reportToHandler(
+      new Error(
+        `${name}: more than ${REPORTED_CAP.toLocaleString('en-US')} staged records do not fit ` +
+          'the fields as declared now. Each ships as stored, and no more are reported until ' +
+          'some of them have shipped',
+      ),
+    ),
+  )
 
   /** One failure count for flush, batch and immediate sends alike. */
   const attempts = createAttempts()
@@ -605,6 +617,16 @@ export function stagedMetric<
    */
   function reportDetached(error: unknown): void {
     reportError(binding?.onError, error, { metric: name })
+  }
+
+  /**
+   * Report news only a handler should hear: something this event already
+   * copes with, found on its own schedule or while a caller read records.
+   * With no `onError` it is dropped, since raising it would end a Node
+   * process that set none, over something that lost nothing.
+   */
+  function reportToHandler(error: unknown): void {
+    if (binding?.onError) reportDetached(error)
   }
 
   /** Hold a detached write for `drain()`, reporting a failure as {@link reportDetached} does. */
@@ -1145,7 +1167,7 @@ export function stagedMetric<
       (late) => {
         const driver = activeDriver()
         const settling = late.records.length > 0 ? driver.release(late) : driver.ack(late)
-        settling.catch(reportDetached)
+        settling.catch(reportToHandler)
       },
     )
     if (claim === undefined || claim.records.length > 0) return claim
@@ -1188,16 +1210,18 @@ export function stagedMetric<
    * Local staging only: one call to the driver about records an earlier
    * declaration left there, waited for at most {@link DRIVER_CHECK_MS}.
    *
-   * A call that fails or does not answer in time is reported and answers
-   * `undefined`, and the driver counts as holding nothing until a flush
-   * interval has passed. Records this process holds do not depend on the
-   * driver, so a driver that is down must not fail their flush, or hold up
-   * `pending()` and `stop()`. `late` receives an answer that arrives after
-   * the wait gave up.
+   * A call that fails or does not answer in time answers `undefined`, and
+   * the driver counts as holding nothing until a flush interval has passed.
+   * Records this process holds do not depend on the driver, so a driver that
+   * is down must not fail their flush, or hold up `pending()` and `stop()`.
+   * The failure goes to `failed`, which by default reports it to `onError`
+   * and drops it when there is none. `late` receives an answer that arrives
+   * after the wait gave up.
    */
   async function askDriver<T>(
     ask: (driver: Driver) => Promise<T>,
     late?: (answer: T) => void,
+    failed: (error: Error) => void = reportToHandler,
   ): Promise<T | undefined> {
     const waitMs = Math.min(DRIVER_CHECK_MS, effectiveFlushMs())
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -1215,7 +1239,7 @@ export function stagedMetric<
       if (gaveUp && late !== undefined) answer.then(late, () => {})
       driverClearAt = clockNow()
       const reason = error instanceof Error ? error.message : String(error)
-      reportDetached(
+      failed(
         new Error(
           `${name}: could not ask the driver for records an earlier stage: 'driver' ` +
             `declaration left there, so this process looks again in ${effectiveFlushMs()}ms. ` +
@@ -1343,16 +1367,10 @@ export function stagedMetric<
    * record every few seconds until it ships.
    */
   function reportUnreadable(id: string, problems: readonly string[]): void {
-    if (reportedUnreadable.has(id)) return
-    if (reportedUnreadable.size >= REPORTED_CAP) {
-      // the oldest, since a Set iterates in insertion order
-      for (const oldest of reportedUnreadable) {
-        reportedUnreadable.delete(oldest)
-        break
-      }
-    }
-    reportedUnreadable.add(id)
-    reportDetached(
+    // the record ships as stored all the same, so with no handler there is
+    // nobody to tell, and nothing to remember
+    if (!binding?.onError || !reportedUnreadable.first(id)) return
+    reportToHandler(
       new Error(
         `${name}: staged record ${id} does not fit the fields as declared now, and ships as ` +
           `stored. ${problems.join('. ')}`,
@@ -1498,9 +1516,23 @@ export function stagedMetric<
       // declaration left there, abandoned by a flusher that died. Only while
       // the driver may still hold some, and never failing or holding up the
       // flush of what this process holds
+      //
+      // A driver that cannot be asked fails this pass alone, so the flush
+      // returns it as `recoveryError` and still ships the local buffer. A
+      // scheduled flush hands that to `onError`, and drops it when there is
+      // none, since the next interval asks again and nothing was lost
       if (stage === 'local') {
         if (!driverMayHold()) return NOTHING_RECOVERED
-        return (await askDriver((driver) => driver.recover(name))) ?? NOTHING_RECOVERED
+        let failure: Error | undefined
+        const pass = await askDriver(
+          (driver) => driver.recover(name),
+          undefined,
+          (error) => {
+            failure = error
+          },
+        )
+        if (failure !== undefined) throw forHandlerOnly(failure)
+        return pass ?? NOTHING_RECOVERED
       }
       return activeDriver().recover(name)
     },
@@ -1546,7 +1578,7 @@ export function stagedMetric<
       if (claim.records.length > 0) failedAt = undefined
       // shipped, so none of these can be read again
       if (reportedUnreadable.size > 0) {
-        for (const record of claim.records) reportedUnreadable.delete(record.id)
+        for (const record of claim.records) reportedUnreadable.forget(record.id)
       }
       if (isLocalClaim(claim)) {
         const { leftover } = settleLocal(claim)

@@ -67,12 +67,42 @@ export function claimWatermark(
   return closedUpTo(resolutionMs, nowMs, options.final ? 0 : graceMs())
 }
 
+/** The stored key of each row a merging snapshot built, see {@link withSeries}. */
+const storedSeries = new WeakMap<Row, string>()
+
 /**
- * Which series a materialized row belongs to: its dim values in declared
- * order, as one string a Map or a Set can key on.
+ * `row`, remembered as belonging to the series stored under `dimKey`, for
+ * {@link seriesKey} to find when a snapshot merges it with others.
+ */
+export function withSeries(row: Row, dimKey: string): Row {
+  storedSeries.set(row, dimKey)
+  return row
+}
+
+/**
+ * Does a snapshot with these options merge rows? Only then does
+ * {@link seriesKey} run, so only then are rows given their stored key, which
+ * costs a map entry per row.
+ */
+export function snapshotMerges(options: SnapshotOptions): boolean {
+  return (
+    (options.rollup !== undefined && options.rollup !== 'none') || options.groupBy !== undefined
+  )
+}
+
+/**
+ * Which series a materialized row belongs to, as one string a Map or a Set
+ * can key on: its stored key, for a row a snapshot built.
+ *
+ * The stored key and not the dim values, because two series can read the
+ * same under the current dims. A key stored under an earlier declaration
+ * comes back with its values as stored, and one with a segment the current
+ * dims have no dim for comes back without it, so its values can match those
+ * of a series written since. A row with no stored key recorded falls back to
+ * its dim values in declared order.
  */
 export function seriesKey(dimNames: readonly string[], row: Row): string {
-  return JSON.stringify(dimNames.map((dim) => row[dim]))
+  return storedSeries.get(row) ?? JSON.stringify(dimNames.map((dim) => row[dim]))
 }
 
 /**
@@ -329,6 +359,8 @@ export interface BucketedReaderOptions {
  */
 interface BucketedReaderInternals extends BucketedReaderOptions {
   readonly assertCell?: (cell: Cell) => void
+  /** True when `mergeValues` tells series apart with {@link seriesKey}. */
+  readonly mergesBySeries?: boolean
 }
 
 /**
@@ -346,8 +378,18 @@ interface BucketedReaderInternals extends BucketedReaderOptions {
 export function bucketedReader<D extends Shape, V>(
   options: BucketedReaderInternals,
 ): BucketedReader<D, V> {
-  const { name, resolutionMs, dims, driver, now, materialize, mergeValues, assertCell, columns } =
-    options
+  const {
+    name,
+    resolutionMs,
+    dims,
+    driver,
+    now,
+    materialize,
+    mergeValues,
+    assertCell,
+    columns,
+    mergesBySeries,
+  } = options
   const decodeKey = dimKeyDecoder(dims)
 
   /**
@@ -361,7 +403,11 @@ export function bucketedReader<D extends Shape, V>(
    * row whose key cannot be read is built anyway, so the first bad row throws
    * exactly what it threw before.
    */
-  function built(live: readonly BucketRow[], filter: object | undefined): BucketedRow[] {
+  function built(
+    live: readonly BucketRow[],
+    filter: object | undefined,
+    keyed: boolean,
+  ): BucketedRow[] {
     const wanted = filter !== undefined && filter !== null ? Object.entries(filter) : undefined
     const out: BucketedRow[] = []
     for (const one of live) {
@@ -380,7 +426,8 @@ export function bucketedReader<D extends Shape, V>(
           continue
         }
       }
-      out.push({ bucketTs: one.bucketTs, row: materialize(one.bucketTs, one.dimKey, one.value) })
+      const row = materialize(one.bucketTs, one.dimKey, one.value)
+      out.push({ bucketTs: one.bucketTs, row: keyed ? withSeries(row, one.dimKey) : row })
     }
     return out
   }
@@ -396,7 +443,8 @@ export function bucketedReader<D extends Shape, V>(
 
       const live = await driver().readBuckets({ metric: name, ...range })
 
-      return applySnapshot(built(live, snapshotOptions.dims), snapshotOptions, {
+      const keyed = mergesBySeries === true && snapshotMerges(snapshotOptions)
+      return applySnapshot(built(live, snapshotOptions.dims, keyed), snapshotOptions, {
         metric: name,
         dims,
         resolutionMs,

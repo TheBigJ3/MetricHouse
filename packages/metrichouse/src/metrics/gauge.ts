@@ -374,6 +374,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       mergeValues,
       columns: () => liveColumns(self.rowShape()),
       assertCell: asFold,
+      mergesBySeries: true,
     }),
 
     ...metricFlush({

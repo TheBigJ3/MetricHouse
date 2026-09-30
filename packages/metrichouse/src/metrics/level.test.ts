@@ -842,6 +842,30 @@ describe('snapshot', () => {
   })
 })
 
+describe('merging series in a snapshot', () => {
+  it('keeps a series stored under an earlier declaration apart from one that reads the same', async () => {
+    const before = level('queue_depth', {
+      dims: { queue: str(), region: str() },
+      resolution: '10s',
+      flush: '10s',
+      write: discard,
+    })
+    before.bind({ driver, now })
+    before.set(5, { queue: 'email', region: 'eu' })
+    await before.drain()
+    before.unbind()
+    const after = bound()
+    after.set(3, EMAIL)
+    await after.drain()
+    clock = at(1)
+
+    const rows = await after.snapshot({ rollup: 'sum' })
+    expect(rows).toHaveLength(1)
+    // the latest of each series, added up: the stored one is not the current one
+    expect(rows[0]).toMatchObject({ queue: 'email', value: 8 })
+  })
+})
+
 describe('a level with no dims', () => {
   const plain = () => {
     const metric = level('in_flight', { resolution: '10s', flush: '10s', write: discard })

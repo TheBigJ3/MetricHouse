@@ -495,9 +495,27 @@ export function isEvent(metric: AnyMetric): metric is Event<Shape> {
   return metric.kind === 'event'
 }
 
+/** Failures {@link reportError} hands to a handler and drops without one. See {@link forHandlerOnly}. */
+const handlerOnly = new WeakSet<object>()
+
+/**
+ * Mark `error` as one only an `onError` should hear. {@link reportError}
+ * drops it when there is no handler, rather than raising it as an unhandled
+ * rejection, which would end a Node process that set none.
+ *
+ * For news about something the library does on its own schedule and already
+ * copes with, such as a driver it could not ask about records an earlier
+ * declaration left there. A failure that loses data is never marked.
+ */
+export function forHandlerOnly<E extends object>(error: E): E {
+  handlerOnly.add(error)
+  return error
+}
+
 /**
  * Hand a failure that cannot be thrown at a caller to `onError`, or raise it
- * as an unhandled rejection when there is no handler.
+ * as an unhandled rejection when there is no handler. One marked
+ * {@link forHandlerOnly} is dropped instead when there is no handler.
  *
  * Never throws, so the promise it runs in never rejects. `drain()` waits on
  * those promises, and one that rejected would end the wait before the other
@@ -510,6 +528,7 @@ export function reportError(
   context: { metric: string },
 ): void {
   let raised = error
+  if (!onError && typeof error === 'object' && error !== null && handlerOnly.has(error)) return
   if (onError) {
     try {
       onError(error, context)

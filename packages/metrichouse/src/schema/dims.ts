@@ -573,6 +573,61 @@ function storedDimValues(dims: Shape, key: string): Record<string, unknown> {
 }
 
 /**
+ * How many unreadable stored keys, or staged records, a process remembers
+ * having reported, per metric. See {@link reportedOnce}.
+ */
+export const REPORTED_CAP = 10_000
+
+/** The ids a metric has reported as unreadable. See {@link reportedOnce}. */
+export interface ReportedOnce {
+  /** How many ids it holds. */
+  readonly size: number
+  /**
+   * True the first time `id` is seen, when it should be reported. False for
+   * an id already held, and for every new id while it holds `cap`.
+   */
+  first(id: string): boolean
+  /** Drop `id`, which will not be read again. */
+  forget(id: string): void
+}
+
+/**
+ * The ids of unreadable keys or records already reported, so a snapshot
+ * polled every second does not report the same one again.
+ *
+ * Holds at most `cap`. The first new id past it calls `overflow` once and
+ * is not added, and neither is any after it, until {@link ReportedOnce.forget}
+ * brings it below the cap. Nothing held is evicted to make room: an evicted
+ * id read again would be reported again, and a poll over more than `cap`
+ * unreadable ids would then report every one of them on every read.
+ */
+export function reportedOnce(cap: number, overflow: () => void): ReportedOnce {
+  const held = new Set<string>()
+  let overflowed = false
+
+  return {
+    get size() {
+      return held.size
+    },
+    first(id) {
+      if (held.has(id)) return false
+      if (held.size >= cap) {
+        if (!overflowed) {
+          overflowed = true
+          overflow()
+        }
+        return false
+      }
+      held.add(id)
+      return true
+    },
+    forget(id) {
+      if (held.delete(id) && held.size < cap) overflowed = false
+    },
+  }
+}
+
+/**
  * A decoder that never refuses, for the rows a metric ships and returns.
  *
  * Reads what {@link dimKeyDecoder} reads. For a key it would refuse, because
@@ -580,8 +635,9 @@ function storedDimValues(dims: Shape, key: string): Record<string, unknown> {
  * stored (see {@link storedDimValues}) and hands `report` an error naming the
  * metric, the dim, the stored text and the reason. `report` is called once per
  * key for as long as the decoder lives, so a snapshot polled every second does
- * not repeat itself. The series keeps its id, because the id comes from the
- * key and not from the values.
+ * not repeat itself. Past {@link REPORTED_CAP} keys it is called once more,
+ * saying so, and then no more. The series keeps its id, because the id comes
+ * from the key and not from the values.
  */
 export function dimKeyReader(
   dims: Shape,
@@ -589,14 +645,23 @@ export function dimKeyReader(
   report: (error: Error) => void,
 ): (key: string) => Record<string, unknown> {
   const decode = dimKeyDecoder(dims)
-  const reported = new Set<string>()
+  // a stored key is never shipped away the way a record is, so nothing is
+  // forgotten, and past the cap no key is reported for as long as this lives
+  const reported = reportedOnce(REPORTED_CAP, () =>
+    report(
+      new Error(
+        `${metricName}: more than ${REPORTED_CAP.toLocaleString('en-US')} stored series keys ` +
+          'cannot be read under the current dims. Each ships with the stored text as each ' +
+          "unreadable dim's value, and no more are reported",
+      ),
+    ),
+  )
 
   return (key) => {
     try {
       return decode(key)
     } catch (error) {
-      if (!reported.has(key)) {
-        reported.add(key)
+      if (reported.first(key)) {
         const why = (error as Error).message.replace(/^decodeDimKey: /, '')
         report(
           new Error(

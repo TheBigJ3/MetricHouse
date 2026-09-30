@@ -361,6 +361,31 @@ describe('materialize', () => {
   })
 })
 
+describe('merging series in a snapshot', () => {
+  it('keeps a series stored under an earlier declaration apart from one that reads the same', async () => {
+    const before = gauge('bowl_level', {
+      dims: { bowlId: str(), room: str(), shelf: str() },
+      resolution: '10s',
+      flush: '1m',
+      write: discard,
+    })
+    before.bind({ driver, now })
+    before.set(5, { ...B1, shelf: 'top' })
+    await before.drain()
+    before.unbind()
+    const after = bound()
+    after.set(3, B1)
+    await after.drain()
+    clock += 10_000
+
+    const rows = await after.snapshot({ rollup: 'sum' })
+    expect(rows).toHaveLength(1)
+    // two series hold the newest window, so no one of them is the latest
+    expect(rows[0]).not.toHaveProperty('last')
+    expect(rows[0]).toMatchObject({ bowlId: 'b1', room: 'kitchen', sum: 8, count: 2 })
+  })
+})
+
 describe('rowShape', () => {
   it('is id, bucket_ts, dims, then the declared aggregates', () => {
     expect(

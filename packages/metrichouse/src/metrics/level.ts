@@ -39,7 +39,9 @@ import {
   bucketedLifecycle,
   claimWatermark,
   seriesKey,
+  snapshotMerges,
   storedKeyReader,
+  withSeries,
 } from './bucketed.js'
 import type {
   AnyMetric,
@@ -715,13 +717,16 @@ export function level<D extends Shape = Record<never, never>>(
     }
 
     const from = range.from
+    const keyed = snapshotMerges(options)
     return applySnapshot(
       rows
         .filter((row) => from === undefined || row.bucketTs >= from)
         .sort((a, b) => a.bucketTs - b.bucketTs || (a.dimKey < b.dimKey ? -1 : 1))
         .map((row) => ({
           bucketTs: row.bucketTs,
-          row: materialize(row.bucketTs, row.dimKey, row.cell),
+          row: keyed
+            ? withSeries(materialize(row.bucketTs, row.dimKey, row.cell), row.dimKey)
+            : materialize(row.bucketTs, row.dimKey, row.cell),
         })),
       options,
       {
