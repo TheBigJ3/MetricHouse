@@ -378,21 +378,39 @@ export function level<D extends Shape = Record<never, never>>(
    * as a different whole number that looks safe. A fractional level adds in
    * doubles, and refuses a total past the largest one, which would otherwise
    * come back as Infinity.
+   *
+   * A stored fraction, which a series holds after a `float()` level was
+   * declared as an integer one, cannot be a BigInt. Then the integer level
+   * adds in doubles too, and refuses a total that is not a whole number.
    */
   function sumAcross(values: Iterable<number>, what: string): number {
-    if (isFloat) {
+    const all = [...values]
+    if (isFloat || !all.every(Number.isInteger)) {
       let total = 0
-      for (const value of values) total += value
+      for (const value of all) total += value
       if (!Number.isFinite(total)) {
         throw new Error(
           `${name}: ${what} would be ${total}, which is past the largest number a metric can store`,
+        )
+      }
+      if (isFloat) return total
+      if (!Number.isInteger(total)) {
+        throw new Error(
+          `${name}: ${what} would be ${total}, which is not a whole number. A stored value is a ` +
+            'fraction, which happens when a float level is declared as an integer one',
+        )
+      }
+      if (!Number.isSafeInteger(total)) {
+        throw new Error(
+          `${name}: ${what} would be ${total}, which is past ${Number.MAX_SAFE_INTEGER}, the ` +
+            'largest whole number a double holds exactly',
         )
       }
       return total
     }
 
     let total = 0n
-    for (const value of values) total += BigInt(value)
+    for (const value of all) total += BigInt(value)
     if (total > MAX_SAFE || total < -MAX_SAFE) {
       throw new Error(
         `${name}: ${what} would be ${total}, which is past ${Number.MAX_SAFE_INTEGER}, the ` +

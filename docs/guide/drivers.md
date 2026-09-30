@@ -244,6 +244,46 @@ record waiting until Redis answers, and a `commandTimeout` rejects records that
 Redis usually applied anyway, as
 [a rejected promise](/primitives/event#durability) describes.
 
+### How a level is stored
+
+A [level](/primitives/level) keeps its series in a hash beside its windows,
+`mh:lvl:<metric>`, one field per series:
+
+```
+value|carried|writtenAt|heldThrough
+12|9|1789000270000|1789000260000
+```
+
+That is what the series is at, what the window `heldThrough` names ended at,
+the window of the newest write, and the newest window a flush has carried the
+series through. It is the layout 0.7.0 reads and writes, so the two versions
+can share a namespace.
+
+A carry also needs `carriedFrom`, the window of the newest write at or before
+`heldThrough`, because a [`holdFor`](/primitives/level#holdfor) expiry is
+measured from it. The four fields say it when the newest write is at or before
+`heldThrough`, since it is that write. When the newest write is past
+`heldThrough`, the driver takes it to be `heldThrough`, the latest it can be,
+unless `mh:lvlfrom:<metric>` has an entry for the series:
+
+```
+carriedFrom|heldThrough|carried
+1789000240000|1789000260000|9
+```
+
+The last two parts name the state the entry was worked out against. An entry
+whose pointer or carried value no longer match the series, because a 0.7.0
+process has carried it or written to it since, is ignored. The driver writes
+an entry only when the four fields cannot say `carriedFrom`, and removes it
+once they can, so most series never have one.
+
+The windows themselves are `mh:b:<metric>:<window>` hashes like any metric's,
+with one cell per series. A cell a write put there is `@7`, one a flush carried
+in is `@ 7`, and one written by a write that missed its own window and moved
+forward to the watermark is `@7 `. Lua's `tonumber` and JavaScript's `Number`
+both skip the space, so 0.7.0 reads all three as `7`, and a claim moves the
+mark along with the number.
+
 ### Looking at a running system
 
 The driver exposes two extras beyond the standard contract:
@@ -338,6 +378,16 @@ export const house = createHouse({ driver, schema })
   two keys the first time a process of this version takes or gives back that
   turn. Until then a 0.7.0 process fails every flush of that metric, so run
   this version on at least one process before rolling back to 0.7.0.
+- **0.7.0 reads the levels this version keeps.** Each series is stored in the
+  four fields 0.7.0 reads, and its cells as numbers 0.7.0 reads, as
+  [How a level is stored](#how-a-level-is-stored) describes. Processes of both
+  versions on one namespace ship the same rows one process alone would, a
+  failed flush included. A series that a build between 0.7.0 and this one
+  stored with a fifth field is rewritten in four the next time this version
+  writes or carries it, and a cell such a build marked `@c` ships once its
+  window is claimed. Until then 0.7.0 treats that series as absent and ships
+  such a cell as `NaN`, so run this version through one flush before rolling
+  back to 0.7.0.
 - Between later versions, follow
   [Changing a schema with data in storage](/guide/production#changing-a-schema-with-data-in-storage)
   for a schema change, and the changelog for anything else.

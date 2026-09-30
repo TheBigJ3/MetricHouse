@@ -59,11 +59,20 @@ function mergeCells(older: Cell, newer: Cell): Cell {
   }
 }
 
-/** One level cell of one series, and whether a `hold` wrote it. */
+/** One level cell of one series, and what wrote it. */
 interface LevelCellAt {
   readonly at: number
   readonly value: number
+  /** A `hold` wrote it. */
   readonly carried: boolean
+  /** A write moved forward to the watermark wrote it, and nothing written in this window since. */
+  readonly moved: boolean
+}
+
+/** What a series held just before a window, and the newest write that decided it. */
+interface LevelBefore {
+  readonly value: number
+  readonly lastWrite: number
 }
 
 /**
@@ -83,11 +92,14 @@ interface LevelCellAt {
  *   value before it. It becomes the held value and `carried` only if nothing
  *   newer has been written: a later window with a written cell was written
  *   after this reading was taken. A `set` moved forward to the watermark
- *   that finds a written cell there is older than that cell, and changes
- *   nothing.
+ *   that finds a cell written in that window's own time is older than that
+ *   cell, and changes nothing. One that finds another moved `set` there
+ *   replaces it, since both are older than the window.
  * - A series past `holdFor` is treated as one never seen, so an `add` starts
  *   from zero. Its pointer and `carried` stay, because the windows it owed
- *   before it expired are still owed.
+ *   before it expired are still owed. An `add` measures that from the newest
+ *   write before its own window, so one that arrives late into a stretch
+ *   where the series had expired starts from zero as well.
  * - A write landing before the pointer, with no cell between the two, moves
  *   the pointer back to it. Only the write that began the series can have
  *   put the pointer there, so an `add` starts from zero. An `add` landing
@@ -100,13 +112,15 @@ function planLevelWrite(
   held: LevelSeries | undefined,
   landingCell: LevelCellAt | undefined,
   later: readonly LevelCellAt[],
-  valueBefore: (held: LevelSeries) => number,
+  before: (held: LevelSeries) => LevelBefore,
 ): { cells: LevelCellAt[]; series: LevelSeries } | undefined {
+  const moved = bucketTs !== op.bucketTs
   if (
     op.mode === 'set' &&
-    bucketTs !== op.bucketTs &&
+    moved &&
     landingCell !== undefined &&
-    !landingCell.carried
+    !landingCell.carried &&
+    !landingCell.moved
   ) {
     return undefined
   }
@@ -132,10 +146,24 @@ function planLevelWrite(
   }
 
   if (op.mode === 'add') {
-    const base =
-      landingCell?.value ??
-      (held === undefined || expired || bucketTs < pointer ? 0 : valueBefore(held))
-    const cells: LevelCellAt[] = [{ at: bucketTs, value: base + op.value, carried: false }]
+    let base = landingCell?.value
+    if (base === undefined) {
+      base = 0
+      if (held !== undefined && bucketTs >= pointer) {
+        const start = before(held)
+        const gone = op.holdFor !== undefined && start.lastWrite + op.holdFor < bucketTs
+        if (!gone) base = start.value
+      }
+    }
+    const cells: LevelCellAt[] = [
+      {
+        at: bucketTs,
+        value: base + op.value,
+        carried: false,
+        // a write in this window's own time makes the cell a reading of it
+        moved: moved && (landingCell === undefined || landingCell.carried || landingCell.moved),
+      },
+    ]
     for (const cell of later) cells.push({ ...cell, value: cell.value + op.value })
     const value = (held === undefined || expired ? 0 : held.value) + op.value
     return {
@@ -156,7 +184,7 @@ function planLevelWrite(
   }
 
   const written = later.find((cell) => !cell.carried)
-  const cells: LevelCellAt[] = [{ at: bucketTs, value: op.value, carried: false }]
+  const cells: LevelCellAt[] = [{ at: bucketTs, value: op.value, carried: false, moved }]
   for (const cell of later) {
     if (cell.carried && (written === undefined || cell.at < written.at)) {
       cells.push({ ...cell, value: op.value })
@@ -565,7 +593,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
           'cells, and set is a level op',
       )
     }
-    return { at, value: cell.level, carried: cell.carried === true }
+    return { at, value: cell.level, carried: cell.carried === true, moved: cell.moved === true }
   }
 
   /** One series' level cells strictly between `after` and `before`, ascending. */
@@ -617,7 +645,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     at: number,
     dimKey: string,
     level: number,
-    carried: boolean,
+    mark: 'carried' | 'moved' | undefined,
     undo: (() => void)[],
   ): void {
     const byBucket = bucketsFor(metric)
@@ -625,7 +653,11 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     const previous = byBucket.get(at)?.get(dimKey)
     cellSlot(metric, at, dimKey).set(
       dimKey,
-      carried ? { level: plainZero(level), carried: true } : { level: plainZero(level) },
+      mark === 'carried'
+        ? { level: plainZero(level), carried: true }
+        : mark === 'moved'
+          ? { level: plainZero(level), moved: true }
+          : { level: plainZero(level) },
     )
     undo.push(() => {
       const bucket = byBucket.get(at)
@@ -754,7 +786,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       // passed it, fills it if it is empty, and moves nothing
       if (op.bucketTs < pointer) {
         if (cell === undefined) {
-          putLevelCell(op.metric, op.bucketTs, op.dimKey, op.value, true, undo)
+          putLevelCell(op.metric, op.bucketTs, op.dimKey, op.value, 'carried', undo)
         }
         return
       }
@@ -772,7 +804,7 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       let carried: number
       if (cell === undefined) {
         carried = plainZero(between.at(-1)?.value ?? held.carried)
-        putLevelCell(op.metric, op.bucketTs, op.dimKey, carried, true, undo)
+        putLevelCell(op.metric, op.bucketTs, op.dimKey, carried, 'carried', undo)
       } else {
         carried = cell.value
       }
@@ -806,11 +838,16 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
       held,
       levelCellAt(op.metric, bucketTs, op.dimKey),
       levelCellsBetween(op.metric, op.dimKey, bucketTs, Number.POSITIVE_INFINITY),
-      // the value in effect just before this window: the newest cell between
-      // the pointer and here, or what the pointer carried
-      (one) =>
-        levelCellsBetween(op.metric, op.dimKey, one.heldThrough, bucketTs).at(-1)?.value ??
-        one.carried,
+      // the value in effect just before this window and the write it came
+      // from: the newest cells between the pointer and here, or what the
+      // pointer carried and the write that was
+      (one) => {
+        const between = levelCellsBetween(op.metric, op.dimKey, one.heldThrough, bucketTs)
+        return {
+          value: between.at(-1)?.value ?? one.carried,
+          lastWrite: between.findLast((cell) => !cell.carried)?.at ?? one.carriedFrom,
+        }
+      },
     )
     if (plan === undefined) return
 
@@ -825,7 +862,8 @@ export function memory(options: MemoryDriverOptions = {}): Driver {
     // refuse on the cap, and a held value written before it would name a
     // window that holds nothing
     for (const cell of plan.cells) {
-      putLevelCell(op.metric, cell.at, op.dimKey, cell.value, cell.carried, undo)
+      const mark = cell.carried ? 'carried' : cell.moved ? 'moved' : undefined
+      putLevelCell(op.metric, cell.at, op.dimKey, cell.value, mark, undo)
     }
     putLevelSeries(
       series,

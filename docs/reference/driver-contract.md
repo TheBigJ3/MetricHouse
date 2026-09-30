@@ -90,6 +90,7 @@ interface GaugeCell {
 interface LevelCell {
   level: number
   carried?: true     // written by a hold rather than by a set or an add
+  moved?: true       // written by a set or an add moved forward to the watermark
 }
 ```
 
@@ -97,8 +98,9 @@ A level's value is boxed rather than stored bare so that storage can tell it
 from a counter's scalar. The two are the same digits meaning the opposite thing
 when a released claim has to be merged back: two counter cells for one window
 add, two level cells do not, because a level that read 42 twice still reads 42.
-`carried` marks a cell a flush filled rather than one somebody wrote, which
-[setLevel](#setlevel) needs to know.
+`carried` marks a cell a flush filled rather than one somebody wrote, and
+`moved` a cell only writes that missed their own window have written to, both
+of which [setLevel](#setlevel) needs to know.
 
 The driver never interprets a cell. It stores what a metric wrote and hands it
 back. Deciding which kind it is belongs to the metric, because the metric is the
@@ -207,11 +209,15 @@ memory driver undoes the call's writes when one is refused.
 | `add` | held plus `value`, treating an unseen series as zero | the new held value |
 | `hold` | unchanged | the value in effect just before that window, but only if it has no cell yet |
 
-Storage has to tell the two kinds of level cell apart. A cell a `set` or an
+Storage has to tell three kinds of level cell apart. A cell a `set` or an
 `add` wrote is a reading. A cell a `hold` wrote only repeats the value before
-it, and `readBuckets` hands it back as `{ level, carried: true }`. The Redis
-driver stores a written cell as `@<number>` and a carried one as `@c<number>`,
-and reads a cell stored before the mark existed as written.
+it, and `readBuckets` hands it back as `{ level, carried: true }`. A cell that
+only writes moved forward to the watermark have written to is a reading older
+than its window, and comes back as `{ level, moved: true }`. The Redis driver
+stores the three as `@7`, `@ 7` and `@7 `, a space after the `@` for a carried
+cell and after the number for a moved one, so a 0.7 process reads each as the
+plain number. [How a level is stored](/guide/drivers#how-a-level-is-stored)
+has the whole layout.
 
 A `hold` is what a flush issues for the windows nobody wrote to. It fills its
 window with the value in effect just before it, worked out when the `hold`
@@ -239,7 +245,12 @@ milliseconds, on a `set` or an `add`. A series whose `writtenAt` plus `holdFor`
 is below the landing window has stopped reporting, even though no flush has
 dropped it yet. The write treats it as a series it has never seen, so an `add`
 starts from zero, and leaves `heldThrough`, `carried` and `carriedFrom` alone,
-because the windows it owed before it expired are still owed.
+because the windows it owed before it expired are still owed. An `add` whose
+landing window has no cell measures the same thing from the newest write
+before that window instead: the newest written cell between `heldThrough` and
+it, or `carriedFrom` when there is none. That is what starts an `add` arriving
+late, into a stretch where the series had expired before a newer write revived
+it, from zero rather than from the value it expired at.
 
 Each series also carries three timestamps, all handed to the driver rather
 than read from a clock it owns:
@@ -286,7 +297,7 @@ a later carried cell only repeated the value before the `set`.
 
 "The value in effect just before" is the newest cell between `heldThrough` and
 the landing window, or `carried` when there is none, or `0` for a series the
-driver has never seen or one past `holdFor`. For a first write, `carried` and
+driver has never seen or one past `holdFor` by the landing window. For a first write, `carried` and
 the held value are the new value, and `heldThrough` and `carriedFrom` are the
 landing window.
 
@@ -306,9 +317,12 @@ window one off.
 
 A `set` or an `add` aimed below the claimed watermark lands on the first window
 of its resolution at or past the watermark, as an increment does, and the rule
-above uses the window it landed in. A `set` moved that way that
+above uses the window it landed in. Mark the cell it writes as moved, until a
+write aimed at that window itself writes there. A `set` moved that way that
 finds a written cell in the window it lands in changes nothing at all: that
-cell is a reading taken after it. A `hold` aimed below the watermark writes no
+cell is a reading taken after it. One that finds a moved cell replaces it,
+since both readings missed their windows and the second to arrive is the
+newer. A `hold` aimed below the watermark writes no
 cell, because a claim has already taken that window, still moves
 `heldThrough`, and carries the value it names, since the cells that would say
 otherwise went with the claim. A `hold` for a window before `heldThrough`
@@ -878,7 +892,10 @@ A driver has to satisfy all of these.
   moves `heldThrough` back to it.
 - An `add` to a series past the `holdFor` it names starts from zero.
 - A `set` replaces the carried cells after it, up to the next written one.
-- A `set` moved to the watermark that finds a written cell there changes nothing.
+- A `set` moved to the watermark that finds a written cell there changes nothing,
+  and one that finds a cell only moved writes wrote replaces it.
+- An `add` into an empty window measures `holdFor` from the newest write before
+  that window.
 - Held values survive the claim and the ack that ship their windows.
 - A `set` or `add` in the window `heldThrough` names replaces `carried`.
 - A `hold` into a window that already has a cell carries that cell's value.

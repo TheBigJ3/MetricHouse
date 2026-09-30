@@ -151,7 +151,10 @@ write, so a write to a series past it that is still in storage starts it over
 the same way: an `inc()` starts from zero rather than from the value it expired
 at. The next flush still ships the windows it reported before it expired, then
 nothing for the windows in between, then the new write onwards. The rows are
-the same whether a flush ran during the gap or not.
+the same whether a flush ran during the gap or not. An `inc()` that reaches
+storage late, aimed at a window inside that gap, starts from zero as well: the
+hold is measured from the newest write before the window the `inc()` lands in,
+not from the write that revived the series.
 
 The clock runs from the window the last write landed in, so it rounds to whole
 windows rather than to the millisecond. The last window a series reports is the
@@ -351,6 +354,11 @@ together can pass it. On a fractional level, a total past the largest number a
 double holds, about `1.8e308`, rejects the same way rather than returning
 `Infinity`.
 
+A level declared `value: int()` over series a `float()` level stored can hold
+fractions. Then the series are added as doubles instead, so `1.5` and `0.5`
+total `2`, and a total that is not a whole number rejects with an error that
+says a stored value is a fraction.
+
 Adding is the merge a level can make honestly, because every held value is true
 at the same moment. A [gauge](/primitives/gauge#gauge-totals) drops `last` from
 its totals for the opposite reason.
@@ -488,7 +496,9 @@ Eight consequences worth knowing:
 - **A late write that missed its window moves forward.** A write aimed at a
   window that has already shipped lands in the first window of its own resolution at or
   past the watermark, as on every type. A `set()` moved that way is dropped when that window already holds
-  a reading, because that reading was taken later.
+  a reading taken in that window's own time, because that reading was taken
+  later. When the window holds only a value an earlier late write moved there,
+  both missed their windows, and the `set()` that arrives second replaces it.
 
 ## What it costs
 
