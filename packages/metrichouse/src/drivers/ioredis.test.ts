@@ -15,6 +15,8 @@
 import { randomUUID } from 'node:crypto'
 import { Redis } from 'ioredis'
 import { afterAll, describe, expect, it } from 'vitest'
+import { level } from '../metrics/level.js'
+import { str } from '../schema/types.js'
 import { describeDriverContract } from './contract.js'
 import {
   decodeRecord,
@@ -55,6 +57,7 @@ const client = await probe()
 function survives(ns: string, key: string): boolean {
   return (
     key.startsWith(`${ns}:wm:`) ||
+    key.startsWith(`${ns}:wmown:`) ||
     key.startsWith(`${ns}:eseq:`) ||
     // a writer's record of the writes it has applied, which expires a day
     // after its last write
@@ -244,8 +247,8 @@ describe('ioredis · round trips of one call', () => {
     dimKey: WILLOW,
     delta: 1,
   })
-  /** The window each script was aimed at, after its three keys and the key prefix. */
-  const windows = (sent: (string | number)[][]) => sent.map((args) => args[4])
+  /** The window each script was aimed at, after its four keys and the key prefix. */
+  const windows = (sent: (string | number)[][]) => sent.map((args) => args[5])
 
   it('sends every round trip of a call before a call made after it', async () => {
     const { client, sent } = scriptedClient([])
@@ -300,8 +303,8 @@ describe('ioredis · scripts Redis forgot', () => {
     dimKey: WILLOW,
     delta: 1,
   })
-  /** The window each script was aimed at, after its three keys and the key prefix. */
-  const windows = (sent: (string | number)[][]) => sent.map((args) => args[4])
+  /** The window each script was aimed at, after its four keys and the key prefix. */
+  const windows = (sent: (string | number)[][]) => sent.map((args) => args[5])
   const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
 
   it('resends what Redis forgot for two calls before a call made while the second waited', async () => {
@@ -704,6 +707,298 @@ if (!client) {
 
       await driver.dropLevels(LV, [WILLOW])
       expect(await live.exists(`${ns}:lvl:${LV}`, `${ns}:lvlfrom:${LV}`)).toBe(0)
+
+      await wipe(ns)
+    })
+
+    it('rewrites a five field series in four on a flush that carries nothing', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      const base = 1_788_616_980_000
+      let clock = base
+      const metric = level(LV, {
+        dims: { dog: str() },
+        resolution: '10s',
+        flush: '10s',
+        write: () => {},
+      })
+      metric.bind({ driver, now: () => clock })
+      metric.set(5, { dog: 'Willow' })
+      await metric.drain()
+      const [field] = await live.hkeys(`${ns}:lvl:${LV}`)
+      if (field === undefined) throw new Error('expected the set to store a series')
+      // what a build between 0.7.0 and this one stored, carriedFrom fifth
+      await live.hset(`${ns}:lvl:${LV}`, field, `5|5|${base}|${base}|${base}`)
+
+      // the window has closed, and the series has no window left to carry
+      clock = base + 12_000
+      await metric.flush()
+
+      expect(await live.hget(`${ns}:lvl:${LV}`, field)).toBe(`5|5|${base}|${base}`)
+      expect(await live.exists(`${ns}:lvlfrom:${LV}`)).toBe(0)
+
+      await wipe(ns)
+    })
+
+    it('keeps carriedFrom beside a five field series it rewrites when four fields cannot say it', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.hset(`${ns}:lvl:${LV}`, WILLOW, '7|5|4000|2000|1000')
+
+      expect((await driver.readLevels(LV))[0]?.carriedFrom).toBe(1000)
+      expect(await live.hget(`${ns}:lvl:${LV}`, WILLOW)).toBe('7|5|4000|2000')
+      expect(await live.hget(`${ns}:lvlfrom:${LV}`, WILLOW)).toBe('1000|2000|5')
+
+      await wipe(ns)
+    })
+
+    it('leaves a series alone that another process rewrote between the read and the rewrite', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.hset(`${ns}:lvl:${LV}`, WILLOW, '5|5|1000|2000|1000')
+      // the read sees five fields, and a 0.7 set lands before the rewrite
+      const hgetall = live.hgetall.bind(live)
+      const racing = Object.assign(Object.create(live), {
+        hgetall: async (key: string) => {
+          const read = await hgetall(key)
+          if (key === `${ns}:lvl:${LV}`) await live.hset(key, WILLOW, '9|5|3000|2000')
+          return read
+        },
+      })
+      await ioredis(racing, { namespace: ns }).readLevels(LV)
+
+      expect(await live.hget(`${ns}:lvl:${LV}`, WILLOW)).toBe('9|5|3000|2000')
+      expect(await driver.readLevels(LV)).toHaveLength(1)
+
+      await wipe(ns)
+    })
+
+    it('marks an @c cell the way 0.7 reads it when a claim takes it', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.hset(`${ns}:b:${LV}:2000`, WILLOW, '@c5', 'Rex', '@4')
+      await live.zadd(`${ns}:idx:${LV}`, 2000, '2000')
+
+      const claim = await driver.claim(LV, 3000)
+
+      expect(await live.hgetall(`${ns}:inflight:${claim.id}`)).toEqual({
+        [`2000:${WILLOW}`]: '@ 5',
+        '2000:Rex': '@4',
+      })
+      expect(claim.kind === 'buckets' && claim.buckets).toEqual([
+        {
+          bucketTs: 2000,
+          values: new Map([
+            [WILLOW, { level: 5, carried: true }],
+            ['Rex', { level: 4 }],
+          ]),
+        },
+      ])
+
+      await wipe(ns)
+    })
+
+    it('marks an @c cell the way 0.7 reads it when it puts a claim back', async () => {
+      const ns = fresh()
+      // a claim a build between 0.7.0 and this one took and then died holding
+      const id = `${LV}#1`
+      await live.hset(`${ns}:inflight:${id}`, `2000:${WILLOW}`, '@c5')
+      await live.zadd(`${ns}:claims:${LV}`, 0, id)
+
+      const report = await ioredis(live, { namespace: ns, recoverAfter: 0 }).recover(LV)
+
+      expect(report.buckets).toBe(1)
+      expect(await live.hgetall(`${ns}:b:${LV}:2000`)).toEqual({ [WILLOW]: '@ 5' })
+
+      await wipe(ns)
+    })
+  })
+
+  describe('ioredis · watermark shared with 0.7', () => {
+    /**
+     * A counter increment the way 0.7.0's scripts land it: a write aimed below
+     * the stored watermark moves to the watermark's own value.
+     */
+    const incrementAs070 = (ns: string, bucketTs: number, delta: number) =>
+      live.eval(
+        `local target = ARGV[2]
+local wm = redis.call('GET', KEYS[2])
+if wm ~= false and tonumber(ARGV[2]) < tonumber(wm) then target = wm end
+redis.call('HINCRBYFLOAT', ARGV[1] .. target, ARGV[3], ARGV[4])
+redis.call('ZADD', KEYS[1], target, target)
+return target`,
+        2,
+        `${ns}:idx:${M}`,
+        `${ns}:wm:${M}`,
+        `${ns}:b:${M}:`,
+        bucketTs,
+        WILLOW,
+        delta,
+      )
+
+    /**
+     * A claim the way 0.7.0's script takes one, then acked: the watermark
+     * rises to upTo when that is higher, and every window below upTo goes.
+     */
+    const claimAs070 = (ns: string, upTo: number, metric: string = M) =>
+      live.eval(
+        `local wm = redis.call('GET', KEYS[1])
+if wm == false or tonumber(ARGV[1]) > tonumber(wm) then redis.call('SET', KEYS[1], ARGV[1]) end
+for _, id in ipairs(redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', '(' .. ARGV[1])) do
+  redis.call('DEL', ARGV[2] .. id)
+  redis.call('ZREM', KEYS[2], id)
+end`,
+        2,
+        `${ns}:wm:${metric}`,
+        `${ns}:idx:${metric}`,
+        upTo,
+        `${ns}:b:${metric}:`,
+      )
+
+    it('keeps the watermark 0.7 reads on the grid after a claim that finds live windows', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await driver.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
+
+      await driver.ack(await driver.claim(M, 5000))
+
+      expect(await live.get(`${ns}:wm:${M}`)).toBe('5000')
+      expect(await live.hget(`${ns}:wmown:${M}`, 'watermark')).toBe('1001|5000')
+      // this version still lands a late write on the first window past the
+      // newest one that held data, and leaves the empty ones after it alone
+      expect(await driver.landing?.(M, 1000, 1000)).toBe(2000)
+      expect(await driver.landing?.(M, 3000, 1000)).toBe(3000)
+
+      await wipe(ns)
+    })
+
+    it('lands a late 0.7 write on a window of the grid', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await driver.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
+      await driver.ack(await driver.claim(M, 5000))
+
+      expect(await incrementAs070(ns, 1000, 2)).toBe('5000')
+      expect(await driver.readBuckets({ metric: M })).toEqual([
+        { bucketTs: 5000, dimKey: WILLOW, value: 2 },
+      ])
+
+      await wipe(ns)
+    })
+
+    it('raises the watermark 0.7 reads on a claim that finds nothing, and its own not at all', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+
+      await driver.ack(await driver.claim(M, 5000))
+
+      expect(await live.get(`${ns}:wm:${M}`)).toBe('5000')
+      expect(await live.hget(`${ns}:wmown:${M}`, 'watermark')).toBe('|5000')
+      expect(await driver.landing?.(M, 1000, 1000)).toBe(1000)
+
+      await wipe(ns)
+    })
+
+    it('lands by a watermark a 0.7 claim raised past its own', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await driver.increment([
+        { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
+      await driver.ack(await driver.claim(M, 5000))
+
+      await claimAs070(ns, 9000)
+      await driver.increment([
+        { metric: M, bucketTs: 3000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+      ])
+
+      expect(await driver.readBuckets({ metric: M })).toEqual([
+        { bucketTs: 9000, dimKey: WILLOW, value: 1 },
+      ])
+      // and the next claim of this version keeps it
+      await driver.ack(await driver.claim(M, 9000))
+      expect(await live.hget(`${ns}:wmown:${M}`, 'watermark')).toBe('9000|9000')
+
+      await wipe(ns)
+    })
+
+    it('moves a write past a window it started in the gap once a 0.7 claim has taken it', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      const at = (bucketTs: number) =>
+        driver.increment([{ metric: M, bucketTs, resolutionMs: 1000, dimKey: WILLOW, delta: 1 }])
+      await at(1000)
+      await driver.ack(await driver.claim(M, 5000))
+
+      // 3000 was empty at the claim, so the write keeps it, and it is recorded
+      await at(3000)
+      expect(await live.hget(`${ns}:wmown:${M}`, '3000')).toBe('1')
+      // a 0.7 claim at the same boundary takes it and leaves mh:wm as it was
+      await claimAs070(ns, 5000)
+      expect(await live.get(`${ns}:wm:${M}`)).toBe('5000')
+
+      expect(await driver.landing?.(M, 3000, 1000)).toBe(4000)
+      await at(3000)
+      // 2000 was never started, so a write there is still its first copy
+      await at(2000)
+      expect(await driver.readBuckets({ metric: M })).toEqual([
+        { bucketTs: 2000, dimKey: WILLOW, value: 1 },
+        { bucketTs: 4000, dimKey: WILLOW, value: 1 },
+      ])
+
+      await wipe(ns)
+    })
+
+    it('carries no cell into a window of the gap a 0.7 claim has taken', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      const LV = 'dogs_in_park'
+      const op = (bucketTs: number, mode: 'set' | 'hold') =>
+        ({ metric: LV, bucketTs, resolutionMs: 1000, dimKey: WILLOW, value: 5, mode }) as const
+      await driver.setLevel([op(1000, 'set')])
+      await driver.ack(await driver.claim(LV, 5000))
+      await driver.setLevel([op(3000, 'set')])
+      await driver.setLevel([op(2000, 'hold')])
+      expect(await live.hget(`${ns}:wmown:${LV}`, '2000')).toBe('1')
+
+      await claimAs070(ns, 5000, LV)
+      await driver.setLevel([op(2000, 'hold'), op(3000, 'hold')])
+
+      expect(await driver.readBuckets({ metric: LV })).toEqual([])
+      expect((await driver.readLevels(LV))[0]?.heldThrough).toBe(3000)
+
+      await wipe(ns)
+    })
+
+    it('forgets the windows recorded in the gap once its own watermark passes them', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      const at = (bucketTs: number) =>
+        driver.increment([{ metric: M, bucketTs, resolutionMs: 1000, dimKey: WILLOW, delta: 1 }])
+      await at(1000)
+      await driver.ack(await driver.claim(M, 5000))
+      await at(3000)
+
+      await driver.ack(await driver.claim(M, 5000))
+
+      expect(await live.hgetall(`${ns}:wmown:${M}`)).toEqual({ watermark: '3001|5000' })
+
+      await wipe(ns)
+    })
+
+    it('reads a watermark a build between 0.7.0 and this one stored off the grid', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      await live.set(`${ns}:wm:${M}`, '1001')
+
+      expect(await driver.landing?.(M, 1000, 1000)).toBe(2000)
+      await driver.claim(M, 5000)
+      expect(await live.get(`${ns}:wm:${M}`)).toBe('5000')
+      expect(await live.hget(`${ns}:wmown:${M}`, 'watermark')).toBe('1001|5000')
 
       await wipe(ns)
     })
