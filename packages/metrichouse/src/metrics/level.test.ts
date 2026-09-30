@@ -258,6 +258,32 @@ describe('writing', () => {
     expect(await metric.current(EMAIL)).toBe(Number.MAX_SAFE_INTEGER)
   })
 
+  it('names the delta a dec was given when it refuses it', () => {
+    const whole = bound({ value: int() })
+    expect(() => whole.dec(1.5, EMAIL)).toThrow(
+      'queue_depth: declares an integer level, so 1.5 is not a legal delta. Declare `value: float()` if fractions are intended',
+    )
+    expect(() => whole.dec(2 ** 53, EMAIL)).toThrow(
+      'queue_depth: 9007199254740992 is past 9007199254740991, the largest whole number a double holds exactly, so an integer level cannot take it',
+    )
+    expect(() => bound().dec(Number.POSITIVE_INFINITY, EMAIL)).toThrow(
+      'queue_depth: value must be a finite number, got Infinity',
+    )
+  })
+
+  it('starts an inc from zero once the series has passed holdFor', async () => {
+    const metric = bound({ holdFor: '30s' })
+    metric.set(42, EMAIL)
+    await metric.drain()
+
+    // its last window was at(3), and no flush has dropped it yet
+    clock = at(6)
+    metric.inc(EMAIL)
+    await metric.drain()
+
+    expect(await metric.current(EMAIL)).toBe(1)
+  })
+
   it('refuses a first argument to inc or dec that is neither a delta nor dims', () => {
     const inFlight = level('in_flight', { resolution: '10s', flush: '10s', write: discard })
     inFlight.bind({ driver, now })
@@ -300,11 +326,23 @@ describe('reading', () => {
     await metric.drain()
 
     await expect(metric.totals()).rejects.toThrow(
-      'queue_depth: the total across series would be 9007199254740992, which is past ' +
+      'queue_depth: the total across series would be 9007199254740993, which is past ' +
         '9007199254740991, the largest whole number a double holds exactly',
     )
     await expect(metric.snapshot({ complete: false, groupBy: [] })).rejects.toThrow(
-      'queue_depth: a merged value would be 9007199254740992, which is past 9007199254740991',
+      'queue_depth: a merged value would be 9007199254740993, which is past 9007199254740991',
+    )
+  })
+
+  it('refuses an integer total across series below the negative safe range', async () => {
+    const metric = bound({ value: int() })
+    metric.set(-Number.MAX_SAFE_INTEGER, EMAIL)
+    metric.set(-2, EXPORT)
+    await metric.drain()
+
+    await expect(metric.totals()).rejects.toThrow(
+      'queue_depth: the total across series would be -9007199254740993, which is past ' +
+        '9007199254740991, the largest whole number a double holds exactly',
     )
   })
 
@@ -315,6 +353,36 @@ describe('reading', () => {
     await metric.drain()
 
     expect(await metric.totals()).toBe(Number.MAX_SAFE_INTEGER + 2)
+  })
+
+  it('refuses a total across fractional series past the largest number a metric can store', async () => {
+    const metric = bound()
+    metric.set(Number.MAX_VALUE, EMAIL)
+    metric.set(Number.MAX_VALUE, EXPORT)
+    await metric.drain()
+
+    await expect(metric.totals()).rejects.toThrow(
+      'queue_depth: the total across series would be Infinity, which is past the largest ' +
+        'number a metric can store',
+    )
+    await expect(metric.snapshot({ complete: false, groupBy: [] })).rejects.toThrow(
+      'queue_depth: a merged value would be Infinity, which is past the largest number a ' +
+        'metric can store',
+    )
+  })
+
+  it('adds integer series exactly when a running sum passes the safe range', async () => {
+    // added as doubles, MAX_SAFE_INTEGER + 2 rounds, and taking 2 back off
+    // lands on a different whole number that looks safe
+    const metric = bound({ value: int() })
+    metric.set(Number.MAX_SAFE_INTEGER, { queue: 'a' })
+    metric.set(2, { queue: 'b' })
+    metric.set(-2, { queue: 'c' })
+    await metric.drain()
+
+    expect(await metric.totals()).toBe(Number.MAX_SAFE_INTEGER)
+    const rows = await metric.snapshot({ complete: false, groupBy: [] })
+    expect(rows.map((row) => row.value)).toEqual([Number.MAX_SAFE_INTEGER])
   })
 
   it('answers from the held value, not from the open window', async () => {
@@ -542,6 +610,63 @@ describe('carrying', () => {
       [at(3), 42],
     ])
     expect(await metric.current(EMAIL)).toBeUndefined()
+  })
+
+  it('carries a series to its old expiry and not through the gap before a write revived it', async () => {
+    // holdFor 30s on 10s windows: written at(0), last reported at(3). The
+    // write at(6) finds it expired and not yet dropped. The same rows ship
+    // whether a flush ran in between or not
+    const shipped = async (flushBetween: boolean) => {
+      driver = memory()
+      clock = BASE
+      const sink = collector()
+      const metric = bound({ write: sink.write, holdFor: '30s' })
+      metric.set(42, EMAIL)
+      await metric.drain()
+      if (flushBetween) {
+        clock = at(2) + 3_000
+        await metric.flush()
+      }
+      clock = at(6)
+      metric.set(7, EMAIL)
+      await metric.drain()
+      clock = at(9) + 3_000
+      await metric.flush()
+      return sink.shape
+    }
+
+    const expected = [
+      [at(0), 42],
+      [at(1), 42],
+      [at(2), 42],
+      [at(3), 42],
+      [at(6), 7],
+      [at(7), 7],
+      [at(8), 7],
+    ]
+    expect(await shipped(false)).toEqual(expected)
+    expect(await shipped(true)).toEqual(expected)
+  })
+
+  it('ships every window between a write and an older one that reached storage after it', async () => {
+    // a clock stepped back between the two writes, so the older reading
+    // arrives second and begins the series
+    const sink = collector()
+    const metric = bound({ write: sink.write })
+    clock = at(2)
+    metric.set(5, EMAIL)
+    await metric.drain()
+    clock = at(0)
+    metric.set(3, EMAIL)
+    await metric.drain()
+
+    clock = at(3) + 3_000
+    await metric.flush()
+    expect(sink.shape).toEqual([
+      [at(0), 3],
+      [at(1), 3],
+      [at(2), 5],
+    ])
   })
 
   it('starts holding again when a dropped series is written to', async () => {

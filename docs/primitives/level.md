@@ -145,6 +145,14 @@ again brings it back, starting from that write. A write that lands while a flush
 is deciding to forget the series wins: the flush checks again at the moment it
 drops a series, and keeps any series written since it looked.
 
+A series is forgotten from the first window past its hold, whether or not a
+flush has removed it from storage yet. The level sends its `holdFor` with every
+write, so a write to a series past it that is still in storage starts it over
+the same way: an `inc()` starts from zero rather than from the value it expired
+at. The next flush still ships the windows it reported before it expired, then
+nothing for the windows in between, then the new write onwards. The rows are
+the same whether a flush ran during the gap or not.
+
 The clock runs from the window the last write landed in, so it rounds to whole
 windows rather than to the millisecond. The last window a series reports is the
 one that `holdFor` after its last write falls in. With `resolution: '1m'` and
@@ -224,6 +232,17 @@ queueDepth.set(38, { queue: 'email' })     // it is now 38
 A second write in the same window replaces the first. On a
 [gauge](/primitives/gauge) the same two calls would be two observations that
 fold together, and that difference is what separates the two types.
+
+Readings are ordered by the window they were written in, not by the moment they
+reached storage. A `set()` for an earlier window than the series' newest write
+fills its own window and the empty ones after it, and leaves the newer value
+current. That is what keeps two processes writing across a window boundary
+right, and it has a cost when a server's clock steps backwards. A reading taken
+after the step lands in an earlier window than the reading taken before it, so
+the older reading stays current. `current()` keeps returning it, and the carry
+keeps repeating it, until something writes to its window or a later one.
+[Buckets and time](/guide/buckets-and-time#a-clock-that-steps-backwards) covers
+the same effect from the clock's side.
 
 **Returns** nothing, and returns before storage has acknowledged anything.
 
@@ -324,10 +343,13 @@ await queueDepth.totals()
 **Returns** the sum of the held values, or `undefined` when no series has ever
 been written to.
 
-On a level declared `value: int()`, a total past `9007199254740991` rejects
-rather than returning a nearby whole number, and so does a `snapshot()` that
-adds series together past it. Each series stays below it on its own, but
-several added together can pass it.
+On a level declared `value: int()`, the series are added as whole numbers,
+exactly, and a total past `9007199254740991` on either side rejects rather than
+returning a nearby whole number. So does a `snapshot()` that adds series
+together past it. Each series stays below it on its own, but several added
+together can pass it. On a fractional level, a total past the largest number a
+double holds, about `1.8e308`, rejects the same way rather than returning
+`Infinity`.
 
 Adding is the merge a level can make honestly, because every held value is true
 at the same moment. A [gauge](/primitives/gauge#gauge-totals) drops `last` from
@@ -453,6 +475,20 @@ Five consequences worth knowing:
   the next window, the late one still counts in its own window and in every
   window after it. A `set()` that arrives late fills its own window and does not
   replace a value written for a later one.
+- **A series begins at its earliest write, whichever arrives first.** When the
+  first write to reach storage is for a later window than a write that arrives
+  after it, the series begins at the earlier one, and every window between the
+  two ships. An `inc()` in the earlier window starts from zero.
+- **A flush sees a write that lands while it runs.** Each empty window is filled
+  with the value in effect just before it at the moment it is filled, so a
+  `set()` that reaches storage after the flush read the series still reaches
+  every empty window after it. A `set()` that lands after the flush has filled
+  the windows after it replaces those carried values, up to the next window
+  somebody wrote to.
+- **A late write that missed its window moves forward.** A write aimed at a
+  window that has already shipped lands in the oldest window that has not, as on
+  every type. A `set()` moved that way is dropped when that window already holds
+  a reading, because that reading was taken later.
 
 ## What it costs
 

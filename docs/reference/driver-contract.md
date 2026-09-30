@@ -89,6 +89,7 @@ interface GaugeCell {
 
 interface LevelCell {
   level: number
+  carried?: true     // written by a hold rather than by a set or an add
 }
 ```
 
@@ -96,6 +97,8 @@ A level's value is boxed rather than stored bare so that storage can tell it
 from a counter's scalar. The two are the same digits meaning the opposite thing
 when a released claim has to be merged back: two counter cells for one window
 add, two level cells do not, because a level that read 42 twice still reads 42.
+`carried` marks a cell a flush filled rather than one somebody wrote, which
+[setLevel](#setlevel) needs to know.
 
 The driver never interprets a cell. It stores what a metric wrote and hands it
 back. Deciding which kind it is belongs to the metric, because the metric is the
@@ -187,7 +190,7 @@ because `last` is whichever observation came last.
 
 ```ts
 setLevel(ops: readonly LevelOp[]): Promise<void>
-// LevelOp: { metric, bucketTs, resolutionMs, dimKey, value, mode, integer? }
+// LevelOp: { metric, bucketTs, resolutionMs, dimKey, value, mode, integer?, holdFor? }
 // mode: 'set' | 'add' | 'hold'
 ```
 
@@ -202,64 +205,99 @@ memory driver undoes the call's writes when one is refused.
 | --- | --- | --- |
 | `set` | `value` | `value` |
 | `add` | held plus `value`, treating an unseen series as zero | the new held value |
-| `hold` | unchanged | `value`, but only if that window has no cell yet |
+| `hold` | unchanged | the value in effect just before that window, but only if it has no cell yet |
 
-A `hold` is what a flush issues for the windows nobody wrote to. It names its
-own value rather than reading the held one, because the window it fills is in
-the past and the series may have moved since. It leaves an existing cell alone,
-so a written value always beats a carried one. A `hold` for a series the driver
-has never seen does nothing at all, and must not bring one into existence.
+Storage has to tell the two kinds of level cell apart. A cell a `set` or an
+`add` wrote is a reading. A cell a `hold` wrote only repeats the value before
+it, and `readBuckets` hands it back as `{ level, carried: true }`. The Redis
+driver stores a written cell as `@<number>` and a carried one as `@c<number>`,
+and reads a cell stored before the mark existed as written.
 
-When a `hold` finds its window already written, `carried` becomes the value in
-that cell rather than the one the hold named. The flush worked out its value
-before a late `set` landed in the window, and carrying that older number would
-repeat a level the series had already left in every empty window after it. The
-same rule makes a `hold` safe to apply twice. A `hold` for the window
-`heldThrough` already names, arriving once a claim has taken that window, leaves
-`carried` alone: the cell that would say what the window ended at is gone, and
-`carried` already holds it.
+A `hold` is what a flush issues for the windows nobody wrote to. It fills its
+window with the value in effect just before it, worked out when the `hold`
+lands: the newest cell between `heldThrough` and the window, or `carried` when
+there is none. The flush named a value too, worked out from a read a moment
+older, and a `set` that lands between that read and the holds has to reach
+every empty window after it. A flush sends its holds in ascending order, so
+each reads what the one before it wrote. A `hold` leaves an existing cell
+alone, so a written value always beats a carried one. A `hold` for a series the
+driver has never seen does nothing at all, and must not bring one into
+existence.
+
+When a `hold` finds its window already holding a cell, `carried` becomes the
+value in that cell. The same rule makes a `hold` safe to apply twice. A `hold`
+for the window `heldThrough` already names, arriving once a claim has taken
+that window, leaves `carried` alone: the cell that would say what the window
+ended at is gone, and `carried` already holds it.
 
 `integer` is set by a level that holds whole numbers. Refuse a `set` or an `add`
 that would leave a cell or the held value past `9007199254740991`, as
 [`increment`](#increment) does.
 
-Each series also carries two timestamps, both handed to the driver rather than
-read from a clock it owns:
+`holdFor` is the level's [`holdFor`](/primitives/level#holdfor) in
+milliseconds, on a `set` or an `add`. A series whose `writtenAt` plus `holdFor`
+is below the landing window has stopped reporting, even though no flush has
+dropped it yet. The write treats it as a series it has never seen, so an `add`
+starts from zero, and leaves `heldThrough`, `carried` and `carriedFrom` alone,
+because the windows it owed before it expired are still owed.
+
+Each series also carries three timestamps, all handed to the driver rather
+than read from a clock it owns:
 
 ```ts
 interface LevelSeries {
   dimKey: string
   value: number        // what it is at now
   carried: number      // what it was at in the window `heldThrough` names
-  writtenAt: number    // the window the last set or add landed in
+  writtenAt: number    // the window the newest set or add landed in
   heldThrough: number  // the newest window a hold has carried it through
+  carriedFrom: number  // the window of the newest set or add at or before `heldThrough`
 }
 ```
 
-`heldThrough` moves only on a `hold`, never on a `set` or an `add`. A series
-written at noon and again at three is still owed a row for every window in
-between, and a pointer that jumped to the later write would skip them.
+`heldThrough` moves forward only on a `hold`, never on a `set` or an `add`
+after it. A series written at noon and again at three is still owed a row for
+every window in between, and a pointer that jumped to the later write would
+skip them.
 
 `carried` is the value the next carry starts from, and it is not always `value`
-for the same reason.
+for the same reason. `carriedFrom` is the write it comes from. A flush measures
+a `holdFor` expiry from it until the carry reaches a newer write, so a series
+written again after it expired reports to its old last window and nothing
+through the gap. A `hold` that finds a written cell in its window, or steps
+over one, moves `carriedFrom` to that write. A `hold` below the claimed
+watermark cannot see the cells it steps over, and takes the newest write to be
+as late as it can be: `writtenAt`, or the hold's own window when that is
+earlier.
 
 Two processes writing to one series near a window boundary can deliver the later
 window's write first. The rules below keep every window right whichever arrives
 second. An `add` is a change, so it applies from the window it lands in onwards.
-A `set` is a reading, and a window after it that already has a cell was written
-later.
+A `set` is a reading. A later window with a written cell was written later, and
+a later carried cell only repeated the value before the `set`.
 
 | | `add` of `delta` | `set` to `value` |
 | --- | --- | --- |
 | Cell in the landing window | the value in effect just before it, plus `delta` | `value` |
-| Cells already in later windows | each plus `delta` | unchanged |
-| Held `value` | plus `delta` | `value`, unless a later window already has a cell |
-| `carried` | plus `delta` when the landing window is at or before `heldThrough` | `value` when the landing window is at or before `heldThrough` and no later cell is too |
+| Cells already in later windows | each plus `delta` | carried cells up to the next written one become `value` |
+| Held `value` | plus `delta` | `value`, unless a later window already has a written cell |
+| `carried` | plus `delta` when the landing window is at or before `heldThrough` | `value` when the landing window is at or before `heldThrough` and no written cell lies between the two |
+| `carriedFrom` | the landing window, when it is at or before `heldThrough` and newer | the same |
 
 "The value in effect just before" is the newest cell between `heldThrough` and
 the landing window, or `carried` when there is none, or `0` for a series the
-driver has never seen. For a first write, `carried` and the held value are the
-new value.
+driver has never seen or one past `holdFor`. For a first write, `carried` and
+the held value are the new value, and `heldThrough` and `carriedFrom` are the
+landing window.
+
+A write that lands before `heldThrough` with no cell in its own window or
+between it and `heldThrough` comes before the write that began the series. It
+reached storage second, from another writer or moved forward to the watermark.
+It moves `heldThrough` and `carriedFrom` back to its own window and `carried`
+to its own cell, so the windows between the two writes are owed a row, and an
+`add` there starts from `0`. An `add` before `heldThrough` into an empty window
+that has cells after it also starts from `0`: the flush skipped that window
+because the series had passed `holdFor` there.
 
 Getting these wrong is easy and shows up as a bug nobody notices for a while:
 `set(5)` then `set(3)` in one window carrying `5` into every empty window after
@@ -268,9 +306,13 @@ window one off.
 
 A `set` or an `add` aimed below the claimed watermark lands on the first window
 of its resolution at or past the watermark, as an increment does, and the rule
-above uses the window it landed in. A `hold` aimed below it writes
-no cell, because a claim has already taken that window, and still moves
-`heldThrough`. A `hold` for a window before `heldThrough` changes neither
+above uses the window it landed in. A `set` moved that way that
+finds a written cell in the window it lands in changes nothing at all: that
+cell is a reading taken after it. A `hold` aimed below the watermark writes no
+cell, because a claim has already taken that window, still moves
+`heldThrough`, and carries the value it names, since the cells that would say
+otherwise went with the claim. A `hold` for a window before `heldThrough`
+fills that window with the value it names if it is empty, and changes neither
 `heldThrough` nor `carried`: it comes from a flusher running behind, and
 `carried` belongs to the pointer's window. An `add` whose result would not be a
 finite number is refused.
@@ -814,11 +856,17 @@ A driver has to satisfy all of these.
 
 - A `set` puts the series at a value, a second `set` replaces it.
 - An `add` treats a series nothing has written to as zero.
-- A `hold` writes only into a window that has no cell, and writes the value it
-  was given rather than the one the series is at.
+- A `hold` writes only into a window that has no cell, marks what it writes as
+  carried, and writes the value in effect just before that window rather than
+  the one the series is at or the one it was given.
 - A `hold` for a series storage has never seen does nothing and creates nothing.
-- `heldThrough` moves on a hold and never on a write; `writtenAt` moves on a
-  write and never on a hold.
+- `heldThrough` moves forward on a hold and never on a write after it;
+  `writtenAt` moves on a write and never on a hold.
+- A write before `heldThrough`, with no cell in its window or between the two,
+  moves `heldThrough` back to it.
+- An `add` to a series past the `holdFor` it names starts from zero.
+- A `set` replaces the carried cells after it, up to the next written one.
+- A `set` moved to the watermark that finds a written cell there changes nothing.
 - Held values survive the claim and the ack that ship their windows.
 - A `set` or `add` in the window `heldThrough` names replaces `carried`.
 - A `hold` into a window that already has a cell carries that cell's value.
