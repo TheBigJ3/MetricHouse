@@ -34,6 +34,7 @@ import {
   assertWhole,
   dimColumns,
   pendingWrites,
+  SETTLE_WRITES,
 } from './types.js'
 
 /** The columns a counter writes on every row itself, which no dim may take. */
@@ -312,6 +313,7 @@ export function counter<D extends Shape = Record<never, never>>(
       driver: slot.driver,
       materialize,
       totalOf,
+      sendsSoFar: slot.sendsSoFar,
     }),
 
     ...bucketedReader<D, { value: number }>({
@@ -423,6 +425,10 @@ export function counter<D extends Shape = Record<never, never>>(
 
     drain(): Promise<void> {
       return writes.drain()
+    },
+
+    [SETTLE_WRITES](): Promise<void> {
+      return writes.settle()
     },
 
     materialize,

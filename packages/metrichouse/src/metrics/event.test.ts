@@ -681,14 +681,14 @@ describe('flush', () => {
     expect(write).not.toHaveBeenCalled()
   })
 
-  it('carries at most claimLimit records per flush', async () => {
+  it('carries at most claimLimit records per call to the sink', async () => {
     const capped = make({ write, claimLimit: 2 })
     const own = createHouse({ driver: memory(), schema: [capped], now })
     capped.recordMany([WALK, WALK, WALK, WALK, WALK])
     await own.drain()
 
-    expect((await own.flush()).metrics.walk_started?.rows).toBe(2)
-    expect(await capped.pending()).toBe(3)
+    expect((await own.flush()).metrics.walk_started?.rows).toBe(5)
+    expect(write.mock.calls.map(([rows]) => rows.length)).toEqual([2, 2, 1])
   })
 })
 

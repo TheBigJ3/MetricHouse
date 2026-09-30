@@ -66,14 +66,35 @@ describe('pendingWrites', () => {
     expect(drained).toBe(true)
   })
 
-  it('waits for a write tracked while it was already waiting', async () => {
+  it('does not wait for a write tracked after drain was called', async () => {
+    const writes = pendingWrites('orders')
+    const first = deferred()
+    const second = deferred()
+    writes.track(first.promise, () => undefined)
+
+    const draining = writes.drain()
+    writes.track(second.promise, () => undefined)
+    first.resolve()
+    await draining
+
+    let settled = false
+    const settling = writes.settle().then(() => {
+      settled = true
+    })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    second.resolve()
+    await settling
+  })
+
+  it('settles only once a write tracked while it was already waiting has landed', async () => {
     const writes = pendingWrites('orders')
     const first = deferred()
     const second = deferred()
     writes.track(first.promise, () => undefined)
 
     let drained = false
-    const draining = writes.drain().then(() => {
+    const draining = writes.settle().then(() => {
       drained = true
     })
     writes.track(second.promise, () => undefined)

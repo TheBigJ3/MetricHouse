@@ -72,6 +72,15 @@ export interface MetricFlushReport {
   readonly nextEligibleInMs?: number
   readonly error?: unknown
   /**
+   * Set beside `error` when claims before the one that failed were written.
+   *
+   * A flush that claims more than once can fail partway. `buckets` and `rows`
+   * count every claim handed to the sink, the failed one included, and this
+   * says how many of them the sink took. Those rows have left storage. The
+   * rest are back in the live set, unless `releaseError` says otherwise.
+   */
+  readonly written?: { readonly buckets: number; readonly rows: number }
+  /**
    * Set when the sink failed and putting its rows back failed too.
    *
    * `error` is still the sink's own failure. This says the rows did not go
@@ -141,6 +150,17 @@ interface FlushState {
    * driver keeps is the half every process sees.
    */
   lastFlushMs: number | undefined
+  /**
+   * When each flush the cadence has let through, and that has not finished
+   * yet, was let through.
+   *
+   * The cadence counts from the newest of these as well as from
+   * `lastFlushMs`. A flush still inside its sink has not set `lastFlushMs`
+   * yet, and a second flush that looked only at that would ship beside it in
+   * the same interval. One that finishes having shipped nothing leaves this
+   * set and moves nothing, so the flush after it goes ahead.
+   */
+  readonly inFlight: Set<{ readonly at: number }>
 }
 
 /**
@@ -159,15 +179,23 @@ export interface Attempts {
 }
 
 /**
- * How early a flush may arrive and still count as on time: fifty
- * milliseconds, or a tenth of the cadence when that is shorter.
+ * How early a flush may arrive and still count as on time: a tenth of the
+ * cadence.
+ *
+ * A tenth rather than a few milliseconds, because the caller's clock is not
+ * the only one that drifts. A cron that fires a few hundred milliseconds
+ * earlier within its minute than it did the last time would otherwise be
+ * refused, and the metric would wait a whole interval for the next call.
  */
 export function cadenceSlack(flushMs: number): number {
-  return Math.min(50, flushMs / 10)
+  return flushMs / 10
 }
 
-/** How many claims one final flush may make before it stops. */
-const FINAL_CLAIM_CAP = 100
+/**
+ * How many claims one flush may make before it stops, when each claim is
+ * capped by a `claimLimit`.
+ */
+const CLAIM_CAP = 100
 
 /** A fresh count, for a metric that has not failed yet. */
 export function createAttempts(): Attempts {
@@ -207,6 +235,15 @@ export interface MetricFlushOptions {
    * holds: a turn another process took would stop it shipping its own.
    */
   readonly sharedDriver?: () => Driver | undefined
+  /**
+   * The most rows one claim of this metric carries, when it has a limit.
+   *
+   * A claim that comes back with this many may have left more behind, so the
+   * flush claims again rather than leaving the rest for the next interval.
+   * Left out, one claim takes everything there is, and a second would find
+   * nothing.
+   */
+  readonly claimLimit?: number
 }
 
 /**
@@ -220,7 +257,7 @@ export interface MetricFlushOptions {
 export function metricFlush(
   options: MetricFlushOptions,
 ): Required<Pick<AnyMetric, 'flush' | typeof SETTLE>> {
-  const state: FlushState = { lastFlushMs: undefined }
+  const state: FlushState = { lastFlushMs: undefined, inFlight: new Set() }
   const attempts = options.attempts ?? createAttempts()
   /**
    * Flushes of this metric that have not returned yet, however they were
@@ -264,23 +301,28 @@ export function metricFlush(
     const final = flushOptions.final === true
 
     // 1. cadence. `flush` is a minimum, so a scheduler tick or a cron call
-    //    that arrives early is a no-op. `lastFlushMs` advances only on
-    //    success.
+    //    that arrives early is a no-op. `lastFlushMs` advances only when
+    //    rows were written.
     //
     //    A clock that has stepped backwards since the last flush reads a
     //    negative elapsed time. That is not "too soon", it is "no longer
     //    comparable", and holding the metric back until the clock caught up
     //    would stall it for as long as the step was.
     //
-    //    A call a hair early counts as on time. The scheduler's interval
+    //    A call a little early counts as on time. The scheduler's interval
     //    runs on a different clock from `now()`, and a tick can fire a
-    //    millisecond before `now()` agrees a full interval has passed.
-    //    Refusing it would push that metric back a whole interval.
+    //    millisecond before `now()` agrees a full interval has passed. A
+    //    cron fires wherever in its minute the platform gets to it. Refusing
+    //    either would push that metric back a whole interval.
+    //
+    //    A flush still running counts as the latest shipment, until it
+    //    finishes having shipped nothing.
     const flushMs = options.flushMs()
     const ignoreCadence = flushOptions.force === true || final
     const gapMs = flushMs - cadenceSlack(flushMs)
-    if (!ignoreCadence && state.lastFlushMs !== undefined) {
-      const elapsed = now - state.lastFlushMs
+    const since = latestShipment()
+    if (!ignoreCadence && since !== undefined) {
+      const elapsed = now - since
       if (elapsed >= 0 && elapsed < gapMs) {
         return {
           buckets: 0,
@@ -292,6 +334,34 @@ export function metricFlush(
       }
     }
 
+    // added before the first `await`, so a flush called while this one waits
+    // for its turn already sees it
+    const entry = { at: now }
+    state.inFlight.add(entry)
+    try {
+      return await shipWithTurn(metric, now, final, flushMs, gapMs, flushOptions)
+    } finally {
+      state.inFlight.delete(entry)
+    }
+  }
+
+  /** The newest of the last shipment and the flushes still running, if any. */
+  function latestShipment(): number | undefined {
+    let latest = state.lastFlushMs
+    // insertion order, so the last one seen is the flush let through last
+    for (const running of state.inFlight) latest = running.at
+    return latest
+  }
+
+  /** Step 1's second half, the turn, then steps 2 to 5. */
+  async function shipWithTurn(
+    metric: AnyMetric,
+    now: number,
+    final: boolean,
+    flushMs: number,
+    gapMs: number,
+    flushOptions: FlushOptions,
+  ): Promise<MetricFlushReport> {
     //    Then the turn every process sharing the driver keeps, since this
     //    process may not be the one that shipped last. `force` takes it with
     //    no gap, so the processes that keep to the cadence count from what it
@@ -375,42 +445,59 @@ export function metricFlush(
     //    a caller flushing a whole house should hear about it and still see
     //    every other metric flushed.
     //
-    //    One claim per flush, except for a final one. A metric with a
-    //    `claimLimit` ships its backlog across several flushes, and a
-    //    process that is stopping has no later flush to wait for, so a final
-    //    flush claims again until the backlog is gone. The cap stops it
-    //    chasing records another process is still appending.
+    //    One claim, unless it came back full. A metric with a `claimLimit`
+    //    caps each claim, and with the turn every process shares, one claim
+    //    per flush would cap what the whole fleet ships in an interval. So a
+    //    claim that carried the limit is followed by another, until one
+    //    carries less. A final flush claims again until one comes back empty,
+    //    since a process that is stopping has no later flush to wait for.
+    //    The cap stops either chasing records another process is still
+    //    appending.
     let buckets = 0
     let rows = 0
-    let wrote = false
+    const written = { buckets: 0, rows: 0 }
     let ackError: unknown
-    for (let claims = 0; claims < FINAL_CLAIM_CAP; claims++) {
+
+    /**
+     * The report for a claim or a sink that failed, carrying what the
+     * claims before it wrote and every ack that failed after them.
+     */
+    const failed = (error: unknown, releaseError?: unknown) => {
+      if (written.rows > 0) state.lastFlushMs = now
+      const report = {
+        buckets,
+        rows,
+        skipped: false,
+        error,
+        ...(written.rows > 0 && { written }),
+        ...(releaseError !== undefined && { releaseError }),
+        ...(ackError !== undefined && { ackError }),
+        ...repair,
+      }
+      return { report, wrote: written.rows > 0 }
+    }
+
+    for (let claims = 0; claims < CLAIM_CAP; claims++) {
       let outcome: ShipOutcome
       try {
         // what is claimable is the metric's judgement, not this file's
         const claim = await metric.claimBatch(now, { final })
         outcome = await shipClaim(metric, claim, options.sink(), { attempts, source: 'flush' })
       } catch (error) {
-        return { report: { buckets, rows, skipped: false, error, ...repair }, wrote }
+        return failed(error)
       }
 
       buckets += outcome.buckets
       rows += outcome.rows
-      if (outcome.error !== undefined) {
-        const report = {
-          buckets,
-          rows,
-          skipped: false,
-          error: outcome.error,
-          ...(outcome.releaseError !== undefined && { releaseError: outcome.releaseError }),
-          ...repair,
-        }
-        return { report, wrote }
-      }
-      if (outcome.rows > 0) wrote = true
+      if (outcome.error !== undefined) return failed(outcome.error, outcome.releaseError)
+      written.buckets += outcome.buckets
+      written.rows += outcome.rows
       if (outcome.ackError !== undefined) ackError ??= outcome.ackError
-      if (!final || outcome.rows === 0) break
+      if (outcome.rows === 0) break
+      const full = options.claimLimit !== undefined && outcome.rows >= options.claimLimit
+      if (!final && !full) break
     }
+    const wrote = written.rows > 0
 
     const settled = { ...repair, ...(ackError !== undefined && { ackError }) }
 

@@ -204,6 +204,29 @@ describe('house.start()', () => {
     expect(errors).toEqual([['recovery failed', { metric: 'm' }]])
     await house.stop()
   })
+
+  it('routes a failed ack on a scheduled flush to onError', async () => {
+    const errors: [string, { metric: string }][] = []
+    const lossy: Driver = {
+      ...driver,
+      ack: () => Promise.reject(new Error('claim was recovered')),
+    }
+    const metric = make('m', vi.fn())
+    const house = createHouse({
+      driver: lossy,
+      schema: [metric],
+      now,
+      onError: (error, context) => errors.push([(error as Error).message, context]),
+    })
+    metric.add(A)
+    await house.drain()
+    settle()
+    house.start()
+
+    await tick(60_000)
+    expect(errors).toEqual([['claim was recovered', { metric: 'm' }]])
+    await house.stop()
+  })
 })
 
 describe('house.stop()', () => {

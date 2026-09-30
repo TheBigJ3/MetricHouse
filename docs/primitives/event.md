@@ -65,7 +65,7 @@ recording to an unbound event throws.
 | `config.timestamp` | `'auto'` or a field name | no | [Where `ts` comes from](#timestamp) |
 | `config.sample` | number or function | no | [The fraction to keep](#sample) |
 | `config.derive` | record of functions | no | [Counters this event also increments](#derive) |
-| `config.claimLimit` | number | no | [Records one flush may carry](#claimlimit) |
+| `config.claimLimit` | number | no | [Records one claim, and one call to `write`, may carry](#claimlimit) |
 | `config.write` | function | yes | [Where the rows go](#write) |
 
 ### name
@@ -450,25 +450,34 @@ reported to `onError` with the event and the target in the message.
 claimLimit?: number      // default: unlimited
 ```
 
-How many records one flush may carry. By default a claim takes the whole
-backlog, the same way a counter's claim takes every closed window.
+How many records one claim may carry, and so one call to `write`. By default a
+claim takes the whole backlog, the same way a counter's claim takes every closed
+window.
 
 ```ts
 claimLimit: 10_000
 ```
 
 Set it when the backlog can outgrow what your database will accept in one
-statement. After a long outage an unbounded claim is one enormous insert, and
-the rest of the backlog ships on the following flush either way.
+statement. After a long outage an unbounded claim is one enormous insert.
+
+A flush does not stop at one claim. A claim that comes back with exactly
+`claimLimit` records may have left more behind, so the flush claims again, and
+it stops at the first claim that carries fewer, or after a hundred claims. Each
+claim is its own call to `write`. A flush on a shared driver takes one
+[turn](/guide/flushing#several-processes-on-one-driver) for the whole fleet, so
+this is what lets the fleet ship more than `claimLimit` records per interval.
 
 The places that have to empty the backlog still do, in batches of this size:
 [`drain()`](#event-drain) and `batch.maxAge` ship every locally staged record,
 and a [final flush](/reference/flush-options#final), which `house.stop()` makes,
-keeps claiming until nothing is left. A full buffer on `batch.maxSize` ships
-batches while it is still full and leaves the rest to the age clock. Under
-`delivery: 'immediate'`, an event staged in the driver claims again while a
-claim comes back full, up to 100 claims for one `record()`, and stops at the
-first send that fails.
+keeps claiming until a claim comes back empty. On a shared, durable driver that
+final flush first waits for the turn, and when another process holds it the
+backlog stays staged for whichever process takes the next one. A full buffer
+on `batch.maxSize` ships batches while it is still full and leaves the rest to
+the age clock. Under `delivery: 'immediate'`, an event staged in the driver
+claims again while a claim comes back full, up to 100 claims for one
+`record()`, and stops at the first send that fails.
 
 A limit that is not a positive whole number throws at declaration.
 
@@ -655,7 +664,8 @@ works across a mixed schema. See
 flush(options?: FlushOptions): Promise<MetricFlushReport>
 ```
 
-Claims the staged backlog, up to [`claimLimit`](#claimlimit), and ships it.
+Claims the staged backlog and ships it, in claims of at most
+[`claimLimit`](#claimlimit) records.
 [Flush options](/reference/flush-options) covers the argument and the report.
 
 ## event.drain()
@@ -664,13 +674,15 @@ Claims the staged backlog, up to [`claimLimit`](#claimlimit), and ships it.
 drain(): Promise<void>
 ```
 
-Resolves once every `record()` issued so far has reached the driver. On a
-locally staged event it also ships whatever is buffered, because that buffer is
-the only place those records exist. It waits for a durable record the driver
-has not answered yet, and for the counter writes that record's
-[`derive`](#derive) makes once the driver answers, so `house.drain()` does not
-resolve with a derived increment still on its way. It resolves even when that
-record's promise rejects, since the caller holding the promise has the error.
+Resolves once every `record()` issued before the call has reached the driver.
+On a locally staged event it also ships whatever is buffered, because that
+buffer is the only place those records exist, and waits for that send. Under
+[immediate delivery](/guide/delivery) it waits for the send to `write` that
+follows each record as well. It waits for a durable record the driver has not
+answered yet, and for the counter writes that record's [`derive`](#derive)
+makes once the driver answers, so `house.drain()` does not resolve with a
+derived increment still on its way. It resolves even when that record's
+promise rejects, since the caller holding the promise has the error.
 
 ## event.rowShape()
 

@@ -83,8 +83,8 @@ Everything on the object `createHouse()` returns.
 | `house.flush(options?)` | `Promise<FlushReport>` | Flushes every metric, one after another. Each still waits for its own cadence unless you pass `force`. Names in `only` that match no metric come back in `unmatched` |
 | `house.start()` | `void` | Gives every metric a timer that flushes it at its own cadence. Calling it again does nothing |
 | `house.running` | `boolean` | `true` between `start()` and `stop()` |
-| `house.stop()` | `Promise<FlushReport>` | Clears the timers, waits for every running flush and for queued writes to reach the driver, then flushes every metric ignoring cadence |
-| `house.drain()` | `Promise<void>` | Resolves once every queued write has reached the driver |
+| `house.stop()` | `Promise<FlushReport>` | Clears the timers, waits for every running flush and for queued writes to reach the driver, then makes a final flush of every metric past this process's cadence. On a shared, durable driver that flush still waits for the turn, and a metric another process holds the turn for is skipped, its rows left in storage for the next turn |
+| `house.drain()` | `Promise<void>` | Resolves once every write issued before the call has reached the driver, and under immediate delivery once the send after each has returned |
 | `house.snapshot(options?)` | `Promise<HouseSnapshot>` | Every metric's unshipped rows, keyed by metric name |
 | `house.current()` | `Promise<HouseSnapshot>` | Only the windows still filling, for counters, gauges, levels and timers |
 
@@ -108,7 +108,7 @@ Every metric type has these members, whatever it measures.
 | `metric.isBound` | `boolean` | Whether a house has registered it yet |
 | `metric.write` | `WriteFn` | The write function it was declared with. Each type narrows its rows, as it narrows `snapshot()` |
 | `metric.flush(options?)` | `Promise<MetricFlushReport>` | Ships everything finished to its write function, if its cadence allows. Needs a bound metric, so it throws before a house has registered it |
-| `metric.drain()` | `Promise<void>` | Resolves once this metric's queued writes have reached the driver |
+| `metric.drain()` | `Promise<void>` | Resolves once this metric's writes issued before the call have reached the driver, and under immediate delivery once the send after each has returned |
 | `metric.snapshot(options?)` | `Promise<LiveRow[]>` | Everything unshipped, as rows |
 | `metric.rowShape()` | `RowShape` | The columns your write function will receive, in order |
 | `metric.bind(binding)` | `void` | Connects the metric to a house's driver, clock and defaults. `createHouse()` and `house.register()` call it for you |

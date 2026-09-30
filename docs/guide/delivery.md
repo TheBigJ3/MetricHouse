@@ -118,21 +118,34 @@ Immediate delivery does not retire finished windows. A counter still needs
 `flush()` from a timer, a cron or a direct call so that closed windows are
 claimed and deleted, otherwise they pile up in the driver forever.
 
-The final flush sends the same id with the complete value, so it supersedes every
-partial send. The two paths agree rather than fight.
+The flush sends the same id with the complete value, so it supersedes every
+partial send, as long as your table lets it. An immediate send reads the running
+total and then calls your function, and a flush can claim the window in
+between. Within one process the flush waits for every immediate send already
+under way for that metric before it hands its rows over, so its row reaches your
+function after theirs. Sends that start after the claim cannot read the claimed
+window, so they are not waited for.
+
+Across processes nothing can order the two. Another process may read its running
+total just before the claim and deliver it just after the flush row. So your
+table has to let a row whose `source` is `'flush'` win over an `'immediate'` row
+with the same id, whichever arrives last. [Telling the two apart in your
+sink](#telling-the-two-apart-in-your-sink) shows one way.
 
 A write that arrived after its window was claimed is
-[moved forward](/guide/buckets-and-time#a-write-that-misses-its-window) to the
-oldest window that has not shipped, and the immediate send follows it there: the
-row it sends is the landing window's. A failed send counts toward `attempt`
-exactly as a failed flush does.
+[moved forward](/guide/buckets-and-time#a-write-that-misses-its-window) to a
+window that has not shipped, and the immediate send follows it. It sends every
+live window of that series from the one the write aimed at onward, so the
+landing window is among them even when a window a failed flush released sits in
+front of it. A failed send counts toward `attempt` exactly as a failed flush
+does.
 
 With several processes writing to one Redis, each of them sends the running
-total it read, and two sends can arrive at your table in either order. A table
-that keeps the newest arrival can briefly hold an older total. Rows carry no
-version number to settle that. What settles it is the flush: it runs after the
-window has closed, so its row is the last one sent for that id, and it holds
-the complete value.
+total it read, and two immediate sends can arrive at your table in either order.
+A table that keeps the newest arrival can briefly hold an older total. Rows
+carry no version number to settle that. What settles it is the flush row, which
+holds the complete value, provided your table keeps it over any immediate row
+that arrives after it.
 
 | | Events and logs | Counters, gauges, timers |
 | --- | --- | --- |
@@ -143,26 +156,45 @@ the complete value.
 
 ## Telling the two apart in your sink
 
-`context.source` says which path a call came from.
+`context.source` says which path a call came from. Under immediate delivery a
+folded metric's flush row carries the id its immediate rows already used, so
+every source is an upsert on `id`. The table also records whether the row it
+holds came from a flush, and an immediate row never replaces one that did.
+
+```sql
+CREATE TABLE http_requests (
+  id         TEXT PRIMARY KEY,
+  bucket_ts  TIMESTAMPTZ NOT NULL,
+  route      TEXT NOT NULL,
+  value      BIGINT NOT NULL,
+  final      BOOLEAN NOT NULL
+);
+```
 
 ```ts
 write: async (rows, context) => {
-  if (context.source === 'immediate') {
-    // A running total. Upsert, keeping the newest.
-    await upsert(rows)
-    return
-  }
-
-  // 'flush' or 'batch'. Send once, and a resend is byte identical.
-  await insert(rows)
+  // true for a flush row, which holds the window's complete value
+  const final = context.source === 'flush'
+  await sql`
+    INSERT INTO http_requests ${sql(
+      rows.map((row) => ({ ...row, final })),
+      'id', 'bucket_ts', 'route', 'value', 'final',
+    )}
+    ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value, final = EXCLUDED.final
+    WHERE EXCLUDED.final OR NOT http_requests.final
+  `
 }
 ```
 
+The `WHERE` on the update is what lets the flush row win. A later immediate row
+for the same id finds `final` set and changes nothing, and a flush resent after
+a failed acknowledgement replaces the row with the same value.
+
 | `source` | When | What your table should do |
 | --- | --- | --- |
-| `'flush'` | A normal flush | Insert. A duplicate is an identical retry |
-| `'batch'` | A locally staged event shipped itself | Insert |
-| `'immediate'` | Immediate delivery | Keep the newest row per id |
+| `'flush'` | A normal flush | Upsert on `id`. Under immediate delivery it replaces the running totals sent before it, and keeps its place against any that arrive after it |
+| `'batch'` | A locally staged event shipped itself | Insert, or upsert on `id`. A duplicate is an identical retry |
+| `'immediate'` | Immediate delivery | Keep the newest row per id, unless the row held came from a flush |
 
 ## Choosing
 

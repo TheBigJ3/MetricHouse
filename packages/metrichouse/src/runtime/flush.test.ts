@@ -985,7 +985,7 @@ describe('cadence across processes sharing a driver', () => {
     const shippedAt = clock
     await one.metric.flush()
 
-    clock = shippedAt + 1000
+    clock = shippedAt + 60_000
     await written(two)
     expect(await two.metric.flush({ force: true })).toMatchObject({ skipped: false, rows: 1 })
 
@@ -1353,3 +1353,262 @@ async function unhandledDuring(run: () => unknown): Promise<string[]> {
   }
   return raised
 }
+
+describe('claims per flush', () => {
+  const paths = (count: number) => Array.from({ length: count }, (_, i) => ({ path: `/${i}` }))
+
+  /** The memory driver, noting how many records each record claim came back with. */
+  const counting = (claims: number[]): Driver => ({
+    ...driver,
+    claimRecords: async (metric, limit) => {
+      const claim = await driver.claimRecords(metric, limit)
+      claims.push(claim.records.length)
+      return claim
+    },
+  })
+
+  it('claims again while a claim comes back full, and stops at one that is not', async () => {
+    const claims: number[] = []
+    const sent: number[] = []
+    const views = event('views', {
+      fields: { path: str() },
+      claimLimit: 2,
+      write: (rows) => {
+        sent.push(rows.length)
+      },
+    })
+    createHouse({ driver: counting(claims), schema: [views], now })
+    views.recordMany(paths(5))
+    await views.drain()
+
+    expect(await views.flush()).toEqual({ buckets: 0, rows: 5, skipped: false })
+    expect(sent).toEqual([2, 2, 1])
+    expect(claims).toEqual([2, 2, 1])
+  })
+
+  it('claims once more after a full claim that emptied the backlog', async () => {
+    const claims: number[] = []
+    const views = event('views', { fields: { path: str() }, claimLimit: 2, write: discard })
+    createHouse({ driver: counting(claims), schema: [views], now })
+    views.recordMany(paths(4))
+    await views.drain()
+
+    expect(await views.flush()).toEqual({ buckets: 0, rows: 4, skipped: false })
+    expect(claims).toEqual([2, 2, 0])
+  })
+
+  it('claims once when the metric has no claimLimit', async () => {
+    const claims: number[] = []
+    const views = event('views', { fields: { path: str() }, write: discard })
+    createHouse({ driver: counting(claims), schema: [views], now })
+    views.recordMany(paths(3))
+    await views.drain()
+
+    expect(await views.flush()).toEqual({ buckets: 0, rows: 3, skipped: false })
+    expect(claims).toEqual([3])
+  })
+
+  it('stops after a hundred claims in one flush', async () => {
+    const views = event('views', { fields: { path: str() }, claimLimit: 1, write: discard })
+    createHouse({ driver, schema: [views], now })
+    views.recordMany(paths(101))
+    await views.drain()
+
+    expect(await views.flush()).toEqual({ buckets: 0, rows: 100, skipped: false })
+    expect(await views.pending()).toBe(1)
+  })
+
+  it('claims a locally staged backlog in batches of claimLimit too', async () => {
+    const sent: number[] = []
+    const views = event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      claimLimit: 2,
+      write: (rows) => {
+        sent.push(rows.length)
+      },
+    })
+    createHouse({ driver, schema: [views], now })
+    views.recordMany(paths(3))
+
+    expect(await views.flush()).toEqual({ buckets: 0, rows: 3, skipped: false })
+    expect(sent).toEqual([2, 1])
+  })
+})
+
+describe('a flush still in flight', () => {
+  it('counts as the latest shipment, so a second flush waits out the cadence', async () => {
+    let release = (): void => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const sent: number[] = []
+    const metric = make('m', {
+      write: async (rows: Row[]) => {
+        sent.push(rows.length)
+        await gate
+      },
+    })
+    createHouse({ driver, schema: [metric], now })
+    metric.add(A)
+    await metric.drain()
+    settle()
+
+    const first = metric.flush()
+    await vi.waitFor(() => expect(sent).toEqual([1]))
+    metric.add(A)
+    await metric.drain()
+    settle()
+
+    expect(await metric.flush()).toEqual({
+      buckets: 0,
+      rows: 0,
+      skipped: true,
+      reason: 'cadence',
+      nextEligibleInMs: 300_000 - 3_000,
+    })
+    release()
+    expect(await first).toEqual({ buckets: 1, rows: 1, skipped: false })
+    expect(sent).toEqual([1])
+  })
+
+  it('stops counting once it has shipped nothing, so the next flush goes ahead', async () => {
+    let release = (): void => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const sent: number[] = []
+    let fail = true
+    const metric = make('m', {
+      write: async (rows: Row[]) => {
+        sent.push(rows.length)
+        await gate
+        if (fail) throw new Error('clickhouse is down')
+      },
+    })
+    createHouse({ driver, schema: [metric], now })
+    metric.add(A)
+    await metric.drain()
+    settle()
+
+    const first = metric.flush()
+    await vi.waitFor(() => expect(sent).toEqual([1]))
+    release()
+    expect((await first).error).toEqual(new Error('clickhouse is down'))
+
+    fail = false
+    expect(await metric.flush()).toEqual({ buckets: 1, rows: 1, skipped: false })
+  })
+})
+
+describe('a flush whose later claim fails', () => {
+  it('reports what the earlier claims wrote beside the error, and counts it as a shipment', async () => {
+    let calls = 0
+    let acks = 0
+    const lossy: Driver = {
+      ...driver,
+      ack: (claim) => {
+        acks += 1
+        return acks === 1 ? Promise.reject(new Error('claim was recovered')) : driver.ack(claim)
+      },
+    }
+    const views = event('views', {
+      fields: { path: str() },
+      claimLimit: 2,
+      write: () => {
+        calls += 1
+        if (calls === 2) throw new Error('clickhouse is down')
+      },
+    })
+    createHouse({ driver: lossy, schema: [views], now })
+    views.recordMany([{ path: '/a' }, { path: '/b' }, { path: '/c' }, { path: '/d' }])
+    await views.drain()
+
+    expect(await views.flush({ final: true })).toEqual({
+      buckets: 0,
+      rows: 4,
+      skipped: false,
+      error: new Error('clickhouse is down'),
+      written: { buckets: 0, rows: 2 },
+      ackError: new Error('claim was recovered'),
+    })
+    expect(await views.flush()).toMatchObject({ skipped: true, reason: 'cadence' })
+  })
+
+  it('reports a claim that fails after an earlier one wrote', async () => {
+    let claims = 0
+    const flaky: Driver = {
+      ...driver,
+      claimRecords: (metric, limit) => {
+        claims += 1
+        return claims === 2
+          ? Promise.reject(new Error('redis is down'))
+          : driver.claimRecords(metric, limit)
+      },
+    }
+    const views = event('views', { fields: { path: str() }, claimLimit: 2, write: discard })
+    createHouse({ driver: flaky, schema: [views], now })
+    views.recordMany([{ path: '/a' }, { path: '/b' }, { path: '/c' }])
+    await views.drain()
+
+    expect(await views.flush({ final: true })).toEqual({
+      buckets: 0,
+      rows: 2,
+      skipped: false,
+      error: new Error('redis is down'),
+      written: { buckets: 0, rows: 2 },
+    })
+  })
+
+  it('leaves written out when nothing was written before the failure', async () => {
+    const views = event('views', {
+      fields: { path: str() },
+      claimLimit: 2,
+      write: () => {
+        throw new Error('clickhouse is down')
+      },
+    })
+    createHouse({ driver, schema: [views], now })
+    views.recordMany([{ path: '/a' }, { path: '/b' }, { path: '/c' }])
+    await views.drain()
+
+    expect(await views.flush({ final: true })).toEqual({
+      buckets: 0,
+      rows: 2,
+      skipped: false,
+      error: new Error('clickhouse is down'),
+    })
+  })
+})
+
+describe('cadence slack', () => {
+  const shippedOnce = async () => {
+    const metric = counter('m', { resolution: '1s', flush: '1m', write: vi.fn() })
+    createHouse({ driver, schema: [metric], now })
+    metric.add()
+    await metric.drain()
+    settle()
+    await metric.flush()
+    metric.add()
+    await metric.drain()
+    return metric
+  }
+
+  it('counts a call a tenth of the cadence early as on time', async () => {
+    const metric = await shippedOnce()
+    clock += 60_000 - 6_000
+    expect(await metric.flush()).toEqual({ buckets: 1, rows: 1, skipped: false })
+  })
+
+  it('skips a call more than a tenth of the cadence early', async () => {
+    const metric = await shippedOnce()
+    clock += 60_000 - 6_001
+    expect(await metric.flush()).toEqual({
+      buckets: 0,
+      rows: 0,
+      skipped: true,
+      reason: 'cadence',
+      nextEligibleInMs: 6_001,
+    })
+  })
+})

@@ -23,6 +23,11 @@ Nothing flushes on its own. Something has to ask.
 5. **Settle.** If your function returned, delete the claimed data. If it threw,
    put it back unchanged.
 
+One claim is usually the whole flush. An event or a log with a
+[`claimLimit`](/primitives/event#claimlimit) caps each claim, so a claim that
+comes back with exactly that many records is followed by another, and the flush
+stops at the first claim that carries fewer, or after a hundred claims.
+
 Recovery comes before the claim on purpose. A claim that was abandoned is already
 out of the live set, so claiming can never find it however long you wait. See
 [Recovering a crashed flush](/guide/reliability#recovering-a-crashed-flush).
@@ -70,6 +75,7 @@ interface MetricFlushReport {
   reason?: 'cadence' | 'not-selected'
   nextEligibleInMs?: number   // when the cadence will allow the next attempt
   error?: unknown             // set if your write function threw, or the claim failed
+  written?: { buckets: number; rows: number }  // set beside error when earlier claims shipped
   releaseError?: unknown      // set if the write threw and putting the rows back failed too
   ackError?: unknown          // set if the rows shipped and settling the claim failed
   recovered?: RecoveryReport  // set if a dead flusher's batch was put back
@@ -137,11 +143,19 @@ early empty call would block the next real one for a full interval, which is
 worst on metrics with coarse resolutions.
 :::
 
-A call that arrives within fifty milliseconds of the cadence, or a tenth of it
-for a cadence shorter than half a second, counts as on time. The scheduler's
-timers and the house clock are two different clocks, and a tick can fire a
-millisecond before the clock says the interval is over. Turning that tick away
-would make the metric wait a second full interval.
+A call that arrives up to a tenth of the cadence early counts as on time, so a
+metric on `flush: '1m'` ships on a call 54 seconds after its last shipment. The
+scheduler's timers and the house clock are two different clocks, and a tick can
+fire a millisecond before the clock says the interval is over. A cron fires
+wherever in its minute the platform gets to it, and one minute's call can come
+a few hundred milliseconds earlier than the last. Turning either away would
+make the metric wait a second full interval.
+
+A flush that is still running counts as the latest shipment. A second call
+while the first is inside your `write` function reports `skipped: true` with
+`reason: 'cadence'`, rather than claiming what closed since and shipping beside
+it in the same interval. If the first ships nothing, because nothing was closed
+or because your function threw, the next call goes ahead.
 
 The cadence is measured from the last flush that shipped rows. Before the first
 one there is nothing to measure from, so the first flush always goes ahead,
@@ -234,7 +248,9 @@ depending on your table. If you want that behaviour deliberately, that is
 [immediate delivery](/guide/delivery).
 
 Events and logs are different. A record is complete the moment you write it, so
-there is no partial state to protect and a flush takes the whole backlog.
+there is no partial state to protect and a flush takes the whole backlog, in
+claims of at most [`claimLimit`](/primitives/event#claimlimit) records each when
+the event sets one.
 
 ## Using the scheduler
 
@@ -254,8 +270,8 @@ What it does:
   database does not stack writes on top of each other.
 - Sends failures to `onError`, since a scheduled flush has no caller to return a
   report to. A failed recovery pass goes there too, as its `recoveryError`,
-  although the flush below it still ran, and so does a `releaseError`. With no
-  `onError`, each becomes an unhandled rejection.
+  although the flush below it still ran, and so do a `releaseError` and an
+  `ackError`. With no `onError`, each becomes an unhandled rejection.
 - Unreferences its timers, so metrics never keep your process alive.
 - Picks up metrics registered after it started.
 
@@ -274,11 +290,13 @@ Clears the timers, waits for every flush still running, then drains writes
 still on their way to the driver and waits for flushes again, and keeps taking
 those two turns until a wait for flushes that follows a drain finds none. Then
 it makes a [final flush](/reference/flush-options#final): past this process's
-cadence, and past grace, so every window that has ended ships. On a shared,
-durable driver such as `ioredis()`, the final flush still waits for the
-[turn](#several-processes-on-one-driver). It returns the report from that
-final flush. A second call while the first is still running returns
-the same promise, unless `house.start()` ran in between.
+cadence, and past grace, so on a driver of its own every window that has ended
+ships. On a shared, durable driver such as `ioredis()`, the final flush still
+waits for the [turn](#several-processes-on-one-driver). A metric another process
+took the turn for reports `skipped: true` and ships nothing, and its rows stay
+in Redis for whichever process takes the next turn. It returns the report from
+that final flush. A second call while the first is still running returns the
+same promise, unless `house.start()` ran in between.
 
 Waiting for a running flush matters. If its `write` function fails after
 `stop()` was called, the rows go back to the driver, and the final flush is what
@@ -293,10 +311,22 @@ timeout.
 process.on('SIGTERM', async () => {
   server.close()
   const report = await house.stop()
-  if (!report.ok) logger.error({ report }, 'data left unflushed at shutdown')
+  if (!report.ok) logger.error({ report }, 'final flush failed')
+
+  // skipped on the turn is not a failure. Those rows wait in Redis for the
+  // process that takes the next turn, and on memory() nothing is skipped
+  const waiting = Object.entries(report.metrics)
+    .filter(([, metric]) => metric.skipped)
+    .map(([name]) => name)
+  if (waiting.length > 0) logger.info({ waiting }, 'left for the next turn')
+
   process.exit(0)
 })
 ```
+
+`report.ok` is `false` when a metric's `write` function threw during the final
+flush. On a durable driver those rows are back in storage for the next process,
+and on `memory()` they go when the process exits.
 
 ## Flushing without a long running process
 

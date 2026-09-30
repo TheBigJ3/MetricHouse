@@ -195,7 +195,9 @@ export async function GET(request: Request) {
 
 One minute is the finest schedule Vercel crons support, and it is enough. Each
 metric still honours its own cadence, so a five minute metric ships every five
-minutes and the calls in between cost a single clock comparison.
+minutes. A call in between usually runs on an instance that did not make the
+last shipment, so it asks Redis for the metric's turn, one round trip per
+metric, and is refused there.
 
 ## Reading it live
 

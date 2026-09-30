@@ -17,7 +17,7 @@ whether the driver can be trusted to hold data between requests.
 | Vercel functions | `ioredis()` | `'staged'` | A cron route |
 | Cloudflare Workers | `ioredis()` | `'staged'` | A scheduled handler |
 | AWS Lambda | `ioredis()` | `'staged'` | An EventBridge rule |
-| Any serverless, no Redis | `memory()` | `'immediate'` | Nothing, plus `drain()` |
+| Any serverless, no Redis | `memory()` | `'immediate'` | Nothing for events and logs, plus `drain()`. See below for folded metrics |
 
 ## A Node server
 
@@ -120,8 +120,10 @@ export async function GET() {
 ```
 
 A minute is the finest schedule Vercel crons support. Each metric still honours
-its own cadence, so a five minute metric ships every five minutes and the calls
-in between cost one clock comparison.
+its own cadence, so a five minute metric ships every five minutes. A call in
+between is a clock comparison when this instance made the last shipment. A
+cron usually lands on a fresh or different instance that has not, so it asks
+Redis for the metric's turn, one round trip per metric, and is refused there.
 
 ## Cloudflare Workers
 
@@ -202,6 +204,14 @@ export const house = createHouse({
 The cost is one database call per application write, and folded metrics resend
 the same row id with a rising running total, so your table must keep the newest
 row per id. Read [Delivery modes](/guide/delivery) before choosing this.
+
+Events and logs ship on `record()` and leave the driver, so they need no flush.
+Counters, gauges, levels and timers do not: immediate delivery sends their open
+window and deletes nothing, so their finished windows stay in the isolate's
+memory until a `flush()` claims them. Call `house.flush()` at the end of a
+request, after `drain()`, so a warm isolate does not fill up with windows
+that already reached your table. Each metric's cadence keeps that to one
+shipment per interval.
 
 ## Changing a schema with data in storage
 

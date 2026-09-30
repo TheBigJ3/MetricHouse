@@ -7,7 +7,7 @@ import { event } from '../metrics/event.js'
 import { timer } from '../metrics/timer.js'
 import type { Row, WriteFn } from '../metrics/types.js'
 import { oneOf, str } from '../schema/types.js'
-import { createHouse } from './house.js'
+import { createHouse, type HouseConfig } from './house.js'
 
 /** A sink that keeps nothing, for declaration tests that never ship. */
 const discard: WriteFn = () => {}
@@ -146,6 +146,44 @@ describe('createHouse', () => {
     createHouse({ driver: { ...memory(), capabilities: DURABLE }, schema: [audit()], onWarn })
     expect(onWarn).not.toHaveBeenCalled()
   })
+
+  it('registers every metric when onWarn throws, and hands the throw to onError', () => {
+    const onError = vi.fn()
+    const thrown = new Error('logger is down')
+    const house = createHouse({
+      driver: memory(),
+      schema: [audit(), makeCounter()],
+      onWarn: (_message, context) => {
+        if (context.metric !== undefined) throw thrown
+      },
+      onError,
+    })
+    expect(house.metrics().map((metric) => metric.name)).toEqual(['order_audit', 'dog_poops'])
+    expect(onError.mock.calls).toEqual([[thrown, { metric: 'order_audit' }]])
+  })
+
+  it('schedules a metric registered while running when onWarn throws', async () => {
+    vi.useFakeTimers()
+    try {
+      const write = vi.fn()
+      const house = createHouse({
+        driver: memory(),
+        onWarn: (_message, context) => {
+          if (context.metric !== undefined) throw new Error('logger is down')
+        },
+        onError: () => {},
+      })
+      house.start()
+      const walks = event('walks', { fields: {}, durability: 'durable', flush: '1s', write })
+      house.register(walks)
+      await walks.record({})
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(write.mock.calls.map(([rows]) => rows.length)).toEqual([1])
+      await house.stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 describe('house config', () => {
@@ -158,6 +196,31 @@ describe('house config', () => {
   it('refuses a default flush cadence a timer cannot wait for', () => {
     expect(() => createHouse({ driver, defaults: { flush: '25d' } })).toThrow(
       /^createHouse: defaults.flush is 25d, longer than 2147483647ms/,
+    )
+  })
+
+  it('refuses a config with no driver', () => {
+    expect(() => createHouse({} as HouseConfig)).toThrow(
+      'createHouse: driver is required, such as memory() or ioredis(client), got undefined',
+    )
+  })
+
+  it('refuses a driver that is not a driver', () => {
+    expect(() => createHouse({ driver: 'redis' } as unknown as HouseConfig)).toThrow(
+      'createHouse: driver is required, such as memory() or ioredis(client), got "redis"',
+    )
+  })
+
+  it('refuses a client passed where its driver belongs', () => {
+    expect(() => createHouse({ driver: {} } as unknown as HouseConfig)).toThrow(
+      'createHouse: driver has no capabilities, so it is not a driver. Pass memory() or ' +
+        'ioredis(client), not the client itself',
+    )
+  })
+
+  it('refuses a clock that is not a function', () => {
+    expect(() => createHouse({ driver, now: 5 } as unknown as HouseConfig)).toThrow(
+      'createHouse: now must be a function returning epoch milliseconds, got 5',
     )
   })
 })
@@ -226,6 +289,32 @@ describe('drain', () => {
 
     expect(await a.current(WILLOW)).toBe(20)
     expect(await b.current(REX)).toBe(20)
+  })
+
+  it('does not wait for a write issued after it was called', async () => {
+    const gates: (() => void)[] = []
+    const inner = memory()
+    const held: Driver = {
+      ...inner,
+      increment: async (ops) => {
+        await new Promise<void>((resolve) => gates.push(resolve))
+        return inner.increment(ops)
+      },
+    }
+    const dogPoops = makeCounter()
+    const house = createHouse({ driver: held, schema: [dogPoops], now })
+
+    dogPoops.add(WILLOW)
+    const drained = watch(house.drain())
+    dogPoops.add(WILLOW)
+    await vi.waitFor(() => expect(gates).toHaveLength(2))
+    gates[0]?.()
+    await vi.waitFor(() => expect(drained.settled).toBe(true))
+    expect(await dogPoops.current(WILLOW)).toBe(1)
+
+    gates[1]?.()
+    await house.drain()
+    expect(await dogPoops.current(WILLOW)).toBe(2)
   })
 
   it('resolves when nothing is pending', async () => {
@@ -522,7 +611,8 @@ describe('house.stop()', () => {
 
     signups.record({ plan: 'team' })
     await signups.drain()
-    const second = signups.flush()
+    // forced, since the first flush still counts as the latest shipment
+    const second = signups.flush({ force: true })
     await vi.waitFor(() => expect(sink.waiting).toHaveLength(2))
     sink.waiting[0]?.(new Error('sink timed out'))
     await first
@@ -673,6 +763,39 @@ describe('house.stop()', () => {
     ])
     expect(report.metrics.logins).toMatchObject({ rows: 1 })
     expect(await logins.snapshot({ complete: false })).toEqual([])
+  })
+
+  it('waits for a write issued while it drains, and ships it', async () => {
+    const gates: (() => void)[] = []
+    const inner = memory()
+    const held: Driver = {
+      ...inner,
+      increment: async (ops) => {
+        await new Promise<void>((resolve) => gates.push(resolve))
+        return inner.increment(ops)
+      },
+    }
+    const shipped: Row[] = []
+    const dogPoops = makeCounter('dog_poops', {
+      write: (rows: Row[]) => {
+        shipped.push(...rows)
+      },
+    })
+    const house = createHouse({ driver: held, schema: [dogPoops], now })
+
+    dogPoops.add(WILLOW)
+    const stopping = house.stop()
+    await macrotask()
+    dogPoops.add(WILLOW)
+    await vi.waitFor(() => expect(gates).toHaveLength(2))
+    gates[0]?.()
+    await macrotask()
+    clock += 1_000
+    gates[1]?.()
+    const report = await stopping
+
+    expect(report.metrics.dog_poops).toEqual({ buckets: 1, rows: 1, skipped: false })
+    expect(shipped).toMatchObject([{ ...WILLOW, value: 2 }])
   })
 
   it('answers a second call while it runs with the same final flush', async () => {

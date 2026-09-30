@@ -287,7 +287,8 @@ Ships every closed window to this gauge's own `write` function.
 drain(): Promise<void>
 ```
 
-Resolves once every `set()` issued so far has reached the driver.
+Resolves once every `set()` issued before the call has reached the driver.
+Under [immediate delivery](/guide/delivery) it also waits for the send to `write` that follows each one.
 
 ## gauge.rowShape()
 

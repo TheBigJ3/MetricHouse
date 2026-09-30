@@ -377,7 +377,8 @@ argument and every field of the report.
 drain(): Promise<void>
 ```
 
-Resolves once every `add()` issued so far has reached the driver.
+Resolves once every `add()` issued before the call has reached the driver.
+Under [immediate delivery](/guide/delivery) it also waits for the send to `write` that follows each one.
 
 ```ts
 httpRequests.add({ route: '/checkout', status: '2xx' })

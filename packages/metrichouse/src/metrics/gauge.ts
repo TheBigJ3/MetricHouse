@@ -33,7 +33,14 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink, describeValue, dimColumns, pendingWrites } from './types.js'
+import {
+  assertMetricName,
+  assertSink,
+  describeValue,
+  dimColumns,
+  pendingWrites,
+  SETTLE_WRITES,
+} from './types.js'
 
 /** The five stored aggregates, in column order. */
 export const GAUGE_AGGREGATES = ['last', 'min', 'max', 'sum', 'count'] as const
@@ -347,6 +354,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       driver: slot.driver,
       materialize,
       totalOf,
+      sendsSoFar: slot.sendsSoFar,
     }),
 
     ...bucketedReader<D, Partial<Record<GaugeAggregate, number>>>({
@@ -450,6 +458,10 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
 
     drain(): Promise<void> {
       return writes.drain()
+    },
+
+    [SETTLE_WRITES](): Promise<void> {
+      return writes.settle()
     },
 
     materialize,

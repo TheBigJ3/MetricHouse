@@ -415,7 +415,8 @@ Ships every closed window to this timer's own `write` function. The
 drain(): Promise<void>
 ```
 
-Resolves once every timing recorded so far has reached the driver.
+Resolves once every timing recorded before the call has reached the driver.
+Under [immediate delivery](/guide/delivery) it also waits for the send to `write` that follows each one.
 
 ## timer.rowShape()
 

@@ -54,10 +54,13 @@ const house = createHouse({
 Defaults are filled in, never overridden. A metric that declares `flush: '5m'`
 because it carries payment data keeps it whatever the house says.
 
-Both `delivery` and `defaults.flush` are checked when the house is created. A
-`delivery` that is not one of the three modes throws, which matters when it is
-read from an environment variable that TypeScript cannot check. A
-`defaults.flush` of zero, or one longer than a timer can wait, throws too. See
+`driver`, `now`, `delivery` and `defaults.flush` are checked when the house is
+created, which matters for a config built in JavaScript or read from an
+environment variable that TypeScript cannot check. A missing `driver` throws, and
+so does an object with no `capabilities`, such as a Redis client passed where
+`ioredis(client)` belongs. A `now` that is not a function throws. A `delivery`
+that is not one of the three modes throws. A `defaults.flush` of zero, or one
+longer than a timer can wait, throws too. See
 [Durations](/reference/durations#settings-a-timer-waits-for).
 
 ## Registering metrics
@@ -89,6 +92,11 @@ for example because it has no flush cadence and the house gives none either,
 `createHouse` throws and none of the metrics in that call stay bound, the one
 that failed included. Fix the mistake and call `createHouse` again with the same
 metrics.
+
+The warnings a registration raises through `onWarn` go out last, once every
+metric is registered and scheduled. An `onWarn` that throws there does not undo
+the registration. The throw goes to `onError`, or becomes an unhandled
+rejection when there is none, and the remaining warnings still go out.
 
 ## Looking at what is registered
 
@@ -146,11 +154,17 @@ moment is a burst nobody asked for. If you want that concurrency, call
 
 ### drain
 
-Resolves once every write you have issued has reached the driver.
+Resolves once every write issued before the call has reached the driver.
 
 ```ts
 await house.drain()
 ```
+
+A write issued while `drain()` waits is not waited for, so a server under steady
+traffic can await it without waiting for a quiet moment. Call it again to cover
+those. Under [immediate delivery](/guide/delivery), a write is followed by a
+send to the metric's `write` function, and `drain()` waits for that send as
+well, so it takes as long as your sink does.
 
 A write that failed does not end the wait early and does not make `drain()`
 reject. It goes to `onError`, or becomes an unhandled rejection when there is
@@ -220,13 +234,15 @@ process.on('SIGTERM', async () => {
    a cron calling `house.flush()`, or your own `metric.flush()`. A
    `house.flush()` is waited for until it has visited every metric it was
    asked to, and a flush that starts while it waits is waited for too.
-3. Drains writes still on their way to the driver. Steps 2 and 3 then take
-   turns until a wait for flushes that follows a drain finds none, so a flush
-   that starts while the writes drain is waited for as well.
+3. Drains writes still on their way to the driver, including those issued
+   while it waits, until none is left. Steps 2 and 3 then take turns until a
+   wait for flushes that follows a drain finds none, so a flush that starts
+   while the writes drain is waited for as well.
 4. Makes a [final flush](/reference/flush-options#final) past this process's
    cadence and every grace period. On a shared, durable driver it still waits
-   for the [turn](/guide/flushing#several-processes-on-one-driver), and what it
-   leaves ships with the next one.
+   for the [turn](/guide/flushing#several-processes-on-one-driver). A metric
+   another process holds the turn for reports `skipped: true`, ships nothing,
+   and leaves its rows in storage for whichever process takes the next turn.
 
 A write or a flush that failed, or an `onError` that threw, is reported and
 does not stop the steps after it. A flush whose sink fails during steps 2 and
@@ -248,8 +264,10 @@ for.
 
 After `stop()` returns, nothing calls a sink on a timer. A locally staged event
 whose send failed during `stop()` keeps its records in memory and arms no
-retry. The next `drain()` or `flush()` sends them, and `house.start()` lets the
-retry timer run again.
+retry. The next `drain()` or `flush()` sends them. `house.start()` arms no
+retry timer of its own. After it, the event's scheduled flush sends them on its
+cadence, and the next `record()` or failed send arms the `batch.maxAge` timer
+again.
 
 What it cannot ship is the window that is still open. It has not finished, and
 sending a partial value under the same row id is the exact problem that
