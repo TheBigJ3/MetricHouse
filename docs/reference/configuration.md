@@ -129,7 +129,7 @@ event(name, { fields, stage, durability, batch, flush, timestamp, sample, derive
 | `timestamp` | `'auto'` or a `ts()` field | `'auto'` | Where `ts` comes from |
 | `sample` | number or function | keep everything | The fraction to keep, 0 to 1 |
 | `derive` | record of functions | none | Counters this event also increments |
-| `claimLimit` | number | unlimited | Records one flush may carry |
+| `claimLimit` | number | unlimited | Records one claim, and one call to `write`, may carry. A flush claims again while a claim comes back full |
 | `write` | `WriteFn` | required | Where the rows go |
 
 A field may not be named `id`, `ts`, `_ingested_at` or `_sample_rate`.
@@ -152,7 +152,7 @@ log(name, { fields, levels, minLevel, stage, batch, flush, claimLimit, write })
 | `batch.maxAge` | duration | `'10s'` | Local staging: ship this long after the first |
 | `batch.maxStaged` | number | `100_000`, or `batch.maxSize` when larger | Local staging: the most records this process holds before it refuses more |
 | `flush` | duration | the house default, then `'30s'` | The fastest this may ship |
-| `claimLimit` | number | unlimited | Lines one flush may carry |
+| `claimLimit` | number | unlimited | Lines one claim, and one call to `write`, may carry. A flush claims again while a claim comes back full |
 | `write` | `WriteFn` | required | Where the rows go |
 
 A field may not be named `id`, `ts`, `level`, `message`, `error_stack`,

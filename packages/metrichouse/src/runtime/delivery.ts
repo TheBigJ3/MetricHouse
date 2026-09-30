@@ -32,7 +32,10 @@
  * `metric.flush()`, from a scheduler tick, a cron, or `house.flush()`, to
  * claim and delete its closed buckets, or they accumulate in the driver
  * forever. The final flush row carries the same id and the complete fold, so it
- * supersedes every partial send, and the two paths converge rather than fight.
+ * supersedes every partial send. In one process a flush waits for the sends
+ * already under way before its rows go, so it is the last row for its window.
+ * Another process can still send an older total after it, which is why a sink
+ * has to let a `'flush'` row win over an `'immediate'` one with the same id.
  */
 
 import type { DriverCapabilities } from '../drivers/types.js'

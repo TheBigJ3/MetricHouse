@@ -55,7 +55,7 @@ writing to an unbound log throws.
 | `config.stage` | `'driver'` or `'local'` | no | [Where lines wait](#stage) |
 | `config.batch` | object | no | [Local staging size and age limits](#batch) |
 | `config.flush` | duration | no | [The fastest this may ship](#flush) |
-| `config.claimLimit` | number | no | [Lines one flush may carry](#claimlimit) |
+| `config.claimLimit` | number | no | [Lines one claim, and one call to `write`, may carry](#claimlimit) |
 | `config.write` | function | yes | [Where the rows go](#write) |
 
 ### name
@@ -190,9 +190,9 @@ so any duration is legal.
 claimLimit?: number      // default: unlimited
 ```
 
-How many lines one flush may carry. Identical to
-[the event's](/primitives/event#claimlimit), and worth setting on a log that
-uploads a file per flush.
+How many lines one claim, and so one call to `write`, may carry. Identical to
+[the event's](/primitives/event#claimlimit): a flush claims again while a claim
+comes back full. Worth setting on a log that uploads a file per call.
 
 ### write
 
@@ -411,7 +411,8 @@ Options are in [Snapshot options](/reference/snapshot-options).
 flush(options?: FlushOptions): Promise<MetricFlushReport>
 ```
 
-Claims the staged lines, up to [`claimLimit`](#claimlimit), and ships them.
+Claims the staged lines and ships them, in claims of at most
+[`claimLimit`](#claimlimit) lines.
 [Flush options](/reference/flush-options) covers the argument and the report.
 
 ## log.drain()
@@ -420,8 +421,9 @@ Claims the staged lines, up to [`claimLimit`](#claimlimit), and ships them.
 drain(): Promise<void>
 ```
 
-Resolves once every line written so far has reached the driver. On a locally
-staged log it also ships what is buffered.
+Resolves once every line written before the call has reached the driver. On a
+locally staged log it also ships what is buffered, and waits for that send.
+Under [immediate delivery](/guide/delivery) it also waits for the send to `write` that follows each one.
 
 ## log.rowShape()
 
@@ -589,7 +591,7 @@ export const appLog = log('app_log', {
   stage: 'driver',
   flush: '10s',
 
-  // Bound, so an outage does not produce one enormous upload.
+  // Bound, so an outage produces several uploads rather than one enormous one.
   claimLimit: 5_000,
 
   write: async (rows) => {

@@ -1,6 +1,7 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { memory } from '../drivers/memory.js'
 import type { Driver } from '../drivers/types.js'
+import { createHouse } from '../runtime/house.js'
 import type { LiveRow } from '../runtime/live.js'
 import { oneOf, str, ts } from '../schema/types.js'
 import { counter } from './counter.js'
@@ -120,5 +121,50 @@ describe('bucketedReader', () => {
     await expect(metric.snapshot({ complete: false, dims: { park: 'riverside' } })).rejects.toThrow(
       'decodeDimKey: expected at most 3 segments for [dogName, park, seen], got 4',
     )
+  })
+})
+
+describe('bucketedLifecycle', () => {
+  it('lets an immediate send already under way reach the sink before the flush row', async () => {
+    let release = (): void => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let reads = 0
+    const held: Driver = {
+      ...driver,
+      readBuckets: async (query) => {
+        const rows = await driver.readBuckets(query)
+        reads += 1
+        // the first send has read its running total, and is slow to send it
+        if (reads === 1) await gate
+        return rows
+      },
+    }
+    const sent: [string, unknown][] = []
+    const visits = counter('visits', {
+      resolution: '1s',
+      flush: '5m',
+      write: (rows, context) => {
+        for (const row of rows) sent.push([context.source, row.value])
+      },
+    })
+    createHouse({ driver: held, schema: [visits], delivery: 'immediate', now })
+
+    visits.add()
+    await vi.waitFor(() => expect(reads).toBe(1))
+    visits.add()
+    await vi.waitFor(() => expect(sent).toEqual([['immediate', 2]]))
+    clock += 3_000
+    const flushing = visits.flush()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    release()
+    await flushing
+
+    expect(sent).toEqual([
+      ['immediate', 2],
+      ['immediate', 1],
+      ['flush', 2],
+    ])
   })
 })

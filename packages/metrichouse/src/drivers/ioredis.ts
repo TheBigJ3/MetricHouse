@@ -1064,8 +1064,10 @@ return { claims, buckets, records, oldest }
  *
  * The rule {@link Driver.takeTurn} states, checked and recorded in one step.
  * The time is the caller's, not Redis's: a turn is compared with the clock
- * the flush reads, the one a test can inject, and hosts whose clocks disagree
- * by a few milliseconds move the gap by that much and no more.
+ * the flush reads, the one a test can inject. Hosts whose clocks disagree
+ * move the gap by that much. The flush asks for a gap a tenth shorter than
+ * its cadence, so a disagreement smaller than that tenth, or a cron firing a
+ * little earlier within its minute than last time, still gets the turn.
  *
  * Applied once, with its answer recorded. A turn resent after a reconnect
  * would otherwise find the one it had just taken in its way and be refused,

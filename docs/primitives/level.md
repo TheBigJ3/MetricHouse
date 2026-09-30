@@ -376,8 +376,10 @@ them. [How carry works](#how-carry-works) covers the first half, and
 drain(): Promise<void>
 ```
 
-Resolves once every write issued so far has reached the driver. Draining does
-not carry or ship anything.
+Resolves once every write issued before the call has reached the driver.
+Draining does not carry or claim anything. Under
+[immediate delivery](/guide/delivery) it waits for the send to `write` that
+follows each write as well.
 
 ## level.rowShape()
 

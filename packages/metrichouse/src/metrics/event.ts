@@ -56,7 +56,14 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink, isCounter, pendingWrites, reportError } from './types.js'
+import {
+  assertMetricName,
+  assertSink,
+  isCounter,
+  pendingWrites,
+  reportError,
+  SETTLE_WRITES,
+} from './types.js'
 
 /**
  * Where records wait between `record()` and your `write()`.
@@ -1155,6 +1162,7 @@ export function stagedMetric<
       attempts,
       // locally staged records are this process's own, and only it can ship them
       sharedDriver: () => (stage === 'local' ? undefined : activeDriver()),
+      ...(config.claimLimit !== undefined && { claimLimit: config.claimLimit }),
     }),
 
     name,
@@ -1361,6 +1369,11 @@ export function stagedMetric<
       if (stage === 'local') shipLocal('batch', true)
 
       await writes.drain()
+    },
+
+    async [SETTLE_WRITES](): Promise<void> {
+      if (stage === 'local') shipLocal('batch', true)
+      await writes.settle()
     },
 
     rowShape(): RowShape {

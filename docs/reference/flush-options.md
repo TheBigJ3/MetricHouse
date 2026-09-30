@@ -92,10 +92,11 @@ those windows, and that write is moved forward into a window that has not
 shipped rather than lost
 ([Buckets and time](/guide/buckets-and-time#a-write-that-misses-its-window)).
 
-A final flush also keeps claiming until the backlog is empty, for a metric with
-a [`claimLimit`](/primitives/event#claimlimit) that ships a backlog across
-several claims. It stops after a hundred claims, so a process that is stopping
-does not chase records another instance is still adding.
+Every flush claims again after a claim that came back with exactly
+[`claimLimit`](/primitives/event#claimlimit) records, and stops at the first
+that carries fewer. A final flush goes further and keeps claiming until a claim
+comes back empty. Either stops after a hundred claims, so a flush does not
+chase records another instance is still adding.
 
 `house.stop()` passes `final` for you. Pass it yourself only in a shutdown path
 that does not go through `stop()`, and call `drain()` first.
@@ -169,9 +170,10 @@ const report = await httpRequests.flush()
 | `skipped` | `boolean` | always | Whether anything was attempted |
 | `reason` | `'cadence'` or `'not-selected'` | when skipped | Why nothing was attempted |
 | `nextEligibleInMs` | `number` | when skipped on cadence | How long until this metric may ship again |
-| `error` | `unknown` | when the flush shipped nothing it meant to | What your `write` function threw, or why taking the turn or the claim failed. The rows are back in the live set, or never left it. A `write` that rejects with no reason, as `Promise.reject()` does, reports `Error: <metric>: the sink rejected without a reason` |
+| `error` | `unknown` | when a claim or a write failed | What your `write` function threw, or why taking the turn or the claim failed. The failed claim's rows are back in the live set, or never left it. A `write` that rejects with no reason, as `Promise.reject()` does, reports `Error: <metric>: the sink rejected without a reason` |
+| `written` | `{ buckets, rows }` | beside `error`, when claims before the failed one were written | A flush that claims more than once can fail partway. `buckets` and `rows` count every claim handed to `write`, the failed one included, and `written` says how many of them `write` took. Those rows have left storage, and the cadence counts the flush as a shipment |
 | `releaseError` | `unknown` | when the write failed and putting the rows back failed too | `error` still holds what `write` threw. The rows are held in the claim rather than back in the live set, where a durable driver's recovery returns them once `recoverAfter` has passed |
-| `ackError` | `unknown` | when the rows were written and the claim could not be settled | The rows did ship. Another flusher had usually recovered the claim first, so the same rows, with the same ids, will arrive again |
+| `ackError` | `unknown` | when the rows were written and a claim could not be settled | The rows did ship. Another flusher had usually recovered the claim first, so the same rows, with the same ids, will arrive again. Kept when a later claim of the same flush fails |
 | `recovered` | `RecoveryReport` | when a dead flusher left a claim | What this flush put back before claiming |
 | `recoveryError` | `unknown` | when recovery itself failed | The flush below it still ran |
 
@@ -186,7 +188,10 @@ if (report.recovered) {
 
 An empty flush leaves the cadence clock untouched. Nothing shipped, so nothing
 should count as a shipment, and data that closes a second later does not have
-to wait a full interval for the next one.
+to wait a full interval for the next one. A flush that is still running counts
+as the latest shipment until it returns, so a second call meanwhile reports
+`skipped: true` with `reason: 'cadence'`. If the running one ships nothing, the
+next call goes ahead.
 
 `ackError` is the one failure that sits beside a success. The rows reached your
 `write` function and it returned, so they count as shipped and the cadence moves
@@ -231,7 +236,7 @@ cadence -> turn -> recover -> claim -> materialise -> write -> ack or release
 | Cadence | An early call returns `skipped: true` unless `force` or `final` says otherwise |
 | Turn | On a shared driver, the metric's turn is taken from the driver. A call another process beat to it returns `skipped: true`. A flush that writes nothing gives the turn back |
 | Recover | A claim a previous flusher died holding is put back, so this flush can ship it |
-| Claim | Finished data leaves the live set atomically, so a second flusher cannot take it. `final` counts a window inside grace as finished |
+| Claim | Finished data leaves the live set atomically, so a second flusher cannot take it. `final` counts a window inside grace as finished. A claim that carried a full `claimLimit` is followed by another |
 | Materialise | The claim becomes the rows your `write` function receives |
 | Write | Your function runs. Throwing means the rows come back |
 | Settle | Success deletes the claimed data, failure returns it with `attempt` raised |

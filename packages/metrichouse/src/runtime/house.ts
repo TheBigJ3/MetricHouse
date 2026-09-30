@@ -17,7 +17,7 @@
  */
 
 import type { Driver } from '../drivers/types.js'
-import { type AnyMetric, isMetric, SETTLE } from '../metrics/types.js'
+import { type AnyMetric, isMetric, reportError, SETTLE, SETTLE_WRITES } from '../metrics/types.js'
 import { bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
 import {
@@ -158,7 +158,10 @@ export interface House {
   current(): Promise<HouseSnapshot>
 
   /**
-   * Resolve when every queued write has reached the driver.
+   * Resolve when every write issued before the call has reached the driver,
+   * and under immediate delivery once the send after each has returned. A
+   * write issued while it waits is not waited for, so steady traffic cannot
+   * keep it from resolving.
    *
    * The only write guarantee on a runtime with no `SIGTERM`, where the isolate
    * freezes the moment the response is returned.
@@ -174,7 +177,41 @@ function collect(schema: SchemaInput | undefined): AnyMetric[] {
   return [...new Set(values.filter(isMetric))]
 }
 
+/** A config value as an error message shows it. */
+function shown(value: unknown): string {
+  return typeof value === 'string' ? JSON.stringify(value) : String(value)
+}
+
+/**
+ * Check what TypeScript cannot, for a config built in JavaScript or from
+ * `any`. Without this a missing driver or a clock that is not a function
+ * fails later, at the first write or flush, as a TypeError naming neither.
+ *
+ * @throws naming the setting and what was passed
+ */
+function assertConfig(config: HouseConfig | undefined): asserts config is HouseConfig {
+  const driver: unknown = config?.driver
+  if (typeof driver !== 'object' || driver === null) {
+    throw new Error(
+      `createHouse: driver is required, such as memory() or ioredis(client), got ${shown(driver)}`,
+    )
+  }
+  if (typeof (driver as Partial<Driver>).capabilities !== 'object') {
+    throw new Error(
+      'createHouse: driver has no capabilities, so it is not a driver. Pass memory() or ' +
+        'ioredis(client), not the client itself',
+    )
+  }
+  const now: unknown = config?.now
+  if (now !== undefined && typeof now !== 'function') {
+    throw new Error(
+      `createHouse: now must be a function returning epoch milliseconds, got ${shown(now)}`,
+    )
+  }
+}
+
 export function createHouse(config: HouseConfig): House {
+  assertConfig(config)
   const now = config.now ?? Date.now
   const registry = new Map<string, AnyMetric>()
   /** Set by `stop()` and cleared by `start()`. Metrics read it before arming a timer. */
@@ -284,11 +321,21 @@ export function createHouse(config: HouseConfig): House {
     }
 
     for (const metric of incoming) {
-      warnIfDurableIsNot(metric)
       registry.set(metric.name, metric)
       // a metric added while the scheduler is running gets its interval now,
       // rather than at the next start() that may never come
       scheduler.add(metric)
+    }
+
+    // last, once every metric is bound, held and scheduled, since `onWarn` is
+    // the caller's code. One that throws is reported like any failure that
+    // has no caller to go to, and the warnings after it still go out
+    for (const metric of incoming) {
+      try {
+        warnIfDurableIsNot(metric)
+      } catch (error) {
+        reportError(config.onError, error, { metric: metric.name })
+      }
     }
   }
 
@@ -350,7 +397,10 @@ export function createHouse(config: HouseConfig): House {
       // a write still in flight to the driver is not yet claimable, and
       // flushing before it lands would leave it behind in a process that is
       // about to exit
-      await Promise.all([...registry.values()].map((metric) => metric.drain()))
+      // and one issued while this waits, which `drain()` alone leaves behind
+      await Promise.all(
+        [...registry.values()].map((metric) => metric[SETTLE_WRITES]?.() ?? metric.drain()),
+      )
       if (!(await settleFlushes())) return
     }
   }

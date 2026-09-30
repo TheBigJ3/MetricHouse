@@ -173,10 +173,15 @@ at its own cadence. Nothing else has to call anything.
 house.start()
 
 process.on('SIGTERM', async () => {
-  await house.stop()   // stop the timers, finish pending writes, ship the rest
+  await house.stop()   // stop the timers, finish pending writes, ship what has closed
   process.exit(0)
 })
 ```
+
+On `memory()` that last flush ships every window that has ended. With several
+servers sharing one Redis it waits for the metric's shared turn instead, and
+what it leaves ships with the next server to take it. See
+[Stopping cleanly](/guide/flushing#stopping-cleanly).
 
 On serverless or edge platforms the process is frozen between requests, so a
 timer never fires. There you call `house.flush()` from a cron job or a request

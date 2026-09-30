@@ -15,6 +15,7 @@ import {
   type Claim,
   type Driver,
   isBucketClaim,
+  isEmptyClaim,
   type RecoveryReport,
 } from '../drivers/types.js'
 import { type Attempts, createAttempts } from '../runtime/flush.js'
@@ -119,6 +120,11 @@ export interface BucketedBinding {
    * open bucket for its series. Otherwise the write as it is.
    */
   deliver(write: Promise<void>, bucketTs: number, dimKey: string): Promise<void>
+  /**
+   * Resolve once every immediate send under way when it was called has
+   * finished, however it ended. Sends started afterwards are not waited for.
+   */
+  sendsSoFar(): Promise<void>
 }
 
 /**
@@ -148,6 +154,8 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
 
   const attempts = createAttempts()
   let binding: MetricBinding | undefined
+  /** Immediate sends that have not finished, each with the write before it. */
+  const sends = new Set<Promise<void>>()
 
   function active(): MetricBinding {
     if (!binding) {
@@ -214,7 +222,7 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
     // that is already stale by one
     deliver(write: Promise<void>, bucketTs: number, dimKey: string): Promise<void> {
       if (binding?.delivery !== 'immediate') return write
-      return write.then(() =>
+      const sent = write.then(() =>
         shipOpenSeries({
           metric: name,
           kind,
@@ -228,6 +236,21 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
           attempts,
         }),
       )
+      // the caller reports a failure, so this copy only has to settle
+      const settled: Promise<void> = sent.then(
+        () => {
+          sends.delete(settled)
+        },
+        () => {
+          sends.delete(settled)
+        },
+      )
+      sends.add(settled)
+      return sent
+    },
+
+    async sendsSoFar(): Promise<void> {
+      await Promise.all([...sends])
     },
   }
 }
@@ -366,10 +389,21 @@ export interface BucketedOptions {
   readonly driver: () => Driver
   readonly materialize: (bucketTs: number, dimKey: string, cell: Cell) => Row
   readonly totalOf: (rows: readonly Row[]) => number
+  /**
+   * {@link BucketedBinding.sendsSoFar}, waited for between a claim and its
+   * rows reaching the sink.
+   *
+   * An immediate send reads a running total and then calls the sink. One
+   * that read before the claim and is still on its way would otherwise reach
+   * the sink after the flush row, under the same id, and a table keeping the
+   * newest row would keep its older total. Sends that start after the claim
+   * cannot read the claimed window, so they are not waited for.
+   */
+  readonly sendsSoFar?: () => Promise<void>
 }
 
 export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
-  const { name, resolutionMs, graceMs, driver, materialize, totalOf } = options
+  const { name, resolutionMs, graceMs, driver, materialize, totalOf, sendsSoFar } = options
 
   /**
    * A bucketed metric can only ever be handed back the claim it asked for. A
@@ -388,7 +422,12 @@ export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
     },
 
     async claimBatch(nowMs: number, claimOptions: ClaimOptions = {}): Promise<Claim> {
-      return driver().claim(name, claimWatermark(resolutionMs, nowMs, graceMs, claimOptions))
+      const claim = await driver().claim(
+        name,
+        claimWatermark(resolutionMs, nowMs, graceMs, claimOptions),
+      )
+      if (sendsSoFar !== undefined && !isEmptyClaim(claim)) await sendsSoFar()
+      return claim
     },
 
     materializeClaim(claim: Claim): MaterializedBatch {

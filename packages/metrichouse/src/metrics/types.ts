@@ -98,12 +98,16 @@ export interface WriteContext {
    * locally staged event shipping itself on `batch.maxSize` or `maxAge`,
    * which happens without anyone calling flush.
    *
-   * `'immediate'` is `delivery: 'immediate'`, and it is the one source whose
-   * rows a sink must treat as **last-write-wins on `id`**. The other two send
-   * a row once and resend it only as a byte-identical retry, so deduplicating
-   * them either way is correct. An immediate bucketed row is a running total
-   * that a later send supersedes, so folding those together, rather than keeping
-   * the newest, double-counts.
+   * `'immediate'` is `delivery: 'immediate'`. An immediate bucketed row is a
+   * running total that a later send supersedes, so a sink must keep the
+   * newest row per `id` rather than fold them together, which double counts.
+   *
+   * A `'flush'` row of a bucketed kind carries the same `id` as the immediate
+   * rows of its window, with the final total, so under immediate delivery it
+   * must **replace** them: an upsert on `id`, not an insert that keeps the
+   * first. It also has to win over an immediate row that arrives after it,
+   * which another process can send. Apart from that, `'flush'` and `'batch'`
+   * resend a row only as a byte identical retry.
    */
   readonly source: 'flush' | 'batch' | 'immediate'
 }
@@ -202,6 +206,13 @@ export interface MaterializedBatch {
  */
 export const SETTLE: unique symbol = Symbol('metrichouse.settle')
 
+/**
+ * The key of {@link AnyMetric}'s internal wait for its writes, including
+ * those issued while it waits. Not exported from the package, as
+ * {@link SETTLE} is not.
+ */
+export const SETTLE_WRITES: unique symbol = Symbol('metrichouse.settleWrites')
+
 export interface AnyMetric {
   readonly name: string
   readonly kind: MetricKind
@@ -269,6 +280,18 @@ export interface AnyMetric {
    * wait for on it.
    */
   [SETTLE]?(): Promise<boolean>
+
+  /**
+   * {@link AnyMetric.drain}, except that it also waits for writes issued
+   * while it waits, until none is left.
+   *
+   * `house.stop()` uses it before the final flush, where a write still on its
+   * way would be left behind by a process about to exit. `drain()` itself
+   * waits only for the writes issued before it was called, so that a server
+   * taking steady traffic can still await it. Optional, so a metric written
+   * by hand still fits; the house then calls `drain()`.
+   */
+  [SETTLE_WRITES]?(): Promise<void>
 
   /** The runtime column list a sink will receive, in order. */
   rowShape(): RowShape
@@ -506,8 +529,14 @@ export interface PendingWrites {
    * every write rather than stopping at the first that failed.
    */
   track(work: Promise<void>, onError: () => MetricBinding['onError']): void
-  /** Resolve once every write tracked so far, and any tracked meanwhile, has settled. */
+  /**
+   * Resolve once every write tracked before the call has settled. A write
+   * tracked while it waits is not waited for, so steady traffic cannot keep
+   * it from resolving.
+   */
   drain(): Promise<void>
+  /** Resolve once every write tracked so far, and any tracked meanwhile, has settled. */
+  settle(): Promise<void>
 }
 
 /**
@@ -538,8 +567,12 @@ export function pendingWrites(name: string): PendingWrites {
     },
 
     async drain(): Promise<void> {
+      await Promise.all([...pending])
+    },
+
+    async settle(): Promise<void> {
       // loops rather than awaiting once: a write issued while we were waiting
-      // is still a write issued before drain() resolves
+      // is still a write issued before this resolves
       while (pending.size > 0) {
         await Promise.all([...pending])
       }
@@ -547,11 +580,12 @@ export function pendingWrites(name: string): PendingWrites {
   }
 }
 
-/** The {@link AnyMetric} methods that ship a batch. */
+/** The {@link AnyMetric} methods that ship a batch, and the waits that go with them. */
 export type BatchMethods = Pick<
   AnyMetric,
   | 'flush'
   | typeof SETTLE
+  | typeof SETTLE_WRITES
   | 'recoverBatch'
   | 'claimBatch'
   | 'materializeClaim'
@@ -576,6 +610,10 @@ export function delegateBatch(inner: AnyMetric): BatchMethods {
 
     async [SETTLE](): Promise<boolean> {
       return (await inner[SETTLE]?.()) ?? false
+    },
+
+    [SETTLE_WRITES](): Promise<void> {
+      return inner[SETTLE_WRITES]?.() ?? inner.drain()
     },
 
     recoverBatch(): Promise<RecoveryReport> {

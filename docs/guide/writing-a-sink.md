@@ -231,9 +231,9 @@ write: async (rows, context) => {
 
 | Value | Meaning |
 | --- | --- |
-| `'flush'` | A normal flush, from a timer, a cron or a direct call |
+| `'flush'` | A normal flush, from a timer, a cron or a direct call. Under immediate delivery it holds a window's final value and must win over an `'immediate'` row with the same `id`, whichever arrives last. See [Delivery modes](/guide/delivery#telling-the-two-apart-in-your-sink) |
 | `'batch'` | A locally staged event filled up and shipped itself |
-| `'immediate'` | Immediate delivery. Treat as last write wins on `id` |
+| `'immediate'` | Immediate delivery. Treat as last write wins on `id`, unless the row held came from a flush |
 
 ## Row ids and duplicates
 

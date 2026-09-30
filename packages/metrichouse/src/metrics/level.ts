@@ -59,6 +59,7 @@ import {
   describeValue,
   dimColumns,
   pendingWrites,
+  SETTLE_WRITES,
 } from './types.js'
 
 /**
@@ -662,6 +663,7 @@ export function level<D extends Shape = Record<never, never>>(
     driver: slot.driver,
     materialize,
     totalOf,
+    sendsSoFar: slot.sendsSoFar,
   })
 
   const self: Level<D> = {
@@ -744,6 +746,10 @@ export function level<D extends Shape = Record<never, never>>(
 
     drain(): Promise<void> {
       return writes.drain()
+    },
+
+    [SETTLE_WRITES](): Promise<void> {
+      return writes.settle()
     },
 
     materialize,

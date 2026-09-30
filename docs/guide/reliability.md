@@ -100,11 +100,14 @@ that wrote it, and a later flush puts it back. See
 process that exits at that instant loses what was still in flight.
 
 ```ts
-await house.drain()   // resolves once every queued write has reached the driver
+await house.drain()   // resolves once every write issued before it has reached the driver
 ```
 
 Call `drain()` before exiting, and on every request on a platform that freezes
-your process when the response returns.
+your process when the response returns. It waits for the writes issued before
+the call, and not for those issued while it waits, so a busy server can await
+it. Under [immediate delivery](/guide/delivery) it also waits for the send to
+your `write` function that follows each of those writes.
 
 A write the driver refuses after `record()` has returned goes to
 [`onError`](#where-errors-go), and that record is lost. For records that must not
@@ -115,12 +118,19 @@ otherwise, so the caller can fail the request instead of reporting success.
 
 ### The window that is still filling
 
-`house.stop()` ships every window that has ended, including those still inside
-grace, since the process has already drained its own writes. It waits for every
-flush still running first, so rows that a failed sink put back during shutdown
-ship with the rest. The one it cannot
-ship is the open window, because it has not ended. At most one `resolution` of
-data is exposed to a shutdown.
+`house.stop()` makes a final flush that takes every window that has ended,
+including those still inside grace, since the process has already drained its
+own writes. It waits for every flush still running first, so rows that a failed
+sink put back during shutdown ship with the rest. The one it cannot ship is the
+open window, because it has not ended. At most one `resolution` of data is
+exposed to a shutdown.
+
+On a shared, durable driver such as `ioredis()` the final flush takes the
+metric's [turn](/guide/flushing#several-processes-on-one-driver) like any other
+flush. When another process holds the turn, the final flush ships nothing for
+that metric and reports `skipped: true`. Nothing is lost: the rows stay in Redis
+and ship with whichever process takes the next turn. If no process takes one,
+because every one has stopped, they wait until one runs again.
 
 Keep the resolution of anything important small, or turn on
 [immediate delivery](/guide/delivery) so those values reach your database as they
@@ -145,8 +155,15 @@ window is no longer in it.
 
 With `ioredis()` that window is still in Redis under a key of its own. Every
 flush that is going to claim first looks for claims that have been held too long,
-merges them back into the live set, and then claims as usual, so the same flush
-ships what it just repaired.
+merges them back into the live set, and then claims as usual. Usually that same
+flush ships what it just repaired. Two cases leave part of it for later flushes:
+
+- **A recovering process whose clock is behind** claims up to a watermark worked
+  out from its own clock, and a repaired window at or past that watermark waits
+  for a flush whose clock has passed it.
+- **An event or a log with a [`claimLimit`](/primitives/event#claimlimit)**
+  ships at most a hundred claims of that size per flush, and a repaired backlog
+  larger than that ships over several flushes.
 
 You do not turn this on. It is what `ioredis()` does.
 
@@ -263,7 +280,14 @@ const house = createHouse({
   durable event's `record()` has not returned by then, so its failure rejects
   the promise instead and does not come here.
 - A flush that failed on a scheduler tick, where nobody is holding the promise.
+  Its `releaseError`, `recoveryError` and `ackError` come here too.
+- A send under [immediate delivery](/guide/delivery) whose `write` function
+  threw, for any metric type.
+- A locally staged event or log whose `write` function threw when it shipped
+  itself on `batch.maxSize`, `batch.maxAge` or `drain()`.
 - A broken `derive` on an event, or a broken `record` pairing on a timer.
+- An `onWarn` that threw while the house registered a metric. The metric is
+  registered anyway.
 
 Without a handler these become unhandled promise rejections. That is noisy, and
 deliberately better than a failure disappearing quietly. A handler that throws

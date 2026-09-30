@@ -18,13 +18,7 @@
  * wrong.
  */
 
-import {
-  type BucketRow,
-  type Cell,
-  type Claim,
-  type Driver,
-  isEmptyClaim,
-} from '../drivers/types.js'
+import { type Cell, type Claim, type Driver, isEmptyClaim } from '../drivers/types.js'
 import type {
   AnyMetric,
   MaterializedBatch,
@@ -189,30 +183,36 @@ export async function shipOpenSeries(ship: OpenSeriesShip): Promise<void> {
   })
 
   // nothing where the write was aimed: a flush claimed that window before the
-  // write arrived, so the driver moved the write forward to the oldest window
-  // that has not shipped. That is the earliest one still live from here on
+  // write arrived, so the driver moved the write forward to a window that has
+  // not shipped. That is usually the earliest one still live from here on,
+  // but not always: a window a failed flush released sits in front of it. So
+  // every live window from here on is sent, and the landing one is among them
   if (live.length === 0) {
-    const later = await ship.driver.readBuckets({
+    live = await ship.driver.readBuckets({
       metric: ship.metric,
       dimKey: ship.dimKey,
       from: ship.bucketTs,
     })
-    const landed = later[0]
     // nothing at all: a flush claimed the landing window too, and it ships
     // the same id with the same fold
-    if (landed === undefined) return
-    live = [landed]
+    if (live.length === 0) return
   }
 
-  const bucketTs = (live[0] as BucketRow).bucketTs
+  let bucketFrom = Number.POSITIVE_INFINITY
+  let newest = Number.NEGATIVE_INFINITY
+  for (const row of live) {
+    if (row.bucketTs < bucketFrom) bucketFrom = row.bucketTs
+    if (row.bucketTs > newest) newest = row.bucketTs
+  }
+  const bucketTo = newest + ship.resolutionMs
   const rows = live.map((row) => ship.materialize(row.bucketTs, row.dimKey, row.value))
 
   try {
     await ship.sink(rows, {
       metric: ship.metric,
       kind: ship.kind,
-      bucketFrom: bucketTs,
-      bucketTo: bucketTs + ship.resolutionMs,
+      bucketFrom,
+      bucketTo,
       total: ship.totalOf(rows),
       // nothing was claimed, so a failure has nothing to release: the next
       // write sends the window again. It is still a failure in a row, and the

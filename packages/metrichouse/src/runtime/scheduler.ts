@@ -108,6 +108,9 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       // `error`. A scheduled flush has no caller to read the report, and
       // this is the only place it can be heard
       if (flushed.recoveryError !== undefined) report(flushed.recoveryError)
+      // the rows shipped, and will arrive a second time. Nothing else would
+      // say so
+      if (flushed.ackError !== undefined) report(flushed.ackError)
     } catch (error) {
       // flush reports its own failures, so this is one it could not, such as
       // an unbound metric. Same destination: there is no caller to hand it to
