@@ -33,7 +33,9 @@ export const jobDuration = timer('job_duration', {
   resolution: '1m',
   flush: '1m',
 
-  // Some jobs take minutes. Give a late write room to land.
+  // A timing is stamped when end() is called, not when the job started, so a
+  // long job does not need extra grace. This only covers a write that reaches
+  // Redis a little after the bucket closes, or a clock a little behind.
   grace: '30s',
 
   record: 'job_duration_samples',
@@ -97,7 +99,7 @@ export const workerLog = log('worker_log', {
 // metrics/house.ts
 import { createHouse } from 'metrichouse/core'
 import { ioredis } from 'metrichouse/ioredis'
-import Redis from 'ioredis'
+import { Redis } from 'ioredis'
 import * as schema from './schema.js'
 import { logger } from '../logger.js'
 
@@ -145,6 +147,7 @@ async function runJob(job: Job) {
   } catch (error) {
     const timedOut = error instanceof TimeoutError
     const outcome = timedOut ? 'timed_out' : 'failed'
+    const stack = (error as Error).stack
 
     // The timer records whatever happened, including failures. A job that runs
     // for thirty seconds and then dies is exactly the duration you need to see.
@@ -161,7 +164,8 @@ async function runJob(job: Job) {
         attempt: job.attempt,
         errorName: (error as Error).name,
         errorMessage: (error as Error).message,
-        errorStack: (error as Error).stack,
+        // An absent optional field is left out, not passed as undefined.
+        ...(stack === undefined ? {} : { errorStack: stack }),
         payload: job.payload,
       })
     }

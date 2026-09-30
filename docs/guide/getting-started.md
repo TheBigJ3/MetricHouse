@@ -116,11 +116,14 @@ This reads the window that is still filling, so it is live.
 ## Step 5: get the rows out
 
 ```ts
+// Run this once the minute the writes landed in has ended, and its grace with it.
 const report = await pageViews.flush()
 // { buckets: 1, rows: 2, skipped: false }
 ```
 
-Your `write` function now runs with an array that looks like this:
+Called right after `add()`, the same line returns `{ buckets: 0, rows: 0 }`,
+because the minute is still open. The tip below shows how to get past that in a
+test. Once the minute has closed, your `write` function runs with an array that looks like this:
 
 ```ts
 [

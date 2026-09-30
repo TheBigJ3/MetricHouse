@@ -592,16 +592,22 @@ ORDER BY p95 DESC;
 import { httpLatency } from '../metrics/schema.js'
 
 export function latencyMiddleware(req, res, next) {
-  const span = httpLatency.start({ route: req.route?.path ?? 'unmatched' })
+  // Routing has not run yet, so req.route is empty here. Only the route is
+  // unknown, so bind nothing now and pass the route to end().
+  const span = httpLatency.start()
+
+  // Read at the end, after routing. The mount path is added so a router
+  // mounted at /orders does not collapse into '/:id'.
+  const route = () => (req.route ? (req.baseUrl ?? '') + req.route.path : 'unmatched')
 
   res.on('finish', () => {
-    span.end({ status: res.statusCode >= 500 ? 'error' : 'ok' })
+    span.end({ route: route(), status: res.statusCode >= 500 ? 'error' : 'ok' })
   })
 
   // A connection dropped before the response finished is still a timing worth
   // having. end() is idempotent, so both handlers firing is harmless.
   res.on('close', () => {
-    span.end({ status: 'error' })
+    span.end({ route: route(), status: 'error' })
   })
 
   next()

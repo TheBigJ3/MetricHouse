@@ -39,7 +39,7 @@ your database.
 - There is no query engine, no dashboard, and no database driver. You write the
   function that puts rows wherever you want them.
 - There is **no SQL**. MetricHouse emits none, diffs no schema and opens no
-  connection. The table your rows land in is yours to create and evolve.
+  database connection. The table your rows land in is yours to create and evolve.
 
 ## Quickstart
 

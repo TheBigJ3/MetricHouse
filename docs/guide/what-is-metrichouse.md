@@ -202,4 +202,4 @@ of the tools above will serve you better. MetricHouse draws no charts.
 - [Getting started](/guide/getting-started) builds a working counter in about
   twenty lines.
 - [How it works](/guide/how-it-works) explains the pipeline in detail.
-- [Metric types](/primitives/) compares the five things you can declare.
+- [Metric types](/primitives/) compares the six things you can declare.

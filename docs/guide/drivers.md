@@ -61,7 +61,7 @@ this once at startup through `onWarn`, and once more for each event declared
 Shared, durable storage over an existing Redis client.
 
 ```ts
-import Redis from 'ioredis'
+import { Redis } from 'ioredis'
 import { createHouse } from 'metrichouse/core'
 import { ioredis } from 'metrichouse/ioredis'
 
@@ -279,6 +279,21 @@ const driver =
 export const house = createHouse({ driver, schema })
 ```
 
+## Upgrading
+
+- **0.4.x and 0.5.x cannot share a namespace with newer versions.** 0.4 cannot
+  read the stamped records newer versions write, and 0.5 drops the `__mh_*`
+  fields they carry. Upgrade from either with a full stop and drain: stop every
+  process, ship what is staged, then start the new version. A rolling deploy
+  puts both versions on one namespace and breaks the older one.
+- **Drain events staged by 0.4.0 first.** A record staged by 0.4.0 with a
+  `json()` field holding a string is stored without the marker newer versions
+  use, so it ships as the bare string instead of parsed JSON. Flush every event
+  and log to the end on 0.4.0 before upgrading.
+- Between later versions, follow
+  [Changing a schema with data in storage](/guide/production#changing-a-schema-with-data-in-storage)
+  for a schema change, and the changelog for anything else.
+
 ## Writing your own
 
 The `Driver` interface is fourteen methods and a `capabilities` property. It is exported, so a driver for
@@ -335,7 +350,7 @@ A Redis setup with connection handling and health reporting:
 
 ```ts
 // metrics/driver.ts
-import Redis from 'ioredis'
+import { Redis } from 'ioredis'
 import { ioredis } from 'metrichouse/ioredis'
 import { logger } from '../logger.js'
 

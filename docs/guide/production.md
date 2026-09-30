@@ -71,7 +71,7 @@ shared driver and flush from a cron route.
 // metrics/house.ts
 import { createHouse } from 'metrichouse/core'
 import { ioredis } from 'metrichouse/ioredis'
-import Redis from 'ioredis'
+import { Redis } from 'ioredis'
 import * as schema from './schema.js'
 
 // Safe at module scope: createHouse opens no connections, and the client
@@ -202,6 +202,56 @@ export const house = createHouse({
 The cost is one database call per application write, and folded metrics resend
 the same row id with a rising running total, so your table must keep the newest
 row per id. Read [Delivery modes](/guide/delivery) before choosing this.
+
+## Changing a schema with data in storage
+
+A schema is code, and code is deployed while the driver still holds what the
+previous release wrote. With `memory()` there is nothing to inherit, because the
+data dies with the process. With `ioredis()` there is, and the rules below
+decide what happens to it.
+
+**Drain before a change that touches stored shapes.** Stop writing, run
+`await house.drain()`, then a final `await house.flush({ final: true })` and check
+`pending()` on each event and log reads 0. Anything the driver no longer holds
+cannot disagree with the new declaration.
+
+**A rolling deploy runs both releases at once.** For a while some processes
+still hold the old declaration and share a Redis with processes on the new one.
+Each process does what its own declaration says, so:
+
+- **A dim added at the end reaches old processes as a key they cannot read.** A
+  process on the old declaration that flushes a series written by a new one
+  finds one segment more than it declares, and its flush throws
+  `decodeDimKey`. Deploy a dim change as a full stop and restart, not a rolling deploy.
+- **A changed `holdFor` is not in effect until the last old process is gone.**
+  A level series keeps carrying for the `holdFor` of whichever process flushes
+  it, so during the roll the old value still applies.
+- **A changed dim type now fails loudly.** A stored key that the new type cannot
+  decode makes the metric's flush or read throw. It is not read back as a wrong
+  value.
+
+**A metric name is the key everything is stored under.**
+
+| Change | What stays in the driver | What you see |
+| --- | --- | --- |
+| Rename a metric | The old name's windows, unshipped | The new name starts empty, and the old data never ships |
+| Remove a metric | Its windows, unshipped | Nothing reads them, and they occupy Redis until you delete them |
+| Reuse a name for a different kind, such as a counter that becomes a gauge | The old kind's windows | The flush throws a kind mismatch until those windows are deleted |
+
+Flush the old metric to the end before you rename or remove it, and delete its
+keys from Redis afterwards. They sit under the `namespace` you gave `ioredis()` (`mh` by default),
+followed by the old metric name.
+
+**Staged records keep the values they were written with.** An event or log on
+`stage: 'driver'` holds each record as it was staged. If the new declaration
+narrows a field, for example a `oneOf()` that drops a value, a record already
+staged can still carry the dropped value. Ship those records before the change.
+
+**A resolution change leaves old windows on the old boundaries.** A window
+already in storage keeps the boundaries it was written on, and the new
+resolution applies to what is written from then on. Flush every window before
+you change `resolution`, so no series is split across two grids. See
+[Buckets and time](/guide/buckets-and-time#where-the-boundaries-are).
 
 ## Testing
 

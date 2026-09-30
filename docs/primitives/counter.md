@@ -525,7 +525,7 @@ export const httpRequests = counter('http_requests', {
   dims: {
     // The route pattern, never the raw URL. '/users/:id', not '/users/98421'.
     route: str(),
-    method: oneOf(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
+    method: oneOf(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OTHER']),
     // Status classes, not codes. Four values instead of forty.
     status: oneOf(['2xx', '3xx', '4xx', '5xx']),
   },
@@ -544,14 +544,26 @@ export const httpRequests = counter('http_requests', {
 import type { NextFunction, Request, Response } from 'express'
 import { httpRequests } from '../metrics/schema.js'
 
-const statusClass = (code: number) => `${Math.floor(code / 100)}xx` as '2xx' | '3xx' | '4xx' | '5xx'
+// Clamped, so a 1xx or an unusual code still lands in a declared class.
+const statusClass = (code: number): '2xx' | '3xx' | '4xx' | '5xx' =>
+  code >= 500 ? '5xx' : code >= 400 ? '4xx' : code >= 300 ? '3xx' : '2xx'
+
+const KNOWN = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const
+type Method = (typeof KNOWN)[number] | 'OTHER'
+// OPTIONS, HEAD and anything else map to OTHER. A value outside oneOf() throws,
+// and inside a 'finish' handler that would crash the process.
+const methodOf = (method: string): Method =>
+  (KNOWN as readonly string[]).includes(method) ? (method as Method) : 'OTHER'
 
 export function metricsMiddleware(req: Request, res: Response, next: NextFunction) {
   res.on('finish', () => {
+    // A client that hangs up first fires 'close' only, so 'finish' is the one
+    // to count. Its statusCode would still be the default 200.
     httpRequests.add({
       // req.route is the pattern, so '/users/98421' is recorded as '/users/:id'.
-      route: req.route?.path ?? 'unmatched',
-      method: req.method as 'GET',
+      // The mount path is added so a mounted router does not collapse into '/:id'.
+      route: req.route ? (req.baseUrl ?? '') + req.route.path : 'unmatched',
+      method: methodOf(req.method),
       status: statusClass(res.statusCode),
     })
   })

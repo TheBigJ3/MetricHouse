@@ -218,7 +218,7 @@ The pattern that covers most deployments:
 import { createHouse } from 'metrichouse/core'
 import { memory } from 'metrichouse/memory'
 import { ioredis } from 'metrichouse/ioredis'
-import Redis from 'ioredis'
+import { Redis } from 'ioredis'
 import * as schema from './schema.js'
 
 const useRedis = Boolean(process.env.REDIS_URL)

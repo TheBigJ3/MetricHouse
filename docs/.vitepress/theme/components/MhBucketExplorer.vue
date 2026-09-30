@@ -30,7 +30,14 @@ const SERIES_STEPS = [1, 2, 4, 8, 12, 25, 50, 100, 250, 500, 1_000, 5_000, 25_00
 const resolutionIndex = ref(indexOf(RESOLUTIONS, props.resolution, 6))
 const flushIndex = ref(indexOf(FLUSHES, props.flush, 4))
 const graceIndex = ref(indexOf(GRACES, props.grace, 3))
-const seriesIndex = ref(Math.max(0, SERIES_STEPS.indexOf(props.series)))
+// A :series that is not one of the steps snaps to the nearest step.
+const seriesIndex = ref(
+  SERIES_STEPS.reduce(
+    (best, step, i) =>
+      Math.abs(step - props.series) < Math.abs((SERIES_STEPS[best] ?? 1) - props.series) ? i : best,
+    0,
+  ),
+)
 
 const resolutionMs = computed(() => RESOLUTIONS[resolutionIndex.value]?.ms ?? 10_000)
 const flushMs = computed(() => FLUSHES[flushIndex.value]?.ms ?? 60_000)
@@ -300,7 +307,7 @@ const snippet = computed(() => {
           grace {{ graceLabel }}
         </text>
         <text x="170" y="58" class="mh-play__axis">
-          a write arriving inside either band lands in this bucket
+          a write stamped inside the bucket is claimed only after the grace has passed
         </text>
       </svg>
     </figure>

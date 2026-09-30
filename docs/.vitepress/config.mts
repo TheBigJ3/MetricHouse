@@ -5,7 +5,8 @@ import { writeCrawlerFiles } from './crawlers.js'
  * Set DOCS_BASE only when the site is served from a sub path rather than the
  * root of a domain. Vercel serves from the root, so it stays unset.
  */
-const base = process.env.DOCS_BASE ?? '/'
+const subPath = (process.env.DOCS_BASE ?? '').trim().replace(/^\/+|\/+$/g, '')
+const base = subPath === '' ? '/' : `/${subPath}/`
 
 /**
  * Where the site is served from, without a trailing slash. The sitemap,
@@ -69,7 +70,12 @@ export default defineConfig({
           '/reference/(dims|fields|durations|snapshot-options|flush-options|field-types)',
       },
       { text: 'Examples', link: '/examples/', activeMatch: '/examples/' },
-      { text: 'Reference', link: '/reference/', activeMatch: '/reference/' },
+      {
+        text: 'Reference',
+        link: '/reference/',
+        activeMatch:
+          '/reference/(?!(dims|fields|durations|snapshot-options|flush-options|field-types))',
+      },
       {
         text: 'v0.7.0',
         items: [

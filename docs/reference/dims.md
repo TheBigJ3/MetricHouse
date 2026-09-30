@@ -291,8 +291,12 @@ after it are keyed in the new one. The two sets never match, so a query that
 groups across the change sees two populations.
 
 Treat a reorder the way you would treat a column rename in a database. Adding a
-dim at the end is safe for rows written from that point on, and rows already
-stored carry no value for it.
+dim at the end leaves the rows already stored readable by a process on the new
+declaration, and they carry no value for it. It is not safe during a rolling
+deploy: a process still on the old declaration throws `decodeDimKey` when it
+flushes a series written with the extra dim. Read
+[Changing a schema with data in storage](/guide/production#changing-a-schema-with-data-in-storage)
+before deploying it.
 
 That includes windows still waiting in the driver when the new declaration
 deploys, such as a Redis full of totals written by the previous release. Their
