@@ -71,7 +71,7 @@ export default defineConfig({
       { text: 'Examples', link: '/examples/', activeMatch: '/examples/' },
       { text: 'Reference', link: '/reference/', activeMatch: '/reference/' },
       {
-        text: 'v0.6.1',
+        text: 'v0.7.0',
         items: [
           {
             text: 'Changelog',
