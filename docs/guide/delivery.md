@@ -128,12 +128,19 @@ reaches your function after theirs. Sends that start after the claim cannot
 read the claimed window, and a send aimed at a window newer than every one the
 flush claimed reads none of them, so neither is waited for.
 
-The wait lasts at most one `flush` interval. A `write` function that never
-answers an immediate send would otherwise hold up every flush of the metric.
-When the interval runs out, the flush hands its rows over anyway. The send
-still waiting may then reach your function after the flush row, with an older
-total under the same id, exactly as a send from another process can. The table
-below keeps the flush row in that case.
+The wait for a send lasts until one `flush` interval after that send started.
+A `write` function that never answers an immediate send would otherwise hold
+up every flush of the metric. When the interval runs out, the flush hands its
+rows over anyway, and no later flush waits for that send again. The send still
+waiting may then reach your function after the flush row, with an older total
+under the same id, exactly as a send from another process can. The table below
+keeps the flush row in that case.
+
+That limit belongs to the flush alone. [`drain()`](/guide/the-house#drain) and
+[`house.stop()`](/guide/the-house#starting-and-stopping) wait for every immediate send already
+under way, with no limit, so a `write` function that never answers keeps them
+waiting for ever. Give your `write` function a timeout of its own, as
+[Writing a sink](/guide/writing-a-sink#in-production) shows.
 
 Across processes nothing can order the two. Another process may read its running
 total just before the claim and deliver it just after the flush row. So your

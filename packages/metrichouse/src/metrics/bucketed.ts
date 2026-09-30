@@ -171,7 +171,8 @@ export interface BucketedBinding {
   /**
    * Resolve once every immediate send under way when it was called, and aimed
    * at a window at or before `newest`, has finished, however it ended, or
-   * once one flush interval has passed, whichever comes first. Sends started
+   * has run for one flush interval, whichever comes first. A send that has
+   * run that long is given up on and never waited for again. Sends started
    * afterwards, and sends aimed past `newest`, are not waited for.
    */
   sendsSoFar(newest: number): Promise<void>
@@ -205,10 +206,11 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
   const attempts = createAttempts()
   let binding: MetricBinding | undefined
   /**
-   * Immediate sends that have not finished, each with the write before it,
-   * and the window the write was aimed at.
+   * Immediate sends that have not finished and have not been given up on,
+   * each with the write before it, the window the write was aimed at, and
+   * when the send started, by the host clock that timers run on.
    */
-  const sends = new Map<Promise<void>, number>()
+  const sends = new Map<Promise<void>, { readonly aimed: number; readonly started: number }>()
 
   function active(): MetricBinding {
     if (!binding) {
@@ -298,25 +300,42 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
           sends.delete(settled)
         },
       )
-      sends.set(settled, bucketTs)
+      sends.set(settled, { aimed: bucketTs, started: Date.now() })
       return sent
     },
 
     async sendsSoFar(newest: number): Promise<void> {
       // a send reads the window it aimed at and the ones after it, so one
       // aimed past the newest claimed window cannot hold a claimed total
+      //
+      // each send is bounded by one flush interval from when it started, so a
+      // sink that never answers an immediate send holds up the flushes of
+      // that interval and no later one
+      const limit = flushMs()
+      const at = Date.now()
       const reading: Promise<void>[] = []
-      for (const [send, aimed] of sends) if (aimed <= newest) reading.push(send)
+      let wait = 0
+      for (const [send, { aimed, started }] of sends) {
+        if (aimed > newest) continue
+        // capped at the limit, in case the host clock stepped back
+        const left = Math.min(started + limit - at, limit)
+        if (left <= 0) {
+          sends.delete(send)
+          continue
+        }
+        reading.push(send)
+        wait = Math.max(wait, left)
+      }
       if (reading.length === 0) return
 
-      // bounded, so a sink that never answers an immediate send holds up one
-      // flush by an interval rather than every flush of the metric for ever
       let timer: ReturnType<typeof setTimeout> | undefined
-      const bound = new Promise<void>((resolve) => {
-        timer = setTimeout(resolve, flushMs())
+      const bound = new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), wait)
       })
       try {
-        await Promise.race([Promise.all(reading), bound])
+        const gaveUp = await Promise.race([Promise.all(reading).then(() => false), bound])
+        // every send still waiting has run its full interval by now
+        if (gaveUp) for (const send of reading) sends.delete(send)
       } finally {
         clearTimeout(timer)
       }

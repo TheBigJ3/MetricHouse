@@ -164,7 +164,7 @@ A write issued while `drain()` waits is not waited for, so a server under steady
 traffic can await it without waiting for a quiet moment. Call it again to cover
 those. Under [immediate delivery](/guide/delivery), a write is followed by a
 send to the metric's `write` function, and `drain()` waits for that send as
-well, so it takes as long as your sink does.
+well, so it takes as long as your sink does, with no limit of its own.
 
 A write that failed does not end the wait early and does not make `drain()`
 reject. It goes to `onError`, or becomes an unhandled rejection when there is
@@ -257,7 +257,10 @@ earlier call to finish before its own steps 2 to 4, so two calls never run
 those steps at the same time.
 
 Steps 2 and 3 have no timeout. A sink that never returns keeps its flush running, and
-`stop()` keeps waiting for that flush, so give your sink a timeout of its own.
+`stop()` keeps waiting for that flush. Under [immediate delivery](/guide/delivery),
+step 3 also waits for the send that follows each write, so a sink that never
+answers an immediate send keeps `stop()` waiting too. Give your sink a timeout
+of its own.
 And stop anything of yours that keeps calling `flush()` before you call
 `stop()`: a flush that starts once the final flush is under way is not waited
 for.
