@@ -12,9 +12,9 @@
 import { type Cell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
 import { metricFlush } from '../runtime/flush.js'
-import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
+import { type LiveRowOf, liveColumns, type SnapshotOptions } from '../runtime/live.js'
 import { assertDimsLegal, dimKeyDecoder, dimKeyEncoder } from '../schema/dims.js'
-import type { FieldType, InferShape, Shape, Simplify } from '../schema/types.js'
+import type { FieldType, InferRow, InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketStart } from '../time/buckets.js'
 import type { DurationInput } from '../time/duration.js'
 import { bucketedBinding, bucketedLifecycle, bucketedReader } from './bucketed.js'
@@ -43,7 +43,7 @@ export type { DimsArgs, RowColumn, RowShape } from './types.js'
 
 /** The row shape a counter's `write()` receives. */
 export type CounterRow<D extends Shape> = Simplify<
-  { id: string; bucket_ts: Date } & InferShape<D> & { value: number }
+  { id: string; bucket_ts: Date } & InferRow<D> & { value: number }
 >
 
 /**
@@ -226,7 +226,7 @@ export function counter<D extends Shape = Record<never, never>>(
 
   // built once, here: every write encodes a key and every row a flush or a
   // snapshot builds decodes one, against a declaration that never changes
-  const encodeKey = dimKeyEncoder(dims)
+  const encodeKey = dimKeyEncoder(dims, name)
   const decodeKey = dimKeyDecoder(dims)
 
   /** Applies defaults, validates, and encodes. Throws on a bad dim set. */
@@ -248,15 +248,42 @@ export function counter<D extends Shape = Record<never, never>>(
   }
 
   /**
-   * A sum a live read hands back, refused for an integer counter when a
-   * double cannot hold it exactly.
+   * The sum of the values a live read merges, for an integer counter refused
+   * when a double cannot hold it exactly.
    *
    * Each series is kept below `Number.MAX_SAFE_INTEGER` by the driver, but
    * several of them added together can pass it, and the answer would be a
-   * different whole number with nothing to say so.
+   * different whole number with nothing to say so. Whole numbers are added as
+   * BigInts, so a running sum that passes the limit and comes back is judged
+   * by its exact total and not by where the doubles rounded on the way.
+   *
+   * A stored fraction, which a series holds after a `float()` counter was
+   * declared as an integer one, cannot be a BigInt. Those are added as doubles
+   * and refused when the total is not a whole number.
    */
-  function exactSum(total: number, what: string): number {
-    if (!isFloat && !Number.isSafeInteger(total)) {
+  function exactSum(values: readonly number[], what: string): number {
+    if (isFloat) return values.reduce((sum, value) => sum + value, 0)
+
+    if (values.every(Number.isInteger)) {
+      let exact = 0n
+      for (const value of values) exact += BigInt(value)
+      if (exact > BigInt(Number.MAX_SAFE_INTEGER) || exact < -BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error(
+          `${name}: ${what} would be ${exact}, which is past ${Number.MAX_SAFE_INTEGER}, the ` +
+            'largest whole number a double holds exactly',
+        )
+      }
+      return Number(exact)
+    }
+
+    const total = values.reduce((sum, value) => sum + value, 0)
+    if (!Number.isInteger(total)) {
+      throw new Error(
+        `${name}: ${what} would be ${total}, which is not a whole number. A stored value is a ` +
+          'fraction, which happens when a float counter is declared as an integer one',
+      )
+    }
+    if (!Number.isSafeInteger(total)) {
       throw new Error(
         `${name}: ${what} would be ${total}, which is past ${Number.MAX_SAFE_INTEGER}, the ` +
           'largest whole number a double holds exactly',
@@ -267,7 +294,12 @@ export function counter<D extends Shape = Record<never, never>>(
 
   /** Counters merge by adding, across buckets and across series alike. */
   function mergeValues(rows: readonly Row[]): Record<string, unknown> {
-    return { value: exactSum(totalOf(rows), 'a merged value') }
+    return {
+      value: exactSum(
+        rows.map((row) => row.value as number),
+        'a merged value',
+      ),
+    }
   }
 
   // named, so the flush mixin can reach the finished metric. It is spread
@@ -290,6 +322,7 @@ export function counter<D extends Shape = Record<never, never>>(
       now: slot.now,
       materialize,
       mergeValues,
+      columns: () => liveColumns(self.rowShape()),
       assertCell: asCount,
     }),
 
@@ -383,7 +416,7 @@ export function counter<D extends Shape = Record<never, never>>(
 
       // an unseen series is zero, not absent, so a dashboard renders 0
       return exactSum(
-        rows.reduce((sum, row) => sum + asCount(row.value), 0),
+        rows.map((row) => asCount(row.value)),
         'the total across series',
       )
     },

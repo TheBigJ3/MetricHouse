@@ -237,6 +237,14 @@ local MH_INT = 'MHRANGE would pass 9007199254740991, the largest whole number a 
 local function mh_safe(x)
   return x == math.floor(x) and x >= -9007199254740991 and x <= 9007199254740991
 end
+
+local MH_FRAC = 'MHRANGE would not be a whole number, so the write was refused. The series holds a fraction, which happens when a float metric is declared as an integer one'
+
+-- the reason mh_safe refused: a fraction, or a whole number past the limit
+local function mh_int_error(x)
+  if x ~= math.floor(x) then return MH_FRAC end
+  return MH_INT
+end
 `
 
 /**
@@ -346,7 +354,7 @@ for i = 4, MH_N, 2 do
   end
   total = total + tonumber(ARGV[i + 1])
   if not mh_finite(total) then return redis.error_reply(MH_RANGE) end
-  if integer and not mh_safe(total) then return redis.error_reply(MH_INT) end
+  if integer and not mh_safe(total) then return redis.error_reply(mh_int_error(total)) end
   totals[field] = total
 end
 
@@ -557,9 +565,9 @@ for i = 5, MH_N, 2 do
     if not mh_finite(c[2]) then return redis.error_reply(MH_RANGE) end
   end
   if integer then
-    if not mh_safe(value) then return redis.error_reply(MH_INT) end
+    if not mh_safe(value) then return redis.error_reply(mh_int_error(value)) end
     for _, c in ipairs(cells) do
-      if not mh_safe(c[2]) then return redis.error_reply(MH_INT) end
+      if not mh_safe(c[2]) then return redis.error_reply(mh_int_error(c[2])) end
     end
   end
 

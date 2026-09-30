@@ -192,7 +192,7 @@ describe('start / end', () => {
     mono += 3
 
     const untyped = span as unknown as { end(dims?: object): number }
-    expect(() => untyped.end()).toThrow('missing required dim "status"')
+    expect(() => untyped.end()).toThrow(new Error('latency: missing required dim "status"'))
 
     // nothing was recorded, so a corrected call still ends it
     mono += 2
@@ -204,7 +204,7 @@ describe('start / end', () => {
   it('rejects an undeclared dim at start(), before any time passes', () => {
     const latency = bound()
     expect(() => latency.start({ nope: 1 } as unknown as { route: string })).toThrow(
-      'unknown dim "nope". The declared dims are [route, status]',
+      new Error('latency: unknown dim "nope". The declared dims are [route, status]'),
     )
   })
 
@@ -317,7 +317,9 @@ describe('time', () => {
     const work = vi.fn(() => 1)
     const untyped = latency as unknown as { time(dims: object, fn: () => number): number }
 
-    expect(() => untyped.time({ route: '/a' }, work)).toThrow('missing required dim "status"')
+    expect(() => untyped.time({ route: '/a' }, work)).toThrow(
+      new Error('latency: missing required dim "status"'),
+    )
     expect(work).not.toHaveBeenCalled()
   })
 
@@ -362,6 +364,13 @@ describe('observe', () => {
       sum: 20,
       count: 2,
     })
+  })
+
+  it('names the type of a duration that is not a number', () => {
+    const latency = bound()
+    expect(() => latency.observe('5' as never, { route: '/a', status: 'ok' })).toThrow(
+      'latency: a duration must be a finite, non-negative number, got "5"',
+    )
   })
 
   it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])('refuses a duration of %s', (ms) => {

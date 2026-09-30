@@ -16,9 +16,9 @@
 import { type Cell, type GaugeCell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
 import { metricFlush } from '../runtime/flush.js'
-import type { LiveRowOf, SnapshotOptions } from '../runtime/live.js'
+import { type LiveRowOf, liveColumns, type SnapshotOptions } from '../runtime/live.js'
 import { assertDimsLegal, dimKeyDecoder, dimKeyEncoder } from '../schema/dims.js'
-import type { InferShape, Shape, Simplify } from '../schema/types.js'
+import type { InferRow, InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketStart } from '../time/buckets.js'
 import type { DurationInput } from '../time/duration.js'
 import { bucketedBinding, bucketedLifecycle, bucketedReader, seriesKey } from './bucketed.js'
@@ -33,7 +33,7 @@ import type {
   WriteContext,
   WriteFn,
 } from './types.js'
-import { assertMetricName, assertSink, dimColumns, pendingWrites } from './types.js'
+import { assertMetricName, assertSink, describeValue, dimColumns, pendingWrites } from './types.js'
 
 /** The five stored aggregates, in column order. */
 export const GAUGE_AGGREGATES = ['last', 'min', 'max', 'sum', 'count'] as const
@@ -50,7 +50,7 @@ export type GaugeTotals = Omit<GaugeCell, 'last'>
 
 /** The row shape a gauge's `write()` receives. */
 export type GaugeRow<D extends Shape> = Simplify<
-  { id: string; bucket_ts: Date } & InferShape<D> & Partial<Record<GaugeAggregate, number>>
+  { id: string; bucket_ts: Date } & InferRow<D> & Partial<Record<GaugeAggregate, number>>
 >
 
 /**
@@ -216,14 +216,17 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
 
   function asFold(cell: Cell): GaugeCell {
     if (!isGaugeCell(cell)) {
-      throw new Error(`${name}: expected a gauge fold but the driver returned a counter cell`)
+      throw new Error(
+        `${name}: expected a gauge fold but the driver returned a ` +
+          `${typeof cell === 'number' ? 'counter cell' : 'level'}`,
+      )
     }
     return cell
   }
 
   // built once, here: every write encodes a key and every row a flush or a
   // snapshot builds decodes one, against a declaration that never changes
-  const encodeKey = dimKeyEncoder(dims)
+  const encodeKey = dimKeyEncoder(dims, name)
   const decodeKey = dimKeyDecoder(dims)
 
   function keyFor(values: InferShape<D> | undefined): string {
@@ -262,6 +265,23 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
   }
 
   /**
+   * A sum across series a live read hands back, refused when it left the
+   * range a double can hold.
+   *
+   * Each series is kept finite by the driver, but several of them added
+   * together can pass the largest double, and `Infinity` would come back as
+   * if it were a reading.
+   */
+  function finiteSum(total: number, what: string): number {
+    if (!Number.isFinite(total)) {
+      throw new Error(
+        `${name}: ${what} would be ${total}, which is past the largest number a double holds`,
+      )
+    }
+    return total
+  }
+
+  /**
    * Merge folds the way the five aggregates merge, which is the reason those
    * five and not `avg`: `sum` and `count` add, `min` and `max` take the
    * extreme, and `last` is the latest, answerable only because rows arrive in
@@ -294,7 +314,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
           merged.max = numbers('max').reduce((high, value) => Math.max(high, value), -Infinity)
           break
         case 'sum':
-          merged.sum = totalOf(rows)
+          merged.sum = finiteSum(totalOf(rows), 'a merged sum')
           break
         case 'count':
           merged.count = numbers('count').reduce((total, value) => total + value, 0)
@@ -337,6 +357,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       now: slot.now,
       materialize,
       mergeValues,
+      columns: () => liveColumns(self.rowShape()),
       assertCell: asFold,
     }),
 
@@ -378,7 +399,9 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       const active = slot.active()
 
       if (typeof value !== 'number' || !Number.isFinite(value)) {
-        throw new Error(`${name}: an observation must be a finite number, got ${String(value)}`)
+        throw new Error(
+          `${name}: an observation must be a finite number, got ${describeValue(value)}`,
+        )
       }
 
       const dimKey = keyFor(args[0])
@@ -417,7 +440,10 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
         // overflows the stack somewhere past a hundred thousand of them
         min: folds.reduce((low, fold) => Math.min(low, fold.min), Infinity),
         max: folds.reduce((high, fold) => Math.max(high, fold.max), -Infinity),
-        sum: folds.reduce((total, fold) => total + fold.sum, 0),
+        sum: finiteSum(
+          folds.reduce((total, fold) => total + fold.sum, 0),
+          'the sum across series',
+        ),
         count: folds.reduce((total, fold) => total + fold.count, 0),
       }
     },

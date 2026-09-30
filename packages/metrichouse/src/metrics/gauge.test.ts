@@ -71,7 +71,7 @@ describe('declaration', () => {
     )
     expect(() => make({ resolution: '7s', flush: '1m' })).toThrow(
       new Error(
-        'assertResolution: resolution 7s does not divide flush 1m evenly, and a shipment would split a bucket',
+        'bowl_level: resolution 7s does not divide flush 1m evenly, and a shipment would split a bucket',
       ),
     )
     expect(() =>
@@ -206,7 +206,9 @@ describe('set and the fold', () => {
 
   it('validates dims synchronously', () => {
     const metric = bound()
-    expect(() => metric.set(1, { bowlId: 'b1' } as never)).toThrow('missing required dim "room"')
+    expect(() => metric.set(1, { bowlId: 'b1' } as never)).toThrow(
+      new Error('bowl_level: missing required dim "room"'),
+    )
   })
 
   it('works with no dims at all', async () => {
@@ -289,6 +291,41 @@ describe('materialize', () => {
   it('refuses a counter cell', () => {
     expect(() => make().materialize(1000, 'b1|kitchen', 7)).toThrow(
       'bowl_level: expected a gauge fold but the driver returned a counter cell',
+    )
+  })
+
+  it('names the kind of a level cell or a counter cell it refuses', () => {
+    expect(() => make().materialize(1000, 'b1|kitchen', { level: 3, at: 1000 } as never)).toThrow(
+      'bowl_level: expected a gauge fold but the driver returned a level',
+    )
+  })
+
+  it('names the type of a value that is not a number', () => {
+    const metric = bound()
+    expect(() => metric.set('1' as never, { bowlId: 'b1', room: 'kitchen' })).toThrow(
+      'bowl_level: an observation must be a finite number, got "1"',
+    )
+    expect(() => metric.set(null as never, { bowlId: 'b1', room: 'kitchen' })).toThrow(
+      'bowl_level: an observation must be a finite number, got null',
+    )
+  })
+
+  it('refuses a sum across series that passes the largest double', async () => {
+    const metric = bound()
+    metric.set(Number.MAX_VALUE, { bowlId: 'b1', room: 'kitchen' })
+    metric.set(Number.MAX_VALUE, { bowlId: 'b2', room: 'kitchen' })
+    await metric.drain()
+
+    await expect(metric.totals()).rejects.toThrow(
+      new Error(
+        'bowl_level: the sum across series would be Infinity, which is past the largest number ' +
+          'a double holds',
+      ),
+    )
+    await expect(metric.snapshot({ complete: false, groupBy: ['room'] })).rejects.toThrow(
+      new Error(
+        'bowl_level: a merged sum would be Infinity, which is past the largest number a double holds',
+      ),
     )
   })
 

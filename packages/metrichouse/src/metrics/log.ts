@@ -17,7 +17,14 @@
  */
 
 import type { LiveFields, SnapshotOptions } from '../runtime/live.js'
-import type { InferShape, MarkOptional, Shape, ShapeArgs, Simplify } from '../schema/types.js'
+import type {
+  InferRow,
+  InferShape,
+  MarkOptional,
+  Shape,
+  ShapeArgs,
+  Simplify,
+} from '../schema/types.js'
 import { oneOf, str } from '../schema/types.js'
 import type { DurationInput } from '../time/duration.js'
 import {
@@ -201,7 +208,7 @@ export type LogRow<F extends Shape, L extends readonly string[]> = Simplify<
     level: L[number]
     message: string
     error_stack?: string
-  } & InferShape<F> & { _ingested_at: Date }
+  } & InferRow<F> & { _ingested_at: Date }
 >
 
 /** One live row from a log: the row a sink would receive, plus the liveness fields. */

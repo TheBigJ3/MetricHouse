@@ -261,7 +261,7 @@ counter('ok', { resolution: '1s', flush: '5m', write })    // 300 whole buckets
 counter('ok', { resolution: '10s', flush: '1m', write })   // 6 whole buckets
 
 counter('bad', { resolution: '7s', flush: '1m', write })
-// Error: resolution 7s does not divide flush 1m evenly
+// Error: bad: resolution 7s does not divide flush 1m evenly
 ```
 
 ## Choosing a resolution

@@ -27,6 +27,7 @@ import {
   assertLimit,
   boundMs,
   type LiveFields,
+  liveColumns,
   orderAndLimit,
   type SnapshotOptions,
 } from '../runtime/live.js'
@@ -34,6 +35,7 @@ import { shipClaim } from '../runtime/ship.js'
 import { applyDimDefaults, assertShapeNames, encodeDimKey, validateDims } from '../schema/dims.js'
 import {
   type FieldType,
+  type InferRow,
   type InferShape,
   isDate,
   jsonText,
@@ -132,7 +134,7 @@ export const RESERVED_EVENT_COLUMNS = ['id', 'ts', '_ingested_at', '_sample_rate
  * inferred, so this is documented rather than encoded.
  */
 export type EventRow<F extends Shape> = Simplify<
-  { id: string; ts: Date } & InferShape<F> & { _ingested_at: Date; _sample_rate?: number }
+  { id: string; ts: Date } & InferRow<F> & { _ingested_at: Date; _sample_rate?: number }
 >
 
 /**
@@ -1024,6 +1026,7 @@ export function stagedMetric<
         rows as unknown as Record<string, unknown>[],
         options,
         name,
+        liveColumns(self.rowShape()),
       ) as unknown as EventLiveRow<F>[]
     },
 

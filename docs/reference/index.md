@@ -65,7 +65,7 @@ metrics on timers without a house. It returns a `Scheduler` with these members.
 | --- | --- |
 | `scheduler.start()` | Starts one interval per metric, at that metric's `flushMs`, each from its own point in the interval. Calling it again does nothing |
 | `scheduler.add(metric)` | Schedules a metric that arrived after `start()`. Does nothing while stopped |
-| `scheduler.stop()` | Clears every timer, including a first tick still waiting. It does not flush |
+| `scheduler.stop()` | Returns a promise. Clears every timer, including a first tick still waiting, and resolves once flushes already running have settled. It does not flush |
 | `scheduler.running` | `true` between `start()` and `stop()` |
 
 ## The house
@@ -76,7 +76,7 @@ Everything on the object `createHouse()` returns.
 
 | Member | Returns | What it does |
 | --- | --- | --- |
-| `house.register(...metrics)` | `void` | Adds metrics after startup. Throws if a metric is already bound to a house, this one included, or if another metric has its name |
+| `house.register(...metrics)` | `void` | Adds metrics after startup. A metric already registered in this house is skipped. Throws if a metric is bound to another house, or if a different metric has its name |
 | `house.metrics()` | `AnyMetric[]` | Every registered metric, in the order they were registered |
 | `house.get(name)` | `AnyMetric \| undefined` | One metric by name |
 | `house.delivery` | `DeliveryMode` | `'staged'` or `'immediate'`. A house configured with `'auto'` has already picked one |
@@ -103,11 +103,11 @@ Every metric type has these members, whatever it measures.
 | `metric.storage` | `StorageModel` | `'bucketed'` for types that fold writes into time windows, `'staged'` for types that keep every record |
 | `metric.dims` | `Shape` | The declared dimensions |
 | `metric.resolutionMs` | `number` | How wide one time window is, in milliseconds |
-| `metric.flushMs` | `number` | The shortest gap allowed between two shipments, in milliseconds |
+| `metric.flushMs` | `number` | The shortest gap allowed between two shipments, in milliseconds. On a counter, gauge, level or timer that declared no `flush`, it throws until a house has bound the metric |
 | `metric.graceMs` | `number` | How long a window waits after it ends before a flush may claim it, in milliseconds |
 | `metric.isBound` | `boolean` | Whether a house has registered it yet |
 | `metric.write` | `WriteFn` | The write function it was declared with. Each type narrows its rows, as it narrows `snapshot()` |
-| `metric.flush(options?)` | `Promise<MetricFlushReport>` | Ships everything finished to its write function, if its cadence allows. Needs no house |
+| `metric.flush(options?)` | `Promise<MetricFlushReport>` | Ships everything finished to its write function, if its cadence allows. Needs a bound metric, so it throws before a house has registered it |
 | `metric.drain()` | `Promise<void>` | Resolves once this metric's queued writes have reached the driver |
 | `metric.snapshot(options?)` | `Promise<LiveRow[]>` | Everything unshipped, as rows |
 | `metric.rowShape()` | `RowShape` | The columns your write function will receive, in order |

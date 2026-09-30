@@ -151,29 +151,29 @@ describe('closedUpTo agrees with isClosed', () => {
 
 describe('assertResolution', () => {
   it('accepts a resolution that divides the flush interval evenly', () => {
-    expect(() => assertResolution(SEC, 5 * MIN)).not.toThrow() // 300 buckets
-    expect(() => assertResolution(10 * SEC, MIN)).not.toThrow() // 6 buckets
-    expect(() => assertResolution(MIN, MIN)).not.toThrow() // 1 bucket
+    expect(() => assertResolution('m', SEC, 5 * MIN)).not.toThrow() // 300 buckets
+    expect(() => assertResolution('m', 10 * SEC, MIN)).not.toThrow() // 6 buckets
+    expect(() => assertResolution('m', MIN, MIN)).not.toThrow() // 1 bucket
   })
 
   it('rejects a resolution that would split a bucket across shipments', () => {
-    expect(() => assertResolution(7 * SEC, MIN)).toThrow(
-      'assertResolution: resolution 7s does not divide flush 1m evenly, and a shipment would split a bucket',
+    expect(() => assertResolution('m', 7 * SEC, MIN)).toThrow(
+      'm: resolution 7s does not divide flush 1m evenly, and a shipment would split a bucket',
     )
-    expect(() => assertResolution(45 * SEC, MIN)).toThrow(
-      'assertResolution: resolution 45s does not divide flush 1m evenly, and a shipment would split a bucket',
+    expect(() => assertResolution('m', 45 * SEC, MIN)).toThrow(
+      'm: resolution 45s does not divide flush 1m evenly, and a shipment would split a bucket',
     )
   })
 
   it('rejects a resolution coarser than the flush interval', () => {
-    expect(() => assertResolution(5 * MIN, MIN)).toThrow(
-      'assertResolution: resolution 5m does not divide flush 1m evenly, and a shipment would split a bucket',
+    expect(() => assertResolution('m', 5 * MIN, MIN)).toThrow(
+      'm: resolution 5m does not divide flush 1m evenly, and a shipment would split a bucket',
     )
   })
 
   it.each([0, -1, 1.5])('rejects resolution %p', (res) => {
-    expect(() => assertResolution(res, MIN)).toThrow(
-      `assertResolution: resolutionMs must be a positive integer, got ${res}`,
+    expect(() => assertResolution('m', res, MIN)).toThrow(
+      `m: resolutionMs must be a positive integer, got ${res}`,
     )
   })
 })

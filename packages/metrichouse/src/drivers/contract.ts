@@ -208,6 +208,16 @@ export function describeDriverContract(name: string, options: DriverContractOpti
         expect((await driver.readBuckets({ metric: M }))[0]?.value).toBe(Number.MAX_SAFE_INTEGER)
       })
 
+      it('says a stored fraction is not a whole number, rather than past the limit', async () => {
+        await incr(1000, WILLOW, 2.5)
+        await expect(
+          driver.increment([
+            { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1, integer: true },
+          ]),
+        ).rejects.toThrow(/not (be )?a whole number/)
+        expect((await driver.readBuckets({ metric: M }))[0]?.value).toBe(2.5)
+      })
+
       it('lets a total without the integer flag pass the largest safe integer', async () => {
         await incr(1000, WILLOW, Number.MAX_SAFE_INTEGER)
         await incr(1000, WILLOW, 2)

@@ -17,11 +17,16 @@ export type TypeKind = 'str' | 'int' | 'float' | 'bool' | 'oneOf' | 'ts' | 'json
  * is the only thing the caller's types care about. The runtime difference
  * survives in {@link FieldType.hasDefault}.
  */
-export interface FieldType<TValue = unknown, TOptional extends boolean = boolean> {
+export interface FieldType<
+  TValue = unknown,
+  TOptional extends boolean = boolean,
+  THasDefault extends boolean = boolean,
+> {
   readonly kind: TypeKind
   /** May the caller omit this key? True for `.optional()` and `.default()`. */
   readonly isOptional: TOptional
-  readonly hasDefault: boolean
+  /** True after `.default()`. Row types read it: a default fills every row, so the key is always there. */
+  readonly hasDefault: THasDefault
   readonly defaultValue: TValue | undefined
   /** `oneOf` only: the closed set, in declaration order. */
   readonly values: readonly TValue[] | undefined
@@ -29,9 +34,9 @@ export interface FieldType<TValue = unknown, TOptional extends boolean = boolean
   readonly dimLegal: boolean
 
   /** Clone, marked omittable. */
-  optional(): FieldType<TValue, true>
+  optional(): FieldType<TValue, true, THasDefault>
   /** Clone, carrying a value used when the call omits this key. */
-  default(value: TValue): FieldType<TValue, true>
+  default(value: TValue): FieldType<TValue, true, true>
 }
 
 /** A set of declared types, keyed by name. Declaration order is significant. */
@@ -56,6 +61,29 @@ export type InferShape<S extends Shape> = Simplify<
     [K in Exclude<keyof S, OptionalKeys<S>>]: InferValue<S[K]>
   } & {
     [K in OptionalKeys<S>]?: InferValue<S[K]>
+  }
+>
+
+type RowOptionalKeys<S extends Shape> = {
+  [K in keyof S]: S[K]['isOptional'] extends true
+    ? S[K]['hasDefault'] extends true
+      ? never
+      : K
+    : never
+}[keyof S]
+
+/**
+ * The object a row carries, which is what a sink and a live read receive.
+ *
+ * Differs from {@link InferShape} in one way: a `.default()` key is required,
+ * because the default fills every row that leaves it out. Only `.optional()`
+ * keys can be missing from a row.
+ */
+export type InferRow<S extends Shape> = Simplify<
+  {
+    [K in Exclude<keyof S, RowOptionalKeys<S>>]: InferValue<S[K]>
+  } & {
+    [K in RowOptionalKeys<S>]?: InferValue<S[K]>
   }
 >
 
@@ -98,20 +126,20 @@ interface TypeOpts<TValue> {
  * every declaration is a fresh frozen object and sharing one across metrics is
  * safe.
  */
-function make<TValue, TOptional extends boolean>(
+function make<TValue, TOptional extends boolean, THasDefault extends boolean = false>(
   kind: TypeKind,
   isOptional: TOptional,
   opts: TypeOpts<TValue> = {},
-): FieldType<TValue, TOptional> {
-  const self: FieldType<TValue, TOptional> = {
+): FieldType<TValue, TOptional, THasDefault> {
+  const self: FieldType<TValue, TOptional, THasDefault> = {
     kind,
     isOptional,
-    hasDefault: opts.hasDefault ?? false,
+    hasDefault: (opts.hasDefault ?? false) as THasDefault,
     defaultValue: opts.defaultValue,
     values: opts.values,
     dimLegal: opts.dimLegal ?? true,
 
-    optional: () => make<TValue, true>(kind, true, opts),
+    optional: () => make<TValue, true, THasDefault>(kind, true, opts),
 
     default: (value: TValue) => {
       // validated here, at declare time, rather than at the first write
@@ -120,31 +148,35 @@ function make<TValue, TOptional extends boolean>(
       // while it converts it. A default is never converted until the first
       // record, so it is checked here instead
       if (kind === 'json') jsonText(value, `default for ${kind}()`)
-      return make<TValue, true>(kind, true, { ...opts, hasDefault: true, defaultValue: value })
+      return make<TValue, true, true>(kind, true, {
+        ...opts,
+        hasDefault: true,
+        defaultValue: value,
+      })
     },
   }
   return Object.freeze(self)
 }
 
-export function str(): FieldType<string, false> {
-  return make<string, false>('str', false)
+export function str(): FieldType<string, false, false> {
+  return make<string, false, false>('str', false)
 }
 
-export function int(): FieldType<number, false> {
-  return make<number, false>('int', false)
+export function int(): FieldType<number, false, false> {
+  return make<number, false, false>('int', false)
 }
 
-export function float(): FieldType<number, false> {
-  return make<number, false>('float', false)
+export function float(): FieldType<number, false, false> {
+  return make<number, false, false>('float', false)
 }
 
-export function bool(): FieldType<boolean, false> {
-  return make<boolean, false>('bool', false)
+export function bool(): FieldType<boolean, false, false> {
+  return make<boolean, false, false>('bool', false)
 }
 
 /** A timestamp. Carried as a `Date`; encoded as epoch milliseconds. */
-export function ts(): FieldType<Date, false> {
-  return make<Date, false>('ts', false)
+export function ts(): FieldType<Date, false, false> {
+  return make<Date, false, false>('ts', false)
 }
 
 /**
@@ -156,7 +188,7 @@ export function ts(): FieldType<Date, false> {
  */
 export function oneOf<const T extends readonly (string | number)[]>(
   values: T,
-): FieldType<T[number], false> {
+): FieldType<T[number], false, false> {
   if (values.length === 0) {
     throw new Error('oneOf: the set must declare at least one member')
   }
@@ -177,15 +209,15 @@ export function oneOf<const T extends readonly (string | number)[]>(
     printed.add(String(value))
   }
 
-  return make<T[number], false>('oneOf', false, { values: Object.freeze([...values]) })
+  return make<T[number], false, false>('oneOf', false, { values: Object.freeze([...values]) })
 }
 
 /**
  * An arbitrary payload. Legal on event and log fields, **rejected as a dim**, because
  * a payload cannot be losslessly encoded into a series key.
  */
-export function json<T = unknown>(): FieldType<T, false> {
-  return make<T, false>('json', false, { dimLegal: false })
+export function json<T = unknown>(): FieldType<T, false, false> {
+  return make<T, false, false>('json', false, { dimLegal: false })
 }
 
 /**

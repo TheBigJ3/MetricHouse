@@ -95,21 +95,21 @@ export function closedUpTo(resolutionMs: number, nowMs: number, graceMs: number)
  * `resolution: '7s'` with `flush: '1m'` is not, and is rejected at declare
  * time rather than discovered as a torn window in production.
  *
+ * The message starts with `name`, the metric, like every other declaration error.
+ *
  * @throws if resolution is not positive, or does not divide `flushMs` evenly
  */
-export function assertResolution(resolutionMs: number, flushMs: number): void {
+export function assertResolution(name: string, resolutionMs: number, flushMs: number): void {
   if (!Number.isSafeInteger(resolutionMs) || resolutionMs <= 0) {
-    throw new Error(
-      `assertResolution: resolutionMs must be a positive integer, got ${resolutionMs}`,
-    )
+    throw new Error(`${name}: resolutionMs must be a positive integer, got ${resolutionMs}`)
   }
   if (!Number.isSafeInteger(flushMs) || flushMs <= 0) {
-    throw new Error(`assertResolution: flushMs must be a positive integer, got ${flushMs}`)
+    throw new Error(`${name}: flushMs must be a positive integer, got ${flushMs}`)
   }
 
   if (flushMs % resolutionMs !== 0) {
     throw new Error(
-      `assertResolution: resolution ${formatDuration(resolutionMs)} does not divide flush ` +
+      `${name}: resolution ${formatDuration(resolutionMs)} does not divide flush ` +
         `${formatDuration(flushMs)} evenly, and a shipment would split a bucket`,
     )
   }

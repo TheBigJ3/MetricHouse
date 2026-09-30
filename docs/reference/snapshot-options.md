@@ -197,6 +197,10 @@ others do not, such as a gauge's `last` after a `groupBy`, is fine: the rows
 without it go last whichever `direction` you ask for, so a top ten is ten rows
 that have the value being ranked.
 
+A name that is not a column of the metric at all throws even when there are no
+rows to sort, and so does a name such as `toString`, which every object
+inherits but no row has.
+
 ```
 http_requests: orderBy names "bucket_ts", which is not a column on these rows
 . They have [route, status, value, bucket_open, bucket_elapsed_ms]

@@ -177,6 +177,15 @@ function plainZero(value: number): number {
  */
 function assertSafe(value: number, metric: string, what: string): void {
   if (!Number.isSafeInteger(value)) {
+    // a fraction is not an overflow: it is what a series holds after a float
+    // metric was declared as an integer one
+    if (!Number.isInteger(value)) {
+      throw new Error(
+        `memory driver: ${metric} ${what} would be ${value}, which is not a whole number, so ` +
+          'the write was refused. The series holds a fraction, which happens when a float ' +
+          'metric is declared as an integer one',
+      )
+    }
     throw new Error(
       `memory driver: ${metric} ${what} would be ${value}, which is past ` +
         `${Number.MAX_SAFE_INTEGER}, the largest whole number a double holds exactly, so the ` +

@@ -399,7 +399,7 @@ queueDepth.rowShape().columns.map((c) => c.name)
 | `storage` | `'bucketed'` | It holds one value per series and fills windows from it |
 | `dims` | `Shape` | The declared dims |
 | `resolutionMs` | `number` | `resolution`, parsed |
-| `flushMs` | `number` | `flush`, parsed, including one taken from the house |
+| `flushMs` | `number` | `flush`, parsed, including one taken from the house. Throws on an unbound metric that declared no `flush` |
 | `graceMs` | `number` | `grace`, parsed, including one taken from the house. `2000` when neither sets it |
 | `holdForMs` | `number \| undefined` | `holdFor`, parsed. `undefined` when a series holds forever |
 | `isFloat` | `boolean` | `true` unless `value: int()` was declared |
@@ -428,7 +428,7 @@ A value somebody wrote always beats a carried one, whichever of the two lands
 first. Two processes carrying the same window write the same number, so they
 cannot disagree.
 
-Three consequences worth knowing:
+Five consequences worth knowing:
 
 - **A series appears from its first write.** Nothing is backfilled before it, so
   a queue declared on Monday and first written on Friday has no Monday rows.

@@ -134,7 +134,7 @@ export function observability(req: Request, res: Response, next: NextFunction) {
   // A child logger carrying the request context into every line downstream.
   req.log = appLog.child({ service: 'api', requestId })
 
-  // The status is not known yet, so only the route is bound here.
+  // Nothing is bound yet: the route and the status are only known at the end.
   const span = httpLatency.start()
 
   // Only 'finish' records. A client that hangs up before the response is

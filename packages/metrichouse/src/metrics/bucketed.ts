@@ -144,7 +144,7 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
   // eager when the metric declares its own cadence: a bad pair is a
   // programming error and should surface when the schema file is read, not at
   // the first flush
-  if (ownFlushMs !== undefined) assertResolution(resolutionMs, ownFlushMs)
+  if (ownFlushMs !== undefined) assertResolution(name, resolutionMs, ownFlushMs)
 
   const attempts = createAttempts()
   let binding: MetricBinding | undefined
@@ -201,7 +201,7 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
       // early enough to be a boot failure rather than a surprise at flush.
       // Checked before the binding is kept, so a refusal leaves the metric
       // free to be registered again once the mistake is fixed
-      if (ownFlushMs === undefined) assertResolution(resolutionMs, flushMs(next))
+      if (ownFlushMs === undefined) assertResolution(name, resolutionMs, flushMs(next))
       binding = next
     },
 
@@ -253,6 +253,8 @@ export interface BucketedReaderOptions {
   readonly now: () => number
   readonly materialize: (bucketTs: number, dimKey: string, cell: Cell) => Row
   readonly mergeValues: MergeValues
+  /** Read late, like `driver`: every column a live row can have, for `orderBy`. */
+  readonly columns?: () => readonly string[]
 }
 
 /**
@@ -282,7 +284,8 @@ interface BucketedReaderInternals extends BucketedReaderOptions {
 export function bucketedReader<D extends Shape, V>(
   options: BucketedReaderInternals,
 ): BucketedReader<D, V> {
-  const { name, resolutionMs, dims, driver, now, materialize, mergeValues, assertCell } = options
+  const { name, resolutionMs, dims, driver, now, materialize, mergeValues, assertCell, columns } =
+    options
   const decodeKey = dimKeyDecoder(dims)
 
   /**
@@ -337,6 +340,7 @@ export function bucketedReader<D extends Shape, V>(
         resolutionMs,
         nowMs,
         mergeValues,
+        ...(columns !== undefined && { columns: columns() }),
       })
     },
   }

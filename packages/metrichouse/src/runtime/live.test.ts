@@ -258,6 +258,24 @@ describe('counter.snapshot', () => {
     await expect(dogPoops.snapshot({ orderBy: 'nope' })).rejects.toThrow(/not a column/)
   })
 
+  it('rejects an orderBy that is not a column even when there are no rows', async () => {
+    const dogPoops = makeCounter()
+    createHouse({ driver, schema: [dogPoops], now })
+    await expect(dogPoops.snapshot({ orderBy: 'nope' })).rejects.toThrow(
+      /^dog_poops: orderBy names "nope", which is not a column on these rows\. They have \[id, bucket_ts, park, kind, value, bucket_open, bucket_elapsed_ms\]/,
+    )
+  })
+
+  it.each(['toString', 'constructor', '__proto__'])(
+    'rejects the inherited property %s as an orderBy',
+    async (name) => {
+      const dogPoops = makeCounter()
+      const house = createHouse({ driver, schema: [dogPoops], now })
+      await seed(dogPoops, house)
+      await expect(dogPoops.snapshot({ orderBy: name })).rejects.toThrow(/not a column/)
+    },
+  )
+
   it('refuses a direction it does not know', async () => {
     const dogPoops = makeCounter()
     const house = createHouse({ driver, schema: [dogPoops], now })
@@ -427,6 +445,15 @@ describe('staged snapshot', () => {
     expect(top.map((row) => row.plan)).toEqual(['team', 'pro'])
     const bottom = await signups.snapshot({ orderBy: 'plan', direction: 'asc', limit: 1 })
     expect(bottom.map((row) => row.plan)).toEqual(['free'])
+  })
+
+  it('refuses an orderBy that names no column when nothing is staged', async () => {
+    const signups = makeEvent()
+    createHouse({ driver, schema: [signups], now })
+
+    await expect(signups.snapshot({ orderBy: 'toString' })).rejects.toThrow(
+      /orderBy names "toString"/,
+    )
   })
 
   it('refuses an orderBy that names no column, as the aggregate kinds do', async () => {

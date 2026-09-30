@@ -323,6 +323,20 @@ out, or until the series is deleted when it has no `holdFor`:
 decodeDimKey: expected at most 2 segments for [route, status], got 3
 ```
 
+Changing the type of a dim, or removing a `oneOf` member, leaves stored keys
+the new declaration cannot read. A key is read back with the current type, so
+a `str()` turned into an `int()` that holds `"abc"`, or a stored value that is
+no longer one of the members, throws when a row is built for it, naming the
+dim. So does a key with no value for a dim that is now required or has a
+default:
+
+```
+decodeDimKey: dim "count" is declared as int(), but the stored value "abc" is not a safe integer. The stored series was written under an earlier declaration
+```
+
+A [level](/primitives/level) stops carrying and totalling such a series, and
+the windows it wrote stay stored until they are deleted from the driver.
+
 ### Every combination is a running total
 
 A metric keeps one total per key per window, so the number of series it can
