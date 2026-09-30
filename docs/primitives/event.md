@@ -134,10 +134,28 @@ such as an order or an audit entry, also wants [`durability: 'durable'`](#durabi
 A locally staged event never writes to the driver, but it still reads it for one
 thing: records an earlier `stage: 'driver'` declaration of the same event left
 there. So moving an event from `'driver'` to `'local'` strands nothing.
-[`pending()`](#event-pending) counts those records, and every
-[`flush()`](#event-flush) claims them before the local buffer, up to
-[`claimLimit`](#claimlimit) at a time, until none are left. That costs one
-`countPending` call to the driver per flush and per `pending()`.
+[`pending()`](#event-pending) counts those records, and a
+[`flush()`](#event-flush) ships them in the same send as the local buffer. The
+flush claims the local buffer first, then fills whatever room
+[`claimLimit`](#claimlimit) leaves with records from the driver, placed ahead of
+the local ones since they were staged earlier. A claim the sink fails puts each
+record back where it came from.
+
+The driver is asked only while it may still hold such records. It starts out
+that way, and stops once `countPending` answers `0`. From then on a flush and a
+`pending()` make no driver call at all, until one [`flush`](#flush) interval has
+passed and the next one asks again, which finds records a process still on the
+old declaration staged during a rolling deploy. A driver call that fails, or
+takes longer than 5 seconds or the flush interval, whichever is shorter, counts
+as `0` and goes to `onError`, so a Redis that is down never fails, or holds up,
+the flush of records only this process holds, and never keeps `house.stop()`
+from returning. A claim the driver hands over after that wait has given up goes
+straight back to the driver.
+
+```
+page_viewed: could not ask the driver for records an earlier stage: 'driver' declaration left there, so this process looks again in 30000ms. the driver did not answer within 5000ms
+```
+
 [`peek()`](#event-peek) and [`snapshot()`](#event-snapshot) read the local
 buffer only.
 
@@ -272,12 +290,18 @@ ends the pause.
 [`memory({ maxStaged })`](/reference/configuration): a sink that stays down
 would otherwise grow the buffer until the process runs out of memory. A
 `record()` or `recordMany()` that would take the count past it stages none of
-its records and reports this to `onError`, and the records already held stay.
-[`derive`](#derive) has run for them by then, as it has for a relaxed record a
-driver refuses.
+its records, and the records already held stay. [`derive`](#derive) has run for
+them by then, as it has for a relaxed record a driver refuses.
+
+The refusal reaches `onError` once per turn of the event loop rather than once
+per record. The first refusal opens a report, every record refused in the rest
+of that turn adds to its count, and the report is sent when the turn ends. A
+burst of 200,000 records into a full buffer is one error naming 200,000, and
+without an `onError` it is one unhandled rejection. `drain()` waits for a report
+still to be sent.
 
 ```
-page_viewed: staging 1 more record would pass batch.maxStaged (100000), with 100000 already held in this process. Locally staged records only leave when a send succeeds, so this is a backlog that nothing is shipping
+page_viewed: refused 200000 records, because staging them would pass batch.maxStaged (100000) with 100000 already held in this process. Locally staged records only leave when a send succeeds, so this is a backlog that nothing is shipping
 ```
 
 A `maxStaged` that is not a positive whole number, or that is below `maxSize`,
@@ -753,20 +777,35 @@ the one that staged it:
 | --- | --- |
 | lacks a field that now has a default | carries the default |
 | lacks a field that is now optional | leaves the column out, as for a record that omitted it |
-| lacks a field that is now required, with no default | throws, naming the record and the field |
-| holds a value the field no longer accepts, such as text in a field now `int()`, or a `oneOf()` member since removed | throws, naming the record and the field |
+| lacks a field that is now required, with no default | leaves the column out, and is reported |
+| holds a value the field no longer accepts, such as text in a field now `int()`, or a `oneOf()` member since removed | carries the value as stored, and is reported |
 | holds text in a field now `json()` | carries that text as JSON text, `"hello"` for `hello`. Text that already reads as JSON, such as `42`, is carried as it is |
 | was staged before `sample` was declared | carries a `_sample_rate` of `1`, since it was kept whole |
 
+A record the current declaration cannot read, the two rows marked reported
+above, still ships. It goes to the sink in its claim like any other record, with
+its values as stored: a default the declaration has fills a field the record
+lacks, and a field with no default and no value is left out. So the flush that
+claims it succeeds, and the records claimed with it are not held up. It is
+reported to `onError` with the metric, the record's id, and a sentence for each
+field it does not fit:
+
 ```
-views: staged record 0192f3a1-5c7e-7b21-8d44-0e9a3c2b7f10 holds a value field "n" no longer accepts. n: expected a safe integer, got "abc"
+views: staged record 0192f3a1-5c7e-7b21-8d44-0e9a3c2b7f10 does not fit the fields as declared now, and ships as stored. Field "n" holds a value it no longer accepts. n: expected a safe integer, got "abc"
 ```
 
-A record that throws fails the flush that claimed it, as a sink failure does:
-the whole claim goes back and is retried on the next flush, so it holds up the
-records claimed with it. `peek()` and `snapshot()` throw the same error. Change
-a field's type in a way that accepts what is already staged, or let the backlog
-ship before the deploy that changes it.
+The row your `write` function receives can therefore break the types
+`EventRow<F>` promises, such as a string in an `int()` column. A sink that
+inserts into a typed table may reject that row, and the claim then fails and is
+retried like any other sink failure. Change a field's type in a way that
+accepts what is already staged, or let the backlog ship before the deploy that
+changes it, and the question never comes up.
+
+`peek()` and `snapshot()` return such a record as stored too. A process reports
+each record at most once, however many times a flush, `peek()` or `snapshot()`
+reads it, so a dashboard polling `house.snapshot()` does not flood `onError`. It
+remembers the last 10,000 records it reported, and forgets a record once it has
+shipped.
 
 ### Table schema
 

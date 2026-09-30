@@ -20,7 +20,7 @@ import type {
   RecoveryReport,
   StagedRecord,
 } from '../drivers/types.js'
-import { isRecordClaim } from '../drivers/types.js'
+import { isRecordClaim, NOTHING_RECOVERED } from '../drivers/types.js'
 import { uuidv7 } from '../identity.js'
 import { createAttempts, metricFlush } from '../runtime/flush.js'
 import {
@@ -114,8 +114,9 @@ export interface EventBatchConfig {
    *
    * The local answer to `memory({ maxStaged })`: a sink that stays down would
    * otherwise grow the buffer until the process runs out of memory. A record
-   * past it is refused and reported to `onError`, and the records already
-   * held stay.
+   * past it is refused, and the records already held stay. The records
+   * refused in one turn of the event loop are reported to `onError` as one
+   * error that counts them.
    */
   readonly maxStaged?: number
 }
@@ -325,6 +326,30 @@ const DEFAULT_FLUSH_MS = 30_000
  */
 const IMMEDIATE_CLAIM_CAP = 100
 
+/**
+ * The longest a locally staged event waits for the driver, when it asks for
+ * records an earlier `stage: 'driver'` declaration left there. Shorter still
+ * when the flush interval is. A driver that cannot be reached must not hold
+ * up records that only this process holds.
+ */
+const DRIVER_CHECK_MS = 5_000
+
+/**
+ * How many unreadable records an event remembers having reported. Past it
+ * the oldest is forgotten, and would be reported again if read again.
+ */
+const REPORTED_CAP = 10_000
+
+/**
+ * A claim of the local buffer, with the records it took from there and, when
+ * it carries some, the driver's claim of records an earlier `stage: 'driver'`
+ * declaration left behind.
+ */
+interface LocalClaim {
+  readonly local: readonly StagedRecord[]
+  readonly leftover?: RecordClaim
+}
+
 /** Is this text JSON, as `record()` stores a `json()` value? */
 function isJsonText(text: string): boolean {
   try {
@@ -468,7 +493,7 @@ export function stagedMetric<
 
   /** Local staging only: records waiting, and claims taken from them. */
   const buffer: StagedRecord[] = []
-  const localInFlight = new Map<string, RecordClaim>()
+  const localInFlight = new Map<string, LocalClaim>()
   let localSeq = 0
   let batchTimer: ReturnType<typeof setTimeout> | undefined
 
@@ -484,6 +509,26 @@ export function stagedMetric<
   let stagedCount = 0
   /** Local staging only: the records in {@link localInFlight}, kept as a count for `maxStaged`. */
   let localInFlightRecords = 0
+
+  /**
+   * Local staging only: when the driver last answered that it holds no
+   * records for this event, by the house clock, or `undefined` while it may
+   * still hold some. A driver that could not be asked counts as holding
+   * none. See {@link driverMayHold}.
+   */
+  let driverClearAt: number | undefined
+
+  /**
+   * Local staging only: the records `record()` refused past `maxStaged` in
+   * this turn of the event loop, reported together once the turn ends.
+   */
+  let refusal: { count: number; held: number } | undefined
+
+  /**
+   * The ids of staged records reported as unreadable under the fields as
+   * declared now, so each is reported once however often it is read.
+   */
+  const reportedUnreadable = new Set<string>()
 
   /** One failure count for flush, batch and immediate sends alike. */
   const attempts = createAttempts()
@@ -800,14 +845,7 @@ export function stagedMetric<
       // has run by now, as it has for a driver that refuses the append
       const held = buffer.length + localInFlightRecords
       if (held + records.length > maxStaged) {
-        const more = records.length === 1 ? '1 more record' : `${records.length} more records`
-        reportDetached(
-          new Error(
-            `${name}: staging ${more} would pass batch.maxStaged (${maxStaged}), with ${held} ` +
-              'already held in this process. Locally staged records only leave when a send ' +
-              'succeeds, so this is a backlog that nothing is shipping',
-          ),
-        )
+        refuse(records.length, held)
         return
       }
       for (const record of records) {
@@ -839,6 +877,42 @@ export function stagedMetric<
     // driver-staged event under immediate delivery still round-trips through
     // the driver. It just does not wait for a flush to claim it back.
     track(isImmediate() ? append.then(shipStagedUnlessPaused) : append)
+  }
+
+  /**
+   * Report records refused past `maxStaged`, once per turn of the event loop.
+   *
+   * A burst that runs into the cap refuses every record after it, and one
+   * report each would cost more than the records themselves, or crash a
+   * process that has no `onError`. So the first refusal of a turn opens a
+   * report, the rest of the turn adds to its count, and it is sent once the
+   * turn ends. Tracked, so `drain()` waits for it.
+   */
+  function refuse(count: number, held: number): void {
+    if (refusal !== undefined) {
+      refusal.count += count
+      return
+    }
+    const opened = { count, held }
+    refusal = opened
+    track(
+      new Promise<void>((_, reject) => {
+        setTimeout(() => {
+          refusal = undefined
+          const what =
+            opened.count === 1
+              ? '1 record, because staging it'
+              : `${opened.count} records, because staging them`
+          reject(
+            new Error(
+              `${name}: refused ${what} would pass batch.maxStaged (${maxStaged}) with ` +
+                `${opened.held} already held in this process. Locally staged records only ` +
+                'leave when a send succeeds, so this is a backlog that nothing is shipping',
+            ),
+          )
+        }, 0)
+      }),
+    )
   }
 
   /**
@@ -1026,37 +1100,144 @@ export function stagedMetric<
       claimedAt: (binding?.now ?? Date.now)(),
       records: taken,
     }
-    localInFlight.set(claim.id, claim)
+    localInFlight.set(claim.id, { local: taken })
     localInFlightRecords += taken.length
     return claim
   }
 
   /**
-   * Local staging only: take a claim of the records a driver staged
-   * declaration of this event left in the driver, or `undefined` when there
-   * are none.
+   * Local staging only: a claim of the local buffer, carrying as well the
+   * records an earlier `stage: 'driver'` declaration of this event left in
+   * the driver, as many as `claimLimit` leaves room for.
    *
-   * An event moved from `stage: 'driver'` to `'local'` keeps whatever it
-   * had staged there, and nothing else would ever claim it. Counted first,
-   * because counting is one round trip and an empty claim is two.
+   * An event moved from `stage: 'driver'` to `'local'` keeps whatever it had
+   * staged there, and nothing else would ever claim it. The local buffer is
+   * claimed first, so a driver that is slow or down cannot hold it up, and
+   * both leave in the one send.
    */
-  async function claimLeftover(): Promise<RecordClaim | undefined> {
-    const driver = activeDriver()
-    if ((await driver.countPending(name)) === 0) return undefined
-    const claim = await driver.claimRecords(name, config.claimLimit)
-    if (claim.records.length > 0) return claim
-    // what was counted is claimed by someone else. The empty claim only
-    // has a registration to drop
-    await driver.ack(claim)
+  async function claimLocal(): Promise<RecordClaim> {
+    const claim = takeLocalClaim()
+    const room =
+      config.claimLimit === undefined ? undefined : config.claimLimit - claim.records.length
+    if (room === 0 || binding === undefined || !driverMayHold()) return claim
+
+    const leftover = await claimLeftover(room)
+    if (leftover === undefined) return claim
+    localInFlight.set(claim.id, { local: claim.records, leftover })
+    // the driver's first: those were staged before anything this process holds
+    return { ...claim, records: [...leftover.records, ...claim.records] }
+  }
+
+  /**
+   * The driver's claim of what an earlier `stage: 'driver'` declaration left
+   * there, or `undefined` when it holds none or could not be asked.
+   *
+   * Counted first, because counting is one round trip and an empty claim is
+   * two, and a count of zero is what lets later flushes skip the driver.
+   */
+  async function claimLeftover(limit: number | undefined): Promise<RecordClaim | undefined> {
+    const count = await countLeftover()
+    if (count === 0) return undefined
+    const claim = await askDriver(
+      (driver) => driver.claimRecords(name, limit),
+      // a claim that arrives after the wait gave up is nobody's to ship, so
+      // its records go straight back
+      (late) => {
+        const driver = activeDriver()
+        const settling = late.records.length > 0 ? driver.release(late) : driver.ack(late)
+        settling.catch(reportDetached)
+      },
+    )
+    if (claim === undefined || claim.records.length > 0) return claim
+    // what was counted is claimed by someone else. The empty claim only has
+    // a registration to drop
+    await askDriver((driver) => driver.ack(claim))
     return undefined
   }
 
+  /**
+   * How many records an earlier `stage: 'driver'` declaration left in the
+   * driver, or `0` when it could not be asked.
+   */
+  async function countLeftover(): Promise<number> {
+    const count = await askDriver((driver) => driver.countPending(name))
+    if (count === 0) driverClearAt = clockNow()
+    return count ?? 0
+  }
+
+  /**
+   * Local staging only: may the driver still hold records an earlier
+   * `stage: 'driver'` declaration left there?
+   *
+   * Yes until it answers that it holds none, and again once a flush
+   * interval has passed since, since a process still on the old declaration
+   * may have staged more in a rolling deploy. Until then, `flush()` and
+   * `pending()` do not ask it, and a locally staged event costs the driver
+   * nothing. A clock that has stepped back reads as no longer comparable,
+   * and asks again.
+   */
+  function driverMayHold(): boolean {
+    if (driverClearAt === undefined) return true
+    const elapsed = clockNow() - driverClearAt
+    if (elapsed >= 0 && elapsed < effectiveFlushMs()) return false
+    driverClearAt = undefined
+    return true
+  }
+
+  /**
+   * Local staging only: one call to the driver about records an earlier
+   * declaration left there, waited for at most {@link DRIVER_CHECK_MS}.
+   *
+   * A call that fails or does not answer in time is reported and answers
+   * `undefined`, and the driver counts as holding nothing until a flush
+   * interval has passed. Records this process holds do not depend on the
+   * driver, so a driver that is down must not fail their flush, or hold up
+   * `pending()` and `stop()`. `late` receives an answer that arrives after
+   * the wait gave up.
+   */
+  async function askDriver<T>(
+    ask: (driver: Driver) => Promise<T>,
+    late?: (answer: T) => void,
+  ): Promise<T | undefined> {
+    const waitMs = Math.min(DRIVER_CHECK_MS, effectiveFlushMs())
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let gaveUp = false
+    const answer = (async () => ask(activeDriver()))()
+    try {
+      return await new Promise<T>((resolve, reject) => {
+        timer = setTimeout(() => {
+          gaveUp = true
+          reject(new Error(`the driver did not answer within ${waitMs}ms`))
+        }, waitMs)
+        answer.then(resolve, reject)
+      })
+    } catch (error) {
+      if (gaveUp && late !== undefined) answer.then(late, () => {})
+      driverClearAt = clockNow()
+      const reason = error instanceof Error ? error.message : String(error)
+      reportDetached(
+        new Error(
+          `${name}: could not ask the driver for records an earlier stage: 'driver' ` +
+            `declaration left there, so this process looks again in ${effectiveFlushMs()}ms. ` +
+            reason,
+          { cause: error },
+        ),
+      )
+      return undefined
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
   /** Take a local claim out of flight, or throw when it is not there. */
-  function settleLocal(claim: RecordClaim): void {
-    if (!localInFlight.delete(claim.id)) {
+  function settleLocal(claim: RecordClaim): LocalClaim {
+    const held = localInFlight.get(claim.id)
+    if (held === undefined) {
       throw new Error(`${name}: claim ${claim.id} is not in flight. Was it already settled?`)
     }
-    localInFlightRecords -= claim.records.length
+    localInFlight.delete(claim.id)
+    localInFlightRecords -= held.local.length
+    return held
   }
 
   function assertRecords(claim: Claim): asserts claim is RecordClaim {
@@ -1089,14 +1270,15 @@ export function stagedMetric<
    *
    * A record can wait in the driver across a deploy that changed the
    * declaration, so it is read against the new one: a default declared since
-   * fills a field the record lacks, and a value the field no longer accepts
-   * throws rather than ship a column of the wrong type.
-   *
-   * @throws naming the record and the field, when a stored value no longer
-   * fits its field or a field now required has no value and no default
+   * fills a field the record lacks. A record the new declaration cannot read,
+   * one lacking a field now required or holding a value its field no longer
+   * accepts, is reported to `onError` and becomes a row with its values as
+   * stored. Refusing it would fail every claim it is in, and so hold up every
+   * record behind it, for as long as it is staged.
    */
   function materialize(record: StagedRecord): Row {
     const row: Row = { id: record.id, ts: new Date(record.ts) }
+    const problems: string[] = []
 
     for (const [key, type] of Object.entries(fields)) {
       // own keys only: an omitted field named `constructor` would otherwise
@@ -1109,17 +1291,19 @@ export function stagedMetric<
           row[key] =
             type.kind === 'json'
               ? jsonText(type.defaultValue, key)
-              : rowValue(record, key, type, type.defaultValue)
+              : rowValue(key, type, type.defaultValue, problems)
           continue
         }
-        if (type.isOptional) continue
-        throw new Error(
-          `${name}: staged record ${record.id} has no value for field ${JSON.stringify(key)}, ` +
-            'which is now required and has no default',
-        )
+        if (!type.isOptional) {
+          problems.push(
+            `Field ${JSON.stringify(key)} has no value, and is now required with no default`,
+          )
+        }
+        continue
       }
-      row[key] = rowValue(record, key, type, value)
+      row[key] = rowValue(key, type, value, problems)
     }
+    if (problems.length > 0) reportUnreadable(record.id, problems)
 
     row._ingested_at = new Date(record.fields._ingested_at as number)
     // a record staged before `sample` was declared was kept whole
@@ -1128,8 +1312,11 @@ export function stagedMetric<
     return row
   }
 
-  /** One stored value as its column carries it. See {@link materialize}. */
-  function rowValue(record: StagedRecord, key: string, type: FieldType, value: unknown): unknown {
+  /**
+   * One stored value as its column carries it, adding to `problems` when
+   * its field no longer accepts it. See {@link materialize}.
+   */
+  function rowValue(key: string, type: FieldType, value: unknown, problems: string[]): unknown {
     if (type.kind === 'json') {
       // a payload is a string column, and `record()` already turned it into
       // JSON text. A record staged by an older version, or while the field
@@ -1141,15 +1328,36 @@ export function stagedMetric<
       assertValue(type, value, key)
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
-      throw new Error(
-        `${name}: staged record ${record.id} holds a value field ${JSON.stringify(key)} no ` +
-          `longer accepts. ${reason}`,
-        { cause: error },
-      )
+      problems.push(`Field ${JSON.stringify(key)} holds a value it no longer accepts. ${reason}`)
     }
     // a copy, so a row changed by a sink, `peek()` or `snapshot()` cannot
     // change a locally staged record that has not shipped yet
     return isDate(value) ? new Date(value.getTime()) : value
+  }
+
+  /**
+   * Report a record {@link materialize} could not read, once per record.
+   *
+   * Once, because `snapshot()` and `peek()` read the same records on every
+   * call, and a dashboard polling them would otherwise report the same
+   * record every few seconds until it ships.
+   */
+  function reportUnreadable(id: string, problems: readonly string[]): void {
+    if (reportedUnreadable.has(id)) return
+    if (reportedUnreadable.size >= REPORTED_CAP) {
+      // the oldest, since a Set iterates in insertion order
+      for (const oldest of reportedUnreadable) {
+        reportedUnreadable.delete(oldest)
+        break
+      }
+    }
+    reportedUnreadable.add(id)
+    reportDetached(
+      new Error(
+        `${name}: staged record ${id} does not fit the fields as declared now, and ships as ` +
+          `stored. ${problems.join('. ')}`,
+      ),
+    )
   }
 
   const self: Event<F, K, D> = {
@@ -1227,7 +1435,7 @@ export function stagedMetric<
         // also what a driver staged declaration of this event left in the
         // driver, since a flush of this one ships those too. Unbound, there
         // is no driver to ask, and the buffer is all there is
-        const inDriver = binding === undefined ? 0 : await binding.driver.countPending(name)
+        const inDriver = binding === undefined || !driverMayHold() ? 0 : await countLeftover()
         return buffer.length + localInFlightRecords + inDriver
       }
       return activeDriver().countPending(name)
@@ -1287,12 +1495,18 @@ export function stagedMetric<
       // there is nothing left behind to put back, the same trade `stage:
       // 'local'` already makes everywhere else. What the driver holds is
       // recovered all the same: a claim of records a driver staged
-      // declaration left there, abandoned by a flusher that died
+      // declaration left there, abandoned by a flusher that died. Only while
+      // the driver may still hold some, and never failing or holding up the
+      // flush of what this process holds
+      if (stage === 'local') {
+        if (!driverMayHold()) return NOTHING_RECOVERED
+        return (await askDriver((driver) => driver.recover(name))) ?? NOTHING_RECOVERED
+      }
       return activeDriver().recover(name)
     },
 
     async claimBatch(): Promise<Claim> {
-      if (stage === 'local') return (await claimLeftover()) ?? takeLocalClaim()
+      if (stage === 'local') return claimLocal()
       return activeDriver().claimRecords(name, config.claimLimit)
     },
 
@@ -1330,8 +1544,13 @@ export function stagedMetric<
       assertRecords(claim)
       // written, so the sink is taking rows again and `record()` may ship
       if (claim.records.length > 0) failedAt = undefined
+      // shipped, so none of these can be read again
+      if (reportedUnreadable.size > 0) {
+        for (const record of claim.records) reportedUnreadable.delete(record.id)
+      }
       if (isLocalClaim(claim)) {
-        settleLocal(claim)
+        const { leftover } = settleLocal(claim)
+        if (leftover !== undefined) await activeDriver().ack(leftover)
         return
       }
       await activeDriver().ack(claim)
@@ -1342,16 +1561,18 @@ export function stagedMetric<
       // only a failed send puts a claim back
       failedAt = clockNow()
       if (isLocalClaim(claim)) {
-        settleLocal(claim)
+        const { local, leftover } = settleLocal(claim)
         // back in the order they were staged. These are older than anything
         // recorded since, but a claim that failed before this one may already
         // be back at the front, and its records are older still
-        const merged = [...claim.records, ...buffer].sort(
+        const merged = [...local, ...buffer].sort(
           (a, b) => (stagedOrder.get(a) ?? 0) - (stagedOrder.get(b) ?? 0),
         )
         buffer.length = 0
         for (const record of merged) buffer.push(record)
         armBatchTimer()
+        // and what came from the driver goes back to the driver
+        if (leftover !== undefined) await activeDriver().release(leftover)
         return
       }
       await activeDriver().release(claim)
