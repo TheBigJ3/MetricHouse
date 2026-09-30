@@ -702,9 +702,14 @@ Four rules that are easy to get wrong:
   would otherwise be overtaken. A call split into several round trips by
   `maxPipelineSize` issues all of them in one step of that queue, so a call made
   after it cannot land between two of them. When Redis has forgotten a script,
-  after a restart or a `SCRIPT FLUSH`, the driver waits for every round trip of
-  the call to be answered and sends the scripts it refused again in one step,
-  in the order they were made.
+  after a restart or a `SCRIPT FLUSH`, it refuses every call sent with the old
+  SHA until the driver loads the script again, and those refusals come back one
+  round trip at a time. From the first one, the driver issues nothing new. It
+  waits for every round trip already sent to be answered, then sends every
+  refused call again in one step, in the order the calls were made, and only
+  then issues the sends that were waiting. A call made after one refused call
+  but before the refusal of another would otherwise land ahead of the other's
+  resend, and a level would end on the older of the two values.
 
 ### Settling twice
 

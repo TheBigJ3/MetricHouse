@@ -291,6 +291,58 @@ describe('ioredis · round trips of one call', () => {
   })
 })
 
+// no server needed: the replies are scripted
+describe('ioredis · scripts Redis forgot', () => {
+  const op = (bucketTs: number) => ({
+    metric: M,
+    bucketTs,
+    resolutionMs: 1000,
+    dimKey: WILLOW,
+    delta: 1,
+  })
+  /** The window each script was aimed at, after its three keys and the key prefix. */
+  const windows = (sent: (string | number)[][]) => sent.map((args) => args[4])
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0))
+
+  it('resends what Redis forgot for two calls before a call made while the second waited', async () => {
+    const forgot = Object.assign(new Error('NOSCRIPT No matching script. Please use EVAL.'), {
+      name: 'ReplyError',
+    })
+    /** A reply held back until its `release` is called. */
+    const held = () => {
+      let release = (): void => {}
+      const reply = new Promise<[Error, null][]>((resolve) => {
+        release = () => resolve([[forgot, null]])
+      })
+      return { reply, release }
+    }
+    const refusals = [held(), held()]
+    const { client, sent } = scriptedClient([])
+    const pipelineOf = client.pipeline.bind(client)
+    let execs = 0
+    ;(client as { pipeline: () => unknown }).pipeline = () => {
+      const pipeline = pipelineOf()
+      const exec = pipeline.exec.bind(pipeline)
+      pipeline.exec = () => refusals[execs++]?.reply ?? exec()
+      return pipeline
+    }
+    const driver = ioredis(client)
+
+    const first = driver.increment([op(1000)])
+    const second = driver.increment([op(2000)])
+    await tick()
+    refusals[0]?.release()
+    await tick()
+    // made after the first refusal came back, while the second is still out
+    const third = driver.increment([op(3000)])
+    await tick()
+    refusals[1]?.release()
+    await Promise.all([first, second, third])
+
+    expect(windows(sent)).toEqual([1000, 2000, 1000, 2000, 3000])
+  })
+})
+
 // no server needed: these never read what a script stored
 describe('ioredis · options and connection', () => {
   it('refuses a maxPipelineSize that is not a positive integer', () => {
@@ -1144,6 +1196,34 @@ if (!client) {
       expect(await live.hget(`${ns}:b:${G}:1000`, WILLOW)).toBe('7|5|7|12|2')
 
       await wipe(ns)
+    })
+
+    it('keeps the last level set of a burst Redis forgot its scripts during', async () => {
+      // one set per turn of the event loop, so refusals come back while later
+      // sets are still being made. Whether a set lands between two of them
+      // depends on timing, so the burst runs several times
+      const finals: number[] = []
+      for (let round = 0; round < 15; round++) {
+        const ns = fresh()
+        const driver = ioredis(live, { namespace: ns })
+        const set = (value: number) =>
+          driver.setLevel([
+            { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, value, mode: 'set' },
+          ])
+        await set(0)
+
+        const writes: Promise<void>[] = []
+        for (let value = 1; value <= 200; value++) {
+          if (value === 190) void live.script('FLUSH')
+          writes.push(set(value))
+          await new Promise((resolve) => setImmediate(resolve))
+        }
+        await Promise.all(writes)
+        for (const series of await driver.readLevels(M)) finals.push(series.value)
+
+        await wipe(ns)
+      }
+      expect(finals).toEqual(Array.from({ length: 15 }, () => 200))
     })
 
     it('loads a script once for every call in a batch that first needs it', async () => {

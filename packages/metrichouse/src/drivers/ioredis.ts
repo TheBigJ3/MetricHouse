@@ -2112,8 +2112,24 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
    */
   let issuing: Promise<unknown> = Promise.resolve()
 
+  /**
+   * The resend of the scripts Redis forgot, while one is under way. Nothing
+   * is issued until it has gone, see {@link resendForgotten}.
+   */
+  let resending: Promise<void> | undefined
+
+  /** Resolve once no resend is under way. */
+  async function afterResends(): Promise<void> {
+    while (resending !== undefined) await resending
+  }
+
   function inOrder<T>(issue: () => Promise<{ reply: Promise<T> }>): Promise<T> {
-    const issued = issuing.then(issue)
+    // checked when the turn comes rather than when it is queued, and only
+    // waited on when there is a resend, so a send costs no extra turn of the
+    // microtask queue the rest of the time
+    const issued = issuing.then(() =>
+      resending === undefined ? issue() : afterResends().then(issue),
+    )
     issuing = issued.catch(() => undefined)
     return issued.then((sent) => sent.reply)
   }
@@ -2128,62 +2144,159 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     return inOrder(async () => ({ reply: read() }))
   }
 
+  type Entry = [error: Error | null, result: unknown]
+  type Results = Entry[] | null
+
+  /** One call of a {@link runScripts} batch, and how far it has got. */
+  interface Sent {
+    readonly call: ScriptCall
+    /**
+     * Its LUA_ONCE sequence number, or 0 for a call that is not a write. Kept
+     * across a resend: the resent call is the same write, so if it did run
+     * after all, the script sees it.
+     */
+    readonly seq: number
+    /** The round trip that last carried it. */
+    trip?: number
+    /** Whether Redis answered it on that round trip. */
+    heard: boolean
+    /** The answer to its resend, once Redis has refused it with NOSCRIPT. */
+    resent?: Promise<Entry>
+  }
+
+  /** Round trips of scripts issued and not yet answered. */
+  const unreplied = new Set<Promise<Results>>()
+
+  /**
+   * Calls Redis refused with NOSCRIPT, with the round trip that carried them
+   * and their place in it, waiting for {@link resendForgotten}.
+   */
+  let forgotten: { sent: Sent; trip: number; at: number; answer: (entry: Entry) => void }[] = []
+
+  /** One round trip carrying `sents`, issued now. */
+  function issueTrip(
+    client: IoredisClient,
+    sents: readonly Sent[],
+    resolved: readonly string[],
+    floor: number,
+    resend: boolean,
+  ): Promise<Results> {
+    const pipeline = client.pipeline()
+    sents.forEach(({ call, seq }, n) => {
+      const keys = seq > 0 ? [...call.keys, writerKey] : call.keys
+      const args = seq > 0 ? [...call.args, floor, seq] : call.args
+      pipeline.evalsha(resolved[n] as string, keys.length, ...keys, ...args)
+    })
+    const trip = ++issued
+    for (const sent of sents) {
+      sent.trip = trip
+      sent.heard = false
+    }
+    const reply = pipeline.exec().then((results) => {
+      sents.forEach((sent, n) => {
+        sent.heard = answered(results?.[n])
+      })
+      if (sents.some((sent) => sent.heard)) settleBefore(trip)
+      // a resend refused again is the caller's error, as a load that fails is
+      if (!resend) {
+        sents.forEach((sent, n) => {
+          if (isNoScript(results?.[n]?.[0])) sent.resent = forget(client, sent, trip, n)
+        })
+      }
+      return results
+    })
+    unreplied.add(reply)
+    const done = () => {
+      unreplied.delete(reply)
+    }
+    reply.then(done, done)
+    return reply
+  }
+
+  /** Queue a call Redis refused with NOSCRIPT for the next resend, and its answer. */
+  function forget(client: IoredisClient, sent: Sent, trip: number, at: number): Promise<Entry> {
+    const answer = new Promise<Entry>((resolve) => {
+      forgotten.push({ sent, trip, at, answer: resolve })
+    })
+    // set before this returns, so nothing is issued from here on until the
+    // resend has gone
+    resending ??= resendForgotten(client)
+    return answer
+  }
+
+  /**
+   * Send again every call Redis refused because it had forgotten the script,
+   * in the order the calls were first sent, ahead of anything newer.
+   *
+   * A restart or a `SCRIPT FLUSH` invalidates every cached SHA at once, so the
+   * whole cache goes and each script is loaded again. Only the calls refused
+   * go again. The others ran, and running them twice is the very thing
+   * LUA_ONCE guards against, while NOSCRIPT means a call never ran.
+   *
+   * Every round trip issued before the first refusal was seen is answered
+   * first, so every refusal among them is known, and nothing new is issued
+   * meanwhile. Otherwise a call made after one refused call, but before the
+   * reply refusing another, would land ahead of that other one's resend, and
+   * a level would end on the older of the two values.
+   */
+  async function resendForgotten(client: IoredisClient): Promise<void> {
+    try {
+      while (unreplied.size > 0) await Promise.allSettled([...unreplied])
+      const batch = forgotten.sort((a, b) => a.trip - b.trip || a.at - b.at)
+      forgotten = []
+      shas.clear()
+      let resolved: string[]
+      try {
+        resolved = await Promise.all(batch.map(({ sent }) => shaFor(client, sent.call.script)))
+      } catch (error) {
+        for (const { answer } of batch) answer([error as Error, null])
+        return
+      }
+      // taken after the load, as late as possible, as for any other send
+      const floor = floorOfUnanswered()
+      for (let start = 0; start < batch.length; start += maxPipeline) {
+        const part = batch.slice(start, start + maxPipeline)
+        issueTrip(
+          client,
+          part.map(({ sent }) => sent),
+          resolved.slice(start, start + part.length),
+          floor,
+          true,
+        ).then(
+          (results) => {
+            part.forEach(({ answer }, n) => {
+              answer(results?.[n] ?? [new Error('ioredis driver: retry was discarded'), null])
+            })
+          },
+          (error: unknown) => {
+            for (const { answer } of part) answer([error as Error, null])
+          },
+        )
+      }
+    } finally {
+      resending = undefined
+    }
+  }
+
   /**
    * Run scripts pipelined, reloading them if Redis has forgotten.
    *
    * Split into round trips of at most `maxPipelineSize` scripts, as commands
    * are. A level carry can send one script per window, and ten thousand of
    * them in one pipeline is the reply buffer the setting exists to bound.
-   *
-   * A restart or a `SCRIPT FLUSH` invalidates every cached SHA at once, so the
-   * recovery is to drop the whole cache and replay the round trip, rather than
-   * unpick which of the calls in it failed. A script that already ran in that
-   * round trip is not run twice: NOSCRIPT means it never ran.
+   * A call Redis refused because it forgot the script is sent again by
+   * {@link resendForgotten}, and its answer there is the one returned.
    */
   async function runScripts(calls: readonly ScriptCall[], what: string): Promise<unknown[]> {
     if (calls.length === 0) return []
     const client = await connect()
 
-    // one number per write, kept across a NOSCRIPT retry: the retried call
-    // is the same write, so if it did run after all, the script sees it
-    const seqs = calls.map((call) => (call.once ? ++writeSeq : 0))
-    for (const seq of seqs) if (seq > 0) unanswered.add(seq)
-
-    // per call: the round trip that last carried it, and whether Redis
-    // answered it there
-    const tripOf: number[] = []
-    const heard: boolean[] = []
-
-    type Entry = [error: Error | null, result: unknown]
-    type Results = Entry[] | null
-
-    /** One round trip carrying the calls at `indexes`, issued now. */
-    function issue(indexes: readonly number[], resolved: readonly string[], floor: number) {
-      const pipeline = client.pipeline()
-      indexes.forEach((i, n) => {
-        const call = calls[i] as ScriptCall
-        const seq = seqs[i] as number
-        const keys = seq > 0 ? [...call.keys, writerKey] : call.keys
-        const args = seq > 0 ? [...call.args, floor, seq] : call.args
-        pipeline.evalsha(resolved[n] as string, keys.length, ...keys, ...args)
-      })
-      const trip = ++issued
-      for (const i of indexes) {
-        tripOf[i] = trip
-        heard[i] = false
-      }
-      const reply = pipeline.exec().then((results) => {
-        indexes.forEach((i, n) => {
-          heard[i] = answered(results?.[n])
-        })
-        if (indexes.some((i) => heard[i])) settleBefore(trip)
-        return results
-      })
-      // awaited in order below, and a rejection waiting its turn there must
-      // not be reported as unhandled meanwhile
-      reply.catch(() => undefined)
-      return reply
-    }
+    const sents: Sent[] = calls.map((call) => ({
+      call,
+      seq: call.once ? ++writeSeq : 0,
+      heard: false,
+    }))
+    for (const { seq } of sents) if (seq > 0) unanswered.add(seq)
 
     /**
      * Every round trip in `trips` issued in one queued step, so no send made
@@ -2192,19 +2305,31 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
      */
     const send = (trips: readonly (readonly number[])[]): Promise<Promise<Results>[]> =>
       inOrder(async () => {
-        const indexes = trips.flat()
-        const found = shasFor(
-          client,
-          indexes.map((i) => (calls[i] as ScriptCall).script),
-        )
-        const resolved = Array.isArray(found) ? found : await found
+        const scripts = trips.flat().map((i) => (sents[i] as Sent).call.script)
+        let resolved: string[]
+        for (;;) {
+          const found = shasFor(client, scripts)
+          resolved = Array.isArray(found) ? found : await found
+          // a resend that began while this loaded a script goes first
+          if (resending === undefined) break
+          await afterResends()
+        }
         // the floor is taken after the await, as late as possible, so it
         // accounts for every write still waiting at the moment this one goes
         const floor = floorOfUnanswered()
         let at = 0
         const replies = trips.map((trip) => {
-          const reply = issue(trip, resolved.slice(at, at + trip.length), floor)
+          const reply = issueTrip(
+            client,
+            trip.map((i) => sents[i] as Sent),
+            resolved.slice(at, at + trip.length),
+            floor,
+            false,
+          )
           at += trip.length
+          // awaited in order below, and a rejection waiting its turn there
+          // must not be reported as unhandled meanwhile
+          reply.catch(() => undefined)
           return reply
         })
         return { reply: Promise.resolve(replies) }
@@ -2232,40 +2357,6 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         }
       }
 
-      // only the calls Redis did not recognise go again. The others ran, and
-      // running them twice is the very thing LUA_ONCE guards against. Every
-      // round trip's are sent again in one queued step, once all of them are
-      // answered, so a call made after this one cannot land between them
-      const missing: number[] = []
-      trips.forEach((indexes, t) => {
-        const answer = answers[t]
-        if (answer === undefined || !('results' in answer)) return
-        indexes.forEach((i, n) => {
-          if (isNoScript(answer.results?.[n]?.[0])) missing.push(i)
-        })
-      })
-      const retried = new Map<number, Entry>()
-      if (missing.length > 0) {
-        shas.clear()
-        const again: number[][] = []
-        for (let start = 0; start < missing.length; start += maxPipeline) {
-          again.push(missing.slice(start, start + maxPipeline))
-        }
-        const resent = await send(again)
-        for (const [t, indexes] of again.entries()) {
-          let results: Results
-          try {
-            results = await (resent[t] as Promise<Results>)
-          } catch (error) {
-            for (const i of indexes) retried.set(i, [error as Error, null])
-            continue
-          }
-          indexes.forEach((i, n) => {
-            retried.set(i, results?.[n] ?? [new Error('ioredis driver: retry was discarded'), null])
-          })
-        }
-      }
-
       for (const [t, indexes] of trips.entries()) {
         const answer = answers[t] as { results: Results } | { error: unknown }
         if (!('results' in answer)) {
@@ -2273,9 +2364,11 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           continue
         }
         let results = answer.results
-        if (results !== null && indexes.some((i) => retried.has(i))) {
+        if (results !== null && indexes.some((i) => (sents[i] as Sent).resent !== undefined)) {
           const first = results
-          results = indexes.map((i, n) => retried.get(i) ?? (first[n] as Entry))
+          results = await Promise.all(
+            indexes.map((i, n) => (sents[i] as Sent).resent ?? (first[n] as Entry)),
+          )
         }
         try {
           // one at a time: a spread passes every reply as an argument, and
@@ -2286,24 +2379,22 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         }
       }
     } finally {
-      calls.forEach((_, i) => {
-        const seq = seqs[i] as number
-        if (seq === 0) return
-        if (heard[i]) {
+      for (const { seq, heard, trip } of sents) {
+        if (seq === 0) continue
+        if (heard) {
           unanswered.delete(seq)
-          return
+          continue
         }
         // never answered, possibly never sent: kept until a later round
         // trip is answered, or for good when it was not sent at all
-        const trip = tripOf[i]
         if (trip === undefined) {
           unanswered.delete(seq)
-          return
+          continue
         }
         const parked = unsettled.get(trip)
         if (parked) parked.push(seq)
         else unsettled.set(trip, [seq])
-      })
+      }
     }
     if (failure !== undefined) throw failure.error
     return out

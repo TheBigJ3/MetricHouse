@@ -226,13 +226,15 @@ describe('bucketedLifecycle', () => {
   })
 
   it('stops waiting for a send aimed at a claimed window after one flush interval', async () => {
-    const { visits, sent, stuck } = hanging(1)
-    visits.add()
-    await vi.waitFor(() => expect(stuck).toEqual([1]))
-    clock += 3_000
-
     vi.useFakeTimers()
     try {
+      const { visits, sent, stuck } = hanging(1)
+      visits.add()
+      // not vi.waitFor, which moves fake time on between its checks
+      await vi.advanceTimersByTimeAsync(0)
+      expect(stuck).toEqual([1])
+      clock += 3_000
+
       let done = false
       const flushing = visits.flush().then((report) => {
         done = true
@@ -241,6 +243,72 @@ describe('bucketedLifecycle', () => {
       await vi.advanceTimersByTimeAsync(999)
       expect(done).toBe(false)
       await vi.advanceTimersByTimeAsync(1)
+      expect(await flushing).toMatchObject({ rows: 1 })
+      expect(sent).toEqual([['flush', 1]])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not wait again for a send an earlier flush gave up on', async () => {
+    vi.useFakeTimers()
+    try {
+      const { visits, sent, stuck } = hanging(1)
+      visits.add()
+      // not vi.waitFor, which moves fake time on between its checks
+      await vi.advanceTimersByTimeAsync(0)
+      expect(stuck).toEqual([1])
+      clock += 3_000
+      const first = visits.flush()
+      await vi.advanceTimersByTimeAsync(1_000)
+      await first
+
+      // a later window, whose own send answers, claimed by the next flush
+      visits.add(2)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(sent).toEqual([
+        ['flush', 1],
+        ['immediate', 2],
+      ])
+      clock += 3_000
+      let done = false
+      const second = visits.flush().then((report) => {
+        done = true
+        return report
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(done).toBe(true)
+      expect(await second).toMatchObject({ rows: 1 })
+      expect(sent).toEqual([
+        ['flush', 1],
+        ['immediate', 2],
+        ['flush', 2],
+      ])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('waits for a send only until one flush interval after it started', async () => {
+    vi.useFakeTimers()
+    try {
+      const { visits, sent, stuck } = hanging(1)
+      visits.add()
+      // not vi.waitFor, which moves fake time on between its checks
+      await vi.advanceTimersByTimeAsync(0)
+      expect(stuck).toEqual([1])
+      await vi.advanceTimersByTimeAsync(600)
+      clock += 3_000
+
+      let done = false
+      const flushing = visits.flush().then((report) => {
+        done = true
+        return report
+      })
+      await vi.advanceTimersByTimeAsync(399)
+      expect(done).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(done).toBe(true)
       expect(await flushing).toMatchObject({ rows: 1 })
       expect(sent).toEqual([['flush', 1]])
     } finally {
