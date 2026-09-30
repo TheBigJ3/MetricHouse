@@ -613,22 +613,24 @@ declare module 'express-serve-static-core' {
 export function requestLogger(req, res, next) {
   const requestId = req.header('x-request-id') ?? randomUUID()
 
-  // One child per request. Every line it writes carries this context.
-  req.log = appLog.child({
-    service: 'api',
-    requestId,
-    route: req.route?.path ?? req.path,
-  })
+  // One child per request. Every line it writes carries this context. The
+  // route is not in it, because routing has not run yet and req.route is empty.
+  req.log = appLog.child({ service: 'api', requestId })
 
   res.setHeader('x-request-id', requestId)
 
   res.on('finish', () => {
+    // The route is known now, and the mount path is added so a router mounted
+    // at /orders does not collapse into '/:id'.
+    const route = req.route ? (req.baseUrl ?? '') + req.route.path : 'unmatched'
+    const userId = req.auth?.userId
+
     if (res.statusCode >= 500) {
-      req.log.error('request failed', { userId: req.auth?.userId })
+      req.log.error('request failed', { route, userId })
     } else if (res.statusCode >= 400) {
-      req.log.warn('request rejected', { userId: req.auth?.userId })
+      req.log.warn('request rejected', { route, userId })
     } else {
-      req.log.info('request completed', { userId: req.auth?.userId })
+      req.log.info('request completed', { route, userId })
     }
   })
 

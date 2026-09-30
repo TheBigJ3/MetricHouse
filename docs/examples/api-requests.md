@@ -20,7 +20,8 @@ import { counter, event, float, log, oneOf, str, timer } from 'metrichouse/core'
 import { toClickHouse } from './sinks.js'
 
 const STATUS_CLASSES = ['2xx', '3xx', '4xx', '5xx'] as const
-const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const
+// OTHER catches OPTIONS, HEAD and anything else, so a preflight cannot throw.
+const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OTHER'] as const
 
 export const httpRequests = counter('http_requests', {
   dims: {
@@ -81,7 +82,7 @@ export const appLog = log('app_log', {
 // metrics/house.ts
 import { createHouse } from 'metrichouse/core'
 import { ioredis } from 'metrichouse/ioredis'
-import Redis from 'ioredis'
+import { Redis } from 'ioredis'
 import * as schema from './schema.js'
 import { logger } from '../logger.js'
 
@@ -108,7 +109,15 @@ import type { NextFunction, Request, Response } from 'express'
 import { appLog, httpLatency, httpRequests } from '../metrics/schema.js'
 
 type StatusClass = '2xx' | '3xx' | '4xx' | '5xx'
-const statusClass = (code: number) => `${Math.floor(code / 100)}xx` as StatusClass
+type Method = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'OTHER'
+
+// Clamped, so a 1xx or an unusual code still lands in a declared class.
+const statusClass = (code: number): StatusClass =>
+  code >= 500 ? '5xx' : code >= 400 ? '4xx' : code >= 300 ? '3xx' : '2xx'
+
+const KNOWN_METHODS: readonly string[] = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']
+const methodOf = (method: string): Method =>
+  KNOWN_METHODS.includes(method) ? (method as Method) : 'OTHER'
 
 declare module 'express-serve-static-core' {
   interface Request {
@@ -128,18 +137,16 @@ export function observability(req: Request, res: Response, next: NextFunction) {
   // The status is not known yet, so only the route is bound here.
   const span = httpLatency.start()
 
-  let recorded = false
-
-  const record = () => {
-    // Both 'finish' and 'close' can fire. end() is idempotent, so the first
-    // one wins and the second does nothing.
-    if (recorded) return
-    recorded = true
-
-    const route = req.route?.path ?? 'unmatched'
+  // Only 'finish' records. A client that hangs up before the response is
+  // written fires 'close' alone, with statusCode still at its default of 200,
+  // so recording it would count a fast success that never happened.
+  res.on('finish', () => {
+    // The route is read here, after routing has run, and the mount path is
+    // added so a router mounted at /orders does not collapse into '/:id'.
+    const route = req.route ? (req.baseUrl ?? '') + req.route.path : 'unmatched'
     const status = statusClass(res.statusCode)
 
-    httpRequests.add({ route, method: req.method as 'GET', status })
+    httpRequests.add({ route, method: methodOf(req.method), status })
 
     const durationMs = span.end({ route, status })
 
@@ -148,22 +155,23 @@ export function observability(req: Request, res: Response, next: NextFunction) {
     } else if (durationMs > 1_000) {
       req.log.warn('slow request', { route, userId: req.auth?.userId })
     }
-  }
-
-  res.on('finish', record)
-  res.on('close', record)
+  })
 
   next()
 }
 ```
 
-Two details worth copying:
+Three details worth copying:
 
-- **`start()` with no dimensions, `end()` with all of them.** The status class is
-  only known once the response is finished.
-- **`end()` is idempotent**, which is why registering both `finish` and `close`
-  is safe. A connection dropped before the response completed is still a timing
-  worth having.
+- **`start()` with no dimensions, `end()` with all of them.** The route and the
+  status class are only known once the response is finished.
+- **Only `finish` records.** A dropped connection fires `close` with no
+  response written, and `res.statusCode` is still 200 at that point. Recording
+  it would file an aborted request as a fast success, so the middleware skips it.
+- **Unknown methods and odd status codes are mapped, not cast.** `OPTIONS` and
+  `HEAD` become `OTHER`, and the status class is clamped to the four declared
+  ones. A value outside a `oneOf()` set throws, and inside a `finish` handler
+  that would crash the process.
 
 ## Using the logger downstream
 
@@ -334,13 +342,15 @@ ORDER BY ts;
 
 ## Cost
 
-At 1,000 requests a second across 40 routes:
+At 1,000 requests a second across 40 routes. A folded table gets at most one
+row per series per bucket, and a day holds 8,640 ten second buckets. Assume each
+route is called with one method and two status classes, so there are 80 series:
 
 | Table | Rows per day | Why |
 | --- | --- | --- |
-| `http_requests` | about 170,000 | 40 routes, a few status classes, 8,640 windows |
-| `http_latency` | about 90,000 | The same, with fewer dimensions |
-| `http_latency_samples` | about 8.6 million | 10 percent of 86 million requests |
+| `http_requests` | at most 691,200 | 80 series times 8,640 buckets, and fewer when a series is quiet |
+| `http_latency` | at most 691,200 | 40 routes times 2 status classes is the same 80 series |
+| `http_latency_samples` | about 8.6 million | 1,000 a second is 86.4 million requests a day, and 10 percent of them are kept, plus every request over a second |
 | `app_log` | depends on your code | Warnings and errors only, at `minLevel: 'info'` |
 
 The two folded tables stay small whatever the traffic does, because their size

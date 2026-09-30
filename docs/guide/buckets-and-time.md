@@ -169,8 +169,11 @@ row was written, so a dimension you did not declare was never captured. Adding
 one later affects new rows only, and reordering the ones you have is a breaking
 change. [dims](/reference/dims#reordering-is-a-breaking-change) covers both.
 
-**Changing resolution splits your history.** Old rows keep their old boundaries.
-That is fine for any query that groups to something coarser than both, which is
+**Changing resolution splits your history.** Old rows keep their old boundaries,
+and windows still in the driver when you deploy are the ones at risk of landing
+off the new grid. Flush them first, as
+[Changing a schema with data in storage](/guide/production#changing-a-schema-with-data-in-storage)
+describes. Old rows are fine for any query that groups to something coarser than both, which is
 almost every query, but a chart that reads raw `bucket_ts` values will see the
 granularity change at the point you made the switch.
 

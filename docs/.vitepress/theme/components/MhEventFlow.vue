@@ -73,6 +73,13 @@ function fmtSeconds(seconds: number): string {
   return `${Math.round(seconds / 60)}m`
 }
 
+/** A duration string parseDuration accepts: whole units only, never '2.0s'. */
+function durationText(ms: number): string {
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`
+  if (ms % 1000 === 0) return `${ms / 1000}s`
+  return `${ms}ms`
+}
+
 // ------------------------------------------------------------------ drawing
 
 const SLOTS = 24
@@ -98,7 +105,7 @@ const snippet = computed(() =>
     `  fields: { /* ... */ },`,
     `  stage: '${stage.value}',`,
     stage.value === 'local'
-      ? `  batch: { maxSize: ${maxSize.value}, maxAge: '${fmtSeconds(maxAgeMs.value / 1000)}' },`
+      ? `  batch: { maxSize: ${maxSize.value}, maxAge: '${durationText(maxAgeMs.value)}' },`
       : null,
     `  flush: '${FLUSHES[flushIndex.value]?.label}',`,
     sample.value < 1 && props.kind === 'event' ? `  sample: ${sample.value},` : null,

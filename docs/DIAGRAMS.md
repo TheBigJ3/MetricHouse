@@ -237,8 +237,8 @@ A horizontal timeline in three segments.
 3. A white segment labelled `now claimable by a flush`.
 
 An arrow coming down from above the grace segment and pointing back into segment
-1, with the text `a request that started at 10:00:06.9 still lands in the right
-bucket`.
+1, with the text `a write stamped 10:00:06.99 that reaches storage late is still waited
+for`.
 
 ---
 
@@ -280,7 +280,7 @@ Two rows of three boxes.
 `house.stop() on shutdown` / "drains and ships the rest" (green).
 
 **Bottom, headed `Serverless or edge, where the process freezes`:**
-`a cron or a handler` / "every 10 seconds" (green) to `house.flush()` (blue) to
+`a cron or a handler` / "every minute" (green) to `house.flush()` (blue) to
 `await house.drain()` / "before the response returns" (green).
 
 ---

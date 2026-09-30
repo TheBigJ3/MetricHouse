@@ -814,7 +814,7 @@ export function trackApiCall(req, res, next) {
     apiCallDetail.record({
       requestId,
       accountId: req.auth?.accountId ?? 'anonymous',
-      route: req.route?.path ?? 'unmatched',
+      route: req.route ? (req.baseUrl ?? '') + req.route.path : 'unmatched',
       statusCode: res.statusCode,
       durationMs: performance.now() - startedAt,
       tier: req.auth?.tier ?? 'free',
@@ -856,7 +856,7 @@ hand.
 // metrics/house.ts
 import { createHouse, event, int, oneOf, str } from 'metrichouse/core'
 import { ioredis } from 'metrichouse/ioredis'
-import Redis from 'ioredis'
+import { Redis } from 'ioredis'
 import { toPostgres } from './sinks.js'
 
 export const orderEvent = event('order_event', {

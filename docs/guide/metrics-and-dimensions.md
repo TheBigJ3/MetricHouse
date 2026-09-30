@@ -135,7 +135,7 @@ export const appLog = log('app_log', { /* ... */ })
 // metrics/house.ts
 import { createHouse } from 'metrichouse/core'
 import { ioredis } from 'metrichouse/ioredis'
-import Redis from 'ioredis'
+import { Redis } from 'ioredis'
 import * as schema from './schema.js'
 
 export const house = createHouse({

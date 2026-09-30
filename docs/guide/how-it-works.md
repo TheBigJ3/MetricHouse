@@ -124,8 +124,10 @@ await pageViews.flush()    // just this one metric
 
 ## What this means in practice
 
-- Measuring something costs a validation pass and a map update. It is not a
-  network call.
+- Measuring something costs a validation pass and a map update. With the
+  `memory()` driver that is all it costs. With `ioredis()` the write is queued
+  and sent to Redis in the background, so `add()` still returns immediately
+  without waiting for it.
 - Nothing you write is visible to your database until a flush runs.
 - You can always read the current numbers without touching your database.
 - If your database is down, writes keep being accepted and pile up in the

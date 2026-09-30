@@ -793,8 +793,11 @@ run it.
 import { describeDriverContract } from './contract.js'
 
 describeDriverContract('mydriver', {
-  make: () => myDriver({ namespace: `test-${Math.random()}` }),
-  cleanup: (driver) => driver.close(),
+  // A fresh, empty driver for every test. A driver over shared storage should
+  // use a new namespace or database each time.
+  make: () => myDriver(),
+  // Optional. Empty the storage after each test when make() does not isolate it.
+  cleanup: async () => {},
   capabilities: { durable: true, shared: true, atomicMerge: true },
 })
 ```

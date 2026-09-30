@@ -17,13 +17,13 @@ hero:
 
 features:
   - icon: 🧮
-    title: Five kinds of metric
-    details: Counters for things you tally, gauges for values you sample, events and logs for records you keep whole, timers for how long work takes.
+    title: Six kinds of metric
+    details: Counters for things you tally, gauges for values you sample, levels for a number that rises and falls, events and logs for records you keep whole, timers for how long work takes.
     link: /primitives/
     linkText: Compare them
   - icon: 🔌
     title: No database built in
-    details: MetricHouse writes no SQL and opens no connections. You supply one function that takes rows, and it can put them anywhere.
+    details: MetricHouse writes no SQL and opens no database connection of its own. You supply one function that takes rows, and it can put them anywhere.
     link: /guide/writing-a-sink
     linkText: Write a sink
   - icon: 📈
