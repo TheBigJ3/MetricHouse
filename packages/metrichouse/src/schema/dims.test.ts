@@ -5,11 +5,14 @@ import {
   assertDimsLegal,
   DIM_ABSENT,
   decodeDimKey,
+  dimKeyCurrent,
   dimKeyDecoder,
   dimKeyEncoder,
+  dimKeyReader,
   dimOrder,
   encodeDimKey,
   escapeDimValue,
+  isDecodableDimKey,
   isShorterDimKey,
   unescapeDimValue,
   validateDims,
@@ -249,6 +252,142 @@ describe('decodeDimKey', () => {
   it('reads the empty key as the empty value of a single dim that can encode to it', () => {
     expect(decodeDimKey({ only: str() }, '')).toEqual({ only: '' })
     expect(decodeDimKey({ only: oneOf(['', 'a']) }, '')).toEqual({ only: '' })
+  })
+})
+
+describe('decodeDimKey on numbers and timestamps', () => {
+  it.each([
+    ['int', int(), ['0x1F', '1e3', ' 7', '7 ', '+5', '007', '-0', '7.0']],
+    ['float', float(), ['0x1F', '1e3', ' 7', '+5', '007', '-0', '1.0', '.5', '1E+21']],
+    ['ts', ts(), ['007', '-0', '+5', ' 7', '1e3']],
+  ])('refuses text the encoder never writes for a %s', (_kind, type, texts) => {
+    for (const raw of texts) {
+      expect(() => decodeDimKey({ x: type }, raw), JSON.stringify(raw)).toThrow(
+        /^decodeDimKey: dim "x"/,
+      )
+      expect(() => dimKeyDecoder({ x: type })(raw), JSON.stringify(raw)).toThrow(
+        /^decodeDimKey: dim "x"/,
+      )
+    }
+  })
+
+  it('reads back every number the encoder writes, at the ends of the range', () => {
+    const ints = [0, 1, -1, 123456789, -123456789, Number.MAX_SAFE_INTEGER, Number.MIN_SAFE_INTEGER]
+    for (const n of ints) {
+      expect(decodeDimKey({ x: int() }, encodeDimKey({ x: int() }, { x: n }))).toEqual({ x: n })
+    }
+    const floats = [
+      0,
+      0.1,
+      -1.5,
+      1e21,
+      -1e21,
+      1e-7,
+      5e-324,
+      Number.MAX_VALUE,
+      Number.MIN_VALUE,
+      2 ** 53,
+    ]
+    for (const n of floats) {
+      expect(decodeDimKey({ x: float() }, encodeDimKey({ x: float() }, { x: n }))).toEqual({ x: n })
+    }
+  })
+
+  it('reads negative zero, which the encoder writes as "0", back as zero', () => {
+    expect(encodeDimKey({ x: float() }, { x: -0 })).toBe('0')
+    expect(decodeDimKey({ x: float() }, '0')).toEqual({ x: 0 })
+  })
+})
+
+describe('dimKeyCurrent', () => {
+  it('answers what isShorterDimKey and isDecodableDimKey say together for every key', () => {
+    const shapes = [
+      {},
+      { only: str() },
+      { only: int() },
+      { a: str(), b: int().optional() },
+      { a: str(), b: str().default('d') },
+      { a: int(), b: bool(), c: oneOf(['x', 'y']) },
+    ]
+    const fragments = ['', 'a', 'x', '1', '0x1', 'true', '\\', '\\|', DIM_ABSENT, '-0']
+    const keys = new Set<string>()
+    for (const one of fragments) {
+      keys.add(one)
+      for (const two of fragments) {
+        keys.add(`${one}|${two}`)
+        for (const three of fragments) keys.add(`${one}|${two}|${three}`)
+      }
+    }
+    keys.add('a|b|c|d')
+    for (const shape of shapes) {
+      const current = dimKeyCurrent(shape)
+      for (const key of keys) {
+        expect(current(key), `${JSON.stringify(Object.keys(shape))} ${JSON.stringify(key)}`).toBe(
+          !isShorterDimKey(shape, key) && isDecodableDimKey(shape, key),
+        )
+      }
+    }
+  })
+})
+
+describe('dimKeyReader', () => {
+  const shape = { a: int(), b: str().optional(), c: ts().optional() }
+
+  function reader() {
+    const errors: string[] = []
+    const read = dimKeyReader(shape, 'orders', (error) => errors.push(error.message))
+    return { read, errors }
+  }
+
+  it('reads a key it can read as dimKeyDecoder does and reports nothing', () => {
+    const { read, errors } = reader()
+    expect(read(`5|x|${DIM_ABSENT}`)).toEqual({ a: 5, b: 'x' })
+    expect(errors).toEqual([])
+  })
+
+  it('returns the stored text of a dim it cannot read and reports the dim and the text', () => {
+    const { read, errors } = reader()
+    expect(read('abc|x|1500')).toEqual({ a: 'abc', b: 'x', c: new Date(1500) })
+    expect(errors).toEqual([
+      'orders: stored series key "abc|x|1500" cannot be read under the current dims: dim "a" is ' +
+        'declared as int(), but the stored value "abc" is not a safe integer. The stored series ' +
+        "was written under an earlier declaration. It ships with the stored text as each unreadable dim's value",
+    ])
+  })
+
+  it('returns every unreadable dim as text, undoes its escapes and leaves an absent marker absent', () => {
+    const { read } = reader()
+    const values = read(`0x1F|a\\|b|nope`)
+    expect(values).toEqual({ a: '0x1F', b: 'a|b', c: 'nope' })
+    expect(read(`abc|${DIM_ABSENT}|${DIM_ABSENT}`)).toEqual({ a: 'abc' })
+  })
+
+  it('returns the dims a key with too many segments has a dim for and reports the count', () => {
+    const { read, errors } = reader()
+    expect(read('1|x|1500|extra')).toEqual({ a: 1, b: 'x', c: new Date(1500) })
+    expect(errors).toEqual([
+      'orders: stored series key "1|x|1500|extra" cannot be read under the current dims: expected ' +
+        "at most 3 segments for [a, b, c], got 4. It ships with the stored text as each unreadable dim's value",
+    ])
+  })
+
+  it('reports a dim that is required now but stored as absent, and leaves it out', () => {
+    const errors: string[] = []
+    const read = dimKeyReader({ a: str(), b: str() }, 'orders', (error) =>
+      errors.push(error.message),
+    )
+    expect(read(`x|${DIM_ABSENT}`)).toEqual({ a: 'x' })
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toContain('dim "b" is required now')
+  })
+
+  it('reports each key once however often it is read, and each different key once', () => {
+    const { read, errors } = reader()
+    read('abc')
+    read('abc')
+    read('abd')
+    read('abc')
+    expect(errors).toHaveLength(2)
   })
 })
 

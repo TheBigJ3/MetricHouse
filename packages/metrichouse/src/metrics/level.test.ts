@@ -1023,6 +1023,40 @@ describe('round two', () => {
     expect(await after.totals()).toBe(3)
   })
 
+  it('ships the window an unreadable series was written in as stored and carries it no further', async () => {
+    const before = level('queue_depth', {
+      dims: { queue: str() },
+      resolution: '10s',
+      flush: '10s',
+      write: discard,
+    })
+    before.bind({ driver, now })
+    before.set(5, { queue: 'email' })
+    await before.drain()
+    before.unbind()
+
+    const shipped: [number, unknown, unknown][] = []
+    const after = level('queue_depth', {
+      dims: { queue: int() },
+      resolution: '10s',
+      flush: '10s',
+      write: (rows) => {
+        for (const row of rows) shipped.push([row.bucket_ts.getTime(), row.queue, row.value])
+      },
+    })
+    after.bind({ driver, now, onError: () => {} })
+    after.set(3, { queue: 1 })
+    await after.drain()
+    clock = at(3)
+
+    expect((await after.flush()).error).toBeUndefined()
+    expect(shipped).toEqual([
+      [at(0), 'email', 5],
+      [at(0), 1, 3],
+      [at(1), 1, 3],
+    ])
+  })
+
   it('forgets a series past holdFor in current() and totals() before any flush', async () => {
     const metric = bound({ holdFor: '20s' })
     metric.set(80, EMAIL)

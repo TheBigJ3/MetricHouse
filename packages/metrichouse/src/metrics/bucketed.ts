@@ -30,7 +30,7 @@ import {
   type TypedSnapshot,
 } from '../runtime/live.js'
 import { shipOpenSeries } from '../runtime/ship.js'
-import { dimKeyDecoder } from '../schema/dims.js'
+import { dimKeyDecoder, dimKeyReader } from '../schema/dims.js'
 import type { Shape } from '../schema/types.js'
 import { assertResolution, bucketStart, closedUpTo } from '../time/buckets.js'
 import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
@@ -43,6 +43,7 @@ import type {
   Row,
   WriteFn,
 } from './types.js'
+import { reportError } from './types.js'
 
 /**
  * How long a window waits after it ends before a flush may claim it, when
@@ -90,6 +91,24 @@ export async function openWindow(
  */
 export function seriesKey(dimNames: readonly string[], row: Row): string {
   return JSON.stringify(dimNames.map((dim) => row[dim]))
+}
+
+/**
+ * The decoder a kind reads its rows' dims with.
+ *
+ * A stored key the current declaration cannot read is reported to the house's
+ * `onError` once and its row is built from the stored text, so one such series
+ * never stops a flush or a snapshot. With no `onError` set it is not reported.
+ */
+export function storedKeyReader(
+  dims: Shape,
+  name: string,
+  slot: { active(): MetricBinding },
+): (key: string) => Record<string, unknown> {
+  return dimKeyReader(dims, name, (error) => {
+    const onError = slot.active().onError
+    if (onError) reportError(onError, error, { metric: name })
+  })
 }
 
 /** What a bucketed kind declares that {@link bucketedBinding} resolves. */

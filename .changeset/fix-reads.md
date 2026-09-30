@@ -11,4 +11,4 @@
 - A counter's `add()` errors for a missing or unknown dim start with the metric name, as do the same errors from a gauge, level and timer.
 - An integer counter adds totals across series and windows exactly, and refuses one only when the exact total passes `Number.MAX_SAFE_INTEGER`.
 - A stored fraction on an integer metric, left by changing `float()` to `int()`, is reported as not a whole number and no longer as an overflow. Both drivers.
-- A stored dim value the current declaration cannot hold, such as text under an `int()` dim, a removed `oneOf` member or a missing value for a required dim, throws `decodeDimKey` naming the dim. A level stops carrying such a series.
+- A stored dim value the current declaration cannot hold, such as text under an `int()` dim, a removed `oneOf` member or a missing value for a required dim, is reported to `onError` and shipped as stored. A level stops carrying such a series.

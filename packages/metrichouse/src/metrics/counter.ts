@@ -13,11 +13,17 @@ import { type Cell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
 import { metricFlush } from '../runtime/flush.js'
 import { type LiveRowOf, liveColumns, type SnapshotOptions } from '../runtime/live.js'
-import { assertDimsLegal, dimKeyDecoder, dimKeyEncoder } from '../schema/dims.js'
+import { assertDimsLegal, dimKeyEncoder } from '../schema/dims.js'
 import type { FieldType, InferRow, InferShape, Shape, Simplify } from '../schema/types.js'
 import { bucketStart } from '../time/buckets.js'
 import type { DurationInput } from '../time/duration.js'
-import { bucketedBinding, bucketedLifecycle, bucketedReader, openWindow } from './bucketed.js'
+import {
+  bucketedBinding,
+  bucketedLifecycle,
+  bucketedReader,
+  openWindow,
+  storedKeyReader,
+} from './bucketed.js'
 import type {
   AnyMetric,
   DimsArgs,
@@ -228,7 +234,7 @@ export function counter<D extends Shape = Record<never, never>>(
   // built once, here: every write encodes a key and every row a flush or a
   // snapshot builds decodes one, against a declaration that never changes
   const encodeKey = dimKeyEncoder(dims, name)
-  const decodeKey = dimKeyDecoder(dims)
+  const decodeKey = storedKeyReader(dims, name, slot)
 
   /** Applies defaults, validates, and encodes. Throws on a bad dim set. */
   function keyFor(values: InferShape<D> | undefined): string {

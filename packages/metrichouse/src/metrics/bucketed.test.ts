@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { memory } from '../drivers/memory.js'
 import type { Driver } from '../drivers/types.js'
+import { rowId } from '../identity.js'
 import { createHouse } from '../runtime/house.js'
 import type { LiveRow } from '../runtime/live.js'
-import { oneOf, str, ts } from '../schema/types.js'
+import { int, oneOf, str, ts } from '../schema/types.js'
 import { counter } from './counter.js'
 import { gauge } from './gauge.js'
+import { level } from './level.js'
+import { timer } from './timer.js'
+import type { Row, WriteFn } from './types.js'
 
 let clock: number
 let driver: Driver
@@ -130,9 +134,10 @@ describe('bucketedReader', () => {
       },
     ])
 
-    await expect(metric.snapshot({ complete: false, dims: { park: 'riverside' } })).rejects.toThrow(
-      'decodeDimKey: expected at most 3 segments for [dogName, park, seen], got 4',
-    )
+    const rows = await metric.snapshot({ complete: false, dims: { park: 'hilltop' } })
+    expect(rows.map(({ dogName, park, seen, value }) => ({ dogName, park, seen, value }))).toEqual([
+      { dogName: 'Rex', park: 'hilltop', seen: undefined, value: 1 },
+    ])
   })
 })
 
@@ -274,5 +279,94 @@ describe('bucketedLifecycle', () => {
     await metric.flush({ final: true })
     expect(shipped).toEqual([])
     expect((await metric.snapshot({ complete: false })).map((row) => row.value)).toEqual([3])
+  })
+})
+
+describe('a stored key the current dims cannot read', () => {
+  const at = 1_788_616_980_000
+  const STORED = 'abc|\\0'
+
+  /** One kind declared under `dims`, and the verb that kind writes one value with. */
+  function declare(kind: string, dims: object, write: WriteFn) {
+    const config = { dims, resolution: '1s', flush: '1m', write } as never
+    const made = {
+      counter: () => counter('m', config),
+      gauge: () => gauge('m', config),
+      level: () => level('m', config),
+      timer: () => timer('m', config),
+    }[kind as 'counter']()
+    const metric = made as never as {
+      bind(binding: object): void
+      drain(): Promise<void>
+      flush(): Promise<{ error?: unknown }>
+      snapshot(options: object): Promise<Record<string, unknown>[]>
+    }
+    const put = (values: object) => {
+      const verbs = made as never as Record<string, (...args: unknown[]) => void>
+      if (kind === 'counter') verbs.add?.(values)
+      else if (kind === 'timer') verbs.observe?.(1, values)
+      else verbs.set?.(1, values)
+    }
+    return { metric, put }
+  }
+
+  it.each(['counter', 'gauge', 'level', 'timer'])(
+    'reports it once and ships a %s series as stored beside the others',
+    async (kind) => {
+      const shared = memory()
+      const before = declare(kind, { q: str(), r: str().optional() }, () => {})
+      before.metric.bind({ driver: shared, now: () => at })
+      before.put({ q: 'abc' })
+      await before.metric.drain()
+
+      const shipped: Row[] = []
+      const errors: [unknown, unknown][] = []
+      const after = declare(kind, { q: int(), r: str().optional() }, (rows) => {
+        shipped.push(...rows)
+      })
+      after.metric.bind({
+        driver: shared,
+        now: () => at + 10_000,
+        onError: (error: unknown, context: unknown) => errors.push([error, context]),
+      })
+      after.put({ q: 7 })
+      await after.metric.drain()
+
+      await after.metric.snapshot({ complete: false })
+      const live = await after.metric.snapshot({ complete: false })
+      expect(live.map(({ q }) => q).sort()).toEqual([7, 'abc'])
+
+      const report = await after.metric.flush()
+      expect(report.error).toBeUndefined()
+      expect(shipped.map(({ id, q, r }) => ({ id, q, r }))).toEqual([
+        { id: rowId('m', at, STORED), q: 'abc', r: undefined },
+      ])
+      expect(errors).toEqual([
+        [
+          new Error(
+            'm: stored series key "abc|\\\\0" cannot be read under the current dims: dim "q" is ' +
+              'declared as int(), but the stored value "abc" is not a safe integer. The stored ' +
+              "series was written under an earlier declaration. It ships with the stored text as each unreadable dim's value",
+          ),
+          { metric: 'm' },
+        ],
+      ])
+    },
+  )
+
+  it('ships it and does not fail the flush when no onError is set', async () => {
+    const shared = memory()
+    const before = declare('counter', { q: str() }, () => {})
+    before.metric.bind({ driver: shared, now: () => at })
+    before.put({ q: 'abc' })
+    await before.metric.drain()
+
+    const shipped: Row[] = []
+    const after = declare('counter', { q: int() }, (rows) => {
+      shipped.push(...rows)
+    })
+    after.metric.bind({ driver: shared, now: () => at + 10_000 })
+    expect((await after.metric.flush()).error).toBeUndefined()
+    expect(shipped.map(({ q }) => q)).toEqual(['abc'])
   })
 })

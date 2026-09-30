@@ -209,51 +209,74 @@ function encodeDimValue(type: FieldType, value: unknown, at = ''): string {
 }
 
 /**
+ * Why `raw`, the text stored for a dim, cannot be read as `type`, or
+ * `undefined` when it can.
+ *
+ * A key outlives the declaration that wrote it, so the stored text may not fit
+ * the type the dim has now: a `str()` turned into an `int()` holds "abc", and a
+ * removed `oneOf` member holds a value the set no longer has.
+ *
+ * A number is read only when the text is exactly what the encoder writes for
+ * it, which is `String(n)`. `Number()` alone also accepts "0x1F", "1e3", " 7",
+ * "+5" and "007", and no encoder writes those, so they are text some other
+ * declaration stored, not the number they would read as.
+ */
+function dimValueProblem(type: FieldType, raw: string): string | undefined {
+  switch (type.kind) {
+    case 'ts': {
+      const ms = Number(raw)
+      if (!/^-?\d+$/.test(raw) || String(ms) !== raw || Number.isNaN(new Date(ms).getTime())) {
+        return 'is not a valid timestamp'
+      }
+      return undefined
+    }
+    case 'bool':
+      return raw === 'true' || raw === 'false' ? undefined : 'is not "true" or "false"'
+    case 'int': {
+      const n = Number(raw)
+      return Number.isSafeInteger(n) && String(n) === raw ? undefined : 'is not a safe integer'
+    }
+    case 'float': {
+      const n = Number(raw)
+      return Number.isFinite(n) && String(n) === raw ? undefined : 'is not a finite number'
+    }
+    case 'oneOf':
+      return type.values?.some((one) => String(one) === raw)
+        ? undefined
+        : 'is not one of the declared members'
+    default:
+      return undefined
+  }
+}
+
+/**
  * Read one stored segment back as the declared type.
  *
- * A key outlives the declaration that wrote it, so the stored text may not
- * fit the type the dim has now: a `str()` turned into an `int()` holds "abc",
- * and a removed `oneOf` member holds a value the set no longer has. Each is
- * refused here, naming the dim, where reading it as `NaN`, an invalid `Date`,
- * `false` or a value outside the set would put a row nobody wrote in front of
- * the sink.
+ * Text the type cannot hold is refused here, naming the dim, where reading it
+ * as `NaN`, an invalid `Date`, `false` or a value outside the set would put a
+ * row nobody wrote in front of the sink.
  */
 function decodeDimValue(name: string, type: FieldType, raw: string): unknown {
-  const bad = (why: string): never => {
+  const problem = dimValueProblem(type, raw)
+  if (problem !== undefined) {
     throw new Error(
       `decodeDimKey: dim ${JSON.stringify(name)} is declared as ${type.kind}(), but the stored ` +
-        `value ${JSON.stringify(raw)} ${why}. The stored series was written under an earlier ` +
+        `value ${JSON.stringify(raw)} ${problem}. The stored series was written under an earlier ` +
         'declaration',
     )
   }
   switch (type.kind) {
-    case 'ts': {
-      const ms = Number(raw)
-      if (!/^-?\d+$/.test(raw) || Number.isNaN(new Date(ms).getTime())) {
-        return bad('is not a valid timestamp')
-      }
-      return new Date(ms)
-    }
+    case 'ts':
+      return new Date(Number(raw))
     case 'bool':
-      if (raw !== 'true' && raw !== 'false') return bad('is not "true" or "false"')
       return raw === 'true'
-    case 'int': {
-      const n = Number(raw)
-      if (raw === '' || !Number.isSafeInteger(n)) return bad('is not a safe integer')
-      return n
-    }
-    case 'float': {
-      const n = Number(raw)
-      if (raw.trim() === '' || !Number.isFinite(n)) return bad('is not a finite number')
-      return n
-    }
-    case 'oneOf': {
+    case 'int':
+    case 'float':
+      return Number(raw)
+    case 'oneOf':
       // a member comes back as the member, so `oneOf([1, 2, 4])` returns the
       // number 2 and not the text "2" it was stored as
-      const member = type.values?.find((one) => String(one) === raw)
-      if (member === undefined) return bad('is not one of the declared members')
-      return member
-    }
+      return type.values?.find((one) => String(one) === raw)
     default:
       return raw
   }
@@ -485,6 +508,105 @@ export function dimKeyDecoder(dims: Shape): (key: string) => Record<string, unkn
       values[name] = decodeDimValue(name, types[i] as FieldType, segments[i] as string)
     }
     return values
+  }
+}
+
+/**
+ * A check for one dims declaration, for a metric to build once and call on
+ * every series it holds.
+ *
+ * True when `key` was written under all of `dims` and reads back under them:
+ * neither {@link isShorterDimKey} nor a key {@link decodeDimKey} refuses. A
+ * level asks it of every series on every read and every flush, so it splits
+ * the key once and builds no values. The metric with no dims and the empty key
+ * are handed to the two functions themselves.
+ */
+export function dimKeyCurrent(dims: Shape): (key: string) => boolean {
+  const order = dimOrder(dims)
+  const types = order.map((name) => dims[name] as FieldType)
+
+  return (key) => {
+    if (order.length === 0 || key === '') {
+      return !isShorterDimKey(dims, key) && isDecodableDimKey(dims, key)
+    }
+    const escaped = key.includes(ESCAPE)
+    const segments = escaped ? splitKey(key) : key.split(DIM_SEPARATOR)
+    // fewer is a key from before a dim was added, more is one that cannot be read
+    if (segments.length !== order.length) return false
+    for (let i = 0; i < segments.length; i++) {
+      const type = types[i] as FieldType
+      const segment = segments[i] as string
+      if (segment === DIM_ABSENT) {
+        if (!type.isOptional || type.hasDefault) return false
+      } else if (
+        dimValueProblem(type, escaped ? unescapeDimValue(segment) : segment) !== undefined
+      ) {
+        return false
+      }
+    }
+    return true
+  }
+}
+
+/**
+ * The values `key` holds as stored, for a key the current declaration cannot
+ * read. Each dim it can read comes back typed. Each it cannot comes back as the
+ * text stored for it, with its escapes undone, and an absent marker comes back
+ * absent. A segment past the last dim has no dim to belong to and is left out.
+ */
+function storedDimValues(dims: Shape, key: string): Record<string, unknown> {
+  const order = dimOrder(dims)
+  const values: Record<string, unknown> = {}
+  if (order.length === 0 || isKeyFromNoDims(dims, order, key)) return values
+  const segments = splitKey(key)
+  order.forEach((name, index) => {
+    const segment = segments[index]
+    if (segment === undefined || segment === DIM_ABSENT) return
+    const raw = unescapeDimValue(segment)
+    try {
+      values[name] = decodeDimValue(name, dims[name] as FieldType, raw)
+    } catch {
+      values[name] = raw
+    }
+  })
+  return values
+}
+
+/**
+ * A decoder that never refuses, for the rows a metric ships and returns.
+ *
+ * Reads what {@link dimKeyDecoder} reads. For a key it would refuse, because
+ * the series was stored under an earlier declaration, it returns the values as
+ * stored (see {@link storedDimValues}) and hands `report` an error naming the
+ * metric, the dim, the stored text and the reason. `report` is called once per
+ * key for as long as the decoder lives, so a snapshot polled every second does
+ * not repeat itself. The series keeps its id, because the id comes from the
+ * key and not from the values.
+ */
+export function dimKeyReader(
+  dims: Shape,
+  metricName: string,
+  report: (error: Error) => void,
+): (key: string) => Record<string, unknown> {
+  const decode = dimKeyDecoder(dims)
+  const reported = new Set<string>()
+
+  return (key) => {
+    try {
+      return decode(key)
+    } catch (error) {
+      if (!reported.has(key)) {
+        reported.add(key)
+        const why = (error as Error).message.replace(/^decodeDimKey: /, '')
+        report(
+          new Error(
+            `${metricName}: stored series key ${JSON.stringify(key)} cannot be read under the ` +
+              `current dims: ${why}. It ships with the stored text as each unreadable dim's value`,
+          ),
+        )
+      }
+      return storedDimValues(dims, key)
+    }
   }
 }
 
