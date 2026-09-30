@@ -151,6 +151,83 @@ function stubClient(buckets = 0): IoredisClient {
   return client as unknown as IoredisClient
 }
 
+/**
+ * A client whose round trips answer from `trips`, in order, one entry per
+ * script, and which keeps the arguments each script was sent with. A round trip
+ * past the end of `trips` answers every script with `1`.
+ */
+function scriptedClient(trips: [error: Error | null, result: unknown][][]) {
+  const sent: (string | number)[][] = []
+  const client = {
+    script: async () => 'sha',
+    pipeline() {
+      let queued = 0
+      const pipeline = {
+        evalsha(_sha: string, _keys: number, ...rest: (string | number)[]) {
+          queued += 1
+          sent.push(rest)
+          return pipeline
+        },
+        exec: async () =>
+          trips.shift() ?? Array.from({ length: queued }, () => [null, 1] as [null, number]),
+      }
+      return pipeline
+    },
+  }
+  return { client: client as unknown as IoredisClient, sent }
+}
+
+// no server needed: the replies are scripted
+describe('ioredis · writes Redis never answered', () => {
+  const op = { metric: M, bucketTs: 1000, dimKey: WILLOW, delta: 1 }
+  /** The floor each write was sent with, the second to last argument. */
+  const floors = (sent: (string | number)[][]) => sent.map((args) => args.at(-2))
+
+  it('keeps a write that timed out below the floor until a later write is answered', async () => {
+    const { client, sent } = scriptedClient([[[new Error('Command timed out'), null]]])
+    const driver = ioredis(client)
+
+    await expect(driver.increment([op])).rejects.toThrow('Command timed out')
+    await driver.increment([op])
+    await driver.increment([op])
+
+    // the second write still protects the first one's record, since ioredis
+    // may resend it. The third comes after an answer, so the first cannot
+    expect(floors(sent)).toEqual([1, 1, 3])
+  })
+
+  it('forgets a write Redis refused with a reply of its own', async () => {
+    const refused = Object.assign(new Error('ERR refused'), { name: 'ReplyError' })
+    const { client, sent } = scriptedClient([[[refused, null]]])
+    const driver = ioredis(client)
+
+    await expect(driver.increment([op])).rejects.toThrow('ERR refused')
+    await driver.increment([op])
+    expect(floors(sent)).toEqual([1, 2])
+  })
+
+  it('keeps every write of a round trip whose pipeline was rejected whole', async () => {
+    let calls = 0
+    const { client, sent } = scriptedClient([])
+    const pipelineOf = client.pipeline.bind(client)
+    ;(client as { pipeline: () => unknown }).pipeline = () => {
+      const pipeline = pipelineOf()
+      calls += 1
+      if (calls === 1)
+        pipeline.exec = async () => Promise.reject(new Error('Connection is closed.'))
+      return pipeline
+    }
+    const driver = ioredis(client)
+
+    await expect(driver.increment([op, { ...op, bucketTs: 2000 }])).rejects.toThrow(
+      'Connection is closed.',
+    )
+    await driver.increment([op])
+    await driver.increment([op])
+    expect(floors(sent)).toEqual([1, 1, 1, 4])
+  })
+})
+
 // no server needed: these never read what a script stored
 describe('ioredis · options and connection', () => {
   it('refuses a maxPipelineSize that is not a positive integer', () => {

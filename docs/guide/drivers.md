@@ -151,6 +151,12 @@ ack does not fail a flush that succeeded and a resent recovery still reports the
 claims it put back. The record is one small key per driver, `mh:w:<id>`, trimmed
 as replies arrive and expired a day after the driver's last write.
 
+This holds with `commandTimeout` set too. A write the client gave up on, because
+it timed out or its connection closed, may still reach Redis later, since
+ioredis resends it after a reconnect. Its record is kept until a write sent
+after it has been answered. Redis answers a connection's commands in the order
+they were sent, so by then the one given up on has run or never will.
+
 `recoverAfter` is the one number behind crash recovery. A claim held by a flusher
 that is still writing looks exactly like a claim held by one that has died, and
 how long it has been held is all there is to tell them apart. Keep it above your

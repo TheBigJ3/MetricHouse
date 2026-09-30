@@ -251,7 +251,9 @@ end
  *
  * The record stays small: each call also sends the lowest sequence number the
  * writer is still waiting on, the second to last argument, and everything below
- * it is removed, because nothing below it can be resent. The whole record
+ * it is removed, because nothing below it can be resent. A write the client
+ * gave up on without an answer from Redis still counts as waiting, until a
+ * later write is answered. The whole record
  * expires a day after its writer's last write.
  *
  * A script whose reply carries information, such as how many claims a
@@ -1413,6 +1415,18 @@ function isNoScript(error: unknown): boolean {
 }
 
 /**
+ * Did Redis itself answer this entry of a pipeline's results?
+ *
+ * A value, or an error Redis replied with, which ioredis names `ReplyError`.
+ * Anything else, a timeout, a closed connection, a request out of retries, the
+ * client raised on its own, and the command may still reach Redis later.
+ */
+function answered(entry: [error: Error | null, result: unknown] | undefined): boolean {
+  if (entry === undefined) return false
+  return entry[0] === null || entry[0].name === 'ReplyError'
+}
+
+/**
  * Turn a Redis-side type complaint into the error the memory driver raises.
  *
  * Two kinds reach here. A gauge script detects the clash itself and says
@@ -1599,6 +1613,33 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
    * of the whole set on every send was quadratic in a burst.
    */
   let lowestWaiting = 1
+
+  /**
+   * Writes Redis never answered, keyed by the round trip that last carried
+   * them, and kept in {@link unanswered} until it is safe to forget them.
+   *
+   * A write whose promise failed without an answer from Redis, because it
+   * timed out or its connection closed, can still reach Redis: ioredis resends
+   * what it never heard back about after a reconnect. Dropping its number
+   * would let the floor pass it, a later write would erase its record, and the
+   * resend would apply it a second time. Redis answers a connection's commands
+   * in the order they were sent, and ioredis resends them in that order, ahead
+   * of anything newer. So once a round trip sent after it has an answer, the
+   * write has run or been dropped for good, and its number can go.
+   */
+  const unsettled = new Map<number, number[]>()
+  /** Round trips issued, in the order they reached the client. */
+  let issued = 0
+
+  /** Forget the writes carried by round trips issued before `trip`. */
+  function settleBefore(trip: number): void {
+    for (const [earlier, seqs] of unsettled) {
+      if (earlier >= trip) continue
+      for (const seq of seqs) unanswered.delete(seq)
+      unsettled.delete(earlier)
+    }
+  }
+
   function floorOfUnanswered(): number {
     while (lowestWaiting <= writeSeq && !unanswered.has(lowestWaiting)) lowestWaiting += 1
     return lowestWaiting
@@ -1654,6 +1695,11 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       const seqs = chunk.map((call) => (call.once ? ++writeSeq : 0))
       for (const seq of seqs) if (seq > 0) unanswered.add(seq)
 
+      // per call: the round trip that last carried it, and whether Redis
+      // answered it there
+      const tripOf: number[] = []
+      const heard: boolean[] = []
+
       const send = (
         indexes: readonly number[],
       ): Promise<[error: Error | null, result: unknown][] | null> =>
@@ -1674,7 +1720,19 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
             const args = seq > 0 ? [...call.args, floor, seq] : call.args
             pipeline.evalsha(resolved[n] as string, keys.length, ...keys, ...args)
           })
-          return { reply: pipeline.exec() }
+          const trip = ++issued
+          for (const i of indexes) {
+            tripOf[i] = trip
+            heard[i] = false
+          }
+          const reply = pipeline.exec().then((results) => {
+            indexes.forEach((i, n) => {
+              heard[i] = answered(results?.[n])
+            })
+            if (indexes.some((i) => heard[i])) settleBefore(trip)
+            return results
+          })
+          return { reply }
         })
 
       try {
@@ -1696,7 +1754,24 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
         // pipeline of a hundred thousand replies overflows the stack
         for (const reply of unwrap(results, what, start)) out.push(reply)
       } finally {
-        for (const seq of seqs) if (seq > 0) unanswered.delete(seq)
+        chunk.forEach((_, i) => {
+          const seq = seqs[i] as number
+          if (seq === 0) return
+          if (heard[i]) {
+            unanswered.delete(seq)
+            return
+          }
+          // never answered, possibly never sent: kept until a later round
+          // trip is answered, or for good when it was not sent at all
+          const trip = tripOf[i]
+          if (trip === undefined) {
+            unanswered.delete(seq)
+            return
+          }
+          const parked = unsettled.get(trip)
+          if (parked) parked.push(seq)
+          else unsettled.set(trip, [seq])
+        })
       }
     }
     return out
