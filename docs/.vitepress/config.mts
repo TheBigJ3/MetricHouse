@@ -77,7 +77,7 @@ export default defineConfig({
           '/reference/(?!(dims|fields|durations|snapshot-options|flush-options|field-types))',
       },
       {
-        text: 'v0.7.0',
+        text: 'v0.8.0',
         items: [
           {
             text: 'Changelog',
