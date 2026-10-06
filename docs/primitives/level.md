@@ -50,6 +50,9 @@ writing to an unbound level throws.
 | `config.grace` | duration | no | [How long a window waits for writes on their way](#grace) |
 | `config.holdFor` | duration | no | [How long a quiet series keeps reporting](#holdfor) |
 | `config.value` | field type | no | [Whether fractions are allowed](#value) |
+| `config.collect` | function | no | [Read a value held elsewhere before each window closes](#collect) |
+| `config.collectLead` | duration | no | [How long before the end of a window to call it](#collectlead) |
+| `config.collectScope` | `'fleet'` or `'process'` | no | [Which processes call it](#collectscope) |
 | `config.write` | function | yes | [Where the rows go](#write) |
 
 ### name
@@ -194,6 +197,109 @@ A level declared `value: int()` stops at `9007199254740991`,
 does. A write whose value is past it throws at the call, and an `inc()` that
 would move the series past it is refused by the driver and reported to
 `onError`.
+
+### collect
+
+```ts
+collect?: (metric: Level<D>) => void | Promise<void>      // default: none
+```
+
+A function MetricHouse calls a little before each window closes, for a quantity
+that is kept somewhere else and only needs reading. It receives the level, calls
+[`set()`](#level-set) on it, and the value lands in the window that is about to
+close and is carried from there like any other write.
+
+```ts
+const poolInUse = level('db_pool_in_use', {
+  value: int(),
+  resolution: '1m',
+  flush: '1m',
+  collect: (self) => self.set(pool.numUsed()),
+  collectScope: 'process',     // every process has a pool of its own
+  write,
+})
+```
+
+The production shape reads a number your application already keeps. Here each
+job queue is a Redis list in your own Redis, and its length is the depth.
+
+```ts
+// metrics/schema.ts
+import { Redis } from 'ioredis'
+import { int, level, oneOf } from 'metrichouse/core'
+import { toClickHouse } from './sinks.js'
+
+const redis = new Redis(process.env.REDIS_URL!)
+const QUEUES = ['email', 'export', 'webhooks'] as const
+
+export const queueDepth = level('queue_depth', {
+  dims: { queue: oneOf(QUEUES) },
+  value: int(),
+  resolution: '1m',
+  flush: '1m',
+
+  // One LLEN per queue, sent together, a second before each minute ends. The
+  // default scope, 'fleet', means one server reads them for the whole fleet,
+  // because every server would see the same lists.
+  collect: async (self) => {
+    const lengths = await Promise.all(QUEUES.map((queue) => redis.llen(`jobs:${queue}`)))
+    QUEUES.forEach((queue, i) => self.set(lengths[i] ?? 0, { queue }))
+  },
+
+  write: toClickHouse('queue_depth'),
+})
+```
+
+Use `set()` inside `collect`, which states what the quantity is now. `inc()` and
+`dec()` move a series by an amount, and a read of an outside value has no amount
+to move by.
+
+With [`house.start()`](/guide/the-house#starting-and-stopping), a timer calls it
+[`collectLead`](#collectlead) before each window ends. Without the scheduler,
+every [`flush()`](#level-flush) calls it first, at most once per window, and
+`house.stop()` calls it once more before its final flush.
+[Collecting before a window closes](/guide/flushing#collecting-before-a-window-closes)
+covers each of those, and what happens when it throws, runs long or runs on
+several servers.
+
+A value lands in the window open at the moment `set()` is called. A `collect`
+that awaits a read has to finish inside the lead, or its value falls into the
+next window. A `collect` that is not a function throws at declaration.
+
+### collectLead
+
+```ts
+collectLead?: DurationInput      // default: '1s', or a tenth of a shorter resolution
+```
+
+How long before the end of each window the scheduler calls `collect`. Make it
+longer than the read inside `collect` takes. The default is one second, or a
+tenth of the `resolution` when that is shorter. A lead of zero, or one as long as
+the `resolution` or longer, throws at declaration, and so does a `collectLead`
+given without `collect`. Identical to [the gauge's](/primitives/gauge#collectlead).
+
+### collectScope
+
+```ts
+collectScope?: 'fleet' | 'process'      // default: 'fleet'
+```
+
+Which processes call `collect` when several share one driver.
+
+| Scope | Calls per window | What the window holds |
+| --- | --- | --- |
+| `'fleet'` | One, from whichever process asks first | The value that process read |
+| `'process'` | One per process | The value the last process to write set |
+
+Keep `'fleet'` for a quantity every process would read the same, such as the
+lists above. Use `'process'` for one each process has its own of, such as its
+connection pool, and give the level an `instance` dim so each process holds a
+series of its own. Without that dim, every process sets the same series and the
+last one to write wins. On a driver that is not shared, such as `memory()`, the
+two are the same. A `collectScope` given without `collect` throws, and so does
+one that is neither of the two.
+[Collecting across a fleet](/guide/flushing#collecting-across-a-fleet) explains
+how one process is picked.
 
 ### write
 
@@ -406,8 +512,10 @@ them. [How carry works](#how-carry-works) covers the first half, and
 drain(): Promise<void>
 ```
 
-Resolves once every write issued before the call has reached the driver.
-Draining does not carry or claim anything. Under
+Resolves once every write issued before the call has reached the driver. On a
+level declared with [`collect`](#collect), it first waits for a `collect` still
+running, so the value it is about to write is waited for too. Draining does not
+carry or claim anything. Under
 [immediate delivery](/guide/delivery) it waits for the send to `write` that
 follows each write as well.
 

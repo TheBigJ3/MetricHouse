@@ -15,7 +15,9 @@
 import { randomUUID } from 'node:crypto'
 import { Redis } from 'ioredis'
 import { afterAll, describe, expect, it } from 'vitest'
+import { gauge } from '../metrics/gauge.js'
 import { level } from '../metrics/level.js'
+import { createHouse } from '../runtime/house.js'
 import { str } from '../schema/types.js'
 import { describeDriverContract } from './contract.js'
 import {
@@ -2335,6 +2337,70 @@ end`,
 
       const found = await driver.readPending({ metric: M, from: 1025 })
       expect(found.map((r) => r.id)).toEqual(['r25', 'r26', 'r27', 'r28', 'r29'])
+
+      await wipe(ns)
+    })
+  })
+
+  describe('ioredis · collect across a fleet', () => {
+    /** The start of a minute. */
+    const START = 1_788_616_980_000
+
+    /**
+     * Two processes on one namespace, each flushing its own copy of the same
+     * gauge once inside each of two windows. Returns how many times each
+     * process ran collect, and the namespace, still holding its keys.
+     */
+    async function twoProcesses(collectScope: 'fleet' | 'process') {
+      const ns = fresh()
+      let clock = START
+      const calls = { one: 0, two: 0 }
+      const processOn = (name: 'one' | 'two') => {
+        const metric = gauge('queue_depth', {
+          resolution: '1m',
+          flush: '1m',
+          collect: (self) => {
+            calls[name] += 1
+            self.set(42)
+          },
+          collectScope,
+          write: () => {},
+        })
+        createHouse({
+          driver: ioredis(live, { namespace: ns }),
+          schema: [metric],
+          now: () => clock,
+        })
+        return metric
+      }
+      const one = processOn('one')
+      const two = processOn('two')
+
+      // one after the other, so which process asks first is not a race
+      for (const window of [0, 1]) {
+        clock = START + window * 60_000 + 10_000
+        await one.flush()
+        await two.flush()
+      }
+      await Promise.all([one.drain(), two.drain()])
+      return { calls, ns }
+    }
+
+    it("runs collect once per window between processes, with 'fleet'", async () => {
+      const { calls, ns } = await twoProcesses('fleet')
+
+      expect(calls).toEqual({ one: 2, two: 0 })
+      // the turn sits beside the flush turn, under a key no metric name can make
+      expect(await live.get(`${ns}:turn:queue_depth:collect`)).toBe(String(START + 60_000))
+
+      await wipe(ns)
+    })
+
+    it("runs collect in every process, with 'process'", async () => {
+      const { calls, ns } = await twoProcesses('process')
+
+      expect(calls).toEqual({ one: 2, two: 2 })
+      expect(await live.exists(`${ns}:turn:queue_depth:collect`)).toBe(0)
 
       await wipe(ns)
     })

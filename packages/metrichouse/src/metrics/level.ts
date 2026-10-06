@@ -21,6 +21,7 @@
 import type { Cell, Claim, LevelOp, LevelSeries } from '../drivers/types.js'
 import { isLevelCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
+import { type CollectOptions, createCollector } from '../runtime/collect.js'
 import { metricFlush } from '../runtime/flush.js'
 import {
   applySnapshot,
@@ -58,6 +59,7 @@ import {
   assertMetricName,
   assertSink,
   assertWhole,
+  COLLECT,
   describeValue,
   dimColumns,
   pendingWrites,
@@ -96,7 +98,11 @@ export type LevelLiveRow<
   O extends SnapshotOptions = Record<never, never>,
 > = LiveRowOf<D, { value: number }, O>
 
-export interface LevelConfig<D extends Shape> {
+/**
+ * `collect`, `collectLead` and `collectScope` come from {@link CollectOptions}:
+ * a callback run a little before each window closes, handed the level.
+ */
+export interface LevelConfig<D extends Shape> extends CollectOptions<Level<D>> {
   /** Omit entirely for a level with no dimensions. */
   readonly dims?: D
   readonly resolution: DurationInput
@@ -255,6 +261,19 @@ export function level<D extends Shape = Record<never, never>>(
   const isFloat = config.value?.kind !== 'int'
 
   const writes = pendingWrites(name)
+
+  // after every other check, so a mistake in the declaration proper is the
+  // one reported
+  const collector = createCollector<Level<D>>(
+    {
+      name,
+      resolutionMs,
+      isBound: slot.isBound,
+      active: slot.active,
+      self: () => self,
+    },
+    config,
+  )
 
   /** The driver stores whatever a metric wrote; a level only writes level cells. */
   function asLevel(cell: Cell): number {
@@ -763,7 +782,10 @@ export function level<D extends Shape = Record<never, never>>(
       self: () => self,
       attempts: slot.attempts,
       sharedDriver: slot.driver,
+      ...(collector !== undefined && { before: collector.beforeFlush }),
     }),
+
+    ...(collector !== undefined && { [COLLECT]: collector }),
 
     name,
     kind: 'level',
@@ -830,12 +852,16 @@ export function level<D extends Shape = Record<never, never>>(
       )
     },
 
-    drain(): Promise<void> {
-      return writes.drain()
+    // a collect still running has writes to make, and they are writes this
+    // call is waiting for
+    async drain(): Promise<void> {
+      await collector?.idle()
+      await writes.drain()
     },
 
-    [SETTLE_WRITES](): Promise<void> {
-      return writes.settle()
+    async [SETTLE_WRITES](): Promise<void> {
+      await collector?.idle()
+      await writes.settle()
     },
 
     materialize,

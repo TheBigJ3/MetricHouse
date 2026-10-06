@@ -88,6 +88,10 @@ metric: `mh:turn:<metric>` holds when the turn was taken, and
 own flush timers, and each metric still ships about once per interval for the
 whole fleet. See
 [Several processes on one driver](/guide/flushing#several-processes-on-one-driver).
+A gauge or a level declared with `collect` keeps one more pair,
+`mh:turn:<metric>:collect` and `mh:turntok:<metric>:collect`, so one instance
+per window runs it. See
+[Collecting across a fleet](/guide/flushing#collecting-across-a-fleet).
 
 ### Passing a client lazily
 

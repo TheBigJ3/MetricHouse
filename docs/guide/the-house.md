@@ -169,6 +169,10 @@ those. Under [immediate delivery](/guide/delivery), a write is followed by a
 send to the metric's `write` function, and `drain()` waits for that send as
 well, so it takes as long as your sink does, with no limit of its own.
 
+On a gauge or a level declared with
+[`collect`](/primitives/gauge#collect), `drain()` first waits for a `collect`
+still running, then for the writes it made.
+
 A write that failed does not end the wait early and does not make `drain()`
 reject. It goes to `onError`, or becomes an unhandled rejection when there is
 none, and `drain()` still waits for every other write. A
@@ -222,6 +226,16 @@ process alive after your HTTP server has closed.
 If a write is slower than the cadence, the next tick is skipped rather than
 stacked on top of the one still running.
 
+A gauge or a level declared with [`collect`](/primitives/gauge#collect) gets a
+second timer, which calls `collect` its `collectLead` before each of its windows
+ends, so what it reads lands in the window that is closing. It is unreferenced
+like the others, and a `collect` still running when the next is due makes the
+next one skip. Without `start()`, each flush calls `collect` instead, at most
+once per window. With several processes on a shared driver, `collectScope`
+decides whether one of them calls it per window or all of them do.
+[Collecting before a window closes](/guide/flushing#collecting-before-a-window-closes)
+has the details.
+
 ```ts
 process.on('SIGTERM', async () => {
   const report = await house.stop()
@@ -230,18 +244,23 @@ process.on('SIGTERM', async () => {
 })
 ```
 
-`stop()` does four things in order:
+`stop()` does five things in order:
 
-1. Clears the timers.
+1. Clears the timers, the flush timers and the `collect` timers both.
 2. Waits for every flush still running, however it was started: a timer tick,
    a cron calling `house.flush()`, or your own `metric.flush()`. A
    `house.flush()` is waited for until it has visited every metric it was
-   asked to, and a flush that starts while it waits is waited for too.
+   asked to, and a flush that starts while it waits is waited for too. A
+   `collect` still running is waited for as well.
 3. Drains writes still on their way to the driver, including those issued
    while it waits, until none is left. Steps 2 and 3 then take turns until a
    wait for flushes that follows a drain finds none, so a flush that starts
    while the writes drain is waited for as well.
-4. Makes a [final flush](/reference/flush-options#final) past this process's
+4. Calls `collect` once on every gauge and level that declares it, unless it
+   has already run for the window that is open, then drains what it wrote the
+   way step 3 does. What it writes lands in that open window. See
+   [Where the readings land](/guide/flushing#where-the-readings-land).
+5. Makes a [final flush](/reference/flush-options#final) past this process's
    cadence and every grace period. On a shared, durable driver it still waits
    for the [turn](/guide/flushing#several-processes-on-one-driver). A metric
    another process holds the turn for reports `skipped: true`, ships nothing,
@@ -249,21 +268,23 @@ process.on('SIGTERM', async () => {
 
 A write or a flush that failed, or an `onError` that threw, is reported and
 does not stop the steps after it. A flush whose sink fails during steps 2 and
-3 puts its rows back in the driver, and step 4 ships them.
+3 puts its rows back in the driver, and step 5 ships them. A `collect` that
+throws goes to `onError` the same way.
 
 A second call to `stop()` while the first is still running, from a `SIGINT`
 and a `SIGTERM` handler both, returns the same promise and so the same report.
-A call made after `stop()` has returned goes through the four steps again. So
+A call made after `stop()` has returned goes through the five steps again. So
 does a call made after `house.start()` while an earlier `stop()` is still
 running: it clears the timers that `start()` set at once, then waits for the
-earlier call to finish before its own steps 2 to 4, so two calls never run
+earlier call to finish before its own steps 2 to 5, so two calls never run
 those steps at the same time.
 
 Steps 2 and 3 have no timeout. A sink that never returns keeps its flush running, and
 `stop()` keeps waiting for that flush. Under [immediate delivery](/guide/delivery),
 step 3 also waits for the send that follows each write, so a sink that never
 answers an immediate send keeps `stop()` waiting too. Give your sink a timeout
-of its own.
+of its own. A `collect` that never returns keeps `stop()` waiting in the same
+way, so give the read inside it one too.
 And stop anything of yours that keeps calling `flush()` before you call
 `stop()`: a flush that starts once the final flush is under way is not waited
 for.

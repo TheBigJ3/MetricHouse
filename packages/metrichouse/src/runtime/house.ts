@@ -17,7 +17,14 @@
  */
 
 import type { Driver } from '../drivers/types.js'
-import { type AnyMetric, isMetric, reportError, SETTLE, SETTLE_WRITES } from '../metrics/types.js'
+import {
+  type AnyMetric,
+  COLLECT,
+  isMetric,
+  reportError,
+  SETTLE,
+  SETTLE_WRITES,
+} from '../metrics/types.js'
 import { bucketStart } from '../time/buckets.js'
 import { type DurationInput, parseDuration, parseInterval } from '../time/duration.js'
 import {
@@ -110,8 +117,10 @@ export interface House {
    * Start flushing each metric on its own cadence.
    *
    * Turns `flush: '5m'` from a floor into a schedule: one interval per metric,
-   * at that metric's `flushMs`, so nothing else has to pump. Idempotent, and
-   * a metric registered afterwards is scheduled as it arrives.
+   * at that metric's `flushMs`, so nothing else has to pump. A gauge or a
+   * level declared with `collect` also gets a timer that calls it its
+   * `collectLead` before each window ends. Idempotent, and a metric
+   * registered afterwards is scheduled as it arrives.
    *
    * **For a long-lived process only.** On Workers, Vercel edge and Lambda the
    * isolate is frozen between requests and the interval never fires. There,
@@ -123,11 +132,13 @@ export interface House {
   /**
    * Stop the scheduler and get everything out.
    *
-   * Clears the intervals, waits for every flush still running however it was
-   * started and drains the writes still on their way to the driver, taking
-   * turns until a wait for flushes that follows a drain finds none, then
-   * makes a final flush past this process's cadence and every grace period.
-   * On shared durable storage that flush still waits for the turn every
+   * Clears the intervals, waits for every flush and collect still running
+   * however it was started and drains the writes still on their way to the
+   * driver, taking turns until a wait for flushes that follows a drain finds
+   * none, runs `collect` once more on each metric that declares it and has
+   * not yet collected the open window, drains again, then makes a final
+   * flush past this process's cadence and every grace period. On shared
+   * durable storage that flush still waits for the turn every
    * process takes, and what it leaves ships with the next one. A call
    * while one is running returns the same promise, unless `start()` came in
    * between: that call clears the intervals again at once and runs its own
@@ -341,6 +352,7 @@ export function createHouse(config: HouseConfig): House {
           // event that names it, and a lazy lookup is what makes that legal
           resolve: (target) => registry.get(target),
           stopped: () => stopped,
+          scheduled: () => scheduler.running,
           ...(config.onError && { onError: config.onError }),
         })
         bound.push(metric)
@@ -472,6 +484,15 @@ export function createHouse(config: HouseConfig): House {
         // write. The flushes' failures are already in their own reports, so
         // only the waiting matters here
         await settleEverything()
+        // a metric declared with collect collects once more, into the window
+        // still open, unless it already has for that window, and its writes
+        // are drained like every other before the final flush looks.
+        // Nothing here rejects: a collect's failure has gone to `onError`
+        const collectors = [...registry.values()].flatMap((metric) => metric[COLLECT] ?? [])
+        if (collectors.length > 0) {
+          await Promise.all(collectors.map((collector) => collector.run()))
+          await settleEverything()
+        }
         // final, so windows still inside grace go too. Only the open window
         // is left, which is the one thing a stopping process cannot finish.
         // Not forced: on shared durable storage a final flush waits for the

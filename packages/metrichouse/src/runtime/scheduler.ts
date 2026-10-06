@@ -10,6 +10,9 @@
  * ```
  * house.start()   ->  per metric, a first tick at its offset, then
  *                     setInterval(metric.flushMs)
+ *                     and per metric declared with collect, a timer at
+ *                     each window's end minus its lead, armed again after
+ *                     every run
  * house.stop()    ->  clear, wait for running ticks, drain, final flush
  * ```
  *
@@ -30,7 +33,7 @@
  * file is not involved.
  */
 
-import { type AnyMetric, reportError } from '../metrics/types.js'
+import { type AnyMetric, COLLECT, reportError } from '../metrics/types.js'
 
 export interface SchedulerOptions {
   /** Read late: `register()` can add a metric after the scheduler is running. */
@@ -52,7 +55,8 @@ export interface Scheduler {
   /** Schedule a metric registered after {@link start}. No-op while stopped. */
   add(metric: AnyMetric): void
   /**
-   * Stop ticking, and resolve once every tick already running has finished.
+   * Stop ticking, and resolve once every tick and every collect already
+   * running has finished.
    *
    * Waiting matters because a tick is a flush in progress. If it is still
    * inside the sink when the caller moves on to a final flush and then exits,
@@ -92,6 +96,14 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
    * next tick is one interval away, and the data is not going anywhere.
    */
   const inFlight = new Map<string, Promise<void>>()
+  /**
+   * metric -> the timer for its next collect. A timeout re-armed after each
+   * run rather than an interval, so it stays on the window boundary however
+   * long the run took and however the clock moved.
+   */
+  const collectTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  /** Collects started by a timer that have not finished. Each never rejects. */
+  const collecting = new Set<Promise<void>>()
   let running = false
 
   async function run(metric: AnyMetric): Promise<void> {
@@ -149,6 +161,29 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     unref(first)
 
     timers.set(metric.name, first)
+    armCollect(metric)
+  }
+
+  /**
+   * Arm the timer for this metric's next collect, at the end of the window
+   * it is due in minus its lead. The collector skips a window it has already
+   * collected and a run that would overlap the last one, so this only has to
+   * keep time.
+   */
+  function armCollect(metric: AnyMetric): void {
+    const collector = metric[COLLECT]
+    if (collector === undefined) return
+    const timer = setTimeout(() => {
+      collectTimers.delete(metric.name)
+      const work = collector.run()
+      collecting.add(work)
+      void work.finally(() => {
+        collecting.delete(work)
+      })
+      armCollect(metric)
+    }, collector.delay())
+    unref(timer)
+    collectTimers.set(metric.name, timer)
   }
 
   return {
@@ -173,8 +208,10 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       // still waiting on its first tick and one already ticking
       for (const timer of timers.values()) clearTimeout(timer)
       timers.clear()
-      // `run` never rejects, so this only waits
-      await Promise.all([...inFlight.values()])
+      for (const timer of collectTimers.values()) clearTimeout(timer)
+      collectTimers.clear()
+      // `run` and a collect never reject, so this only waits
+      await Promise.all([...inFlight.values(), ...collecting])
     },
   }
 }

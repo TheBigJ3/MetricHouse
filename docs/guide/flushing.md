@@ -292,6 +292,9 @@ What it does:
   `recoveryError` of a locally staged event that could not ask its driver for
   records an earlier declaration left there, which is dropped. The next interval
   asks again, and nothing was lost.
+- Arms a second timer for each gauge and level declared with `collect`, which
+  calls it a little before each window ends. See
+  [Collecting before a window closes](#collecting-before-a-window-closes).
 - Unreferences its timers, so metrics never keep your process alive.
 - Picks up metrics registered after it started.
 
@@ -306,10 +309,12 @@ house.start()     // calling again does nothing
 await house.stop()
 ```
 
-Clears the timers, waits for every flush still running, then drains writes
-still on their way to the driver and waits for flushes again, and keeps taking
-those two turns until a wait for flushes that follows a drain finds none. Then
-it makes a [final flush](/reference/flush-options#final): past this process's
+Clears the timers, waits for every flush and every `collect` still running,
+then drains writes still on their way to the driver and waits for flushes again,
+and keeps taking those two turns until a wait for flushes that follows a drain
+finds none. Then it calls `collect` once on every gauge and level that declares
+it, unless it has already run for the window that is open, and drains what that
+wrote. Then it makes a [final flush](/reference/flush-options#final): past this process's
 cadence, and past grace, so on a driver of its own every window that has ended
 ships. On a shared, durable driver such as `ioredis()`, the final flush still
 waits for the [turn](#several-processes-on-one-driver). A metric another process
@@ -347,6 +352,98 @@ process.on('SIGTERM', async () => {
 `report.ok` is `false` when a metric's `write` function threw during the final
 flush. On a durable driver those rows are back in storage for the next process,
 and on `memory()` they go when the process exits.
+
+## Collecting before a window closes
+
+A [gauge](/primitives/gauge#collect) or a [level](/primitives/level#collect)
+declared with `collect` reads its value from somewhere else, such as a list
+length in your own Redis, rather than waiting for your code to write it. The
+metric pages show the declaration. This section covers when the function runs.
+
+| What calls it | When |
+| --- | --- |
+| The scheduler, after `house.start()` | `collectLead` before each window of the metric ends |
+| `metric.flush()` or `house.flush()`, while the scheduler is not running | First, before the cadence check |
+| `house.stop()` | Once, after the running flushes and writes have settled and before the final flush |
+
+Whatever calls it, `collect` runs at most once per window in each process. A
+window a flush has already collected is not collected again by the timer or by
+`stop()`, and a second flush inside the same window does not call it. A clock
+that steps back into an earlier window collects again straight away, rather
+than waiting to catch up.
+
+A flush made while the scheduler is running leaves `collect` to the timer, which
+runs closer to the end of the window. A [final flush](/reference/flush-options#final)
+never calls it, because `house.stop()` has called it already and drained what it
+wrote.
+
+### Where the readings land
+
+`collect` calls `set()` like any other code, and a write lands in the window that
+is open at that moment.
+
+- **On the timer**, that is the window about to close, provided `collect`
+  finishes inside the lead. A read slower than the lead lands in the next
+  window, so give `collectLead` room for it.
+- **From a flush**, it is the window open when the flush started. That flush
+  ships only windows that have closed, so the reading ships with a later flush.
+  A cron calling `house.flush()` once a minute therefore collects once a
+  minute, at whatever point in the window the cron fires.
+- **From `house.stop()`**, it is the window still open, which a stopping
+  process cannot ship. On a shared, durable driver it stays in storage for the
+  process that takes the next turn. On `memory()` it ends with the process,
+  like any other write to that window.
+
+The timer is set again after every run, from the clock, rather than repeating at
+a fixed interval, so a run that takes a while does not push later ones off the
+window boundary. Started inside the lead, the scheduler waits for the next
+window.
+
+### When it fails or runs long
+
+- **A `collect` that throws or rejects** goes to `onError` with the metric's
+  name, and with no `onError` it becomes an unhandled rejection, as a failed
+  write does. It never stops a flush, and the flush report does not mention it.
+- **A `collect` still running when the next one is due** is left running, and the
+  one that was due is skipped rather than started beside it.
+- **`drain()` and `house.stop()` wait for a `collect` still running**, and for the
+  writes it makes. A `collect` that never returns keeps both waiting, so give
+  the read inside it a timeout. For the same reason, `collect` must not await
+  `drain()` or `stop()` itself, because each would wait for the `collect` that
+  is waiting for it.
+- **`house.stop()` clears the timers**, and no `collect` runs on a timer after it
+  returns.
+
+### Collecting across a fleet
+
+With `collectScope: 'fleet'`, the default, on a driver that is shared, such as
+`ioredis()`, one process per window runs `collect`. Before it calls the
+function, a process takes a turn from the driver, with the same `takeTurn` a
+flush uses but under a key of its own, the metric name followed by
+`:collect`. No metric name can hold a colon, so that key never belongs to a
+real metric. On Redis it is `mh:turn:<metric>:collect`, beside the metric's
+flush turn.
+
+The turn is stamped with the start of the window rather than the time, and the
+gap is one `resolution`. Every process asks about the same window at about the
+same moment, by its own clock, so the first to ask is granted and every other
+is refused and skips that window. A clock that is off by less than a window
+still names the same window, so it changes which process collects and nothing
+else. The turn is never given back, so a `collect` that fails leaves that window
+without a reading rather than letting a second process try. A turn the driver
+cannot give, because Redis is unreachable, goes to `onError`, and that process
+skips the window.
+
+With `collectScope: 'process'`, no turn is taken and every process runs
+`collect` every window. On a driver that is not shared, such as `memory()`,
+there is nobody to take turns with, and the two scopes are the same.
+
+| | `'fleet'` | `'process'` |
+| --- | --- | --- |
+| Calls per window, with N processes | 1 | N |
+| A gauge's window | one observation | N observations, folded into `min`, `max`, `sum` and `count` |
+| A level's window | the value one process read | the value the last process to write set |
+| Right for | a value every process reads the same, such as a queue in shared Redis | a value each process has its own of, such as its heap, with an `instance` dim |
 
 ## Flushing without a long running process
 

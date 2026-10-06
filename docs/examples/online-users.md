@@ -49,7 +49,9 @@ describe the whole fleet.
 
 ## Sampling
 
-Nothing samples for you. A gauge only has a value when you write one.
+A gauge only has a value when something writes one. Here that is a timer of
+your own, because six readings a minute is what makes `min` and `max` mean
+something.
 
 ```ts
 // metrics/sampler.ts
@@ -73,6 +75,11 @@ export function startSampling() {
   return () => clearInterval(handle)
 }
 ```
+
+When one reading per window is enough, declare the gauge with
+[`collect`](/primitives/gauge#collect) instead. MetricHouse then calls it a
+second before each minute ends, clears it on `house.stop()`, and on several
+servers lets one of them take the reading for all.
 
 ::: tip Write a zero rather than skipping
 If a region has nobody online, write `0` rather than skipping it. A missing

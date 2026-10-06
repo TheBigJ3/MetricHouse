@@ -202,6 +202,11 @@ export function startSampling() {
 }
 ```
 
+Six readings a minute is the point of this sampler, so it keeps a timer of its
+own. When one reading per window is enough,
+[`collect`](/primitives/gauge#collect) on the gauge replaces the timer and the
+code that stops it.
+
 ## Running it
 
 ```ts

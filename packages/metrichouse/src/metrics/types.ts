@@ -149,6 +149,14 @@ export interface MetricBinding {
    */
   readonly stopped?: () => boolean
   /**
+   * True while `house.start()` has the scheduler running, until `stop()`.
+   *
+   * A metric with `collect` runs it before a flush only when nothing else
+   * will: with the scheduler running, a timer collects near the end of each
+   * window instead.
+   */
+  readonly scheduled?: () => boolean
+  /**
    * Look up a sibling metric by name.
    *
    * `event({ derive })` names the counters an event also writes, and names are
@@ -212,6 +220,33 @@ export const SETTLE: unique symbol = Symbol('metrichouse.settle')
  * {@link SETTLE} is not.
  */
 export const SETTLE_WRITES: unique symbol = Symbol('metrichouse.settleWrites')
+
+/**
+ * The key of {@link AnyMetric}'s collector, for a gauge or a level declared
+ * with `collect`. Not exported from the package, as {@link SETTLE} is not.
+ */
+export const COLLECT: unique symbol = Symbol('metrichouse.collect')
+
+/**
+ * What the scheduler, a flush and `house.stop()` ask of a metric declared
+ * with `collect`. Built by `createCollector`.
+ */
+export interface Collector {
+  /** `collectLead`, parsed, or the default. */
+  readonly leadMs: number
+  readonly scope: 'fleet' | 'process'
+  /** How long from now until the next window's collect is due. */
+  delay(): number
+  /**
+   * Collect for the window open now, unless this process already has, or a
+   * collect is still running. Never rejects.
+   */
+  run(): Promise<void>
+  /** {@link run}, unless the scheduler is running or the flush is final. */
+  beforeFlush(options: FlushOptions): Promise<void>
+  /** Resolve once no collect is running, including one started while it waits. */
+  idle(): Promise<void>
+}
 
 export interface AnyMetric {
   readonly name: string
@@ -292,6 +327,14 @@ export interface AnyMetric {
    * by hand still fits; the house then calls `drain()`.
    */
   [SETTLE_WRITES]?(): Promise<void>
+
+  /**
+   * Present on a gauge or a level declared with `collect`. The scheduler arms
+   * a timer from it, and `house.stop()` collects through it before the final
+   * flush. Keyed by a symbol this package does not export, as {@link SETTLE}
+   * is.
+   */
+  readonly [COLLECT]?: Collector
 
   /** The runtime column list a sink will receive, in order. */
   rowShape(): RowShape

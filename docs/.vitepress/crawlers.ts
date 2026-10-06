@@ -186,6 +186,10 @@ building in TypeScript or JavaScript and:
   until something changes it, including the windows nobody wrote to. That is the
   difference from a gauge, and it costs a row per window per series whether or
   not anything moved. \`holdFor\` stops a series that has gone quiet.
+- A gauge or a level can take a \`collect\` function, called a little before
+  each window closes, to copy in a value held elsewhere, such as a queue length
+  in the application's own Redis. On a shared driver one process per window
+  runs it.
 - **\`event\`** keeps discrete records whole, never aggregated. The home for user
   ids, request ids, free text and JSON payloads. Supports per event sampling and
   can increment counters as a side effect, and those count every record whether
