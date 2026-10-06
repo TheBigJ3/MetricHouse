@@ -49,6 +49,9 @@ writing to an unbound gauge throws.
 | `config.flush` | duration | no | [The fastest this may ship](#flush) |
 | `config.grace` | duration | no | [How long a window waits for observations on their way](#grace) |
 | `config.aggregate` | array | no | [Which of the five columns reach your sink](#aggregate) |
+| `config.collect` | function | no | [Read a value held elsewhere before each window closes](#collect) |
+| `config.collectLead` | duration | no | [How long before the end of a window to call it](#collectlead) |
+| `config.collectScope` | `'fleet'` or `'process'` | no | [Which processes call it](#collectscope) |
 | `config.write` | function | yes | [Where the rows go](#write) |
 
 There is a third parameter, `kind`, which lets another metric type present
@@ -152,6 +155,114 @@ import { GAUGE_AGGREGATES } from 'metrichouse/core'
 
 An empty array throws, and so does a name that is not one of the five or a name
 given twice.
+
+### collect
+
+```ts
+collect?: (metric: Gauge<D>) => void | Promise<void>      // default: none
+```
+
+A function MetricHouse calls a little before each window closes, for a value
+that lives somewhere else and only needs reading. It receives the gauge, calls
+[`set()`](#gauge-set) on it, and the observations land in the window that is
+about to close.
+
+```ts
+const heapUsedMb = gauge('heap_used_mb', {
+  resolution: '1m',
+  flush: '1m',
+  collect: (self) => self.set(process.memoryUsage().heapUsed / 1024 / 1024),
+  collectScope: 'process',     // every process has a heap of its own
+  write,
+})
+```
+
+The production shape reads a number your application already keeps. Here the
+sessions are a sorted set per region in your own Redis, scored by the last time
+each user was seen.
+
+```ts
+// metrics/schema.ts
+import { Redis } from 'ioredis'
+import { gauge, oneOf } from 'metrichouse/core'
+import { toClickHouse } from './sinks.js'
+
+const redis = new Redis(process.env.REDIS_URL!)
+const REGIONS = ['us-east', 'eu-west', 'ap-south'] as const
+
+export const onlineUsers = gauge('online_users', {
+  dims: { region: oneOf(REGIONS) },
+  resolution: '1m',
+  flush: '1m',
+
+  // One reading per region per minute, taken a second before the minute ends.
+  // The default scope, 'fleet', means one server takes it for all of them,
+  // because every server would read the same sorted sets.
+  collect: async (self) => {
+    const since = Date.now() - 5 * 60_000
+    const counts = await Promise.all(
+      REGIONS.map((region) => redis.zcount(`sessions:${region}`, since, '+inf')),
+    )
+    REGIONS.forEach((region, i) => self.set(counts[i] ?? 0, { region }))
+  },
+
+  write: toClickHouse('online_users'),
+})
+```
+
+With [`house.start()`](/guide/the-house#starting-and-stopping), a timer calls it
+[`collectLead`](#collectlead) before each window ends. Without the scheduler,
+every [`flush()`](#gauge-flush) calls it first, at most once per window, and
+`house.stop()` calls it once more before its final flush.
+[Collecting before a window closes](/guide/flushing#collecting-before-a-window-closes)
+covers each of those, and what happens when it throws, runs long or runs on
+several servers.
+
+An observation lands in the window open at the moment `set()` is called. A
+`collect` that awaits a read has to finish inside the lead, or its readings fall
+into the next window. A `collect` that is not a function throws at declaration.
+
+### collectLead
+
+```ts
+collectLead?: DurationInput      // default: '1s', or a tenth of a shorter resolution
+```
+
+How long before the end of each window the scheduler calls `collect`. Make it
+longer than the read inside `collect` takes.
+
+```ts
+collect: readFromWarehouse,
+collectLead: '10s',      // a slow query, so start it ten seconds before the minute ends
+```
+
+The default is one second, or a tenth of the `resolution` when that is shorter,
+so a `5s` window is collected 500 milliseconds before it ends. A lead of zero, or
+one as long as the `resolution` or longer, throws at declaration, and so does a
+`collectLead` given without `collect`.
+[Durations](/reference/durations) covers the format.
+
+### collectScope
+
+```ts
+collectScope?: 'fleet' | 'process'      // default: 'fleet'
+```
+
+Which processes call `collect` when several share one driver.
+
+| Scope | Calls per window | What the window holds |
+| --- | --- | --- |
+| `'fleet'` | One, from whichever process asks first | One observation, so `last`, `min` and `max` are the reading |
+| `'process'` | One per process | One observation per process, folded together like any other |
+
+Keep `'fleet'` for a value every process would read the same, such as the
+sorted sets above. Use `'process'` for a value each process has its own of, such
+as its heap, and give the gauge an `instance` dim so each process keeps a
+series of its own. On a driver that is not shared, such as `memory()`, the two
+are the same. A `collectScope` given without `collect` throws, and so does one
+that is neither of the two.
+[Collecting across a fleet](/guide/flushing#collecting-across-a-fleet) explains
+how one process is picked.
 
 ### write
 
@@ -288,7 +399,9 @@ Ships every closed window to this gauge's own `write` function.
 drain(): Promise<void>
 ```
 
-Resolves once every `set()` issued before the call has reached the driver.
+Resolves once every `set()` issued before the call has reached the driver. On a
+gauge declared with [`collect`](#collect), it first waits for a `collect` still
+running, so the readings it is about to write are waited for too.
 Under [immediate delivery](/guide/delivery) it also waits for the send to `write` that follows each one.
 
 ## gauge.rowShape()

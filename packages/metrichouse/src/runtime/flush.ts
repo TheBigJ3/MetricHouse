@@ -277,6 +277,13 @@ export interface MetricFlushOptions {
    * it, and the cap applies.
    */
   readonly outlivesProcess?: () => boolean
+  /**
+   * Run before anything else in each flush, the cadence check included, and
+   * inside the flush `house.stop()` waits for. A gauge or a level declared
+   * with `collect` collects here when no scheduler is running. Must not
+   * reject: a failure belongs to whatever it ran, not to the flush.
+   */
+  readonly before?: (options: FlushOptions) => Promise<void>
 }
 
 /**
@@ -332,6 +339,10 @@ export function metricFlush(
   }
 
   async function flushOnce(flushOptions: FlushOptions): Promise<MetricFlushReport> {
+    // first, and awaited, so its writes have been issued before the cadence
+    // and the clock are read. They land in the window open now, which this
+    // flush does not claim
+    if (options.before !== undefined) await options.before(flushOptions)
     const metric = options.self()
     // reads the bound clock, so an unbound metric fails here rather than
     // claiming against `Date.now` and a driver that does not exist

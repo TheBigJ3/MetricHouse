@@ -878,6 +878,15 @@ process of this version asks for or gives back the turn.
 The time is the caller's `now`, so an injected test clock applies to turns as it
 does to windows.
 
+A gauge or a level declared with
+[`collect`](/guide/flushing#collecting-across-a-fleet) takes a turn as well, to
+pick the one process that collects each window. It asks under its name followed
+by `:collect`, such as `queue_depth:collect`, with `now` set to the start of the
+window and `gapMs` to its resolution, and never gives the turn back. A metric
+name cannot hold a colon, so that key is never another metric's, and a driver
+keeps it like any other. The Redis driver stores it at
+`mh:turn:queue_depth:collect` and `mh:turntok:queue_depth:collect`.
+
 ### returnTurn
 
 Put `previous` back as the recorded turn, token included, or clear the turn

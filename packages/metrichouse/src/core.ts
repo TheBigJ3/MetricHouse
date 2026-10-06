@@ -114,6 +114,8 @@ export type {
   WriteContext,
   WriteFn,
 } from './metrics/types.js'
+// the collect settings a gauge and a level share
+export type { CollectOptions, CollectScope } from './runtime/collect.js'
 // delivery, how a house gets rows out, as opposed to what a metric measures
 export type { DeliveryConfig, DeliveryMode, HouseDefaults } from './runtime/delivery.js'
 export { resolveDelivery } from './runtime/delivery.js'

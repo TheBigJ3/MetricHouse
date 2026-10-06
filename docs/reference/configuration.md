@@ -57,7 +57,7 @@ counter(name, { dims, resolution, flush, grace, value, write })
 The page: [gauge](/primitives/gauge).
 
 ```ts
-gauge(name, { dims, resolution, flush, grace, aggregate, write })
+gauge(name, { dims, resolution, flush, grace, aggregate, collect, collectLead, collectScope, write })
 ```
 
 | Option | Type | Default | Meaning |
@@ -67,14 +67,22 @@ gauge(name, { dims, resolution, flush, grace, aggregate, write })
 | `flush` | duration | house default | The fastest this may ship |
 | `grace` | duration | house default, then `'2s'` | How long a window waits for observations on their way |
 | `aggregate` | array | `['last','min','max','sum','count']` | Which columns reach your sink |
+| `collect` | `(gauge) => void \| Promise<void>` | none | Called a little before each window closes, to read a value held elsewhere and `set()` it |
+| `collectLead` | duration | `'1s'`, or a tenth of a shorter `resolution` | How long before the end of each window the scheduler calls `collect` |
+| `collectScope` | `'fleet'` or `'process'` | `'fleet'` | On a shared driver, one process per window calls `collect`, or every process does |
 | `write` | `WriteFn` | required | Where the rows go |
+
+`collectLead` has to be longer than zero and shorter than `resolution`, and
+`collectLead` and `collectScope` need `collect`. See
+[Collecting before a window closes](/guide/flushing#collecting-before-a-window-closes)
+for when `collect` runs.
 
 ## level
 
 The page: [level](/primitives/level).
 
 ```ts
-level(name, { dims, resolution, flush, grace, holdFor, value, write })
+level(name, { dims, resolution, flush, grace, holdFor, value, collect, collectLead, collectScope, write })
 ```
 
 | Option | Type | Default | Meaning |
@@ -85,9 +93,13 @@ level(name, { dims, resolution, flush, grace, holdFor, value, write })
 | `grace` | duration | house default, then `'2s'` | How long a window waits for writes on their way |
 | `holdFor` | duration | forever | How long a series keeps reporting after its last write |
 | `value` | `float()` or `int()` | `float()` | Whether fractions are allowed |
+| `collect` | `(level) => void \| Promise<void>` | none | Called a little before each window closes, to read a value held elsewhere and `set()` it |
+| `collectLead` | duration | `'1s'`, or a tenth of a shorter `resolution` | How long before the end of each window the scheduler calls `collect` |
+| `collectScope` | `'fleet'` or `'process'` | `'fleet'` | On a shared driver, one process per window calls `collect`, or every process does |
 | `write` | `WriteFn` | required | Where the rows go |
 
-`holdFor` has to be at least one `resolution`.
+`holdFor` has to be at least one `resolution`. `collectLead` has to be longer
+than zero and shorter than `resolution`, as on a gauge.
 
 ## timer
 
@@ -266,6 +278,12 @@ These all throw when the module is first imported, not at the first write.
 | Invalid duration | `parseDuration: "1.5m"` |
 | Bad default value | `default for int(): expected a safe integer, got "five"` |
 | Unknown gauge aggregate | `unknown aggregate "avg"` |
+| A `collect` that is not a function | `q: collect must be a function, got string` |
+| A `collectLead` of zero | `q: collectLead must be longer than zero, got "0s"` |
+| A `collectLead` as long as `resolution` or longer | `q: collectLead is 1m, and it must be shorter than the resolution, 1m` |
+| A `collectLead` that is not a duration | `q: collectLead: parseDuration: "1.5s"` |
+| An unknown `collectScope` | `q: collectScope must be 'fleet' or 'process', got "cluster"` |
+| `collectLead` or `collectScope` without `collect` | `q: collectLead is set, but collect is not, so nothing would run` |
 | A gauge aggregate named twice | `aggregate names ["sum","sum"], and each one may appear once` |
 | A dim named after a column the metric writes | `dim "id" is a reserved column` |
 | A dim or field named like a whole number | `a dim cannot be named "2024"` |

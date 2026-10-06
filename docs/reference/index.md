@@ -63,9 +63,9 @@ metrics on timers without a house. It returns a `Scheduler` with these members.
 
 | Member | What it does |
 | --- | --- |
-| `scheduler.start()` | Starts one interval per metric, at that metric's `flushMs`, each from its own point in the interval. Calling it again does nothing |
+| `scheduler.start()` | Starts one interval per metric, at that metric's `flushMs`, each from its own point in the interval, and one timer per gauge or level declared with `collect`, `collectLead` before each window ends. Calling it again does nothing |
 | `scheduler.add(metric)` | Schedules a metric that arrived after `start()`. Does nothing while stopped |
-| `scheduler.stop()` | Returns a promise. Clears every timer, including a first tick still waiting, and resolves once flushes already running have settled. It does not flush |
+| `scheduler.stop()` | Returns a promise. Clears every timer, including a first tick still waiting, and resolves once flushes and `collect` calls already running have settled. It does not flush |
 | `scheduler.running` | `true` between `start()` and `stop()` |
 
 ## The house
@@ -81,9 +81,9 @@ Everything on the object `createHouse()` returns.
 | `house.get(name)` | `AnyMetric \| undefined` | One metric by name |
 | `house.delivery` | `DeliveryMode` | `'staged'` or `'immediate'`. A house configured with `'auto'` has already picked one |
 | `house.flush(options?)` | `Promise<FlushReport>` | Flushes every metric, one after another. Each still waits for its own cadence unless you pass `force`. Names in `only` that match no metric come back in `unmatched` |
-| `house.start()` | `void` | Gives every metric a timer that flushes it at its own cadence. Calling it again does nothing |
+| `house.start()` | `void` | Gives every metric a timer that flushes it at its own cadence, and every gauge or level declared with `collect` a timer that calls it before each window ends. Calling it again does nothing |
 | `house.running` | `boolean` | `true` between `start()` and `stop()` |
-| `house.stop()` | `Promise<FlushReport>` | Clears the timers, waits for every running flush and for queued writes to reach the driver, then makes a final flush of every metric past this process's cadence. On a shared, durable driver that flush still waits for the turn, and a metric another process holds the turn for is skipped, its rows left in storage for the next turn |
+| `house.stop()` | `Promise<FlushReport>` | Clears the timers, waits for every running flush and `collect` and for queued writes to reach the driver, calls `collect` once more where a metric declares it, then makes a final flush of every metric past this process's cadence. On a shared, durable driver that flush still waits for the turn, and a metric another process holds the turn for is skipped, its rows left in storage for the next turn |
 | `house.drain()` | `Promise<void>` | Resolves once every write issued before the call has reached the driver, and under immediate delivery once the send after each has returned |
 | `house.snapshot(options?)` | `Promise<HouseSnapshot>` | Every metric's unshipped rows, keyed by metric name |
 | `house.current()` | `Promise<HouseSnapshot>` | Only the windows still filling, for counters, gauges, levels and timers |
@@ -259,6 +259,7 @@ All of these are exported as types from `metrichouse/core`.
 `Counter`, `CounterConfig`, `CounterRow`, `CounterLiveRow`,
 `Gauge`, `GaugeConfig`, `GaugeRow`, `GaugeLiveRow`, `GaugeAggregate`, `GaugeTotals`,
 `Level`, `LevelConfig`, `LevelRow`, `LevelLiveRow`,
+`CollectOptions`, `CollectScope`,
 `Event`, `EventConfig`, `EventRow`, `EventLiveRow`, `EventStage`, `EventDurability`,
 `RecordResult`, `EventBatchConfig`,
 `DeriveFn`, `DeriveTarget`,

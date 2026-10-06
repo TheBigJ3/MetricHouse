@@ -15,6 +15,7 @@
 
 import { type Cell, type GaugeCell, isGaugeCell } from '../drivers/types.js'
 import { rowId } from '../identity.js'
+import { type CollectOptions, createCollector } from '../runtime/collect.js'
 import { metricFlush } from '../runtime/flush.js'
 import { type LiveRowOf, liveColumns, type SnapshotOptions } from '../runtime/live.js'
 import { readOpenWindow } from '../runtime/ship.js'
@@ -43,6 +44,7 @@ import type {
 import {
   assertMetricName,
   assertSink,
+  COLLECT,
   describeValue,
   dimColumns,
   pendingWrites,
@@ -79,7 +81,11 @@ export type GaugeLiveRow<
   O extends SnapshotOptions = Record<never, never>,
 > = LiveRowOf<D, Partial<Record<GaugeAggregate, number>>, O>
 
-export interface GaugeConfig<D extends Shape> {
+/**
+ * `collect`, `collectLead` and `collectScope` come from {@link CollectOptions}:
+ * a callback run a little before each window closes, handed the gauge.
+ */
+export interface GaugeConfig<D extends Shape> extends CollectOptions<Gauge<D>> {
   /** Omit entirely for a gauge with no dimensions. */
   readonly dims?: D
   readonly resolution: DurationInput
@@ -227,6 +233,20 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
   assertDimsLegal(dims, name, ['id', 'bucket_ts', ...aggregate])
 
   const writes = pendingWrites(name)
+
+  // after every other check, so a mistake in the declaration proper is the
+  // one reported. The gauge is handed over as a plain gauge: only a timer
+  // declares another kind, and a timer passes no collect
+  const collector = createCollector<Gauge<D>>(
+    {
+      name,
+      resolutionMs,
+      isBound: slot.isBound,
+      active: slot.active,
+      self: () => self as unknown as Gauge<D>,
+    },
+    config,
+  )
 
   function asFold(cell: Cell): GaugeCell {
     if (!isGaugeCell(cell)) {
@@ -386,7 +406,10 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       self: () => self,
       attempts: slot.attempts,
       sharedDriver: slot.driver,
+      ...(collector !== undefined && { before: collector.beforeFlush }),
     }),
+
+    ...(collector !== undefined && { [COLLECT]: collector }),
 
     name,
     kind,
@@ -473,12 +496,16 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       }
     },
 
-    drain(): Promise<void> {
-      return writes.drain()
+    // a collect still running has writes to make, and they are writes this
+    // call is waiting for
+    async drain(): Promise<void> {
+      await collector?.idle()
+      await writes.drain()
     },
 
-    [SETTLE_WRITES](): Promise<void> {
-      return writes.settle()
+    async [SETTLE_WRITES](): Promise<void> {
+      await collector?.idle()
+      await writes.settle()
     },
 
     materialize,
