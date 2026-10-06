@@ -54,13 +54,16 @@ const house = createHouse({
 Defaults are filled in, never overridden. A metric that declares `flush: '5m'`
 because it carries payment data keeps it whatever the house says.
 
-`driver`, `now`, `delivery` and `defaults.flush` are checked when the house is
-created, which matters for a config built in JavaScript or read from an
-environment variable that TypeScript cannot check. A missing `driver` throws, and
-so does an object with no `capabilities`, such as a Redis client passed where
-`ioredis(client)` belongs. A `now` that is not a function throws. A `delivery`
-that is not one of the three modes throws. A `defaults.flush` of zero, or one
-longer than a timer can wait, throws too. See
+`driver`, `now`, `delivery`, `defaults.flush` and `defaults.grace` are checked
+when the house is created, which matters for a config built in JavaScript or read
+from an environment variable that TypeScript cannot check. A missing `driver`
+throws, and so does an object with no `capabilities`, such as a Redis client
+passed where `ioredis(client)` belongs, or a driver factory passed without
+calling it, such as `memory` where `memory()` belongs. A `now` that is not a
+function throws. A `delivery` that is not one of the three modes throws. A
+`defaults.flush` of zero, or one longer than a timer can wait, throws too. A
+`defaults.flush` or `defaults.grace` that is not a duration throws an error that
+names the setting, such as `createHouse: defaults.grace: parseDuration: -1`. See
 [Durations](/reference/durations#settings-a-timer-waits-for).
 
 ## Registering metrics

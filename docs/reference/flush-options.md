@@ -104,7 +104,11 @@ Every flush claims again after a claim that came back with exactly
 [`claimLimit`](/primitives/event#claimlimit) records, and stops at the first
 that carries fewer. A final flush goes further and keeps claiming until a claim
 comes back empty. Either stops after a hundred claims, so a flush does not
-chase records another instance is still adding.
+chase records another instance is still adding. The one exception is a final
+flush whose records end with the process: a locally staged event, or an event
+staged in a driver that is not durable, such as `memory()`. That flush has no
+cap and claims until a claim comes back empty, since nothing could ship what it
+left behind.
 
 `house.stop()` passes `final` for you. Pass it yourself only in a shutdown path
 that does not go through `stop()`, and call `drain()` first.

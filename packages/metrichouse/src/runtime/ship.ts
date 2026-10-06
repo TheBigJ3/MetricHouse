@@ -18,7 +18,13 @@
  * wrong.
  */
 
-import { type Cell, type Claim, type Driver, isEmptyClaim } from '../drivers/types.js'
+import {
+  type BucketRow,
+  type Cell,
+  type Claim,
+  type Driver,
+  isEmptyClaim,
+} from '../drivers/types.js'
 import type {
   AnyMetric,
   MaterializedBatch,
@@ -177,6 +183,11 @@ export interface OpenSeriesShip {
   readonly sink: WriteFn
   /** The metric's failure count, shared with its flushes. */
   readonly attempts: Attempts
+  /**
+   * Whether this process has claimed at or past `aimed`. Left out, it counts
+   * as having done so, and the driver is always asked where the write landed.
+   */
+  readonly claimedPast?: (aimed: number) => boolean
 }
 
 /**
@@ -217,13 +228,7 @@ export async function shipOpenSeries(ship: OpenSeriesShip): Promise<void> {
   // watermark. Every live window from the aimed one through that one is
   // sent: a window a failed flush released can sit in front of the landing
   // one, the aimed window among them
-  let live = await readOpenWindow(
-    ship.driver,
-    ship.metric,
-    ship.bucketTs,
-    ship.resolutionMs,
-    (newest) => read(ship.bucketTs, newest + ship.resolutionMs),
-  )
+  let live = await readLanded(ship, read)
 
   // a driver that cannot say where the write landed: nothing where it was
   // aimed means it was moved, so every live window from there on is sent
@@ -260,4 +265,33 @@ export async function shipOpenSeries(ship: OpenSeriesShip): Promise<void> {
     throw sinkFailure(ship.metric, thrown)
   }
   ship.attempts.current = 1
+}
+
+/**
+ * The live windows of one series from the one a write aimed at through the
+ * one it landed in.
+ *
+ * Usually the write landed where it aimed, and asking the driver where it
+ * landed costs as much again as the read. So while no claim this process made
+ * reaches the aimed window, the aimed window is read alone, and a write found
+ * there counts as having landed there. Only an aimed window that reads back
+ * empty asks the driver, since a claim by another process is the one way a
+ * write is then moved. A window this process claimed, which a failed flush may
+ * have released while the write moved past it, is read the way
+ * {@link readOpenWindow} reads it.
+ */
+async function readLanded(
+  ship: OpenSeriesShip,
+  read: (from: number, to?: number) => Promise<BucketRow[]>,
+): Promise<BucketRow[]> {
+  const { driver, metric, bucketTs: aimed, resolutionMs } = ship
+  if (driver.landing === undefined || ship.claimedPast?.(aimed) !== false) {
+    return readOpenWindow(driver, metric, aimed, resolutionMs, (newest) =>
+      read(aimed, newest + resolutionMs),
+    )
+  }
+  const atAimed = await read(aimed, aimed + resolutionMs)
+  if (atAimed.length > 0) return atAimed
+  const landed = await driver.landing(metric, aimed, resolutionMs)
+  return landed === aimed ? atAimed : read(aimed, landed + resolutionMs)
 }

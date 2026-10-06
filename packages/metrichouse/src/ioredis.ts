@@ -10,5 +10,6 @@ export {
   type IoredisDriverOptions,
   type IoredisPipeline,
   type IoredisSource,
+  type IoredisTransaction,
   ioredis,
 } from './drivers/ioredis.js'

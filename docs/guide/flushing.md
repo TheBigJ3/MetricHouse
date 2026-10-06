@@ -191,13 +191,14 @@ driver records when the turn was taken, with a token unique to that turn, and
 refuses the next one until nine tenths of the interval has passed, whichever
 process asks. The last tenth is slack, so a cron that fires a little earlier
 within its minute than it did last time still gets the turn. A refused flush reports
-`skipped: true` with `reason: 'cadence'`, and `nextEligibleInMs` counts from the
-turn the other process took.
+`skipped: true` with `reason: 'cadence'`, and `nextEligibleInMs` says how long
+until nine tenths of the interval has passed since the turn the other process
+took.
 
 ```ts
 // flush: '1m', and server A shipped 20 seconds ago
 const report = await httpRequests.flush()      // on server B
-// { buckets: 0, rows: 0, skipped: true, reason: 'cadence', nextEligibleInMs: 40_000 }
+// { buckets: 0, rows: 0, skipped: true, reason: 'cadence', nextEligibleInMs: 34_000 }
 ```
 
 A flush that writes nothing gives its turn back, so another process can ship

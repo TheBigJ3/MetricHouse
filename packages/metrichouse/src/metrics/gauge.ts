@@ -362,6 +362,7 @@ export function gauge<D extends Shape = Record<never, never>, K extends MetricKi
       materialize,
       totalOf,
       sendsSoFar: slot.sendsSoFar,
+      claiming: slot.claiming,
     }),
 
     ...bucketedReader<D, Partial<Record<GaugeAggregate, number>>>({

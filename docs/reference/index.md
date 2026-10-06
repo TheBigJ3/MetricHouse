@@ -293,4 +293,4 @@ All of these are exported as types from `metrichouse/core`.
 **Driver entry points**
 `MemoryDriverOptions` from `metrichouse/memory`.
 `IoredisClient`, `IoredisDriver`, `IoredisDriverOptions`, `IoredisPipeline`,
-`IoredisSource` from `metrichouse/ioredis`.
+`IoredisSource`, `IoredisTransaction` from `metrichouse/ioredis`.

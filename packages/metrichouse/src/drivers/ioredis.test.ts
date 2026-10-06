@@ -344,6 +344,138 @@ describe('ioredis · scripts Redis forgot', () => {
 
     expect(windows(sent)).toEqual([1000, 2000, 1000, 2000, 3000])
   })
+
+  it('resends a call Redis refused again on its resend, ahead of a call made meanwhile', async () => {
+    const forgot = Object.assign(new Error('NOSCRIPT No matching script. Please use EVAL.'), {
+      name: 'ReplyError',
+    })
+    /** A refusal held back until its `release` is called. */
+    const held = () => {
+      let release = (): void => {}
+      const reply = new Promise<[Error, null][]>((resolve) => {
+        release = () => resolve([[forgot, null]])
+      })
+      return { reply, release }
+    }
+    // the first send, its resend, and a call made while that resend is out
+    const refusals = [held(), held(), held()]
+    const { client, sent } = scriptedClient([])
+    const pipelineOf = client.pipeline.bind(client)
+    let execs = 0
+    ;(client as { pipeline: () => unknown }).pipeline = () => {
+      const pipeline = pipelineOf()
+      const exec = pipeline.exec.bind(pipeline)
+      pipeline.exec = () => refusals[execs++]?.reply ?? exec()
+      return pipeline
+    }
+    const driver = ioredis(client)
+
+    const first = driver.increment([op(1000)])
+    await tick()
+    refusals[0]?.release()
+    await tick()
+    // the resend is out, so this goes behind it
+    const later = driver.increment([op(2000)])
+    await tick()
+    refusals[1]?.release()
+    await tick()
+    refusals[2]?.release()
+    await Promise.all([first, later])
+
+    expect(windows(sent)).toEqual([1000, 1000, 2000, 1000, 2000])
+  })
+
+  it('resends a call Redis refused on each of its first two resends', async () => {
+    const forgot = Object.assign(new Error('NOSCRIPT No matching script. Please use EVAL.'), {
+      name: 'ReplyError',
+    })
+    const { client, sent } = scriptedClient(Array.from({ length: 3 }, () => [[forgot, null]]))
+    const driver = ioredis(client)
+
+    await driver.increment([op(1000)])
+    expect(windows(sent)).toEqual([1000, 1000, 1000, 1000])
+  })
+
+  it('fails a call Redis refused on its third resend', async () => {
+    const forgot = Object.assign(new Error('NOSCRIPT No matching script. Please use EVAL.'), {
+      name: 'ReplyError',
+    })
+    const { client, sent } = scriptedClient(Array.from({ length: 4 }, () => [[forgot, null]]))
+    const driver = ioredis(client)
+
+    await expect(driver.increment([op(1000)])).rejects.toThrow(
+      'NOSCRIPT No matching script. Please use EVAL.',
+    )
+    expect(windows(sent)).toEqual([1000, 1000, 1000, 1000])
+  })
+})
+
+// no server needed: the loads are recorded, not run
+describe('ioredis · loading the scripts', () => {
+  const op = { metric: M, bucketTs: 1000, resolutionMs: 1000, dimKey: WILLOW, delta: 1 }
+
+  it('loads every script inside one transaction, behind one comment naming the set', async () => {
+    const { client } = scriptedClient([])
+    const direct: unknown[] = []
+    const loaded: string[] = []
+    const transactions: number[] = []
+    const withMulti = Object.assign(client, {
+      script: async (...args: unknown[]) => {
+        direct.push(args)
+        return 'sha'
+      },
+      multi: () => {
+        transactions.push(loaded.length)
+        const transaction = {
+          script: (_subcommand: string, text: string) => {
+            loaded.push(text)
+            return transaction
+          },
+          exec: async () => loaded.map(() => [null, 'sha'] as [null, string]),
+        }
+        return transaction
+      },
+    })
+
+    await ioredis(withMulti).increment([op])
+
+    expect(direct).toEqual([])
+    expect(transactions).toEqual([0])
+    expect(loaded).toHaveLength(20)
+    const markers = new Set(loaded.map((text) => text.slice(0, text.indexOf('\n') + 1)))
+    expect([...markers]).toHaveLength(1)
+    expect([...markers][0]).toMatch(/^-- metrichouse set [0-9a-f]{16}\n$/)
+  })
+
+  it('fails the call when Redis refuses a load inside the transaction', async () => {
+    const { client } = scriptedClient([])
+    const refused = Object.assign(new Error('ERR busy'), { name: 'ReplyError' })
+    const withMulti = Object.assign(client, {
+      multi: () => {
+        const transaction = {
+          script: () => transaction,
+          exec: async () => [[refused, null]] as [Error, null][],
+        }
+        return transaction
+      },
+    })
+
+    await expect(ioredis(withMulti).increment([op])).rejects.toThrow('ERR busy')
+  })
+
+  it('fails the call when the transaction is discarded', async () => {
+    const { client } = scriptedClient([])
+    const withMulti = Object.assign(client, {
+      multi: () => {
+        const transaction = { script: () => transaction, exec: async () => null }
+        return transaction
+      },
+    })
+
+    await expect(ioredis(withMulti).increment([op])).rejects.toThrow(
+      'ioredis driver: the script load was discarded',
+    )
+  })
 })
 
 // no server needed: these never read what a script stored
@@ -1584,10 +1716,15 @@ end`,
       const loads: unknown[] = []
       const counting = new Proxy(live, {
         get(target, prop, receiver) {
-          if (prop !== 'script') return Reflect.get(target, prop, receiver)
-          return (...args: [string, ...unknown[]]) => {
-            if (args[0] === 'LOAD') loads.push(args[1])
-            return target.script(...(args as Parameters<typeof target.script>))
+          if (prop !== 'multi') return Reflect.get(target, prop, receiver)
+          return () => {
+            const transaction = target.multi()
+            const queue = transaction.script.bind(transaction)
+            transaction.script = ((...args: [string, ...unknown[]]) => {
+              if (args[0] === 'LOAD') loads.push(args[1])
+              return queue(...(args as Parameters<typeof queue>))
+            }) as typeof transaction.script
+            return transaction
           }
         },
       })

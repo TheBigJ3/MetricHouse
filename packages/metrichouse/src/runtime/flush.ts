@@ -72,7 +72,11 @@ export interface MetricFlushReport {
   readonly rows: number
   readonly skipped: boolean
   readonly reason?: FlushSkipReason
-  /** How long until the cadence lets this metric ship again. */
+  /**
+   * How long until the cadence lets this metric ship again: until nine tenths
+   * of the interval has passed since the last shipment, since a call that
+   * early already counts as on time.
+   */
   readonly nextEligibleInMs?: number
   readonly error?: unknown
   /**
@@ -264,6 +268,15 @@ export interface MetricFlushOptions {
    * nothing.
    */
   readonly claimLimit?: number
+  /**
+   * Whether what this metric holds outlives the process.
+   *
+   * A final flush on a metric whose storage does not stops claiming only at a
+   * claim that comes back empty, with no cap, because whatever it leaves
+   * behind ends with the process. Left out, the storage counts as outliving
+   * it, and the cap applies.
+   */
+  readonly outlivesProcess?: () => boolean
 }
 
 /**
@@ -354,7 +367,7 @@ export function metricFlush(
           rows: 0,
           skipped: true,
           reason: 'cadence',
-          nextEligibleInMs: flushMs - elapsed,
+          nextEligibleInMs: gapMs - elapsed,
         }
       }
     }
@@ -364,7 +377,7 @@ export function metricFlush(
     const entry = { at: now, seq: ++state.admitted }
     state.inFlight.add(entry)
     try {
-      return await shipWithTurn(metric, entry, final, flushMs, gapMs, flushOptions)
+      return await shipWithTurn(metric, entry, final, gapMs, flushOptions)
     } finally {
       state.inFlight.delete(entry)
     }
@@ -398,7 +411,6 @@ export function metricFlush(
     metric: AnyMetric,
     entry: Admitted,
     final: boolean,
-    flushMs: number,
     gapMs: number,
     flushOptions: FlushOptions,
   ): Promise<MetricFlushReport> {
@@ -425,7 +437,7 @@ export function metricFlush(
           rows: 0,
           skipped: true,
           reason: 'cadence',
-          nextEligibleInMs: taken.lastTakenAt + flushMs - now,
+          nextEligibleInMs: taken.lastTakenAt + gapMs - now,
         }
       }
       turn = { driver, taken }
@@ -494,7 +506,9 @@ export function metricFlush(
     //    carries less. A final flush claims again until one comes back empty,
     //    since a process that is stopping has no later flush to wait for.
     //    The cap stops either chasing records another process is still
-    //    appending.
+    //    appending. A final flush on storage that ends with this process has
+    //    no cap: what it left behind would be lost, and no other process
+    //    appends to storage only this one can see.
     let buckets = 0
     let rows = 0
     const written = { buckets: 0, rows: 0 }
@@ -519,7 +533,9 @@ export function metricFlush(
       return { report, wrote: written.rows > 0 }
     }
 
-    for (let claims = 0; claims < CLAIM_CAP; claims++) {
+    const cap =
+      final && options.outlivesProcess?.() === false ? Number.POSITIVE_INFINITY : CLAIM_CAP
+    for (let claims = 0; claims < cap; claims++) {
       let outcome: ShipOutcome
       try {
         // what is claimable is the metric's judgement, not this file's

@@ -534,11 +534,13 @@ The window a write aimed at `bucketTs` would land in now, by the rule in
 otherwise the first window of `resolutionMs` at or past the watermark.
 `counter.current()`, `gauge.current()` and `gauge.totals()` read the window this
 names. After a clock steps back behind the watermark, writes land ahead of the
-clock, and reading the window the clock is in would leave them out. An
+clock, and reading the window the clock is in would leave them out. A metric
+asks for it at the same time as it reads `bucketTs`, so when the two agree,
+which is nearly always, it waits for one answer rather than two in a row. An
 immediate send reads every window of its series from `bucketTs` through the one
-this names. A metric asks for it at the same time as it reads `bucketTs`, so
-when the two agree, which is nearly always, it waits for one answer rather than
-two in a row. A driver without this method is read at `bucketTs`.
+this names, and asks only when its process has claimed at or past `bucketTs`,
+or when `bucketTs` reads back empty. Otherwise it reads `bucketTs` alone. A
+driver without this method is read at `bucketTs`.
 
 The Redis driver runs the same Lua function its write scripts use, so a read
 and a write cannot disagree about where a write goes.
@@ -726,11 +728,26 @@ Four rules that are easy to get wrong:
   end on the older of the two values. A plain read sent without a script, such
   as the index lookup of `readBuckets`, cannot be refused, so when a round
   trip sent before it turns out to have been refused, the driver runs the read
-  again once the resend has gone. One gap remains. The set goes to Redis as
-  one `SCRIPT LOAD` per script, back to back, and a restart or a flush that
-  lands between two of them leaves part of the set loaded. Until the next
-  refusal reloads it, a call on a script that survived can land ahead of the
-  resend of a call made before it.
+  again once the resend has gone. Redis can forget the scripts again between
+  the reload and the resend, so a resend can be refused too. That call goes
+  into the next reload and resend as a first refusal does, still ahead of
+  anything made after it, and the driver resends one call at most three times.
+  A call refused on its third resend fails with the `NOSCRIPT` error Redis
+  answered. The set goes to Redis inside one `MULTI`/`EXEC` transaction, so a
+  flush cannot land between two of its loads and leave part of the set
+  loaded. A client without `multi()` loads each script on its own, back to
+  back, and there a restart or a flush between two loads still leaves part of
+  the set loaded, so until the next refusal reloads it a call on a script that
+  survived can land ahead of the resend of a call made before it. Every script
+  is loaded behind a comment that names the set, `-- metrichouse set` and a
+  hash of every script's text. Redis knows a script by the SHA1 of its text, so
+  no script of this driver shares a SHA with a script of 0.7.0 or of a build
+  whose scripts differ, and another process reloading its own scripts after a
+  flush cannot reload one of this driver's. What still holds the order is that
+  every script call of one writer goes through that writer's queue. A process
+  of the same build reloading the same set after a flush can still let a call
+  of this writer, issued before its own refusal came back, run ahead of that
+  refused call's resend.
 
 ### Settling twice
 

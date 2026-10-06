@@ -177,9 +177,28 @@ function collect(schema: SchemaInput | undefined): AnyMetric[] {
   return [...new Set(values.filter(isMetric))]
 }
 
-/** A config value as an error message shows it. */
+/**
+ * A config value as an error message shows it. A function is named rather
+ * than printed, since its source says nothing about the mistake.
+ */
 function shown(value: unknown): string {
+  if (typeof value === 'function') return 'a function'
   return typeof value === 'string' ? JSON.stringify(value) : String(value)
+}
+
+/**
+ * Parse a duration setting, naming the setting in the error when the
+ * duration itself does not parse.
+ */
+function parseSetting(what: string, parse: () => number): number {
+  try {
+    return parse()
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('parseDuration: ')) {
+      throw new Error(`${what}: ${error.message}`)
+    }
+    throw error
+  }
 }
 
 /**
@@ -191,6 +210,11 @@ function shown(value: unknown): string {
  */
 function assertConfig(config: HouseConfig | undefined): asserts config is HouseConfig {
   const driver: unknown = config?.driver
+  if (typeof driver === 'function') {
+    throw new Error(
+      'createHouse: driver is a function, not a driver. Call it, as in memory() or ioredis(client)',
+    )
+  }
   if (typeof driver !== 'object' || driver === null) {
     throw new Error(
       `createHouse: driver is required, such as memory() or ioredis(client), got ${shown(driver)}`,
@@ -226,11 +250,16 @@ export function createHouse(config: HouseConfig): House {
   // driver cannot change under a house
   const delivery: DeliveryMode = resolveDelivery(config.delivery, config.driver.capabilities)
 
+  const { flush, grace } = config.defaults ?? {}
   const defaults: HouseDefaults = {
-    ...(config.defaults?.flush !== undefined && {
-      flushMs: parseInterval(config.defaults.flush, 'createHouse: defaults.flush'),
+    ...(flush !== undefined && {
+      flushMs: parseSetting('createHouse: defaults.flush', () =>
+        parseInterval(flush, 'createHouse: defaults.flush'),
+      ),
     }),
-    ...(config.defaults?.grace !== undefined && { graceMs: parseDuration(config.defaults.grace) }),
+    ...(grace !== undefined && {
+      graceMs: parseSetting('createHouse: defaults.grace', () => parseDuration(grace)),
+    }),
   }
 
   // said once, at boot: a driver that cannot survive a restart cannot honour
