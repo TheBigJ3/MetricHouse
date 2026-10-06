@@ -151,8 +151,8 @@ afterwards does not change what ships.
 
 ```ts
 dims: { metadata: json() }
-// Error: dim "metadata" declares json(), which cannot be encoded into a series
-// key. Put it on an event instead.
+// Error: http_requests: dim "metadata" declares json(), which cannot be encoded
+// into a series key. Put it on an event instead.
 ```
 
 ## Modifiers

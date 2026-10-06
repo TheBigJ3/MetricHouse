@@ -288,7 +288,10 @@ What it does:
 - Sends failures to `onError`, since a scheduled flush has no caller to return a
   report to. A failed recovery pass goes there too, as its `recoveryError`,
   although the flush below it still ran, and so do a `releaseError` and an
-  `ackError`. With no `onError`, each becomes an unhandled rejection.
+  `ackError`. With no `onError`, each becomes an unhandled rejection, except the
+  `recoveryError` of a locally staged event that could not ask its driver for
+  records an earlier declaration left there, which is dropped. The next interval
+  asks again, and nothing was lost.
 - Unreferences its timers, so metrics never keep your process alive.
 - Picks up metrics registered after it started.
 
@@ -400,7 +403,8 @@ Two separate things are happening here, and both are needed:
 
 With the memory driver on serverless, `drain()` is not enough, because the data
 is inside an isolate that may never run again. Use a shared driver such as
-`ioredis()`, or turn on immediate delivery. See
+`ioredis()`. Immediate delivery also gets the rows out, but each isolate then
+sends its own running total, so only events and logs stay exact. See
 [Deployment targets](/guide/production).
 
 ## In production

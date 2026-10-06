@@ -2,10 +2,10 @@
 
 A driver is where running totals and staged records live between a write and a
 flush. The interface is fourteen methods and one `capabilities` property, plus
-two [optional reads](#optional-reads) a driver may add to answer two questions
-with less data on the wire, and two optional methods for
-[taking turns](#taking-turns), which keep every process sharing the driver to
-one flush cadence. Implementing it is how you put MetricHouse on storage it
+three [optional reads](#optional-reads) a driver may add, two to answer a
+question with less data on the wire and one to find where a moved write
+landed, and two optional methods for [taking turns](#taking-turns), which keep
+every process sharing the driver to one flush cadence. Implementing it is how you put MetricHouse on storage it
 does not ship with.
 
 ```ts
@@ -283,9 +283,14 @@ earlier.
 
 Two processes writing to one series near a window boundary can deliver the later
 window's write first. The rules below keep every window right whichever arrives
-second. An `add` is a change, so it applies from the window it lands in onwards.
-A `set` is a reading. A later window with a written cell was written later, and
-a later carried cell only repeated the value before the `set`.
+second only when every write to the series is an `add` and none lands past
+`holdFor`. An `add` is a change, so it applies from the window it lands in
+onwards. A `set` is a reading. A later window with a written cell was written
+later, and a later carried cell only repeated the value before the `set`.
+
+Mixing the two is where arrival order shows. A late `add` also adds its `delta`
+to a later window a `set` wrote, and a late `set` does not rebase a later
+window an `add` wrote. Both built in drivers follow the table as written.
 
 | | `add` of `delta` | `set` to `value` |
 | --- | --- | --- |
@@ -587,8 +592,8 @@ window, so no late write would ever move forward again.
 **Never reuse a claim id**, even after storage loses its most recent writes. A
 Redis restart between two disk syncs, or a failover to a replica that was
 behind, rolls back anything Redis kept, a counter included. An id handed out a
-second time names a claim still in flight, the two share one in-flight key, and
-settling either one settles both. The Redis driver mints each id in the process
+second time names a claim still in flight, the two share one key for claims in
+flight, and settling either one settles both. The Redis driver mints each id in the process
 as the metric name and a UUID version 7, which needs nothing Redis remembers.
 Claims taken under the `metric#n` ids of an earlier version still recover and
 settle, because nothing reads an id apart from the key it names.
@@ -866,7 +871,7 @@ and nothing else, the layout 0.7.0 reads, and `mh:turntok:<metric>` holds the
 token. The script writes and compares both together. It mints the token in the
 process, a UUID version 7. A turn 0.7.0 took has no token of its own and reads
 with whatever token the second key held before it. A turn stored as
-`at|token` in a single key, the layout of builds between 0.7.0 and this one,
+`at|token` in a single key, the layout of a prerelease build of 0.8.0,
 is read as that turn and rewritten into the two keys the first time a
 process of this version asks for or gives back the turn.
 

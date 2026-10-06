@@ -318,7 +318,7 @@ the time.
 A 0.7.0 claim that raises `mh:wm` leaves the second part naming an older value.
 This version then lands writes by the higher of the two watermarks, and there is
 no gap. With no `mh:wmown` key at all, `mh:wm` is the whole watermark, as 0.7.0
-left it, or as a build between 0.7.0 and this one left it between two
+left it, or as a prerelease build of 0.8.0 left it between two
 boundaries. The next claim of this version writes both keys.
 
 ### Looking at a running system
@@ -379,7 +379,7 @@ ship. See [Delivery modes](/guide/delivery).
 | One long running server, some loss acceptable | `memory()` |
 | Several instances behind a load balancer | `ioredis()` |
 | Data you cannot lose | `ioredis()` |
-| Serverless or edge | `ioredis()`, or `memory()` with immediate delivery |
+| Serverless or edge | `ioredis()`, or `memory()` with immediate delivery for events and logs only |
 | You want live reads across the whole fleet | `ioredis()` |
 
 ## Switching between them
@@ -411,7 +411,7 @@ export const house = createHouse({ driver, schema })
   alone, the layout 0.7.0 reads, and the token sits in a key of its own that
   0.7.0 leaves alone. Processes of both versions on one namespace, in a rolling
   deploy either way, take and give back each other's turns. A turn key that a
-  build between 0.7.0 and this one left as `at|token` is rewritten into the
+  prerelease build of 0.8.0 left as `at|token` is rewritten into the
   two keys the first time a process of this version takes or gives back that
   turn. Until then a 0.7.0 process fails every flush of that metric, so run
   this version on at least one process before rolling back to 0.7.0.
@@ -421,14 +421,28 @@ export const house = createHouse({ driver, schema })
   versions on one namespace share every series and every window, a failed
   flush included. Each process applies the level rules of its own version to
   what it writes and carries, so each window ships by the rules of the version
-  that wrote or carried it. The two differ in two places. This version stops
-  carrying a series once `holdFor` has passed since the newest write before
-  the window, where 0.7.0 counts from the newest write of all. So when writes
-  pause for longer than `holdFor` and then resume, 0.7.0 carries the windows of
-  the pause and this version skips them. An
-  `add` that arrives late for a window where the series had already expired
-  starts from zero on this version, and from the expired value on 0.7.0.
-- **0.7.0 reads the levels a build between it and this one left, after one
+  that wrote or carried it. The two differ in four places.
+  - This version stops carrying a series once `holdFor` has passed since the
+    newest write before the window, where 0.7.0 counts from the newest write of
+    all. So when writes pause for longer than `holdFor` and then resume, 0.7.0
+    carries the windows of the pause and this version skips them.
+  - An `add` that arrives late for a window where the series had already
+    expired starts from zero on this version, and from the expired value on
+    0.7.0.
+  - An `inc` or `dec` aimed at a window more than `holdFor` after the series'
+    newest write starts from zero on this version. On 0.7.0 it builds on the
+    expired value until a flush drops the series.
+  - A `set` that missed its window and moved forward to the watermark, and
+    finds a reading taken in that window, is dropped by this version. 0.7.0
+    replaces the reading with it.
+
+  A write 0.7.0 makes past a series' pointer can also leave this version unable
+  to tell which write the series last carried from. It keeps that in
+  `mh:lvlfrom` only for its own writes, so it takes the pointer, the latest
+  that write can be. The series may then carry for up to `holdFor` past the
+  window it was last carried through before it expires, where a process of
+  this version alone would have stopped earlier.
+- **0.7.0 reads the levels a prerelease build of 0.8.0 left, after one
   flush.** Such a build stored some series with a fifth field and marked some
   carried cells `@c`, and 0.7.0 treats that series as absent and ships such a
   cell as `NaN`. A process of this version rewrites every series of a level in
@@ -442,7 +456,7 @@ export const house = createHouse({ driver, schema })
   late write for a window that was empty when a claim of this version last
   ran keeps that window on a process of this version, and moves to the
   boundary that claim reached on 0.7.0, so it ships in the window the version
-  that wrote it chose. A watermark that a build between 0.7.0 and this one
+  that wrote it chose. A watermark that a prerelease build of 0.8.0
   stored between two boundaries stays until a claim of this version reaches a
   boundary past it, and until then 0.7.0 moves a late write into a window no
   row of the metric can name.
@@ -489,7 +503,7 @@ export function myDriver(): Driver {
 The bodies are placeholders, so this compiles and does nothing useful yet.
 Fill in each one from the contract.
 
-Three more methods are optional. `readLevel` reads one series of a level, and
+Five more methods are optional. Three are reads. `readLevel` reads one series of a level, and
 `sumBuckets` adds up an integer counter's window where the data lives. Leave
 them out and every answer stays the same: `level.current(dims)` and
 `counter.current()` read through the fourteen methods instead, which fetches
@@ -499,6 +513,11 @@ one would land in, so `current()` still counts a write the driver moved ahead
 of the clock. Without it, `current()` reads the window the clock is in. The
 [optional reads](/reference/driver-contract#optional-reads) section says what
 each one has to return.
+
+The other two, `takeTurn` and `returnTurn`, come as a pair. They keep every
+process that shares the driver to one flush cadence per metric, and without them
+each process flushes on its own clock. See
+[Taking turns](/reference/driver-contract#taking-turns).
 
 The full method by method contract, including the rules a driver has to obey, is
 in the [driver contract reference](/reference/driver-contract).

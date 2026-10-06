@@ -478,11 +478,16 @@ Nine consequences worth knowing:
 - **The window a series was written in ends at its last write.** Set a queue
   to 5 and then to 3 inside one window, or `inc(5)` then `dec(2)`, and that
   window and every empty one after it hold 3.
-- **`inc()` and `dec()` from several processes add up in any order.** When one
-  server's `inc()` for a window reaches Redis after another server's `inc()` for
-  the next window, the late one still counts in its own window and in every
-  window after it. A `set()` that arrives late fills its own window and does not
-  replace a value written for a later one.
+- **Order does not matter only when every write to a series is `inc()` or
+  `dec()`, and none lands past `holdFor`.** When one server's `inc()` for a
+  window reaches Redis after another server's `inc()` for the next window, the
+  late one still counts in its own window and in every window after it. A series
+  that also takes `set()` can end up different depending on which write
+  arrives first. A late `inc()` adds its change to a later window a `set()`
+  wrote. A late `set()` fills its own window and the carried windows after it,
+  and does not replace a value written for a later one, so a later window an
+  `inc()` wrote is not rebased onto it. An `inc()` that lands more than
+  `holdFor` after the series' newest write starts from zero.
 - **A series begins at its earliest write, whichever arrives first.** When the
   first write to reach storage is for a later window than a write that arrives
   after it, the series begins at the earlier one, and every window between the

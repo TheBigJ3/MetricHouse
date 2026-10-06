@@ -188,8 +188,8 @@ building in TypeScript or JavaScript and:
   not anything moved. \`holdFor\` stops a series that has gone quiet.
 - **\`event\`** keeps discrete records whole, never aggregated. The home for user
   ids, request ids, free text and JSON payloads. Supports per event sampling and
-  can increment counters as a side effect, with the counters evaluated before
-  sampling so they stay exact.
+  can increment counters as a side effect, and those count every record whether
+  sampling keeps it or not, so they stay exact.
 - **\`log\`** is an event with a severity level, a \`minLevel\` filter that drops
   lines before they cost anything, an \`Error\` overload that puts the stack in a
   queryable column, and bound child loggers.

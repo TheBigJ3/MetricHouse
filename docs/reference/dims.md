@@ -89,8 +89,8 @@ a series. Put it on an [event field](/reference/fields) instead.
 
 ```ts
 dims: { metadata: json() }
-// Error: dim "metadata" declares json(), which cannot be encoded into a series
-// key. Put it on an event instead
+// Error: http_requests: dim "metadata" declares json(), which cannot be encoded
+// into a series key. Put it on an event instead
 ```
 
 ### Names a dim cannot take
@@ -518,21 +518,21 @@ half finished state behind.
 
 | Message | Cause |
 | --- | --- |
-| `dim "x" declares json(), which cannot be encoded into a series key` | `json()` used as a dim. At declaration |
+| `http_requests: dim "x" declares json(), which cannot be encoded into a series key` | `json()` used as a dim. At declaration |
 | `default for int(): expected a safe integer, got "five"` | `.default()` given a value its own type rejects. At declaration |
-| `dim "duration_ms" is reserved` | A timer dim using the name a timing carries onto its record event. At declaration |
-| `dim "ts" is reserved` | A timer dim using a column its record event writes on every row: `ts`, `_ingested_at` or `_sample_rate`. At declaration |
-| `dim "id" is a reserved column` | A dim named after a column the metric writes itself. At declaration |
-| `a dim cannot be named "__proto__"` | JavaScript treats that key as an object's prototype, so no row could carry it. At declaration |
-| `a dim cannot be named "2024"` | A name that reads as a whole number, which JavaScript moves ahead of every other key. At declaration |
-| `a dim cannot be named "bucket_open"` | A name every snapshot row already uses, and the same for `bucket_elapsed_ms`. At declaration |
+| `http_latency: dim "duration_ms" is reserved, because it is the field a timing carries onto a record event` | A timer dim using the name a timing carries onto its record event. At declaration |
+| `http_latency: dim "ts" is reserved, because a record event writes a column of that name on every row` | A timer dim using a column its record event writes on every row: `ts`, `_ingested_at` or `_sample_rate`. At declaration |
+| `http_requests: dim "id" is a reserved column` | A dim named after a column the metric writes itself. At declaration |
+| `http_requests: a dim cannot be named "__proto__"` | JavaScript treats that key as an object's prototype, so no row could carry it. At declaration |
+| `http_requests: a dim cannot be named "2024"` | A name that reads as a whole number, which JavaScript moves ahead of every other key. At declaration |
+| `http_requests: a dim cannot be named "bucket_open"` | A name every snapshot row already uses, and the same for `bucket_elapsed_ms`. At declaration |
 | `http_requests: missing required dim "status"` | A declared dim with no value and no default |
 | `http_requests: unknown dim "pakr". The declared dims are [route, status]` | A key that is not declared |
 | `http_requests: route: expected a string, got 42` | A value of the wrong type |
 | `http_requests: status: "200" is not one of ["2xx", "3xx", "4xx", "5xx"]` | A value outside a `oneOf` set |
 | `http_requests: occurredAt: expected a valid Date, got "2026-09-17"` | A `ts()` dim given something that is not a `Date` |
 | `http_requests: dims names "pakr", which is not a declared dim` | A snapshot filter or `groupBy` naming an undeclared dim |
-| `dim value "a\ud800" holds half of a surrogate pair` | A string cut in the middle of an emoji, which storage kept as UTF-8 could not tell apart from another |
+| `http_requests: dim value "a\ud800" holds half of a surrogate pair` | A string cut in the middle of an emoji, which storage kept as UTF-8 could not tell apart from another |
 | `memory driver: http_requests exceeded maxSeries (100000)` | A dim with unbounded values, on `memory()` |
 
 ## Related

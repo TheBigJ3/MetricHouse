@@ -110,8 +110,11 @@ keeps whichever row arrived last can end on an older total than the flush row.
 The house warns about this once at startup through `onWarn`.
 :::
 
-In ClickHouse that means `ReplacingMergeTree`. In Postgres it means
-`ON CONFLICT (id) DO UPDATE`.
+In Postgres that means `ON CONFLICT (id) DO UPDATE`. In ClickHouse it means
+`ReplacingMergeTree(final)` with a `final` column that is 1 on a flush row. A
+plain `ReplacingMergeTree` keeps the row inserted last, so an immediate row that
+arrives after the flush row would replace it. Both tables are shown in
+[Telling the two apart in your sink](#telling-the-two-apart-in-your-sink).
 
 ### Flushing is still required for folded metrics
 
@@ -184,7 +187,9 @@ folded metric's flush row carries the id its immediate rows already used, so
 every source is an upsert on `id`. The table also records whether the row it
 holds came from a flush, and an immediate row never replaces one that did.
 
-```sql
+::: code-group
+
+```sql [Postgres]
 CREATE TABLE http_requests (
   id         TEXT PRIMARY KEY,
   bucket_ts  TIMESTAMPTZ NOT NULL,
@@ -194,7 +199,23 @@ CREATE TABLE http_requests (
 );
 ```
 
-```ts
+```sql [ClickHouse]
+CREATE TABLE http_requests (
+  id         String,
+  bucket_ts  DateTime64(3),
+  route      String,
+  value      Int64,
+  final      UInt8
+)
+ENGINE = ReplacingMergeTree(final)
+ORDER BY (bucket_ts, route);
+```
+
+:::
+
+::: code-group
+
+```ts [Postgres]
 write: async (rows, context) => {
   // true for a flush row, which holds the window's complete value
   const final = context.source === 'flush'
@@ -208,6 +229,26 @@ write: async (rows, context) => {
   `
 }
 ```
+
+```ts [ClickHouse]
+write: async (rows, context) => {
+  // 1 for a flush row, which holds the window's complete value
+  const final = context.source === 'flush' ? 1 : 0
+  await clickhouse.insert({
+    table: 'http_requests',
+    values: rows.map((row) => ({ ...row, final })),
+  })
+}
+```
+
+:::
+
+`ReplacingMergeTree(final)` keeps, among the rows that share a sorting key, the
+one with the largest `final`, and the one inserted last when they tie. A flush
+row therefore beats every immediate row, and a flush row resent after a failed
+acknowledgement replaces the earlier copy with the same value. ClickHouse
+removes the losing rows when it merges parts, so a query that must not see them
+before then reads `FROM http_requests FINAL`.
 
 The `WHERE` on the update is what lets the flush row win. A later immediate row
 for the same id finds `final` set and changes nothing, and a flush resent after

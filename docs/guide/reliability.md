@@ -35,6 +35,8 @@ Your table decides what to do about that.
 ::: code-group
 
 ```sql [ClickHouse]
+-- Fine for the default delivery. For immediate delivery use
+-- ReplacingMergeTree(final), see Delivery modes.
 CREATE TABLE http_requests (
   id         String,
   bucket_ts  DateTime64(3),
@@ -289,6 +291,13 @@ const house = createHouse({
   threw, for any metric type.
 - A locally staged event or log whose `write` function threw when it shipped
   itself on `batch.maxSize`, `batch.maxAge` or `drain()`.
+- A failed acknowledgement, or a failed release, after a send of a locally
+  staged event, or after an immediate send of a driver staged one. For an
+  acknowledgement the rows reached your sink and only the claim could not be
+  settled. For a release the sink failed and the rows could not be put back.
+- A `record()` or `recordMany()` refused by a locally staged event past
+  `batch.maxStaged`, once per turn of the event loop, as the
+  [event page](/primitives/event#batch) describes.
 - A broken `derive` on an event, or a broken `record` pairing on a timer.
 - An `onWarn` that threw while the house registered a metric. The metric is
   registered anyway.

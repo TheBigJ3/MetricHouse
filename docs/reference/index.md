@@ -156,8 +156,12 @@ Some types add properties of their own.
 | `log.at(level, message, fields?)` | Writes at a level chosen while the program runs. Throws if the level was not declared |
 | `log.child(fields)` | A logger that adds `fields` to every line it writes |
 
-`dims?` may be left out only on a metric that declares no dimensions, or on a
-timer handle whose `start()` already supplied them. A log `message` may be a
+`dims?` may be left out on a metric that declares no dimensions. On
+`handle.end()`, `timer.observe()`, `timer.time()` and the log level methods it
+may also be left out once nothing in the shape is still required, for example
+because every dim is optional or `start()` already supplied the rest. Every other
+write and `current()` on a gauge, a level or a timer needs it as soon as one dim
+is declared. See [When the argument may be left out](/reference/dims#when-the-argument-may-be-left-out). A log `message` may be a
 string or an `Error`, and an `Error` fills the `error_stack` column. A child
 logger has the same level methods, `at()` and `child()`, plus `bound`, the
 fields it adds to every line.
@@ -278,13 +282,13 @@ All of these are exported as types from `metrichouse/core`.
 `MergeValues`
 
 **Schema**
-`FieldType`, `Shape`, `ShapeArgs`, `TypeKind`, `InferShape`, `InferValue`,
+`FieldType`, `Shape`, `ShapeArgs`, `TypeKind`, `InferShape`, `InferRow`, `InferValue`,
 `RequiredKeys`, `MarkOptional`, `Simplify`
 
 **Drivers**
 `Driver`, `DriverCapabilities`, `Cell`, `GaugeCell`, `LevelCell`, `LevelSeries`, `BucketRow`, `BucketQuery`, `BucketRange`,
 `PendingQuery`, `StagedRecord`, `Claim`, `BucketClaim`, `RecordClaim`,
-`ClaimedBucket`, `IncrOp`, `GaugeOp`, `LevelOp`, `AppendOp`, `RecoveryReport`, `ShipTurn`, `Hasher`
+`ClaimedBucket`, `IncrOp`, `GaugeOp`, `LevelOp`, `AppendOp`, `RecoveryReport`, `Turn`, `ShipTurn`, `Hasher`
 
 **Extension points**
 `BatchLifecycle`, `BucketedOptions`, `BucketedReader`, `BucketedReaderOptions`,
