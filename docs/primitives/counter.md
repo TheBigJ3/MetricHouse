@@ -129,7 +129,7 @@ windows.
 
 ```ts
 resolution: '10s', flush: '1m'    // 6 windows per shipment
-resolution: '7s',  flush: '1m'    // Error: 7s does not divide 1m evenly
+resolution: '7s',  flush: '1m'    // Error: http_requests: resolution 7s does not divide flush 1m evenly
 ```
 
 Omit it to take `defaults.flush` from the house. A counter with neither throws

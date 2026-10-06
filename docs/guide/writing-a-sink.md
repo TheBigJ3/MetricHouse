@@ -214,6 +214,7 @@ obvious thing:
 | --- | --- |
 | `counter` | every increment in the batch added up |
 | `gauge`, `timer` | every observed value added up |
+| `level` | where every series stood at the end of the batch, so the newest window's values added up. Adding every window would count a level that sat at 42 for five windows as 210 |
 | `event`, `log` | how many records are in the batch |
 
 That is useful when your sink only wants the headline and does not care about the
@@ -232,7 +233,7 @@ write: async (rows, context) => {
 | Value | Meaning |
 | --- | --- |
 | `'flush'` | A normal flush, from a timer, a cron or a direct call. Under immediate delivery it holds a window's final value and must win over an `'immediate'` row with the same `id`, whichever arrives last. See [Delivery modes](/guide/delivery#telling-the-two-apart-in-your-sink) |
-| `'batch'` | A locally staged event filled up and shipped itself |
+| `'batch'` | A locally staged event or log shipped itself, because it reached `batch.maxSize`, because `batch.maxAge` ran out, or because `drain()` ran |
 | `'immediate'` | Immediate delivery. Upsert on `id`, unless the row held came from a flush |
 
 ## Row ids and duplicates
@@ -254,7 +255,8 @@ your table's decision.
 ::: code-group
 
 ```sql [ClickHouse]
--- Keeps the newest row per sorting key.
+-- Keeps the newest row per sorting key. Under immediate delivery use
+-- ReplacingMergeTree(final) instead, so a flush row cannot be replaced.
 CREATE TABLE http_requests (
   id         String,
   bucket_ts  DateTime64(3),

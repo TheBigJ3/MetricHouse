@@ -17,7 +17,7 @@ whether the driver can be trusted to hold data between requests.
 | Vercel functions | `ioredis()` | `'staged'` | A cron route |
 | Cloudflare Workers | `ioredis()` | `'staged'` | A scheduled handler |
 | AWS Lambda | `ioredis()` | `'staged'` | An EventBridge rule |
-| Any serverless, no Redis | `memory()` | `'immediate'` | Nothing for events and logs, plus `drain()`. See below for folded metrics |
+| Any serverless, no Redis | `memory()` | `'immediate'` | Nothing for events and logs, plus `drain()`. Counters, gauges, levels and timers are not exact across isolates, see below |
 
 ## A Node server
 
@@ -191,7 +191,7 @@ export const flushHandler = async () => {
 
 If you do not want a shared driver, use `memory()` with immediate delivery. Rows
 reach your database as they are written, so nothing depends on an isolate
-surviving.
+surviving. This is exact for events and logs only.
 
 ```ts
 export const house = createHouse({
@@ -204,6 +204,16 @@ export const house = createHouse({
 The cost is one database call per application write, and folded metrics resend
 the same row id with a rising running total, so your table must upsert on id and
 let the flush row win. Read [Delivery modes](/guide/delivery) before choosing this.
+
+::: warning Counters, gauges, levels and timers are not exact here
+Every isolate has its own `memory()` driver, so each one keeps its own running
+total for a window and sends it under the same row id, because the id comes from
+the metric, the window and the labels. Your table keeps one isolate's share, and
+a flush from another isolate replaces it with that isolate's share. Count what
+must be exact as an event and add it up in your database, or use a shared driver.
+[Serverless analytics](/examples/serverless-analytics#without-redis) shows the
+numbers from a test.
+:::
 
 Events and logs ship on `record()` and leave the driver, so they need no flush.
 Counters, gauges, levels and timers do not: immediate delivery sends their open
@@ -221,9 +231,17 @@ data dies with the process. With `ioredis()` there is, and the rules below
 decide what happens to it.
 
 **Drain before a change that touches stored shapes.** Stop writing, run
-`await house.drain()`, then a final `await house.flush({ final: true })` and check
-`pending()` on each event and log reads 0. Anything the driver no longer holds
-cannot disagree with the new declaration.
+`await house.drain()`, then `await house.flush({ final: true, force: true })`.
+On a shared durable driver such as `ioredis()`, a final flush without `force`
+skips every metric whose turn another process holds and leaves its rows in
+Redis. `force` ships them now.
+
+Then check what is left. `pending()` counts only the records of an event or a
+log, so check that it reads 0 on each of them. A counter, a gauge, a level or a
+timer has no such count, so read the report of that flush to see what shipped.
+The window that is still open when you stop writing cannot ship, so
+wait until the clock has passed its end and flush again. Anything the driver no
+longer holds cannot disagree with the new declaration.
 
 **A rolling deploy runs both releases at once.** For a while some processes
 still hold the old declaration and share a Redis with processes on the new one.
@@ -352,8 +370,11 @@ The package is marked side effect free, so a bundler removes what you do not use
 
 - [ ] The driver matches how many processes you run.
 - [ ] `house.delivery` is logged at startup.
-- [ ] Something asks for a flush: `start()`, a cron, or immediate delivery.
+- [ ] Something asks for a flush: `start()` or a cron. Immediate delivery does
+      not, and finished windows of counters, gauges, levels and timers stay in
+      the driver until a flush claims them.
 - [ ] `drain()` runs before a serverless response returns.
 - [ ] `stop()` runs on `SIGTERM`.
 - [ ] `onError` and `onWarn` reach your logger.
-- [ ] Tables exist and treat `id` as unique.
+- [ ] Tables exist and upsert on `id`. Under immediate delivery, a row from a
+      flush wins over a running total that arrives after it.
