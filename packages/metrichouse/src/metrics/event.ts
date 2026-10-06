@@ -530,7 +530,10 @@ export function stagedMetric<
    * The ids of staged records reported as unreadable under the fields as
    * declared now, so each is reported once however often it is read. Past
    * {@link REPORTED_CAP} of them, one report says so and the rest go
-   * unreported until records it holds have shipped.
+   * unreported until records it holds have shipped. Records this process
+   * ships are forgotten in `ackBatch`, and records another process shipped
+   * are forgotten by the next read of the whole staged list, see
+   * {@link forgetShipped}.
    */
   const reportedUnreadable = reportedOnce(REPORTED_CAP, () =>
     reportToHandler(
@@ -1360,6 +1363,20 @@ export function stagedMetric<
   }
 
   /**
+   * Forget the reported records a read of the whole staged list did not find.
+   *
+   * Only this process's `ackBatch` forgets a record it shipped. One shipped
+   * by another process sharing the driver would otherwise stay remembered
+   * for good, and at {@link REPORTED_CAP} no record would be reported again.
+   * Called only for a read of the driver's whole list, with no range and no
+   * limit, since a partial read leaves out records still staged.
+   */
+  function forgetShipped(records: readonly StagedRecord[]): void {
+    if (reportedUnreadable.size === 0) return
+    reportedUnreadable.keepOnly(new Set(records.map((record) => record.id)))
+  }
+
+  /**
    * Report a record {@link materialize} could not read, once per record.
    *
    * Once, because `snapshot()` and `peek()` read the same records on every
@@ -1478,6 +1495,9 @@ export function stagedMetric<
               ...(to !== undefined && { to }),
               ...(readLimit !== undefined && { limit: readLimit }),
             })
+      if (stage !== 'local' && from === undefined && to === undefined && readLimit === undefined) {
+        forgetShipped(records)
+      }
 
       const rows = records.map(
         (record) =>
@@ -1504,6 +1524,7 @@ export function stagedMetric<
         stage === 'local'
           ? buffer.slice(0, n ?? buffer.length)
           : await activeDriver().readPending({ metric: name, ...(n !== undefined && { limit: n }) })
+      if (stage !== 'local' && n === undefined) forgetShipped(records)
       return records.map(materialize) as unknown as EventRow<F>[]
     },
 

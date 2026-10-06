@@ -458,6 +458,30 @@ describe('reportedOnce', () => {
     expect(reported.first('c')).toBe(false)
     expect(overflows()).toBe(1)
   })
+
+  it('keeps only the staged ids it holds, and takes new ids again below the cap', () => {
+    const { reported, overflows } = tracked(2)
+    reported.first('a')
+    reported.first('b')
+    reported.first('c')
+    reported.keepOnly(new Set(['b', 'z']))
+    expect(reported.size).toBe(1)
+    expect([reported.first('b'), reported.first('a'), reported.first('d')]).toEqual([
+      false,
+      true,
+      false,
+    ])
+    expect(overflows()).toBe(2)
+  })
+
+  it('stays silent after keeping every id it holds while at the cap', () => {
+    const { reported, overflows } = tracked(1)
+    reported.first('a')
+    reported.first('b')
+    reported.keepOnly(new Set(['a']))
+    expect(reported.first('c')).toBe(false)
+    expect(overflows()).toBe(1)
+  })
 })
 
 describe('isShorterDimKey', () => {

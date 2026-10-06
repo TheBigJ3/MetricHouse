@@ -714,12 +714,23 @@ Four rules that are easy to get wrong:
   after it cannot land between two of them. When Redis has forgotten a script,
   after a restart or a `SCRIPT FLUSH`, it refuses every call sent with the old
   SHA until the driver loads the script again, and those refusals come back one
-  round trip at a time. From the first one, the driver issues nothing new. It
-  waits for every round trip already sent to be answered, then sends every
-  refused call again in one step, in the order the calls were made, and only
-  then issues the sends that were waiting. A call made after one refused call
-  but before the refusal of another would otherwise land ahead of the other's
-  resend, and a level would end on the older of the two values.
+  round trip at a time. The driver loads all of its scripts together, as one
+  set, so after a restart or a flush every SHA it holds is stale and Redis
+  refuses every script call it sends, including one sent while the refusal of
+  an earlier call is still on its way back. From the first refusal, the driver
+  issues nothing new. It waits for every round trip already sent to be
+  answered, then loads the set again, sends every refused call again in one
+  step, in the order the calls were made, and only then issues the sends that
+  were waiting. A call made after one refused call but before the refusal of
+  another would otherwise land ahead of the other's resend, and a level would
+  end on the older of the two values. A plain read sent without a script, such
+  as the index lookup of `readBuckets`, cannot be refused, so when a round
+  trip sent before it turns out to have been refused, the driver runs the read
+  again once the resend has gone. One gap remains. The set goes to Redis as
+  one `SCRIPT LOAD` per script, back to back, and a restart or a flush that
+  lands between two of them leaves part of the set loaded. Until the next
+  refusal reloads it, a call on a script that survived can land ahead of the
+  resend of a call made before it.
 
 ### Settling twice
 

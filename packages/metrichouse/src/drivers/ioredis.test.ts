@@ -1521,8 +1521,65 @@ end`,
       expect(finals).toEqual(Array.from({ length: 15 }, () => 200))
     })
 
-    it('loads a script once for every call in a batch that first needs it', async () => {
-      // a first carry sends one hold script per window
+    it('lands a write ahead of a claim made while Redis was refusing the write', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      const at = (bucketTs: number) => ({
+        metric: M,
+        bucketTs,
+        resolutionMs: 1000,
+        dimKey: WILLOW,
+        delta: 1,
+      })
+      await driver.increment([at(1000)])
+      await live.script('FLUSH')
+      // a claim of another metric, the first call after the flush, so the
+      // claim script is the one Redis is asked for first
+      await driver.claim('other', 0)
+
+      // the write is refused, and the claim made before that refusal comes
+      // back must not run ahead of the write's resend
+      const write = driver.increment([at(2000)])
+      const claim = driver.claim(M, 10_000)
+      await write
+      const { buckets } = await claim
+
+      expect(buckets.map(({ bucketTs, values }) => [bucketTs, Object.fromEntries(values)])).toEqual(
+        [
+          [1000, { [WILLOW]: 1 }],
+          [2000, { [WILLOW]: 1 }],
+        ],
+      )
+
+      await wipe(ns)
+    })
+
+    it('reads a write made before the read while Redis was refusing the write', async () => {
+      const ns = fresh()
+      const driver = ioredis(live, { namespace: ns })
+      const at = (bucketTs: number) => ({
+        metric: M,
+        bucketTs,
+        resolutionMs: 1000,
+        dimKey: WILLOW,
+        delta: 1,
+      })
+      await driver.increment([at(1000)])
+      await live.script('FLUSH')
+
+      const write = driver.increment([at(2000)])
+      const read = driver.readBuckets({ metric: M })
+      await write
+
+      expect(await read).toEqual([
+        { bucketTs: 1000, dimKey: WILLOW, value: 1 },
+        { bucketTs: 2000, dimKey: WILLOW, value: 1 },
+      ])
+
+      await wipe(ns)
+    })
+
+    it('loads every script once, together, for the calls that first need one', async () => {
       const ns = fresh()
       const loads: unknown[] = []
       const counting = new Proxy(live, {
@@ -1535,11 +1592,20 @@ end`,
         },
       })
       const driver = ioredis(counting, { namespace: ns })
-      await driver.setLevel([
-        { metric: M, bucketTs: 0, resolutionMs: 1000, dimKey: WILLOW, value: 1, mode: 'set' },
+      // two calls on two scripts at once, both waiting on the one load
+      await Promise.all([
+        driver.setLevel([
+          { metric: M, bucketTs: 0, resolutionMs: 1000, dimKey: WILLOW, value: 1, mode: 'set' },
+        ]),
+        driver.increment([
+          { metric: G, bucketTs: 0, resolutionMs: 1000, dimKey: WILLOW, delta: 1 },
+        ]),
       ])
+      expect(loads).toHaveLength(20)
+      expect(new Set(loads).size).toBe(20)
       loads.length = 0
 
+      // a first carry sends one hold script per window, and the set is loaded
       await driver.setLevel(
         Array.from({ length: 20 }, (_, i) => ({
           metric: M,
@@ -1550,7 +1616,7 @@ end`,
           mode: 'hold' as const,
         })),
       )
-      expect(loads).toHaveLength(1)
+      expect(loads).toEqual([])
       expect((await driver.readLevels(M))[0]?.heldThrough).toBe(20_000)
 
       await wipe(ns)

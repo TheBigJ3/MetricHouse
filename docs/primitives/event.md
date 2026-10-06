@@ -150,7 +150,9 @@ takes longer than 5 seconds or the flush interval, whichever is shorter, counts
 as `0`, so a Redis that is down never fails, or holds up, the flush of records
 only this process holds, and never keeps `house.stop()` from returning. A claim
 the driver hands over after that wait has given up goes straight back to the
-driver.
+driver. If giving it back fails, that failure goes to `onError`, or is dropped
+when there is none, and the claim stays in flight until a recovery pass
+returns its records.
 
 ```
 page_viewed: could not ask the driver for records an earlier stage: 'driver' declaration left there, so this process looks again in 30000ms. the driver did not answer within 5000ms
@@ -817,9 +819,16 @@ changes it, and the question never comes up.
 `peek()` and `snapshot()` return such a record as stored too. A process reports
 each record at most once, however many times a flush, `peek()` or `snapshot()`
 reads it, so a dashboard polling `house.snapshot()` does not flood `onError`. It
-remembers up to 10,000 reported records per event, and forgets a record once it
-has shipped. The first unreadable record past 10,000 is reported once more, for
-all of them, and no record after it is reported until records it remembers have
+remembers up to 10,000 reported records per event. It forgets a record once its
+own flush has shipped it. A record another process shipped is forgotten by the
+next read of the whole staged list, which is a `peek()` with no `n`, or a
+`snapshot()` with no `from`, `to` or `limit` (or with a `limit` and an
+`orderBy`, which reads every record before it sorts). Only an event staged in
+the driver does this, since the local buffer holds nothing another process
+ships. Such a read also forgets a record a flush has claimed but not yet
+shipped, so if that flush fails and puts the record back, it is reported once
+more. The first unreadable record past 10,000 is reported once more, for all of
+them, and no record after it is reported until records it remembers have
 shipped and brought it below 10,000 again:
 
 ```
