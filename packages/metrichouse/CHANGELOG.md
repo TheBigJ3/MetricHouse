@@ -1,5 +1,211 @@
 # metrichouse
 
+## 0.8.0
+
+### Minor Changes
+
+- 57a43e5: Fix the drivers.
+  
+  - A turn to ship now carries a token of its own, so a flush that wrote nothing no longer gives back a turn another flush took in the same millisecond. `takeTurn` answers `{ granted: true, turn, previous }` with `Turn` objects of `{ at, token }`, and `returnTurn(metric, turn, previous)` takes the turn it gives back. A custom driver that implements the two has to follow. The Redis driver reads a turn stored by an earlier version.
+  - The Redis driver mints claim ids in the process, as the metric and a UUID version 7, instead of from a counter in Redis. A counter that Redis rolled back after losing its latest writes handed out an id still in flight, and settling one claim settled the other. Claims taken under the old ids still recover and settle. `IoredisClient` no longer needs `incr`.
+  - `claim()` throws on a watermark that is not a finite number in both drivers, instead of storing `NaN` and letting late writes land in windows that already shipped.
+  - `memory()` copies a record's fields on `append` and hands out copies from `readPending`, `readLevels` and `readLevel`, so editing either one no longer changes what is stored.
+  - A `memory()` release stopped by a cell of another kind now leaves the claim in flight and the live set unchanged, instead of settling the claim and losing it.
+  - `memory({ maxSeries, maxStaged })` throws on anything but a positive whole number or `Number.POSITIVE_INFINITY`, instead of treating `NaN` as no cap and `0` as a cap that refuses every write.
+  - The Redis driver issues every round trip of one call before any call made after it, so a call split by `maxPipelineSize` no longer has another call's writes land between its halves.
+  - The Redis driver puts a record staged before sequence stamps back ahead of stamped records on release and recovery, the order it reads them in.
+  - The Redis driver refuses a namespace holding half of a surrogate pair, which Redis would store as the same key as other such namespaces.
+  - The Redis driver reads back a record field named `__mh_x` that a version before 0.6.0 stored, instead of renaming it `x`.
+  - Docs: `maxmemory-policy noeviction` is the only safe eviction policy, Redis 4.0 is the minimum version, Redis Cluster is not supported, a large claim backlog blocks Redis while it is claimed, and a refusal is all or nothing per script call of up to 1000 operations.
+- 5cb4e3f: Events, logs and timers:
+  
+  - `timer.time()` returns a new promise when `fn` returns one, settled once the
+    timing is recorded, instead of the caller's own promise. A handler on that
+    promise hid a rejection nobody awaited, which is now reported as an unhandled
+    rejection again.
+  - A timer dim may no longer be named `ts`, `_ingested_at` or `_sample_rate`, the
+    columns a `record` event writes, so pairing a timer with an event later never
+    invalidates it.
+  - `timer.start()` and `log.child()` mark as supplied only the keys the argument
+    is sure to hold, so an object typed `Partial<...>` no longer lets `end()` or a
+    line leave out a required value that then throws.
+  - `timer.start()`, `timer.time()` and a log's own `child()` copy the object they
+    are given, so changing it afterwards moves nothing. `child()` on the log also
+    drops a field passed as `undefined`, as a nested child already did.
+  - After a failed send, `record()` stops sending an event's backlog itself until
+    `batch.maxAge` (local staging) or `flush` (driver staging) has passed. Every
+    record used to hand a sink that was down the whole backlog again, with one
+    `onError` report each. The age clock, `flush()` and `drain()` still send.
+  - New `batch.maxStaged` caps how many records a locally staged event or log
+    holds, `100_000` by default or `maxSize` when larger. A record past it is
+    refused and reported to `onError`.
+  - Under immediate delivery, a driver staged event with a `claimLimit` keeps
+    claiming while a claim comes back full, so one send empties the backlog.
+  - A locally staged event also ships, and counts in `pending()`, records a
+    `stage: 'driver'` declaration of it left in the driver.
+  - A staged record becomes a row under the current declaration: a default
+    declared since fills a missing field, a record staged before `sample` carries
+    `_sample_rate: 1`, text in a field now `json()` ships as JSON text, and a value
+    the field no longer accepts throws, naming the record and the field.
+  - `house.drain()` waits for the counter writes a durable record derives, and
+    derive reads the record as stored, with a fresh copy for each function.
+  - A failed ack after an immediate or local batch send reaches `onError`.
+  - `peek()`, `snapshot()` and sink rows of a locally staged event carry copies of
+    `ts()` values.
+  - `stage: null` is refused at declaration instead of read as `'driver'`.
+- dc61a09: - A flush claims again while a claim comes back with a full `claimLimit`, up to a hundred claims, so a fleet sharing one turn is no longer capped at `claimLimit` records per interval. `claimLimit` now bounds one claim, and one call to `write`, rather than one flush.
+  - A flush still running counts as the latest shipment, so a second flush started meanwhile on the same process reports `skipped` on the cadence rather than shipping in the same interval.
+  - A flush that fails on a later claim reports what the earlier claims wrote as `written`, keeps their `ackError`, and counts as a shipment for the cadence.
+  - A call up to a tenth of the cadence early counts as on time, instead of fifty milliseconds, so a cron firing a little earlier within its minute no longer waits a whole interval.
+  - A scheduled flush sends its `ackError` to `onError`.
+  - `drain()` waits only for the writes issued before it was called, so it resolves under steady traffic. `house.stop()` still waits for writes issued while it drains.
+  - Under immediate delivery, a flush waits for the immediate sends of that metric already under way before its rows reach the sink, so a stale running total cannot arrive after the flush row from the same process.
+  - An immediate send for a write moved forward past a released window sends every live window of the series from the one aimed at, so the landing window is always sent.
+  - `createHouse` refuses a missing driver, an object that is not a driver, and a `now` that is not a function, with messages naming them.
+  - `house.register()` binds and schedules every metric before warning, and an `onWarn` that throws goes to `onError` instead of leaving metrics half registered.
+- 866a554: Fix how a level carries and adds up its series.
+  
+  - A write to a level series past its `holdFor` that no flush had dropped yet
+    moved the value it expired with, and the next flush carried that old value
+    through every window up to the write. The write now starts the series over,
+    so an `inc()` starts from zero, and the flush ships the windows it reported
+    before it expired and nothing through the gap.
+  - `level.totals()` and a `snapshot()` that adds series together returned
+    `Infinity` for fractional series past the largest double. They now reject.
+  - On a level declared `value: int()`, `totals()` and a `snapshot()` that adds
+    series together now add as whole numbers, exactly, and reject only when the
+    exact total is past `9007199254740991`. Added as doubles, a running sum could
+    pass that bound partway and come back as a different whole number.
+  - `level.dec()` named the negated amount when it refused one: `dec(1.5)` on an
+    integer level said `-1.5 is not a legal delta`. It now names `1.5`.
+  - A late `set()` moved forward to the oldest unshipped window replaced a newer
+    reading already there. It is now dropped.
+  - A write that landed while a flush was carrying a series was lost in the
+    windows after it. A `set()` landing between the flush reading the series and
+    filling its windows now reaches every empty window after it, and one landing
+    after the fill replaces the carried values after it up to the next written
+    window, and becomes the current value.
+  - A series whose earliest write reached storage second, from another process
+    or moved forward to the oldest unshipped window, skipped the windows between
+    its two writes, and an `inc()` there counted from the later value. The series
+    now begins at the earlier write, every window between ships, and the `inc()`
+    starts from zero.
+  
+  Custom drivers: `LevelOp` gains `holdFor`, `LevelSeries` gains `carriedFrom`,
+  and `LevelCell` gains `carried`, which a driver sets on a cell a `hold` writes.
+  A `hold` fills its window with the value in effect just before it, read when it
+  lands. The driver contract page has the rules under `setLevel`, and the shared
+  contract suite checks them. `ioredis()` reads
+  level state and cells stored by earlier versions.
+- 26b461c: - A final flush on a driver that is not durable, such as `memory()`, also ships
+    every window ahead of the clock. After the clock stepped back, `house.stop()`
+    used to report success with nothing shipped and the writes were lost.
+  - A claim raises the watermark no further than one past the newest window that
+    held data, and a claim that finds nothing leaves it alone. One flush on a clock
+    far ahead no longer moves every later write into a single window that no flush
+    can take until the clock catches up.
+  - `current()` on a counter, a gauge or a timer, and `gauge.totals()`, read the
+    window a write made now lands in, so a write moved ahead of a clock that
+    stepped back counts in the open total.
+  - A write aimed below the watermark lands on the first window of its own
+    resolution at or past it. After a change of resolution it used to land on the
+    old watermark, off the new grid, and a level lost the value it set in every
+    window carried after it.
+  - Driver contract: `IncrOp`, `GaugeOp` and `LevelOp` carry `resolutionMs`,
+    `claim()` takes an optional `aheadFrom`, and a driver may add `landing()`. A
+    custom driver has to land a moved write on the operation's own grid, and
+    follow the new watermark rules in the driver contract reference.
+
+### Patch Changes
+
+- 6512ad5: - A gauge `totals()` or a merged `sum` across series that passes the largest double throws instead of returning `Infinity`.
+  - A row's `.default()` dim or field is typed as always present on sink rows and live rows. Call sites still may omit it.
+  - The published type declarations no longer include the internal `Gauge.openFolds`.
+  - `snapshot({ orderBy })` throws for a name that is not a column of the metric even when there are no rows, and no longer accepts an inherited property such as `toString`.
+  - Declaration errors for a `resolution` that does not divide `flush` start with the metric name.
+  - A value of the wrong type passed to a gauge, level or timer is named by its type in the error, and a cell of the wrong kind names the kind the driver returned.
+  - A counter's `add()` errors for a missing or unknown dim start with the metric name, as do the same errors from a gauge, level and timer.
+  - An integer counter adds totals across series and windows exactly, and refuses one only when the exact total passes `Number.MAX_SAFE_INTEGER`.
+  - A stored fraction on an integer metric, left by changing `float()` to `int()`, is reported as not a whole number and no longer as an overflow. Both drivers.
+  - A stored dim value the current declaration cannot hold, such as text under an `int()` dim, a removed `oneOf` member or a missing value for a required dim, is reported to `onError` and shipped as stored. A level stops carrying such a series.
+- 6735fe5: - Reword the startup warning of immediate delivery. It now says the sink must upsert on id and keep the flush row over an immediate one.
+- ef48c84: Events and logs:
+  
+  - A staged record the current declaration cannot read, one missing a field now
+    required or holding a value its field no longer accepts, ships with its
+    values as stored and is reported to `onError` with the metric, its id and the
+    reason, instead of failing every flush that claimed it and holding up every
+    record behind it. `peek()`, `snapshot()` and `house.snapshot()` return it as
+    stored too, and a process reports each record at most once.
+  - A locally staged event asks the driver for records an earlier
+    `stage: 'driver'` declaration left there only until the driver answers that
+    it holds none, and again once per flush interval after that. Until then a
+    flush and `pending()` make no driver call. A driver that fails or does not
+    answer within 5 seconds, or the flush interval when shorter, is reported to
+    `onError` and counts as holding none, so a Redis that is down no longer fails
+    a local flush, hangs `pending()` or keeps `house.stop()` from returning.
+  - A flush of a locally staged event ships the records left in the driver and
+    the local buffer in the same send, instead of leaving the buffer for the
+    next trigger.
+  - Records refused past `batch.maxStaged` are reported once per turn of the
+    event loop, naming how many were refused, instead of one error per record.
+- d579474: - The Redis turn key `mh:turn:<metric>` holds the time alone again, the layout 0.7.0 reads, and the token moves to `mh:turntok:<metric>`. A 0.7.0 process on the same namespace no longer fails every flush, and a turn key left as `at|token` by a prerelease build of 0.8.0 is rewritten into the two keys the first time a process takes or gives back that turn.
+  - Under immediate delivery, a flush waits only for the immediate sends aimed at a window it claimed, and for at most one `flush` interval, so a `write` function that never answers an immediate send no longer holds up every later flush of the metric.
+  - When flushes overlap, the cadence counts from the one started last, so a slow flush finishing after a forced one no longer lets the next call ship twice in one interval.
+  - When Redis has forgotten its scripts, the Redis driver sends the refused scripts of every round trip of one call again in one step, so a later call cannot land between them.
+  - An immediate send for a write aimed at a released window sends the window the write landed in as well.
+  - `counter.current()`, `gauge.current()` and `gauge.totals()` on Redis ask where a write lands at the same time as they read, so they wait for one round trip instead of two.
+- 9449f1f: - A level on Redis keeps each series in the four fields 0.7.0 reads, `value|carried|writtenAt|heldThrough`, and `carriedFrom` in a hash of its own, `mh:lvlfrom:<metric>`, only when those four cannot say it. A carried cell is stored as `@ 7` and a moved one as `@7 `, which 0.7.0 reads as `7`. A 0.7.0 process sharing the namespace in a rolling deploy now ships the same rows as one process alone, where it used to overwrite series it could not read and ship `NaN` for carried cells. A series or cell a prerelease build of 0.8.0 stored as five fields or as `@c7` is still read, and is rewritten in the new layout the next time it is written or carried.
+  - A second `set()` that missed its window and moved forward to the watermark replaces the first one moved there, and `current()` follows it. It used to be dropped, as if the first were a reading taken in that window. A reading taken in the window itself still wins over both.
+  - An `inc()` or `dec()` that arrives late, aimed at a window inside a stretch where the series had passed `holdFor` before a newer write revived it, starts from zero. It used to build on the value the series expired with.
+  - `totals()` and a merging `snapshot()` on a level declared `value: int()` add stored fractions, which a `float()` level wrote, as doubles: `1.5` and `0.5` total `2`, and a total that is not a whole number rejects with an error naming the cause. They used to throw a bare `RangeError`.
+  - Level writes and flushes on Redis cost about what they cost in 0.7.0 again. A flush holds every series from one read of the windows between its pointer and the window it fills, and a write reads the windows after its own once per call.
+  - The Redis driver loads a script once when many calls in one batch first need it. A first level carry used to load the same script once per window it filled.
+  - Document that a level series whose first write lands between a flush's read and its claim, stamped more than `grace` in the past, loses the windows that flush claims.
+  
+  Custom drivers: `LevelCell` gains `moved`, which a driver sets on a cell only writes moved forward to the watermark have written.
+- 885969c: Fix the reads.
+  
+  - A stored series key the current declaration cannot decode, such as text under an `int()` dim, a removed `oneOf` member, a dim removed from the end or a value stored as absent for a dim that is now required, no longer fails the flush of its metric and `snapshot()`. It is reported to `onError` once per process with the metric, the dim, the stored text and the reason, and its rows ship with the stored text as the value of each dim that cannot be read. Other series ship as usual. This holds for a counter, gauge, level and timer. A level still leaves such a series out of its carry and `totals()`.
+  - A number or a timestamp stored in a dim key is decoded only from the text MetricHouse writes for it, so `0x1F`, `1e3`, ` 7`, `+5` and `007` are no longer read as numbers.
+  - Docs: a `oneOf` member or a `.default()` added to an optional dim reaches processes still on the old declaration as keys they cannot decode during a rolling deploy, and the dim errors that docs quote start with the metric name.
+- 5917b6c: Keep Redis storage readable by 0.7.0 during a rolling deploy.
+  
+  - A claim on Redis raises `mh:wm:<metric>` to the window boundary it claimed up to, the value 0.7.0 reads, and keeps the lower watermark this version lands late writes by in the hash `mh:wmown:<metric>`, with the windows its writes start between the two, so a write of this version moves past one that a 0.7.0 claim at the same boundary has taken since. The key 0.7.0 reads used to hold one past the newest window with data, off the metric's grid, so a 0.7.0 process moved a late write into a window of its own one millisecond past a real one, and a level carried the wrong value from it. A watermark a 0.7.0 claim raises is still honoured, and one a prerelease build of 0.8.0 stored off the grid is read as it is and replaced by the next claim of this version.
+  - Every flush of a level on Redis rewrites series a prerelease build of 0.8.0 stored in five fields into the four 0.7.0 reads, even when it carries nothing. They used to stay in five fields until written or carried, and 0.7.0 treated them as absent. A claim that takes, or a release or recovery that puts back, a cell such a build marked `@c` rewrites it as `@ `, which 0.7.0 reads as its number.
+  - Docs: a namespace shared with 0.7.0 ships each level window by the rules of the version that wrote or carried it, and the upgrade notes say how the two differ.
+- 6e5ca64: Fix how sends wait for one another.
+  
+  - A flush under immediate delivery waits for an immediate send only until one flush interval after that send started, and never waits again for a send an earlier flush gave up on. A `write` function that never answered one immediate send used to hold up every later flush of the metric by a full interval, so a metric on the scheduler shipped only every other interval.
+  - The Redis driver keeps one writer's writes in order when Redis forgets its scripts. After the first NOSCRIPT refusal it issues nothing new until every round trip already sent is answered, then sends every refused call again in the order the calls were made. A call made between two refusals used to land ahead of the second one's resend, so a level set or gauge could end on the older value.
+  - Docs: `drain()` and `house.stop()` wait for an immediate send already under way with no limit, so a `write` function needs a timeout of its own.
+- d0320bb: Stored data the current declaration cannot read:
+  
+  - A house with no `onError` no longer crashes on news the library reports on its own. A locally staged event that cannot ask the driver for records an earlier `stage: 'driver'` declaration left there, and a staged record the current fields cannot read, are reported only when there is an `onError`, instead of raising an unhandled rejection that ends a Node process. The record still ships as stored.
+  - A locally staged event's failed driver check on a flush comes back in the flush report as `recoveryError`. A scheduled flush hands it to `onError`, or drops it when there is none, and `pending()` reports it only to `onError`.
+  - Past 10,000 unreadable staged records per event, or 10,000 unreadable stored series keys per metric, one report says so and later ones are not reported, instead of forgetting the oldest and reporting every record again on each read. An event reports records again once some it remembers have shipped.
+  - A snapshot that merges series, with `groupBy` or a `rollup`, keeps a series stored under an earlier declaration apart from one written since that reads the same, so a level adds both and a gauge leaves `last` off, instead of dropping one of them.
+  - Docs: a sink that inserts into a typed table may reject every batch that carries a stored key the current dims cannot read.
+- 30b8577: Fix what a script reload lets through, and what an event stops reporting.
+  
+  - The Redis driver loads all of its scripts together, as one set, so after a restart or a `SCRIPT FLUSH` Redis refuses every script call the driver sends until the set is loaded again. A call made while the refusal of an earlier call was still on its way back used to run ahead of that call's resend when its own script had been loaded since the flush, so a claim could miss a write made before it.
+  - The Redis driver runs a plain read again once a resend has gone, when Redis refused a round trip sent before the read. `readBuckets` and the other reads used to miss a write made before them while Redis was refusing it.
+  - An event staged in the driver forgets a reported unreadable record once a read of the whole staged list no longer finds it. Records another process shipped used to stay remembered for good, and once 10,000 of them had piled up no unreadable record was reported again.
+  - Docs: a `flush()` you call returns only its recovery pass's failure as `recoveryError`. A failure while it claims from the driver, or while it gives back a late claim, goes to `onError`, or is dropped when there is none.
+- d31cb15: - A final flush of a locally staged event, or of an event staged in a driver that is not durable such as `memory()`, claims until a claim comes back empty, with no cap of a hundred claims. With a small `claimLimit`, `house.stop()` no longer drops the records past the hundredth claim.
+  - `nextEligibleInMs` in a cadence skip counts to nine tenths of the interval, the moment the cadence lets the metric ship again, rather than to the whole interval.
+  - `createHouse({ driver: memory })`, a driver factory passed without calling it, throws `createHouse: driver is a function, not a driver. Call it, as in memory() or ioredis(client)` instead of printing the function's source.
+  - A `defaults.grace` or `defaults.flush` that is not a duration throws an error naming the setting, such as `createHouse: defaults.grace: parseDuration: -1`.
+  - When a send of a locally staged batch fails, the `batch.maxAge` clock starts again from the failure even when a record staged during the send had already started it.
+  - A locally staged event ships the records an earlier `stage: 'driver'` declaration left in the driver on its immediate sends and on `drain()`, so under immediate delivery they no longer wait for a `flush()` that may never come.
+  - An immediate send of a counter, gauge, timer or level asks the driver where its write landed only when this process has claimed at or past the window the write aimed at, or when that window reads back empty. On nearly every write the send now makes one read instead of two.
+  - When Redis forgets its scripts again between the reload and the resend, the Redis driver reloads and resends the refused call again, up to three times, still ahead of anything made after it, instead of failing the call.
+  - The Redis driver loads its scripts inside one `MULTI`/`EXEC` when the client has `multi()`, and each script carries a comment naming its set, so no script shares a SHA with 0.7.0 or with a build whose scripts differ. `IoredisTransaction` is exported from `metrichouse/ioredis`.
+- aba1dfd: - The `InferRow` and `Turn` types are exported from `metrichouse/core`. `InferRow` is the object a row carries, where `InferShape` is the object a call takes, and the two differ for a key declared with `.default()`.
+  - Docs: counters, gauges, levels and timers are not exact across isolates on `memory()` with immediate delivery, and the guides that recommended it for serverless now say so.
+  - Docs: the ClickHouse table that lets a flush row win under immediate delivery is `ReplacingMergeTree(final)`.
+  - Docs: `inc()` and `dec()` add up in any order only when every write to a series is one of them and none lands past `holdFor`, and the upgrade notes list every level rule 0.7.0 applies differently.
+
 ## 0.7.0
 
 ### Minor Changes
