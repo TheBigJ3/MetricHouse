@@ -2084,6 +2084,54 @@ describe('records staged under an earlier declaration', () => {
     expect(errors).toHaveLength(10_001)
   })
 
+  it('reports again past 10,000 once another process has shipped what it remembers', async () => {
+    await stagedBefore(
+      { n: str() },
+      Array.from({ length: 10_001 }, () => ({ n: 'abc' })),
+    )
+    const errors: string[] = []
+    const views = event('views', { fields: { n: int() }, write: discard })
+    createHouse({
+      driver,
+      schema: [views],
+      now,
+      onError: (error) => errors.push((error as Error).message),
+    })
+    await views.peek()
+    expect(errors).toHaveLength(10_001)
+
+    // another process claims and ships every staged record
+    await driver.ack(await driver.claimRecords('views'))
+    await stagedBefore({ n: str() }, [{ n: 'xyz' }])
+    const [staged] = await driver.readPending({ metric: 'views' })
+
+    await views.peek()
+    expect(errors.slice(10_001)).toEqual([
+      `views: staged record ${staged?.id} does not fit the fields as declared now, and ships ` +
+        'as stored. Field "n" holds a value it no longer accepts. n: expected a safe integer, ' +
+        'got "xyz"',
+    ])
+  })
+
+  it('keeps what it reported when a read covers only part of the staged list', async () => {
+    await stagedBefore({ n: str() }, [{ n: 'abc' }, { n: 'def' }])
+    const errors: unknown[] = []
+    const views = event('views', { fields: { n: int() }, write: discard })
+    createHouse({
+      driver,
+      schema: [views],
+      now,
+      onError: (error) => errors.push(error),
+    })
+
+    await views.peek()
+    await views.peek(1)
+    await views.snapshot({ limit: 1 })
+    await views.snapshot({ to: now() })
+    await views.peek()
+    expect(errors).toHaveLength(2)
+  })
+
   it('ships text stored under str() as JSON text once the field is json()', async () => {
     await stagedBefore({ note: str() }, [{ note: 'hello' }])
     const views = event('views', { fields: { note: json() }, write: discard })

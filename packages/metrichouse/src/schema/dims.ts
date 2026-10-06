@@ -589,6 +589,12 @@ export interface ReportedOnce {
   first(id: string): boolean
   /** Drop `id`, which will not be read again. */
   forget(id: string): void
+  /**
+   * Drop every id not in `staged`, the ids a read of everything still staged
+   * found. An id missing from it has shipped, or is in a claim and is read
+   * again only if that claim puts it back.
+   */
+  keepOnly(staged: ReadonlySet<string>): void
 }
 
 /**
@@ -623,6 +629,10 @@ export function reportedOnce(cap: number, overflow: () => void): ReportedOnce {
     },
     forget(id) {
       if (held.delete(id) && held.size < cap) overflowed = false
+    },
+    keepOnly(staged) {
+      for (const id of held) if (!staged.has(id)) held.delete(id)
+      if (held.size < cap) overflowed = false
     },
   }
 }

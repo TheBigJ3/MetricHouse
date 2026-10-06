@@ -1741,6 +1741,38 @@ return string.format('%.17g', pos + neg)
 `
 
 /**
+ * Every script the driver sends, loaded into Redis together as one set.
+ *
+ * A restart or a `SCRIPT FLUSH` forgets every script at once. With the whole
+ * set loaded at once too, either every SHA the driver holds is still known to
+ * Redis or none is, so a call made just after a refused one is refused as well
+ * and is resent behind it. Had the second call's script been loaded on its own
+ * after the flush, it would run ahead of the first call's resend.
+ */
+const SCRIPTS: readonly string[] = [
+  INCREMENT,
+  MERGE_GAUGE,
+  SET_LEVEL,
+  HOLD_LEVEL,
+  REWRITE_LEVELS,
+  DROP_LEVELS,
+  CLAIM_BUCKETS,
+  ACK_CLAIM,
+  APPEND_RECORDS,
+  RELEASE_BUCKETS,
+  CLAIM_RECORDS,
+  RELEASE_RECORDS,
+  RECOVER_CLAIMS,
+  TAKE_TURN,
+  RETURN_TURN,
+  READ_PAGE,
+  COUNT_PENDING,
+  READ_SERIES,
+  LANDING,
+  SUM_COUNTS,
+]
+
+/**
  * Marks an encoded `Date` inside a record's fields.
  *
  * `fields` is opaque to the driver, but it is not opaque to `JSON`: a `ts()`
@@ -2112,35 +2144,45 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     return connection
   }
 
-  /** Script source -> SHA1, filled by the first call that needs it. */
-  const shas = new Map<string, string>()
   /**
-   * Script source -> the load still on its way, shared by every call that
-   * asks meanwhile. A first level carry sends one script per window, and
-   * without this each of a thousand windows loaded the same script again.
+   * Script source -> SHA1, for every one of {@link SCRIPTS} or for none,
+   * filled by the first call that needs a script.
    */
-  const loading = new Map<string, Promise<string>>()
+  let shas: ReadonlyMap<string, string> = new Map()
+  /**
+   * The load of the whole set still on its way, shared by every call that
+   * asks meanwhile. A first level carry sends one script per window, and
+   * without this each of a thousand windows loaded the set again.
+   */
+  let loading: Promise<ReadonlyMap<string, string>> | undefined
 
-  function shaFor(client: IoredisClient, script: string): Promise<string> {
-    const cached = shas.get(script)
-    if (cached !== undefined) return Promise.resolve(cached)
-
-    let load = loading.get(script)
-    if (load === undefined) {
-      load = Promise.resolve(client.script('LOAD', script)).then((reply) => {
-        const sha = String(reply)
-        shas.set(script, sha)
-        return sha
-      })
-      const settled = load
+  /** Load every script, back to back, and cache their SHAs once all are in. */
+  function loadScripts(client: IoredisClient): Promise<ReadonlyMap<string, string>> {
+    if (loading === undefined) {
+      const load = Promise.all(SCRIPTS.map((script) => client.script('LOAD', script))).then(
+        (replies) => {
+          const loaded = new Map(SCRIPTS.map((script, n) => [script, String(replies[n])]))
+          shas = loaded
+          return loaded
+        },
+      )
+      loading = load
       // forgotten once settled either way, so a failed load is tried again
       const forget = () => {
-        if (loading.get(script) === settled) loading.delete(script)
+        if (loading === load) loading = undefined
       }
-      settled.then(forget, forget)
-      loading.set(script, settled)
+      load.then(forget, forget)
     }
-    return load
+    return loading
+  }
+
+  /** The SHA of each script in a set just loaded. */
+  function pick(loaded: ReadonlyMap<string, string>, scripts: readonly string[]): string[] {
+    return scripts.map((script) => {
+      const sha = loaded.get(script)
+      if (sha === undefined) throw new Error('ioredis driver: a script is missing from SCRIPTS')
+      return sha
+    })
   }
 
   /**
@@ -2156,7 +2198,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     const known: string[] = []
     for (const script of scripts) {
       const sha = shas.get(script)
-      if (sha === undefined) return Promise.all(scripts.map((one) => shaFor(client, one)))
+      if (sha === undefined) return loadScripts(client).then((loaded) => pick(loaded, scripts))
       known.push(sha)
     }
     return known
@@ -2285,13 +2327,30 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
   }
 
   /**
-   * One read, issued only after every send made before it.
+   * One read, issued only after every send made before it, and answered with
+   * what Redis holds once those sends have landed.
    *
    * A read sent straight to the client could reach Redis ahead of a write
    * that was made first but is still loading its script, and would miss it.
+   * A read issued while an earlier round trip's refusal is still on its way
+   * back reaches Redis ahead of that round trip's resend, and misses it too.
+   * So once every round trip issued before the read is answered, if Redis
+   * refused one of them, the read runs again after the resend.
    */
-  function afterSends<T>(read: () => Promise<T>): Promise<T> {
-    return inOrder(async () => ({ reply: read() }))
+  async function afterSends<T>(read: () => Promise<T>): Promise<T> {
+    for (;;) {
+      let earlier: Promise<Results>[] = []
+      const value = await inOrder(async () => {
+        earlier = unreplied.size === 0 ? [] : [...unreplied]
+        return { reply: read() }
+      })
+      if (earlier.length === 0) return value
+      // sent ahead of the read on the same connection, so already answered
+      // or about to be
+      await Promise.allSettled(earlier)
+      if (!earlier.some((trip) => refused.has(trip))) return value
+      await afterResends()
+    }
   }
 
   type Entry = [error: Error | null, result: unknown]
@@ -2316,6 +2375,8 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
   /** Round trips of scripts issued and not yet answered. */
   const unreplied = new Set<Promise<Results>>()
+  /** Round trips Redis refused a call of with NOSCRIPT, for {@link afterSends}. */
+  const refused = new WeakSet<Promise<Results>>()
 
   /**
    * Calls Redis refused with NOSCRIPT, with the round trip that carried them
@@ -2350,7 +2411,9 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       // a resend refused again is the caller's error, as a load that fails is
       if (!resend) {
         sents.forEach((sent, n) => {
-          if (isNoScript(results?.[n]?.[0])) sent.resent = forget(client, sent, trip, n)
+          if (!isNoScript(results?.[n]?.[0])) return
+          sent.resent = forget(client, sent, trip, n)
+          refused.add(reply)
         })
       }
       return results
@@ -2379,7 +2442,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
    * in the order the calls were first sent, ahead of anything newer.
    *
    * A restart or a `SCRIPT FLUSH` invalidates every cached SHA at once, so the
-   * whole cache goes and each script is loaded again. Only the calls refused
+   * whole cache goes and the whole set is loaded again. Only the calls refused
    * go again. The others ran, and running them twice is the very thing
    * LUA_ONCE guards against, while NOSCRIPT means a call never ran.
    *
@@ -2394,10 +2457,16 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       while (unreplied.size > 0) await Promise.allSettled([...unreplied])
       const batch = forgotten.sort((a, b) => a.trip - b.trip || a.at - b.at)
       forgotten = []
-      shas.clear()
+      // a load issued before the refusal may have reached Redis before the
+      // flush, so the set is loaded again from here
+      shas = new Map()
+      loading = undefined
       let resolved: string[]
       try {
-        resolved = await Promise.all(batch.map(({ sent }) => shaFor(client, sent.call.script)))
+        resolved = pick(
+          await loadScripts(client),
+          batch.map(({ sent }) => sent.call.script),
+        )
       } catch (error) {
         for (const { answer } of batch) answer([error as Error, null])
         return
@@ -2560,11 +2629,17 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
 
     const out: unknown[] = []
     for (let start = 0; start < commands.length; start += maxPipeline) {
-      const pipeline = client.pipeline()
-      for (const queue of commands.slice(start, start + maxPipeline)) queue(pipeline)
+      const part = commands.slice(start, start + maxPipeline)
       // queued behind any write still loading its script, so a read issued
       // after a write sees it
-      const replies = unwrap(await inOrder(async () => ({ reply: pipeline.exec() })), what)
+      const replies = unwrap(
+        await afterSends(() => {
+          const pipeline = client.pipeline()
+          for (const queue of part) queue(pipeline)
+          return pipeline.exec()
+        }),
+        what,
+      )
       for (const reply of replies) out.push(reply)
     }
     return out

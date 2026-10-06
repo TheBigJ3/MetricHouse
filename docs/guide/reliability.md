@@ -299,22 +299,28 @@ const house = createHouse({
   [Records staged under an earlier declaration](/primitives/event#records-staged-under-an-earlier-declaration)
   describes. The record ships as stored.
 - A locally staged event that could not ask the driver for records an earlier
-  `stage: 'driver'` declaration left there, from `pending()` or a scheduled
-  flush. A `flush()` you call returns it as `recoveryError` instead, as the
+  `stage: 'driver'` declaration left there, from `pending()`, from a scheduled
+  flush, or from the claim of any flush. Only the recovery pass of a `flush()`
+  you call returns its failure as `recoveryError` instead, as the
   [event page](/primitives/event#stage) sets out.
+- A locally staged event that could not give back to the driver a claim the
+  driver handed over after the event had stopped waiting for it.
 
 Without a handler these become unhandled promise rejections, except the last
-three. That is noisy, and deliberately better than a failure disappearing
+four. That is noisy, and deliberately better than a failure disappearing
 quietly. A handler that throws is raised the same way, and neither case stops
 `drain()` or `stop()` from waiting for the rest.
 
-The last three are dropped without a handler, because each is something the
+The last four are dropped without a handler, because each is something the
 library found on its own schedule, or while a caller read data, and already
-copes with: the row ships as stored, or the local buffer ships and the driver
-is asked again an interval later. Nothing was lost, and an unhandled rejection
-would end a Node process that set no `onError`. A `flush()` you call still
-returns the driver failure in its report, so a caller without a handler can
-see it there.
+copes with. The row ships as stored. Or the local buffer ships and the driver
+is asked again an interval later. Or the claim that was not given back stays
+in flight in the driver until a recovery pass returns it. Nothing was lost,
+and an unhandled rejection would end a Node process that set no `onError`. A
+`flush()` you call still returns a failure of its recovery pass in its report,
+as `recoveryError`, so a caller without a handler can see that one there. A
+failure while that flush claims from the driver, or while it gives back a
+late claim, is not in the report.
 
 `onWarn` receives startup warnings about your setup, and there are three kinds:
 
