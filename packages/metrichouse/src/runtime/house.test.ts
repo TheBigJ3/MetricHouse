@@ -199,6 +199,24 @@ describe('house config', () => {
     )
   })
 
+  it('refuses a default grace that is not a duration, naming the setting', () => {
+    expect(() => createHouse({ driver, defaults: { grace: -1 } })).toThrow(
+      'createHouse: defaults.grace: parseDuration: -1',
+    )
+  })
+
+  it('refuses a default flush cadence that is not a duration, naming the setting', () => {
+    expect(() => createHouse({ driver, defaults: { flush: '1.5m' } })).toThrow(
+      'createHouse: defaults.flush: parseDuration: "1.5m"',
+    )
+  })
+
+  it('refuses a driver factory passed without calling it', () => {
+    expect(() => createHouse({ driver: memory } as unknown as HouseConfig)).toThrow(
+      'createHouse: driver is a function, not a driver. Call it, as in memory() or ioredis(client)',
+    )
+  })
+
   it('refuses a config with no driver', () => {
     expect(() => createHouse({} as HouseConfig)).toThrow(
       'createHouse: driver is required, such as memory() or ioredis(client), got undefined',

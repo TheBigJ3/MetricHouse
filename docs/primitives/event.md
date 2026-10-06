@@ -141,9 +141,16 @@ flush claims the local buffer first, then fills whatever room
 the local ones since they were staged earlier. A claim the sink fails puts each
 record back where it came from.
 
+The sends that happen without a flush ship them too, since under
+[immediate delivery](/guide/delivery) a flush may never come. An immediate send
+and [`drain()`](#event-drain) ship the local buffer first, then claim what the
+driver holds in a send of its own, in claims of at most `claimLimit`, until a
+claim comes back with fewer or after 100 claims. Only one such pass runs at a
+time, so a burst of records asks the driver once.
+
 The driver is asked only while it may still hold such records. It starts out
-that way, and stops once `countPending` answers `0`. From then on a flush and a
-`pending()` make no driver call at all, until one [`flush`](#flush) interval has
+that way, and stops once `countPending` answers `0`. From then on a flush, a
+send and a `pending()` make no driver call at all, until one [`flush`](#flush) interval has
 passed and the next one asks again, which finds records a process still on the
 old declaration staged during a rolling deploy. A driver call that fails, or
 takes longer than 5 seconds or the flush interval, whichever is shorter, counts
@@ -510,7 +517,10 @@ this is what lets the fleet ship more than `claimLimit` records per interval.
 The places that have to empty the backlog still do, in batches of this size:
 [`drain()`](#event-drain) and `batch.maxAge` ship every locally staged record,
 and a [final flush](/reference/flush-options#final), which `house.stop()` makes,
-keeps claiming until a claim comes back empty. On a shared, durable driver that
+keeps claiming until a claim comes back empty. That final flush stops after a
+hundred claims only on a durable driver, where what it leaves stays staged. A
+locally staged event, or one staged in a driver that is not durable, has no
+later flush, so its final flush has no cap. On a shared, durable driver that
 final flush first waits for the turn, and when another process holds it the
 backlog stays staged for whichever process takes the next one. A full buffer
 on `batch.maxSize` ships batches while it is still full and leaves the rest to

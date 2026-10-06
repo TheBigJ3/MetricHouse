@@ -176,6 +176,13 @@ export interface BucketedBinding {
    * afterwards, and sends aimed past `newest`, are not waited for.
    */
   sendsSoFar(newest: number): Promise<void>
+  /**
+   * Note a claim this process is about to make, up to `upTo`, exclusive.
+   * `Infinity` for a claim that also takes the windows ahead of the clock.
+   * An immediate send aimed below the newest one asks the driver where its
+   * write landed. See {@link shipOpenSeries}.
+   */
+  claiming(upTo: number): void
 }
 
 /**
@@ -211,6 +218,12 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
    * when the send started, by the host clock that timers run on.
    */
   const sends = new Map<Promise<void>, { readonly aimed: number; readonly started: number }>()
+  /**
+   * The newest watermark this process has claimed up to. Windows below it may
+   * have been claimed here, and a write aimed at one may have been moved
+   * forward past it.
+   */
+  let claimedUpTo = Number.NEGATIVE_INFINITY
 
   function active(): MetricBinding {
     if (!binding) {
@@ -289,6 +302,7 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
           totalOf,
           sink,
           attempts,
+          claimedPast: (aimed) => aimed < claimedUpTo,
         }),
       )
       // the caller reports a failure, so this copy only has to settle
@@ -302,6 +316,10 @@ export function bucketedBinding(options: BucketedBindingOptions): BucketedBindin
       )
       sends.set(settled, { aimed: bucketTs, started: Date.now() })
       return sent
+    },
+
+    claiming(upTo: number): void {
+      if (upTo > claimedUpTo) claimedUpTo = upTo
     },
 
     async sendsSoFar(newest: number): Promise<void> {
@@ -507,10 +525,13 @@ export interface BucketedOptions {
    * sends aimed past every window the claim took.
    */
   readonly sendsSoFar?: (newest: number) => Promise<void>
+  /** {@link BucketedBinding.claiming}, told before every claim. */
+  readonly claiming?: (upTo: number) => void
 }
 
 export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
-  const { name, resolutionMs, graceMs, driver, materialize, totalOf, sendsSoFar } = options
+  const { name, resolutionMs, graceMs, driver, materialize, totalOf, sendsSoFar, claiming } =
+    options
 
   /**
    * A bucketed metric can only ever be handed back the claim it asked for. A
@@ -536,10 +557,13 @@ export function bucketedLifecycle(options: BucketedOptions): BatchLifecycle {
       // one made before the clock stepped back. Nothing else will ship them.
       // Storage that outlives the process keeps them for a later flush, and
       // leaves the open windows of other processes alone
-      const claim =
-        claimOptions.final && !storage.capabilities.durable
-          ? await storage.claim(name, upTo, bucketStart(nowMs, resolutionMs) + resolutionMs)
-          : await storage.claim(name, upTo)
+      const ahead = claimOptions.final === true && !storage.capabilities.durable
+      // before the claim, so an immediate send that starts while it runs
+      // already asks where its write landed
+      claiming?.(ahead ? Number.POSITIVE_INFINITY : upTo)
+      const claim = ahead
+        ? await storage.claim(name, upTo, bucketStart(nowMs, resolutionMs) + resolutionMs)
+        : await storage.claim(name, upTo)
       if (sendsSoFar !== undefined && claim.buckets.length > 0) {
         let newest = Number.NEGATIVE_INFINITY
         for (const bucket of claim.buckets) newest = Math.max(newest, bucket.bucketTs)

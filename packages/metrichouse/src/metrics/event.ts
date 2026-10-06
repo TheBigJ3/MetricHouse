@@ -519,6 +519,11 @@ export function stagedMetric<
    * none. See {@link driverMayHold}.
    */
   let driverClearAt: number | undefined
+  /**
+   * Local staging only: whether an immediate send or `drain()` is already
+   * asking the driver for what an earlier declaration left there.
+   */
+  let askingLeftover = false
 
   /**
    * Local staging only: the records `record()` refused past `maxStaged` in
@@ -1079,8 +1084,16 @@ export function stagedMetric<
    * being retried in a loop. `record()` is not one of those triggers until
    * `maxAge` has passed since the failure: the age clock, `flush()` and
    * `drain()` are.
+   *
+   * `leftover` is for immediate sends and `drain()`, which ship without a
+   * flush: they also ship what an earlier `stage: 'driver'` declaration left
+   * in the driver. See {@link shipLeftover}.
    */
-  function shipLocal(source: WriteContext['source'], everything = false): void {
+  function shipLocal(
+    source: WriteContext['source'],
+    everything = false,
+    leftover = isImmediate(),
+  ): void {
     if (batchTimer !== undefined) {
       clearTimeout(batchTimer)
       batchTimer = undefined
@@ -1095,7 +1108,43 @@ export function stagedMetric<
       if (!everything && !isImmediate() && buffer.length < maxSize) break
     }
     for (const claim of claims) sendLocalClaim(claim, source)
+    if (leftover) shipLeftover(source)
     armBatchTimer()
+  }
+
+  /**
+   * Ship what an earlier `stage: 'driver'` declaration of this event left in
+   * the driver, in claims of at most `claimLimit`, while the driver may still
+   * hold some.
+   *
+   * For the sends that happen without a flush, immediate sends and
+   * `drain()`, since under immediate delivery a flush may never come to
+   * claim them. One pass at a time, so a burst of records does not ask the
+   * driver once per record, and once the driver answers that it holds none
+   * it is not asked again for a flush interval. A claim that comes back full
+   * is followed by another, up to {@link IMMEDIATE_CLAIM_CAP}, and a failed
+   * send stops it: those records are back in the driver.
+   */
+  function shipLeftover(source: WriteContext['source']): void {
+    if (askingLeftover || binding === undefined || !driverMayHold()) return
+    askingLeftover = true
+    track(
+      (async (): Promise<void> => {
+        try {
+          for (let claims = 0; claims < IMMEDIATE_CLAIM_CAP; claims++) {
+            const claim = await claimLeftover(config.claimLimit)
+            if (claim === undefined) return
+            const outcome = await shipClaim(self, claim, sink, { attempts, source })
+            if (outcome.releaseError !== undefined) reportDetached(outcome.releaseError)
+            if (outcome.ackError !== undefined) reportDetached(outcome.ackError)
+            if (outcome.error !== undefined) throw outcome.error
+            if (config.claimLimit === undefined || claim.records.length < config.claimLimit) return
+          }
+        } finally {
+          askingLeftover = false
+        }
+      })(),
+    )
   }
 
   /** One claim from the local buffer, sent off the caller's stack. */
@@ -1405,6 +1454,9 @@ export function stagedMetric<
       attempts,
       // locally staged records are this process's own, and only it can ship them
       sharedDriver: () => (stage === 'local' ? undefined : activeDriver()),
+      // locally staged records, and records in a driver that is not durable,
+      // end with this process, so its final flush claims until none are left
+      outlivesProcess: () => stage !== 'local' && activeDriver().capabilities.durable,
       ...(config.claimLimit !== undefined && { claimLimit: config.claimLimit }),
     }),
 
@@ -1623,6 +1675,12 @@ export function stagedMetric<
         )
         buffer.length = 0
         for (const record of merged) buffer.push(record)
+        // the age clock starts again from the failure, even when a record
+        // staged during the send already has it running
+        if (batchTimer !== undefined) {
+          clearTimeout(batchTimer)
+          batchTimer = undefined
+        }
         armBatchTimer()
         // and what came from the driver goes back to the driver
         if (leftover !== undefined) await activeDriver().release(leftover)
@@ -1640,7 +1698,7 @@ export function stagedMetric<
       // `claimLimit` needs. A failed sink releases its records back into the
       // buffer, and re-shipping whatever is in the buffer would spin against a
       // sink that is down until the process dies.
-      if (stage === 'local') shipLocal('batch', true)
+      if (stage === 'local') shipLocal('batch', true, true)
 
       await writes.drain()
     },

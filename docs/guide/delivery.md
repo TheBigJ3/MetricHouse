@@ -150,12 +150,18 @@ sink](#telling-the-two-apart-in-your-sink) shows one way.
 
 A write that arrived after its window was claimed is
 [moved forward](/guide/buckets-and-time#a-write-that-misses-its-window) to a
-window that has not shipped, and the immediate send follows it. It asks the
-driver which window the write landed in, and sends every live window of that
-series from the one the write aimed at through that one. A window a failed
-flush released can sit in front of the landing window, or be the aimed window
-itself, and the landing window is still sent. A failed send counts toward
-`attempt` exactly as a failed flush does.
+window that has not shipped, and the immediate send follows it. Once this
+process has claimed the window the write aimed at, or when that window reads
+back empty, the send asks the driver which window the write landed in, and
+sends every live window of that series from the one the write aimed at through
+that one. A window a failed flush of this process released can sit in front of
+the landing window, or be the aimed window itself, and the landing window is
+still sent. Otherwise the send reads the aimed window alone, which saves a
+driver call on nearly every write. The one case it misses is a window another
+process claimed and then put back, after a failed flush or a recovery: a write
+aimed there is moved forward and the send carries only the window it aimed at.
+The flush ships the landing window with its full value either way. A failed
+send counts toward `attempt` exactly as a failed flush does.
 
 With several processes writing to one Redis, each of them sends the running
 total it read, and two immediate sends can arrive at your table in either order.

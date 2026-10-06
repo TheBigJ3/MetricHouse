@@ -73,11 +73,26 @@ export interface IoredisClient {
   lrange(key: string, start: number, stop: number): Promise<string[]>
   zrangebyscore(key: string, min: string | number, max: string | number): Promise<string[]>
   /**
+   * Start a transaction. Optional in this shape: with it, the driver loads
+   * its scripts inside one `MULTI`/`EXEC`, so a `SCRIPT FLUSH` cannot land
+   * between two of the loads. Without it, each script is loaded on its own.
+   */
+  multi?(): IoredisTransaction
+  /**
    * Close the connection. Optional in this shape, because only
    * {@link IoredisDriver.close} uses it, and only on a client the driver
    * created itself.
    */
   quit?(): Promise<unknown>
+}
+
+/**
+ * A transaction, as `client.multi()` starts one. Only `SCRIPT LOAD` is
+ * queued on it.
+ */
+export interface IoredisTransaction {
+  script(subcommand: string, ...args: unknown[]): unknown
+  exec(): Promise<[error: Error | null, result: unknown][] | null>
 }
 
 /** The chainable half of {@link IoredisClient}. */
@@ -178,6 +193,13 @@ function chunks<T>(items: readonly T[], size: number): T[][] {
 const DEFAULT_MAX_PIPELINE = 1000
 /** Five minutes. Far longer than any sane sink, which is the point. */
 const DEFAULT_RECOVER_AFTER = 300_000
+/**
+ * How many times a call Redis refused with NOSCRIPT is resent before its
+ * refusal is the caller's error. Each resend follows a reload of the whole
+ * set, so a call refused this many times in a row met a Redis that forgot
+ * its scripts again every time they were loaded.
+ */
+const MAX_RESENDS = 3
 
 /**
  * The watermark a write is landed by, from the two keys a claim keeps.
@@ -1773,6 +1795,36 @@ const SCRIPTS: readonly string[] = [
 ]
 
 /**
+ * FNV-1a over `text`, from `seed`, as eight hex digits.
+ *
+ * Only to tell one set of scripts from another, so it need not resist
+ * anyone choosing the text.
+ */
+function fnv1a(text: string, seed: number): string {
+  let hash = seed >>> 0
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(16).padStart(8, '0')
+}
+
+/**
+ * The comment every script is loaded with, naming the set it belongs to.
+ *
+ * Redis knows a script by the SHA1 of its text, so a script with the same
+ * text as one of another build's, 0.7.0's among them, has the same SHA. A
+ * process of that build loading its scripts after a `SCRIPT FLUSH` would then
+ * load this driver's too, one at a time, and a call of this driver's on that
+ * script could land ahead of the resend of a call refused before it. With
+ * this in front, every script's text, and so its SHA, belongs to this set
+ * alone. A build whose scripts are the same shares the SHAs, and runs the
+ * same scripts.
+ */
+const SET_MARKER = ((set: string) =>
+  `-- metrichouse set ${fnv1a(set, 0x811c9dc5)}${fnv1a(set, 0x01000193)}\n`)(SCRIPTS.join('\n'))
+
+/**
  * Marks an encoded `Date` inside a record's fields.
  *
  * `fields` is opaque to the driver, but it is not opaque to `JSON`: a `ts()`
@@ -2156,16 +2208,17 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
    */
   let loading: Promise<ReadonlyMap<string, string>> | undefined
 
-  /** Load every script, back to back, and cache their SHAs once all are in. */
+  /**
+   * Load every script, each behind {@link SET_MARKER}, inside one transaction
+   * when the client can start one, and cache their SHAs once all are in.
+   */
   function loadScripts(client: IoredisClient): Promise<ReadonlyMap<string, string>> {
     if (loading === undefined) {
-      const load = Promise.all(SCRIPTS.map((script) => client.script('LOAD', script))).then(
-        (replies) => {
-          const loaded = new Map(SCRIPTS.map((script, n) => [script, String(replies[n])]))
-          shas = loaded
-          return loaded
-        },
-      )
+      const load = loadSet(client).then((replies) => {
+        const loaded = new Map(SCRIPTS.map((script, n) => [script, String(replies[n])]))
+        shas = loaded
+        return loaded
+      })
       loading = load
       // forgotten once settled either way, so a failed load is tried again
       const forget = () => {
@@ -2174,6 +2227,22 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       load.then(forget, forget)
     }
     return loading
+  }
+
+  /** The SHA of every script in {@link SCRIPTS}, in its order, as Redis answers a load. */
+  async function loadSet(client: IoredisClient): Promise<unknown[]> {
+    const texts = SCRIPTS.map((script) => SET_MARKER + script)
+    if (client.multi === undefined) {
+      return Promise.all(texts.map((text) => client.script('LOAD', text)))
+    }
+    const transaction = client.multi()
+    for (const text of texts) transaction.script('LOAD', text)
+    const replies = await transaction.exec()
+    if (replies === null) throw new Error('ioredis driver: the script load was discarded')
+    return replies.map(([error, sha]) => {
+      if (error) throw error
+      return sha
+    })
   }
 
   /** The SHA of each script in a set just loaded. */
@@ -2371,6 +2440,12 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     heard: boolean
     /** The answer to its resend, once Redis has refused it with NOSCRIPT. */
     resent?: Promise<Entry>
+    /** Settles {@link resent}, with the answer to the last resend. */
+    settle?: (entry: Entry) => void
+    /** How many times it has been resent. */
+    resends: number
+    /** Whether it waits in {@link forgotten} for the next resend. */
+    queued: boolean
   }
 
   /** Round trips of scripts issued and not yet answered. */
@@ -2382,7 +2457,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
    * Calls Redis refused with NOSCRIPT, with the round trip that carried them
    * and their place in it, waiting for {@link resendForgotten}.
    */
-  let forgotten: { sent: Sent; trip: number; at: number; answer: (entry: Entry) => void }[] = []
+  let forgotten: { sent: Sent; trip: number; at: number }[] = []
 
   /** One round trip carrying `sents`, issued now. */
   function issueTrip(
@@ -2402,20 +2477,23 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     for (const sent of sents) {
       sent.trip = trip
       sent.heard = false
+      if (resend) sent.resends += 1
     }
     const reply = pipeline.exec().then((results) => {
       sents.forEach((sent, n) => {
         sent.heard = answered(results?.[n])
       })
       if (sents.some((sent) => sent.heard)) settleBefore(trip)
-      // a resend refused again is the caller's error, as a load that fails is
-      if (!resend) {
-        sents.forEach((sent, n) => {
-          if (!isNoScript(results?.[n]?.[0])) return
-          sent.resent = forget(client, sent, trip, n)
-          refused.add(reply)
-        })
-      }
+      // a resend refused again, because Redis forgot the scripts once more
+      // between the reload and the resend, goes into the next reload as a
+      // first refusal does. Past MAX_RESENDS it is the caller's error, as a
+      // load that fails is
+      sents.forEach((sent, n) => {
+        if (!isNoScript(results?.[n]?.[0]) || sent.resends >= MAX_RESENDS) return
+        const answer = forget(client, sent, trip, n)
+        if (!resend) sent.resent = answer
+        refused.add(reply)
+      })
       return results
     })
     unreplied.add(reply)
@@ -2426,11 +2504,18 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
     return reply
   }
 
-  /** Queue a call Redis refused with NOSCRIPT for the next resend, and its answer. */
+  /**
+   * Queue a call Redis refused with NOSCRIPT for the next resend, and its
+   * answer: the answer to the last resend it gets.
+   */
   function forget(client: IoredisClient, sent: Sent, trip: number, at: number): Promise<Entry> {
-    const answer = new Promise<Entry>((resolve) => {
-      forgotten.push({ sent, trip, at, answer: resolve })
-    })
+    const answer =
+      sent.resent ??
+      new Promise<Entry>((resolve) => {
+        sent.settle = resolve
+      })
+    sent.queued = true
+    forgotten.push({ sent, trip, at })
     // set before this returns, so nothing is issued from here on until the
     // resend has gone
     resending ??= resendForgotten(client)
@@ -2457,6 +2542,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       while (unreplied.size > 0) await Promise.allSettled([...unreplied])
       const batch = forgotten.sort((a, b) => a.trip - b.trip || a.at - b.at)
       forgotten = []
+      for (const { sent } of batch) sent.queued = false
       // a load issued before the refusal may have reached Redis before the
       // flush, so the set is loaded again from here
       shas = new Map()
@@ -2468,7 +2554,7 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           batch.map(({ sent }) => sent.call.script),
         )
       } catch (error) {
-        for (const { answer } of batch) answer([error as Error, null])
+        for (const { sent } of batch) sent.settle?.([error as Error, null])
         return
       }
       // taken after the load, as late as possible, as for any other send
@@ -2483,12 +2569,16 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
           true,
         ).then(
           (results) => {
-            part.forEach(({ answer }, n) => {
-              answer(results?.[n] ?? [new Error('ioredis driver: retry was discarded'), null])
+            part.forEach(({ sent }, n) => {
+              // refused again and queued for the next resend, which answers it
+              if (sent.queued) return
+              sent.settle?.(
+                results?.[n] ?? [new Error('ioredis driver: retry was discarded'), null],
+              )
             })
           },
           (error: unknown) => {
-            for (const { answer } of part) answer([error as Error, null])
+            for (const { sent } of part) sent.settle?.([error as Error, null])
           },
         )
       }
@@ -2514,6 +2604,8 @@ export function ioredis(source: IoredisSource, options: IoredisDriverOptions = {
       call,
       seq: call.once ? ++writeSeq : 0,
       heard: false,
+      resends: 0,
+      queued: false,
     }))
     for (const { seq } of sents) if (seq > 0) unanswered.add(seq)
 

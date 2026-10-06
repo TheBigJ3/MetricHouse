@@ -113,6 +113,89 @@ describe('shipOpenSeries', () => {
   })
 })
 
+describe('shipOpenSeries and where a write landed', () => {
+  /** A memory driver that counts how often it is asked where a write landed. */
+  function counting(): { driver: Driver; asked: number[] } {
+    const inner = memory()
+    const asked: number[] = []
+    const driver: Driver = {
+      ...inner,
+      landing: async (metric, bucketTs, resolutionMs) => {
+        asked.push(bucketTs)
+        return (await inner.landing?.(metric, bucketTs, resolutionMs)) as number
+      },
+    }
+    return { driver, asked }
+  }
+
+  function visitsSending(sent: [number, number][]) {
+    return counter('visits', {
+      resolution: '1s',
+      flush: '5m',
+      write: (rows: Row[], context) => {
+        if (context.source !== 'immediate') return
+        for (const row of rows) sent.push([(row.bucket_ts as Date).getTime(), row.value as number])
+      },
+    })
+  }
+
+  it('does not ask the driver when no claim of this process reaches the aimed window', async () => {
+    const { driver, asked } = counting()
+    const sent: [number, number][] = []
+    const visits = visitsSending(sent)
+    const house = createHouse({ driver, schema: [visits], delivery: 'immediate', now })
+
+    visits.add()
+    await house.drain()
+    visits.add()
+    await house.drain()
+
+    expect(sent).toEqual([
+      [T, 1],
+      [T, 2],
+    ])
+    expect(asked).toEqual([])
+  })
+
+  it('asks the driver when the aimed window reads back empty, and sends where the write landed', async () => {
+    const { driver, asked } = counting()
+    const sent: [number, number][] = []
+    const visits = visitsSending(sent)
+    const house = createHouse({ driver, schema: [visits], delivery: 'immediate', now })
+
+    // another process writes the window at T and claims it, so this process
+    // has claimed nothing
+    await driver.increment([
+      { metric: 'visits', bucketTs: T, resolutionMs: 1000, dimKey: '', delta: 1 },
+    ])
+    await driver.ack(await driver.claim('visits', T + 1_000))
+    visits.add()
+    await house.drain()
+
+    expect(sent).toEqual([[T + 1_000, 1]])
+    expect(asked).toEqual([T])
+  })
+
+  it('asks the driver once this process has claimed at or past the aimed window', async () => {
+    const { driver, asked } = counting()
+    const sent: [number, number][] = []
+    const visits = visitsSending(sent)
+    const house = createHouse({ driver, schema: [visits], delivery: 'immediate', now })
+
+    visits.add()
+    await house.drain()
+    clock = T + 3_000
+    await visits.flush()
+    sent.length = 0
+    clock = T + 500
+    visits.add()
+    await house.drain()
+
+    expect(sent).toEqual([[T + 1_000, 1]])
+    expect(asked).toEqual([T])
+  })
+})
+
 describe('readOpenWindow', () => {
   let driver: Driver
 

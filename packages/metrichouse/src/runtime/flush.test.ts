@@ -829,7 +829,7 @@ describe('metric.flush()', () => {
 
     const report = await metric.flush()
     expect(report).toMatchObject({ skipped: true, reason: 'cadence', rows: 0 })
-    expect(report.nextEligibleInMs).toBe(300_000 - 3_000)
+    expect(report.nextEligibleInMs).toBe(270_000 - 3_000)
     expect(write).toHaveBeenCalledTimes(1)
   })
 
@@ -948,7 +948,7 @@ describe('cadence across processes sharing a driver', () => {
       rows: 0,
       skipped: true,
       reason: 'cadence',
-      nextEligibleInMs: 299_000,
+      nextEligibleInMs: 269_000,
     })
   })
 
@@ -1418,6 +1418,42 @@ describe('claims per flush', () => {
     expect(await views.pending()).toBe(1)
   })
 
+  it('claims past a hundred on a final flush when the driver is not durable', async () => {
+    const views = event('views', { fields: { path: str() }, claimLimit: 1, write: discard })
+    createHouse({ driver, schema: [views], now })
+    views.recordMany(paths(150))
+    await views.drain()
+
+    expect(await views.flush({ final: true })).toEqual({ buckets: 0, rows: 150, skipped: false })
+    expect(await views.pending()).toBe(0)
+  })
+
+  it('claims past a hundred on a final flush of a locally staged event', async () => {
+    const views = event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      claimLimit: 1,
+      write: discard,
+    })
+    createHouse({ driver, schema: [views], now })
+    views.recordMany(paths(150))
+
+    expect(await views.flush({ final: true })).toEqual({ buckets: 0, rows: 150, skipped: false })
+    expect(await views.pending()).toBe(0)
+  })
+
+  it('stops a final flush after a hundred claims when the driver is durable', async () => {
+    const views = event('views', { fields: { path: str() }, claimLimit: 1, write: discard })
+    const inner = memory()
+    const durable: Driver = { ...inner, capabilities: { ...inner.capabilities, durable: true } }
+    createHouse({ driver: durable, schema: [views], now })
+    views.recordMany(paths(150))
+    await views.drain()
+
+    expect(await views.flush({ final: true })).toEqual({ buckets: 0, rows: 100, skipped: false })
+    expect(await views.pending()).toBe(50)
+  })
+
   it('claims a locally staged backlog in batches of claimLimit too', async () => {
     const sent: number[] = []
     const views = event('views', {
@@ -1465,7 +1501,7 @@ describe('a flush still in flight', () => {
       rows: 0,
       skipped: true,
       reason: 'cadence',
-      nextEligibleInMs: 300_000 - 3_000,
+      nextEligibleInMs: 270_000 - 3_000,
     })
     release()
     expect(await first).toEqual({ buckets: 1, rows: 1, skipped: false })
@@ -1540,7 +1576,7 @@ describe('a flush still in flight', () => {
     rows: 0,
     skipped: true,
     reason: 'cadence',
-    nextEligibleInMs: 300_000 - 103_000,
+    nextEligibleInMs: 270_000 - 103_000,
   }
 
   it('counts from a newer shipment than a flush let through before it and still running', async () => {
@@ -1667,7 +1703,7 @@ describe('cadence slack', () => {
       rows: 0,
       skipped: true,
       reason: 'cadence',
-      nextEligibleInMs: 6_001,
+      nextEligibleInMs: 1,
     })
   })
 })

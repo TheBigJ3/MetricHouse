@@ -749,6 +749,7 @@ export function level<D extends Shape = Record<never, never>>(
     materialize,
     totalOf,
     sendsSoFar: slot.sendsSoFar,
+    claiming: slot.claiming,
   })
 
   const self: Level<D> = {

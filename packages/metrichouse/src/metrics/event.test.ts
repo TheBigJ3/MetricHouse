@@ -1055,6 +1055,50 @@ describe('local staging after a failure', () => {
     }
   })
 
+  it('restarts the age clock when a send fails while a later record has it running', async () => {
+    vi.useFakeTimers()
+    try {
+      const sent: string[][] = []
+      let fail: (() => void) | undefined
+      let failing = true
+      const pageViews = event('page_view', {
+        fields: { path: str() },
+        stage: 'local',
+        batch: { maxAge: '10s' },
+        write: async (rows) => {
+          if (failing) {
+            failing = false
+            await new Promise<void>((resolve) => {
+              fail = resolve
+            })
+            throw new Error('down')
+          }
+          sent.push(rows.map((row) => row.path as string))
+        },
+      })
+      createHouse({ driver: memory(), schema: [pageViews], onError: () => {} })
+
+      pageViews.record({ path: '/a' })
+      // the age clock ships /a, and the send hangs
+      await vi.advanceTimersByTimeAsync(10_000)
+      // /b starts a clock for 12s from now
+      await vi.advanceTimersByTimeAsync(2_000)
+      pageViews.record({ path: '/b' })
+      // the send of /a fails 5s after it started
+      await vi.advanceTimersByTimeAsync(3_000)
+      fail?.()
+      await vi.advanceTimersByTimeAsync(0)
+
+      // the clock /b started would fire now. The failure restarted it
+      await vi.advanceTimersByTimeAsync(9_000)
+      expect(sent).toEqual([])
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(sent).toEqual([['/a', '/b']])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('puts back two failed batches in the order they were recorded', async () => {
     const release: (() => void)[] = []
     const seen: string[][] = []
@@ -1913,6 +1957,42 @@ describe('records staged under an earlier declaration', () => {
     expect(shipped).toEqual([['/old1', '/old2', '/new']])
     expect(await driver.countPending('views')).toBe(0)
     expect(await views.pending()).toBe(0)
+  })
+
+  it('ships what a driver staged event left behind with an immediate send', async () => {
+    await stagedBefore({ path: str() }, [{ path: '/old' }])
+    const shipped: string[][] = []
+    const views = event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      write: (rows) => {
+        shipped.push(rows.map((row) => row.path))
+      },
+    })
+    const house = createHouse({ driver, schema: [views], now, delivery: 'immediate' })
+    views.record({ path: '/new' })
+    await house.drain()
+
+    expect(shipped).toEqual([['/new'], ['/old']])
+    expect(await driver.countPending('views')).toBe(0)
+  })
+
+  it('ships what a driver staged event left behind on drain()', async () => {
+    await stagedBefore({ path: str() }, [{ path: '/old' }])
+    const shipped: string[][] = []
+    const views = event('views', {
+      fields: { path: str() },
+      stage: 'local',
+      write: (rows) => {
+        shipped.push(rows.map((row) => row.path))
+      },
+    })
+    createHouse({ driver, schema: [views], now })
+    views.record({ path: '/new' })
+    await views.drain()
+
+    expect(shipped).toEqual([['/new'], ['/old']])
+    expect(await driver.countPending('views')).toBe(0)
   })
 
   it('fills what claimLimit leaves after the local buffer with records from the driver', async () => {

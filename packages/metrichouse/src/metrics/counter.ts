@@ -315,6 +315,7 @@ export function counter<D extends Shape = Record<never, never>>(
       materialize,
       totalOf,
       sendsSoFar: slot.sendsSoFar,
+      claiming: slot.claiming,
     }),
 
     ...bucketedReader<D, { value: number }>({
